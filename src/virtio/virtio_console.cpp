@@ -124,6 +124,9 @@ void ConsoleDevice::DrainTransmitQueue() {
                 const char* p = static_cast<const char*>(b.host_addr);
                 captured_.insert(captured_.end(), p, p + b.len);
             }
+            if (byte_observer_) {
+                byte_observer_(static_cast<const char*>(b.host_addr), b.len);
+            }
             total += b.len;
         }
         if (sink_ != nullptr) std::fflush(sink_);

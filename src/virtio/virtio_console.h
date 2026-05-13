@@ -72,6 +72,13 @@ public:
     void SetSink(std::FILE* f) { sink_ = f; }
     void SetCapture(bool on) { capture_ = on; }
 
+    // Optional host-side observer for every chunk of guest TX. Used by
+    // tinyvmm's boot timer to detect "=== init complete" without parsing
+    // stdout. Set to nullptr to disable. Called from the VCPU thread under
+    // the txq drain path.
+    using ByteObserverFn = std::function<void(const char* data, std::size_t n)>;
+    void SetByteObserver(ByteObserverFn fn) { byte_observer_ = std::move(fn); }
+
     // Push host-side input bytes (e.g. from stdin) toward the guest's
     // /dev/hvc0. Thread-safe; safe to call before DRIVER_OK (bytes are
     // buffered until rxq is ready). After enqueueing, attempts to drain
@@ -103,6 +110,7 @@ private:
     std::FILE* sink_ = nullptr;
     bool capture_ = false;
     std::vector<char> captured_;
+    ByteObserverFn byte_observer_;
 
     std::atomic<std::uint64_t> tx_bytes_{0};
     std::atomic<std::uint64_t> tx_chains_{0};

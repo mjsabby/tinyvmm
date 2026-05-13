@@ -105,6 +105,10 @@ void Serial8250::HandleWrite(IoAccess& acc) {
                 }
             } else {
                 ++tx_bytes_;
+                if (!first_byte_fired_) {
+                    first_byte_fired_ = true;
+                    if (first_byte_cb_) first_byte_cb_();
+                }
                 if (sink_ != nullptr) {
                     std::fputc(v, sink_);
                     std::fflush(sink_);

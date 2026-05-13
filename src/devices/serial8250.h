@@ -108,6 +108,19 @@ private:
     bool capture_ = false;
     std::string captured_;
 
+    // Optional callback invoked on the FIRST byte ever written to THR
+    // (after construction). Used by tinyvmm's BootTimer to record when the
+    // kernel first emits output via earlyprintk/ttyS0 -- typically far
+    // earlier than the virtio-console becomes live.
+    using FirstByteFn = std::function<void()>;
+    FirstByteFn first_byte_cb_;
+    bool first_byte_fired_ = false;
+
+public:
+    void SetFirstByteCallback(FirstByteFn fn) { first_byte_cb_ = std::move(fn); }
+
+private:
+
     // Lifetime statistics: number of bytes the guest wrote to THR. Useful
     // for confirming kernel output is reaching the UART even when stdout is
     // captured/piped and visible bytes get lost.

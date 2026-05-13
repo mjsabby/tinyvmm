@@ -56,6 +56,7 @@ add_executable(tinyvmm
     src/pci/msix.cpp
     src/boot/pvh_loader.cpp
     src/boot/acpi_tables.cpp
+    src/diag/etw.cpp
 )
 
 target_include_directories(tinyvmm PRIVATE

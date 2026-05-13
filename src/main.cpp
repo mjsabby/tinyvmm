@@ -6,6 +6,8 @@
 #include "devices/mmio_bus.h"
 #include "devices/pit8254.h"
 #include "devices/serial8250.h"
+#include "diag/boot_timer.h"
+#include "diag/etw.h"
 #include "host/block_file.h"
 #include "host/privilege.h"
 #include "host/xdp_probe.h"
@@ -1841,7 +1843,12 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     using namespace tinyvmm;
     using namespace tinyvmm::whp;
 
+    diag::EtwRegister();
+    diag::BootTimer btimer;
+    btimer.Mark("pvh-run start");
+
     CheckWhpAvailable();
+    btimer.Mark("WHP probe done");
     std::puts("[pvh-run] WHP available");
     ReportHostCapabilities();
 
@@ -1859,6 +1866,7 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     part.Setup();
 
     GuestMemory ram(part, /*gpa=*/0, kRamBytes, /*executable=*/true);
+    btimer.Mark("guest RAM mapped");
     std::printf("[pvh-run] guest RAM: %zu MiB at GPA 0 (%s)\n",
                 ram.size() / (1024 * 1024),
                 ram.large_pages() ? "MEM_LARGE_PAGES" : "4 KiB pages");
@@ -1871,6 +1879,7 @@ int RunPvhRun(const char* path, const std::string& cmdline,
         cfg.initramfs = std::filesystem::path(initrd_path);
     }
     auto load = boot::LoadPvh(ram, std::filesystem::path(path), cfg);
+    btimer.Mark("vmlinux+initramfs loaded");
     std::printf("[pvh-run] loaded %llu bytes; entry=0x%08x start_info_gpa=0x%llx "
                 "gdt_gpa=0x%llx\n",
                 static_cast<unsigned long long>(load.bytes_loaded),
@@ -1891,6 +1900,9 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     devices::MmioBus mmio_bus;
     devices::Serial8250 com1(0x3F8, stdout);
     com1.Attach(io_bus);
+    com1.SetFirstByteCallback([btimer_ptr = &btimer]() {
+        btimer_ptr->Mark("guest: first 8250 byte");
+    });
     devices::Pit8254 pit;
     pit.Attach(io_bus);
     devices::LegacyIsaStubs legacy;
@@ -1965,6 +1977,45 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     // TTY (see stdin_reader_thread further down).
     auto vcon = std::make_unique<virtio::ConsoleDevice>(ram, stdout);
     virtio::ConsoleDevice* vcon_ptr = vcon.get();
+
+    // Scan TX bytes for boot waypoint markers emitted by /init.
+    // Detecting them lets us record an honest "userspace ready" time without
+    // requiring guest cooperation beyond a couple of echo lines.
+    static constexpr const char* kMarkers[] = {
+        "Run /init as init process",        // kernel ready to hand off
+        "[init] === tinyvmm init starting", // /init pid 1 alive
+        "[init] === init complete",         // /init finished setup
+    };
+    static constexpr const char* kMarkerLabels[] = {
+        "guest: kernel done",
+        "guest: /init started",
+        "guest: /init complete",
+    };
+    static_assert(std::size(kMarkers) == std::size(kMarkerLabels));
+    auto marker_state = std::make_shared<std::array<bool, std::size(kMarkers)>>();
+    auto pending_buf  = std::make_shared<std::string>();
+    auto pending_mu   = std::make_shared<std::mutex>();
+    auto first_byte   = std::make_shared<std::atomic<bool>>(false);
+    auto btimer_ptr   = &btimer;
+    vcon->SetByteObserver([marker_state, pending_buf, pending_mu, first_byte, btimer_ptr]
+                          (const char* d, std::size_t n) {
+        if (!first_byte->exchange(true)) {
+            btimer_ptr->Mark("guest: first hvc0 byte");
+        }
+        std::lock_guard<std::mutex> lg(*pending_mu);
+        pending_buf->append(d, n);
+        // Cap rolling buffer to avoid unbounded growth.
+        if (pending_buf->size() > 4096) {
+            pending_buf->erase(0, pending_buf->size() - 2048);
+        }
+        for (std::size_t i = 0; i < std::size(kMarkers); ++i) {
+            if ((*marker_state)[i]) continue;
+            if (pending_buf->find(kMarkers[i]) != std::string::npos) {
+                (*marker_state)[i] = true;
+                btimer_ptr->Mark(kMarkerLabels[i]);
+            }
+        }
+    });
     {
         virtio::PciTransport::Options copts;
         copts.subsys_id        = static_cast<std::uint16_t>(virtio::kDeviceIdConsole);
@@ -2124,57 +2175,66 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     // Watchdog + per-second exit-rate telemetry. We print deltas (not
     // running totals) so it's obvious whether the guest is currently
     // generating traffic in a given category, and at what rate.
-    // `watchdog_secs == 0` -> telemetry only, never auto-stop (default).
+    // `watchdog_secs == 0` -> no watchdog AND no telemetry (interactive
+    // default; telemetry would otherwise corrupt the on-console shell).
     const bool watchdog_enabled = (watchdog_secs > 0);
     std::atomic<bool> watchdog_done{false};
-    std::thread watchdog([&] {
-        std::uint64_t prev_io = 0, prev_mmio = 0, prev_halt = 0;
-        std::uint64_t prev_cpuid = 0, prev_msi = 0, prev_uart = 0;
-        int s = 0;
-        while (!watchdog_done.load()) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            if (watchdog_done.load()) return;
-            ++s;
-            const std::uint64_t cur_io    = loop.io_exits();
-            const std::uint64_t cur_mmio  = loop.mmio_exits();
-            const std::uint64_t cur_halt  = loop.halt_exits();
-            const std::uint64_t cur_cpuid = loop.cpuid_exits();
-            const std::uint64_t cur_msi   = whp::MsiInjectCount();
-            const std::uint64_t cur_uart  = com1.tx_bytes();
-            std::fprintf(stderr,
-                "[pvh-run] @%2ds  io=%llu(+%llu) mmio=%llu(+%llu) "
-                "cpuid=%llu(+%llu) halt=%llu(+%llu) msi=%llu(+%llu) "
-                "uart=%llu(+%llu)\n",
-                s,
-                static_cast<unsigned long long>(cur_io),
-                static_cast<unsigned long long>(cur_io - prev_io),
-                static_cast<unsigned long long>(cur_mmio),
-                static_cast<unsigned long long>(cur_mmio - prev_mmio),
-                static_cast<unsigned long long>(cur_cpuid),
-                static_cast<unsigned long long>(cur_cpuid - prev_cpuid),
-                static_cast<unsigned long long>(cur_halt),
-                static_cast<unsigned long long>(cur_halt - prev_halt),
-                static_cast<unsigned long long>(cur_msi),
-                static_cast<unsigned long long>(cur_msi - prev_msi),
-                static_cast<unsigned long long>(cur_uart),
-                static_cast<unsigned long long>(cur_uart - prev_uart));
-            prev_io    = cur_io;
-            prev_mmio  = cur_mmio;
-            prev_halt  = cur_halt;
-            prev_cpuid = cur_cpuid;
-            prev_msi   = cur_msi;
-            prev_uart  = cur_uart;
-            if (watchdog_enabled && s >= watchdog_secs) {
+    std::thread watchdog;
+    if (watchdog_enabled) {
+        watchdog = std::thread([&] {
+            std::uint64_t prev_io = 0, prev_mmio = 0, prev_halt = 0;
+            std::uint64_t prev_cpuid = 0, prev_msi = 0, prev_uart = 0;
+            int s = 0;
+            while (!watchdog_done.load()) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (watchdog_done.load()) return;
+                ++s;
+                const std::uint64_t cur_io    = loop.io_exits();
+                const std::uint64_t cur_mmio  = loop.mmio_exits();
+                const std::uint64_t cur_halt  = loop.halt_exits();
+                const std::uint64_t cur_cpuid = loop.cpuid_exits();
+                const std::uint64_t cur_msi   = whp::MsiInjectCount();
+                const std::uint64_t cur_uart  = com1.tx_bytes();
                 std::fprintf(stderr,
-                    "[pvh-run] watchdog: %ds elapsed, requesting stop\n",
-                    watchdog_secs);
-                loop.RequestStop();
-                return;
+                    "[pvh-run] @%2ds  io=%llu(+%llu) mmio=%llu(+%llu) "
+                    "cpuid=%llu(+%llu) halt=%llu(+%llu) msi=%llu(+%llu) "
+                    "uart=%llu(+%llu)\n",
+                    s,
+                    static_cast<unsigned long long>(cur_io),
+                    static_cast<unsigned long long>(cur_io - prev_io),
+                    static_cast<unsigned long long>(cur_mmio),
+                    static_cast<unsigned long long>(cur_mmio - prev_mmio),
+                    static_cast<unsigned long long>(cur_cpuid),
+                    static_cast<unsigned long long>(cur_cpuid - prev_cpuid),
+                    static_cast<unsigned long long>(cur_halt),
+                    static_cast<unsigned long long>(cur_halt - prev_halt),
+                    static_cast<unsigned long long>(cur_msi),
+                    static_cast<unsigned long long>(cur_msi - prev_msi),
+                    static_cast<unsigned long long>(cur_uart),
+                    static_cast<unsigned long long>(cur_uart - prev_uart));
+                prev_io    = cur_io;
+                prev_mmio  = cur_mmio;
+                prev_halt  = cur_halt;
+                prev_cpuid = cur_cpuid;
+                prev_msi   = cur_msi;
+                prev_uart  = cur_uart;
+                if (s >= watchdog_secs) {
+                    std::fprintf(stderr,
+                        "[pvh-run] watchdog: %ds elapsed, requesting stop\n",
+                        watchdog_secs);
+                    loop.RequestStop();
+                    return;
+                }
             }
-        }
-    });
+        });
+    }
 
+    btimer.Mark("entering guest");
+    TINYVMM_ETW_INFO("GuestEntry",
+        TraceLoggingString(path, "kernel"),
+        TraceLoggingBool(with_net, "with_net"));
     StopReason stop = loop.Run();
+    btimer.Mark("guest exited");
     watchdog_done.store(true);
     stdin_stop.store(true);
     if (watchdog.joinable()) {
@@ -2386,6 +2446,11 @@ int RunPvhRun(const char* path, const std::string& cmdline,
         ExitReasonName(loop.last_exit().ExitReason),
         static_cast<unsigned int>(loop.last_exit().ExitReason),
         static_cast<unsigned long long>(loop.last_exit().VpContext.Rip));
+
+    btimer.Mark("teardown done");
+    TINYVMM_ETW_INFO("VmStop",
+        TraceLoggingFloat64(btimer.ElapsedMs(), "total_ms"));
+    diag::EtwUnregister();
 
     // For post-mortem debugging: dump first 64 MiB of guest RAM so we can
     // grep for printk strings, parse the ringbuffer, etc.
