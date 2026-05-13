@@ -1,5 +1,10 @@
 #pragma once
 
+// winsock2.h must precede Windows.h. We do this globally here so any
+// later <iphlpapi.h>, <ws2tcpip.h>, third-party `wintun.h`, etc.
+// include in any translation unit gets the right typedefs.
+#include <winsock2.h>
+
 #include <Windows.h>
 #include <winerror.h>
 

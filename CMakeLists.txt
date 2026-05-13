@@ -44,6 +44,8 @@ add_executable(tinyvmm
     src/virtio/virtio_console.cpp
     src/virtio/net_loopback.cpp
     src/virtio/net_xdp.cpp
+    src/virtio/net_wintun.cpp
+    src/net/wintun_loader.cpp
     src/host/block_file.cpp
     src/host/rng.cpp
     src/host/xdp_probe.cpp
@@ -68,6 +70,13 @@ target_link_libraries(tinyvmm PRIVATE
     # XDP driver via NtCreateFile + NtDeviceIoControlFile, so we link ntdll
     # for those Nt* exports. No xdpapi.lib required.
     ntdll.lib
+    # IPHLPAPI: CreateUnicastIpAddressEntry / Get|SetIpInterfaceEntry for
+    # configuring the WinTun adapter's IPv4 address (M16).
+    Iphlpapi.lib
+    # Ws2_32: InetPton, basic Winsock helpers used by net_wintun.cpp.
+    Ws2_32.lib
+    # PathFileExistsW used by net/wintun_loader.cpp for DLL discovery.
+    Shlwapi.lib
 )
 
 target_compile_definitions(tinyvmm PRIVATE

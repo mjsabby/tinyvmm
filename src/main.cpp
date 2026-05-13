@@ -9,6 +9,7 @@
 #include "host/block_file.h"
 #include "host/privilege.h"
 #include "host/xdp_probe.h"
+#include "net/wintun_loader.h"
 #include "pci/msix.h"
 #include "pci/pci.h"
 #include "pci/pci_bus.h"
@@ -25,6 +26,7 @@
 #include "virtio/net_backend.h"
 #include "virtio/net_loopback.h"
 #include "virtio/net_xdp.h"
+#include "virtio/net_wintun.h"
 #include "whp/cpuid.h"
 #include "whp/memory.h"
 #include "whp/msi.h"
@@ -69,8 +71,9 @@ void PrintUsage() {
         "  tinyvmm --virtio-console-test     Host-side virtio-console transmitq drain\n"
         "  tinyvmm --cpuid-test              Verify CPUID resolver policy (M18 time hygiene)\n"
         "  tinyvmm --xdp-probe [<IfIndex>]   List host NICs / probe XDP attachment\n"
+        "  tinyvmm --wintun-probe [<secs>]   Bring up WinTun adapter 10.0.0.1/24 and dump RX (admin)\n"
         "  tinyvmm --pvh-info <vmlinux>      Inspect a PVH-capable ELF\n"
-        "  tinyvmm --pvh-run [--net] [--net-backend loopback|xdp] [--xdp-if <idx>]\n"
+        "  tinyvmm --pvh-run [--net] [--net-backend loopback|xdp|wintun] [--xdp-if <idx>]\n"
         "                   [--initrd <path>] <vmlinux> [-- <kernel cmdline...>]\n"
         "                                    Load and run a PVH kernel\n"
         "  tinyvmm --help                    Show this help\n");
@@ -1827,7 +1830,7 @@ int RunPvhInfo(const char* path) {
 //   "none"     : guest sees the device but no packets ever flow
 //   "loopback" : TX echoes back as RX via LoopbackNetBackend (debug)
 //   "xdp"      : AF_XDP zero-copy to host NIC queue `xdp_if`/`xdp_queue`
-enum class NetBackendKind { None, Loopback, Xdp };
+enum class NetBackendKind { None, Loopback, Xdp, Wintun };
 int RunPvhRun(const char* path, const std::string& cmdline,
               bool with_net,
               NetBackendKind net_backend,
@@ -2012,6 +2015,13 @@ int RunPvhRun(const char* path, const std::string& cmdline,
             net->SetBackend(std::make_unique<virtio::XdpNetBackend>(
                 *net, ram, xo));
             backend_name = "xdp";
+            break;
+        }
+        case NetBackendKind::Wintun: {
+            virtio::WintunNetBackend::Options wo;
+            net->SetBackend(std::make_unique<virtio::WintunNetBackend>(
+                *net, wo));
+            backend_name = "wintun";
             break;
         }
         }
@@ -4888,6 +4898,14 @@ int main(int argc, char** argv) {
             }
             return tinyvmm::host::RunXdpProbe(if_index);
         }
+        if (cmd == "--wintun-probe") {
+            int seconds = 5;
+            if (argc >= 3) {
+                seconds = std::atoi(argv[2]);
+                if (seconds <= 0) seconds = 5;
+            }
+            return tinyvmm::RunWintunProbe(seconds);
+        }
         if (cmd == "--pvh-info") {
             if (argc < 3) {
                 std::fputs("--pvh-info: expected path to vmlinux\n", stderr);
@@ -4924,9 +4942,10 @@ int main(int argc, char** argv) {
                     if (kind == "none")          net_backend = NetBackendKind::None;
                     else if (kind == "loopback") net_backend = NetBackendKind::Loopback;
                     else if (kind == "xdp")      net_backend = NetBackendKind::Xdp;
+                    else if (kind == "wintun")   net_backend = NetBackendKind::Wintun;
                     else {
                         std::fprintf(stderr,
-                            "--pvh-run: unknown --net-backend '%.*s' (want none|loopback|xdp)\n",
+                            "--pvh-run: unknown --net-backend '%.*s' (want none|loopback|xdp|wintun)\n",
                             static_cast<int>(kind.size()), kind.data());
                         return 1;
                     }
@@ -4970,6 +4989,11 @@ int main(int argc, char** argv) {
             }
             if (net_backend == NetBackendKind::Xdp && !with_net) {
                 std::fputs("--pvh-run: --net-backend xdp requires --net\n",
+                           stderr);
+                return 1;
+            }
+            if (net_backend == NetBackendKind::Wintun && !with_net) {
+                std::fputs("--pvh-run: --net-backend wintun requires --net\n",
                            stderr);
                 return 1;
             }
