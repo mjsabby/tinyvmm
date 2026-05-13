@@ -47,6 +47,7 @@ add_executable(tinyvmm
     src/virtio/net_wintun.cpp
     src/net/wintun_loader.cpp
     src/host/block_file.cpp
+    src/host/mapped_file.cpp
     src/host/rng.cpp
     src/host/xdp_probe.cpp
     src/whp/notification_port.cpp
