@@ -76,10 +76,12 @@ void PrintUsage() {
         "  tinyvmm --wintun-probe [<secs>]   Bring up WinTun adapter 10.0.0.1/24 and dump RX (admin)\n"
         "  tinyvmm --pvh-info <vmlinux>      Inspect a PVH-capable ELF\n"
         "  tinyvmm --pvh-run [--net] [--net-backend loopback|xdp|wintun] [--xdp-if <idx>]\n"
-        "                   [--initrd <path>] [--watchdog-secs <N>] [--debug-boot]\n"
+        "                   [--initrd <path>] [--drive <path>[,readonly]]...\n"
+        "                   [--watchdog-secs <N>] [--debug-boot]\n"
         "                   [--expose-tsc-deadline]\n"
         "                   <vmlinux> [-- <kernel cmdline...>]\n"
         "                                    Load and run a PVH kernel\n"
+        "                                    --drive may be repeated; drive N appears as /dev/vd<a+N>\n"
         "  tinyvmm --help                    Show this help\n");
 }
 
@@ -1835,12 +1837,20 @@ int RunPvhInfo(const char* path) {
 //   "loopback" : TX echoes back as RX via LoopbackNetBackend (debug)
 //   "xdp"      : AF_XDP zero-copy to host NIC queue `xdp_if`/`xdp_queue`
 enum class NetBackendKind { None, Loopback, Xdp, Wintun };
+// One disk attached via --drive. We open with FILE_FLAG_OVERLAPPED and bind
+// to a per-disk IOCP worker thread; see host::BlockFile.
+struct DriveSpec {
+    std::string path;
+    bool        readonly = false;
+};
+
 int RunPvhRun(const char* path, const std::string& cmdline,
               bool with_net,
               NetBackendKind net_backend,
               std::uint32_t xdp_if,
               std::uint32_t xdp_queue,
               const std::string& initrd_path,
+              const std::vector<DriveSpec>& drives,
               int watchdog_secs,
               bool hide_tsc_deadline) {
     using namespace tinyvmm;
@@ -2051,6 +2061,72 @@ int RunPvhRun(const char* path, const std::string& cmdline,
         const pci::Bdf cbdf = pbus->AddDevice(std::move(cxport));
         std::printf("[pvh-run] virtio-console on PCI %02x:%02x.%u (sink=stdout)\n",
                     cbdf.bus, cbdf.device, cbdf.function);
+    }
+
+
+    // --- virtio-blk (M13, optional, repeatable via --drive) -----------
+    // Each --drive becomes one virtio-blk PCI device, backed by an async
+    // host::BlockFile (FILE_FLAG_OVERLAPPED + per-disk IOCP worker thread).
+    // Drive N typically shows up in the guest as /dev/vd<a+N>; ordering
+    // matches the order of --drive flags on the command line.
+    //
+    // Lifetime: BlockFile and BlockDevice MUST be kept alive past loop.Run()
+    // because (a) the PciTransport stored in pbus references the BlockDevice
+    // by reference, and (b) BlockDevice's completion callback runs on the
+    // BlockFile's IOCP worker. We Stop() each backend in the shutdown
+    // section below so no completion can race with destructor unwind.
+    std::vector<std::unique_ptr<host::BlockFile>>    blk_backends;
+    std::vector<std::unique_ptr<virtio::BlockDevice>> blk_devices;
+    blk_backends.reserve(drives.size());
+    blk_devices.reserve(drives.size());
+    for (std::size_t i = 0; i < drives.size(); ++i) {
+        const auto& d = drives[i];
+        std::wstring wpath = std::filesystem::path(d.path).wstring();
+        auto backend = std::make_unique<host::BlockFile>(wpath, d.readonly);
+        if (!backend->open()) {
+            std::fprintf(stderr,
+                "[pvh-run] --drive: failed to open '%s' (readonly=%d): hr=0x%08lx\n",
+                d.path.c_str(), d.readonly ? 1 : 0,
+                static_cast<unsigned long>(backend->open_hr()));
+            return 4;
+        }
+
+        auto blk = std::make_unique<virtio::BlockDevice>(
+            ram, *backend, virtio::BlockDevice::IrqFn{}, /*queue_max=*/256);
+        virtio::BlockDevice* bp = blk.get();
+
+        virtio::PciTransport::Options opts;
+        opts.subsys_id        = static_cast<std::uint16_t>(virtio::kDeviceIdBlk);
+        opts.num_msix_vectors = 2;     // requestq + config
+        opts.pci_class        = 0x01;  // Mass Storage
+        opts.pci_subclass     = 0x00;  // SCSI Controller (canonical for virtio-blk)
+        auto xport = std::make_unique<virtio::PciTransport>(
+            *bp, opts, mmio_bus, inject_fn);
+        virtio::PciTransport* xp = xport.get();
+
+        // Wire IRQ BEFORE starting the IOCP worker, otherwise an early
+        // completion (e.g. from a request submitted before this loop iter
+        // returns -- not currently possible since the kernel hasn't driven
+        // the device yet, but cheap insurance) could fire with a null sink.
+        bp->SetIrqCallback(
+            [xp](std::uint32_t q) { xp->RaiseQueueInterrupt(q); });
+
+        char nbuf[32];
+        std::snprintf(nbuf, sizeof(nbuf), "virtio-pci-blk[%zu]", i);
+        xport->set_name(nbuf);
+
+        backend->Start();
+
+        const pci::Bdf bbdf = pbus->AddDevice(std::move(xport));
+        const std::uint64_t cap_sect = backend->size() / 512;
+        std::printf("[pvh-run] virtio-blk[%zu] on PCI %02x:%02x.%u "
+                    "path=%s%s capacity=%llu sectors (%.1f MiB)\n",
+                    i, bbdf.bus, bbdf.device, bbdf.function,
+                    d.path.c_str(), d.readonly ? " (ro)" : "",
+                    static_cast<unsigned long long>(cap_sect),
+                    static_cast<double>(backend->size()) / (1024.0 * 1024.0));
+        blk_backends.push_back(std::move(backend));
+        blk_devices .push_back(std::move(blk));
     }
 
 
@@ -2325,6 +2401,15 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     // unregistered before the partition handle goes away.
     if (net) {
         if (auto* b = net->backend()) b->Stop();
+    }
+
+    // Quiesce every virtio-blk IOCP worker before the BlockDevice owners
+    // (in blk_devices) get destroyed. Otherwise a completion landing
+    // after BlockDevice is gone but before BlockFile::~BlockFile runs Stop
+    // would invoke a method on freed memory. Stop() is idempotent so it's
+    // fine if the destructor runs Stop() again.
+    for (auto& b : blk_backends) {
+        b->Stop();
     }
 
     // Dump the guest's view of itself at the moment we stopped, so we can
@@ -5159,6 +5244,7 @@ int main(int argc, char** argv) {
             std::uint32_t xdp_if = 0;
             std::uint32_t xdp_queue = 0;
             std::string initrd_path;
+            std::vector<DriveSpec> drives;
             int watchdog_secs = 0;  // 0 = disabled (default; previously 20)
             // Hide TSC-deadline by default: WHP's LAPIC emulation rejects
             // WRMSR 0x6E0 even when the bit is set in CpuidResultList, so
@@ -5219,6 +5305,56 @@ int main(int argc, char** argv) {
                     }
                     ++vmlinux_arg;
                     initrd_path = argv[vmlinux_arg];
+                } else if (f == "--drive") {
+                    if (vmlinux_arg + 1 >= argc) {
+                        std::fputs("--pvh-run: --drive wants <path>[,readonly]\n",
+                                   stderr);
+                        return 1;
+                    }
+                    ++vmlinux_arg;
+                    std::string_view spec(argv[vmlinux_arg]);
+                    DriveSpec ds;
+                    const auto comma = spec.find(',');
+                    if (comma == std::string_view::npos) {
+                        ds.path = std::string(spec);
+                    } else {
+                        ds.path = std::string(spec.substr(0, comma));
+                        std::string_view opts = spec.substr(comma + 1);
+                        // Comma-separated options after the path. Today the
+                        // only recognised one is `readonly`. Keep parsing
+                        // tolerant so future options (cache=, discard=...)
+                        // can be slotted in without breaking existing usage.
+                        while (!opts.empty()) {
+                            const auto next = opts.find(',');
+                            std::string_view kv = (next == std::string_view::npos)
+                                                  ? opts
+                                                  : opts.substr(0, next);
+                            if (kv == "readonly" || kv == "ro") {
+                                ds.readonly = true;
+                            } else {
+                                std::fprintf(stderr,
+                                    "--pvh-run: --drive: unknown option '%.*s' "
+                                    "(want: readonly)\n",
+                                    static_cast<int>(kv.size()), kv.data());
+                                return 1;
+                            }
+                            opts = (next == std::string_view::npos)
+                                   ? std::string_view{}
+                                   : opts.substr(next + 1);
+                        }
+                    }
+                    if (ds.path.empty()) {
+                        std::fputs("--pvh-run: --drive: empty path\n", stderr);
+                        return 1;
+                    }
+                    if (drives.size() >= 8) {
+                        // Cap drives at /dev/vda..vdh; beyond that the user
+                        // probably wants a different VM architecture anyway.
+                        std::fputs("--pvh-run: --drive: max 8 drives supported\n",
+                                   stderr);
+                        return 1;
+                    }
+                    drives.push_back(std::move(ds));
                 } else if (f == "--watchdog-secs") {
                     if (vmlinux_arg + 1 >= argc) {
                         std::fputs("--pvh-run: --watchdog-secs wants a number "
@@ -5301,7 +5437,7 @@ int main(int argc, char** argv) {
             }
             return RunPvhRun(argv[vmlinux_arg], cmdline, with_net,
                              net_backend, xdp_if, xdp_queue, initrd_path,
-                             watchdog_secs, hide_tsc_deadline);
+                             drives, watchdog_secs, hide_tsc_deadline);
         }
         if (cmd == "--help" || cmd == "-h") {
             PrintUsage();
