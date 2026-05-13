@@ -77,6 +77,7 @@ void PrintUsage() {
         "  tinyvmm --pvh-info <vmlinux>      Inspect a PVH-capable ELF\n"
         "  tinyvmm --pvh-run [--net] [--net-backend loopback|xdp|wintun] [--xdp-if <idx>]\n"
         "                   [--initrd <path>] [--watchdog-secs <N>] [--debug-boot]\n"
+        "                   [--expose-tsc-deadline]\n"
         "                   <vmlinux> [-- <kernel cmdline...>]\n"
         "                                    Load and run a PVH kernel\n"
         "  tinyvmm --help                    Show this help\n");
@@ -1840,7 +1841,8 @@ int RunPvhRun(const char* path, const std::string& cmdline,
               std::uint32_t xdp_if,
               std::uint32_t xdp_queue,
               const std::string& initrd_path,
-              int watchdog_secs) {
+              int watchdog_secs,
+              bool hide_tsc_deadline) {
     using namespace tinyvmm;
     using namespace tinyvmm::whp;
 
@@ -1857,9 +1859,26 @@ int RunPvhRun(const char* path, const std::string& cmdline,
 
     Partition part(/*vcpu_count=*/1);
     // Enable CPUID exits so we can layer tinyvmm policy (advertise
-    // tsc-deadline / invariant_tsc, mask Hyper-V leaves) on top of WHP's
-    // host-passthrough defaults. See `whp/cpuid.cpp`.
+    // invariant_tsc, ARAT, TSC frequency, mask Hyper-V leaves) on top of
+    // WHP's host-passthrough defaults. See `whp/cpuid.cpp`.
     part.EnableExtendedExits({.cpuid = true});
+    // Also publish the same overrides as a static CpuidResultList. WHP's
+    // in-hypervisor LAPIC emulation makes architectural feature decisions at
+    // SetupPartition time based on this list -- NOT on what our runtime
+    // CPUID exit handler will return. Keeping the two in sync prevents the
+    // static and dynamic guest views from drifting (e.g. if we one day add
+    // a feature WHP gates on the static list).
+    //
+    // Note on TSC-deadline (CPUID.01H:ECX[24]): empirically WHP rejects
+    // WRMSR 0x6E0 regardless of how the bit is advertised here. We
+    // therefore default to *hiding* the bit (see `hide_tsc_deadline`) so
+    // Linux uses LAPIC oneshot from the start instead of issuing a doomed
+    // WRMSR that produces an `unchecked MSR access` trace + ~30 line call
+    // dump in dmesg. The actual effective timer is the same either way.
+    SetHideTscDeadline(hide_tsc_deadline);
+    const auto static_cpuid =
+        BuildStaticCpuidResultList(hide_tsc_deadline);
+    part.SetCpuidResultList(static_cpuid.data(), static_cpuid.size());
     // Let WHP fully emulate the LAPIC in-hypervisor: this both removes the
     // boot-time MMIO traps at 0xfee00xxx and is the prerequisite for
     // hypervisor-side IRQ delivery (M5).
@@ -4893,6 +4912,19 @@ int RunCpuidTest() {
         if ((r.ecx & (1u << 31)) == 0) return fail("leaf 1: hypervisor bit not set");
     }
 
+    // Leaf 0x01 + hide-tsc-deadline: bit 24 must be cleared, bit 31 still set.
+    {
+        tinyvmm::whp::SetHideTscDeadline(true);
+        CpuidResult r = resolve(0x00000001u);
+        tinyvmm::whp::SetHideTscDeadline(false);  // restore default
+        if ((r.ecx & (1u << 24)) != 0) {
+            return fail("leaf 1 (hide): tsc-deadline still set");
+        }
+        if ((r.ecx & (1u << 31)) == 0) {
+            return fail("leaf 1 (hide): hypervisor bit cleared");
+        }
+    }
+
     // Leaf 0x06: ARAT.
     {
         CpuidResult r = resolve(0x00000006u);
@@ -5075,6 +5107,13 @@ int main(int argc, char** argv) {
             std::uint32_t xdp_queue = 0;
             std::string initrd_path;
             int watchdog_secs = 0;  // 0 = disabled (default; previously 20)
+            // Hide TSC-deadline by default: WHP's LAPIC emulation rejects
+            // WRMSR 0x6E0 even when the bit is set in CpuidResultList, so
+            // advertising it just causes Linux to log a 30-line `unchecked
+            // MSR access` trace before silently falling back to LAPIC
+            // oneshot. Pass --expose-tsc-deadline if/when WHP gains real
+            // TSC-deadline support and you want to probe it.
+            bool hide_tsc_deadline = true;
             int vmlinux_arg = 2;
             // Optional flags between --pvh-run and <vmlinux>.
             while (vmlinux_arg < argc &&
@@ -5144,6 +5183,17 @@ int main(int argc, char** argv) {
                     // 8250 UART. Has no effect if the user supplies
                     // their own cmdline via `-- ...`.
                     debug_boot = true;
+                } else if (f == "--hide-tsc-deadline") {
+                    // Already on by default; accept for clarity in scripts.
+                    hide_tsc_deadline = true;
+                } else if (f == "--expose-tsc-deadline") {
+                    // Re-enable CPUID.01H:ECX[24]. Linux will then try to
+                    // program MSR 0x6E0, WHP will reject it, and you'll
+                    // see an `unchecked MSR access` trace in dmesg followed
+                    // by a transparent fallback to LAPIC oneshot. Useful
+                    // only for probing whether WHP gained TSC-deadline
+                    // support in a newer Windows build.
+                    hide_tsc_deadline = false;
                 } else {
                     std::fprintf(stderr,
                                  "--pvh-run: unknown flag '%.*s'\n",
@@ -5198,7 +5248,7 @@ int main(int argc, char** argv) {
             }
             return RunPvhRun(argv[vmlinux_arg], cmdline, with_net,
                              net_backend, xdp_if, xdp_queue, initrd_path,
-                             watchdog_secs);
+                             watchdog_secs, hide_tsc_deadline);
         }
         if (cmd == "--help" || cmd == "-h") {
             PrintUsage();

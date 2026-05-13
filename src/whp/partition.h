@@ -39,6 +39,15 @@ public:
     void EnableExtendedExits(const ExtendedExits& bits);
     void SetLocalApicEmulation(WHV_X64_LOCAL_APIC_EMULATION_MODE mode);
 
+    // Register a list of static CPUID leaf values. WHP reads this list at
+    // SetupPartition time to inform its internal architectural feature model
+    // (e.g. whether to accept WRMSR 0x6E0 / IA32_TSC_DEADLINE in its LAPIC
+    // emulation). When `X64CpuidExit` is also enabled, the runtime exit
+    // handler still wins for guest-visible CPUID values; the static list is
+    // only consulted by WHP itself. Must be called before Setup().
+    void SetCpuidResultList(const WHV_X64_CPUID_RESULT* entries,
+                            std::size_t count);
+
     // Finalize. Required before mapping memory or creating vCPUs.
     void Setup();
 

@@ -46,6 +46,22 @@ void Partition::SetLocalApicEmulation(WHV_X64_LOCAL_APIC_EMULATION_MODE mode) {
     SetProperty(WHvPartitionPropertyCodeLocalApicEmulationMode, mode);
 }
 
+void Partition::SetCpuidResultList(const WHV_X64_CPUID_RESULT* entries,
+                                   std::size_t count) {
+    if (setup_done_) {
+        Fatal("SetCpuidResultList called after Setup()");
+    }
+    if (count == 0) return;
+    // WHvPartitionPropertyCodeCpuidResultList accepts a packed array of
+    // WHV_X64_CPUID_RESULT structures. The `cb` argument is the byte size
+    // of the whole array (not a struct count).
+    const UINT32 bytes =
+        static_cast<UINT32>(count * sizeof(WHV_X64_CPUID_RESULT));
+    HRESULT hr = WHvSetPartitionProperty(
+        handle_, WHvPartitionPropertyCodeCpuidResultList, entries, bytes);
+    ThrowIfFailed(hr, "WHvSetPartitionProperty(CpuidResultList)");
+}
+
 void Partition::Setup() {
     if (setup_done_) {
         return;
