@@ -2126,6 +2126,17 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     // When stdin is a real console (TTY), forward keystrokes to the guest's
     // /dev/hvc0. Skip when stdin is redirected/piped/null so we don't burn a
     // thread polling a pipe and so test scripts behave normally.
+    //
+    // We implement a qemu-compatible Ctrl+A escape so the user can quit:
+    //   Ctrl+A X   -> request graceful shutdown
+    //   Ctrl+A H   -> print help line to stderr
+    //   Ctrl+A A   -> forward a literal Ctrl+A (0x01) to the guest
+    //   Ctrl+A ?   -> alias for H
+    // Anything else right after Ctrl+A is swallowed with a hint. Without an
+    // escape we'd be stuck -- raw stdin mode means Windows never sees Ctrl+C
+    // as SIGINT (we forward it as 0x03 to the guest shell), so the only way
+    // out otherwise is to close the terminal window or taskkill from another
+    // shell.
     HANDLE hstdin = ::GetStdHandle(STD_INPUT_HANDLE);
     DWORD original_console_mode = 0;
     bool restore_console_mode = false;
@@ -2152,8 +2163,12 @@ int RunPvhRun(const char* path, const std::string& cmdline,
                                           ENABLE_VIRTUAL_TERMINAL_PROCESSING);
             }
         }
-        stdin_thread = std::thread([hstdin, vcon_ptr, &stdin_stop]() {
+        std::fputs("[pvh-run] interactive console -- press Ctrl+A then X "
+                   "to quit, Ctrl+A H for help\n", stderr);
+        stdin_thread = std::thread(
+            [hstdin, vcon_ptr, &stdin_stop, &loop]() {
             INPUT_RECORD recs[64];
+            bool escape_armed = false;
             while (!stdin_stop.load(std::memory_order_relaxed)) {
                 // 50ms wait so we can poll the stop flag.
                 DWORD wr = ::WaitForSingleObject(hstdin, 50);
@@ -2167,12 +2182,43 @@ int RunPvhRun(const char* path, const std::string& cmdline,
                 if (!::ReadConsoleInputW(hstdin, recs, to_read, &read)) continue;
                 std::string out;
                 out.reserve(read);
+                bool quit_requested = false;
                 for (DWORD i = 0; i < read; ++i) {
                     if (recs[i].EventType != KEY_EVENT) continue;
                     const auto& k = recs[i].Event.KeyEvent;
                     if (!k.bKeyDown) continue;
                     wchar_t wc = k.uChar.UnicodeChar;
                     if (wc == 0) continue;
+                    // ---- Ctrl+A escape state machine ------------------
+                    if (escape_armed) {
+                        escape_armed = false;
+                        if (wc == L'x' || wc == L'X') {
+                            std::fputs("\r\n[pvh-run] Ctrl+A X -- "
+                                       "quitting\r\n", stderr);
+                            quit_requested = true;
+                            break;
+                        }
+                        if (wc == L'h' || wc == L'H' || wc == L'?') {
+                            std::fputs(
+                                "\r\n[pvh-run] Ctrl+A keys: "
+                                "X=quit, A=literal ^A, H=help\r\n",
+                                stderr);
+                            continue;
+                        }
+                        if (wc == 0x01) {
+                            // Pass a literal Ctrl+A through to the guest.
+                            out.push_back('\x01');
+                            continue;
+                        }
+                        std::fputs("\r\n[pvh-run] unknown Ctrl+A sequence; "
+                                   "Ctrl+A H for help\r\n", stderr);
+                        continue;
+                    }
+                    if (wc == 0x01) {  // Ctrl+A -- arm escape, swallow.
+                        escape_armed = true;
+                        continue;
+                    }
+                    // ---- normal forwarding ----------------------------
                     if (wc == L'\r') { out.push_back('\n'); continue; }
                     if (wc < 0x80) {
                         out.push_back(static_cast<char>(wc));
@@ -2186,11 +2232,18 @@ int RunPvhRun(const char* path, const std::string& cmdline,
                 if (!out.empty()) {
                     vcon_ptr->WriteHostInput(out.data(), out.size());
                 }
+                if (quit_requested) {
+                    // Ask the run loop to break out of WHvRunVirtualProcessor
+                    // and return StopReason::Cancelled. main() will then
+                    // join us, restore the console mode, and tear down.
+                    loop.RequestStop();
+                    return;
+                }
             }
         });
     }
 
-    std::puts("[pvh-run] running... (no CPUID/APIC yet, expect early exit)");
+    std::puts("[pvh-run] running");
 
     // Watchdog + per-second exit-rate telemetry. We print deltas (not
     // running totals) so it's obvious whether the guest is currently
