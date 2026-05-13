@@ -1,0 +1,231 @@
+# tinyvmm Firecracker-style kernel config delta
+#
+# Apply on top of your existing 7.0.0 .config either by:
+#
+#   (a) Hand-edit your .config to match the lines below, then
+#       `make ARCH=x86_64 olddefconfig` to pick up dependent
+#       symbols, or
+#   (b) Save these lines to a fragment file and run:
+#         scripts/kconfig/merge_config.sh -m .config tinyvmm.frag
+#         make ARCH=x86_64 olddefconfig
+#
+# Each section explains why and what tinyvmm provides instead.
+# Lines starting with `#` are comments (Kconfig style).
+# `=y` enables, `# CONFIG_X is not set` disables, `=N` for tristate disable.
+#
+# Expected results (measured on tinyvmm):
+#   - vmlinux on-disk:   18 MB (stripped, current)  ->  ~6-8 MB
+#   - "entering guest" -> "first hvc0 byte": 352 ms -> target ~80-120 ms
+#   - .text size: 10.6 MB -> ~5-6 MB
+
+# ============================================================
+# 1. SMP off  -- single-vCPU guests only. Removes secondary-CPU
+#    bringup, per-CPU init duplication, IPI plumbing. (~30-50 ms.)
+# ============================================================
+# CONFIG_SMP is not set
+# CONFIG_HOTPLUG_CPU is not set
+# CONFIG_X86_X2APIC is not set
+
+# ============================================================
+# 2. PREEMPT off -- microvm wants throughput, not low-latency.
+#    Firecracker uses PREEMPT_NONE.
+# ============================================================
+CONFIG_PREEMPT_NONE=y
+# CONFIG_PREEMPT_VOLUNTARY is not set
+# CONFIG_PREEMPT is not set
+# CONFIG_PREEMPT_LAZY is not set
+# CONFIG_PREEMPT_DYNAMIC is not set
+
+# ============================================================
+# 3. Kill address randomization -- saves PRNG init wait and
+#    relocation work. Pure boot-time win; no security concern
+#    inside a microvm you own.
+# ============================================================
+# CONFIG_RANDOMIZE_BASE is not set
+# CONFIG_RANDOMIZE_MEMORY is not set
+# CONFIG_RANDOMIZE_KSTACK_OFFSET is not set
+
+# ============================================================
+# 4. Netfilter / iptables / nftables -- gone. tinyvmm's guest
+#    doesn't firewall; the host does. ~300-500 KB of code.
+# ============================================================
+# CONFIG_NETFILTER is not set
+# CONFIG_NF_CONNTRACK is not set
+# CONFIG_NF_TABLES is not set
+# CONFIG_NF_NAT is not set
+# CONFIG_NETFILTER_NETLINK is not set
+# CONFIG_IP_NF_IPTABLES is not set
+# CONFIG_IP_NF_FILTER is not set
+# CONFIG_IP_NF_NAT is not set
+# CONFIG_BRIDGE is not set
+# CONFIG_BRIDGE_NETFILTER is not set
+# CONFIG_VLAN_8021Q is not set
+
+# ============================================================
+# 5. IPv6 / TLS / advanced TCP off. IPv4 + default cubic only.
+# ============================================================
+# CONFIG_IPV6 is not set
+# CONFIG_TLS is not set
+# CONFIG_TCP_CONG_ADVANCED is not set
+# (drops BBR, BIC, WESTWOOD, etc.; kernel falls back to tcp_cubic)
+
+# ============================================================
+# 6. Filesystems: tinyvmm boots from initramfs (tmpfs in RAM).
+#    Drop everything else unless you mount virtio-blk images.
+#    EXT4 only if you actually want disk images; for pure
+#    initramfs builds drop it too.
+# ============================================================
+# CONFIG_EXT4_FS is not set        # set =y only if you mount disks
+# CONFIG_FUSE_FS is not set
+# CONFIG_OVERLAY_FS is not set
+# CONFIG_VIRTIO_FS is not set
+# CONFIG_NETFS_SUPPORT is not set
+# CONFIG_NFS_FS is not set
+# CONFIG_9P_FS is not set
+# CONFIG_BTRFS_FS is not set
+# CONFIG_XFS_FS is not set
+# CONFIG_F2FS_FS is not set
+# CONFIG_QUOTA is not set
+# CONFIG_FANOTIFY is not set
+# CONFIG_INOTIFY_USER is not set     # keep =y if init system uses it
+
+# ============================================================
+# 7. virtio: keep ONLY what tinyvmm presents (BLK/NET/CONSOLE/RNG
+#    on PCI transport). Drop MMIO transport, vsock, virtio-RTC,
+#    virtio-fs, etc.
+# ============================================================
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_PCI=y
+CONFIG_VIRTIO_PCI_LIB=y
+CONFIG_VIRTIO_BLK=y                  # =m or =n if no disk use case
+CONFIG_VIRTIO_NET=y
+CONFIG_VIRTIO_CONSOLE=y
+CONFIG_HW_RANDOM=y
+CONFIG_HW_RANDOM_VIRTIO=y
+# CONFIG_VIRTIO_PCI_LEGACY is not set        # tinyvmm uses modern only
+# CONFIG_VIRTIO_PCI_ADMIN_LEGACY is not set
+# CONFIG_VIRTIO_MMIO is not set
+# CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES is not set
+# CONFIG_VIRTIO_RTC is not set
+# CONFIG_VIRTIO_FS is not set
+# CONFIG_VSOCKETS is not set
+# CONFIG_VIRTIO_VSOCKETS is not set
+# CONFIG_VIRTIO_VSOCKETS_COMMON is not set
+# CONFIG_VIRTIO_BALLOON is not set
+# CONFIG_VIRTIO_INPUT is not set
+# CONFIG_VIRTIO_DMA_BUF is not set
+
+# ============================================================
+# 8. Misc subsystems we don't need.
+# ============================================================
+# CONFIG_BPF_SYSCALL is not set        # only set =y if you load eBPF
+# CONFIG_CGROUPS is not set            # set =y only if init uses them
+# CONFIG_NAMESPACES is not set         # set =y for container workloads
+# CONFIG_KALLSYMS is not set           # ~1-2 MB savings; oops becomes useless
+# CONFIG_KALLSYMS_ALL is not set
+# CONFIG_AUDIT is not set
+# CONFIG_GENERIC_TRACER is not set
+# CONFIG_KPROBES is not set
+# CONFIG_PROFILING is not set
+# CONFIG_PERF_EVENTS is not set
+# CONFIG_OPROFILE is not set
+# CONFIG_NUMA is not set
+# CONFIG_NUMA_BALANCING is not set
+# CONFIG_TRANSPARENT_HUGEPAGE is not set
+# CONFIG_MEMCG is not set
+# CONFIG_CMA is not set
+# CONFIG_SUSPEND is not set
+# CONFIG_HIBERNATION is not set
+# CONFIG_PM is not set
+# CONFIG_PM_SLEEP is not set
+# CONFIG_CPU_FREQ is not set           # microvm: vCPU is host pCPU
+# CONFIG_CPU_IDLE is not set           # see "Idle" note below
+# CONFIG_THERMAL is not set
+# CONFIG_WATCHDOG is not set
+# CONFIG_INPUT is not set              # no console keyboards in guest
+# CONFIG_SOUND is not set
+# CONFIG_TTY_PRINTK is not set
+# CONFIG_RTC_CLASS is not set          # tinyvmm has no MC146818
+
+# ============================================================
+# 9. Timer / HZ: 100 Hz is enough for a tickless idle microvm.
+# ============================================================
+CONFIG_HZ_100=y
+# CONFIG_HZ_250 is not set
+# CONFIG_HZ_300 is not set
+# CONFIG_HZ_1000 is not set
+CONFIG_HZ=100
+CONFIG_NO_HZ_IDLE=y
+CONFIG_HIGH_RES_TIMERS=y
+
+# ============================================================
+# 10. printk / console
+#     EARLY_PRINTK stays =y so --debug-boot still works.
+# ============================================================
+CONFIG_PRINTK=y
+CONFIG_EARLY_PRINTK=y
+# CONFIG_PRINTK_TIME is not set        # we measure boot host-side
+CONFIG_SERIAL_8250=y                   # for --debug-boot
+CONFIG_SERIAL_8250_CONSOLE=y           # for --debug-boot
+CONFIG_SERIAL_8250_NR_UARTS=1
+CONFIG_SERIAL_8250_RUNTIME_UARTS=1
+# CONFIG_SERIAL_8250_PCI is not set
+
+# ============================================================
+# 11. Idle: with CONFIG_CPU_IDLE=n above, the kernel default-idles
+#     via `default_idle` which does `HLT`. tinyvmm handles HLT
+#     correctly (we count halt_exits). Keep HALT_POLL off; only
+#     useful when the host is KVM with its halt-polling logic.
+# ============================================================
+# CONFIG_HALT_POLL is not set
+
+# ============================================================
+# 12. PCI tuning -- match what tinyvmm presents (bus 0, CFG #1).
+# ============================================================
+CONFIG_PCI=y
+# CONFIG_PCIE_DPC is not set
+# CONFIG_PCIEAER is not set
+# CONFIG_PCI_MSI is not set if you don't need MSI-X
+#   ^ tinyvmm DOES use MSI-X for virtio doorbell completion --
+#     leave PCI_MSI=y; just drop the AER/DPC pieces.
+CONFIG_PCI_MSI=y
+# CONFIG_PCIEPORTBUS is not set
+# CONFIG_PCI_QUIRKS is not set         # we expose no quirky vendors
+
+# ============================================================
+# 13. Init / startup
+# ============================================================
+CONFIG_BLK_DEV_INITRD=y                # required: we ship initramfs.cpio
+# CONFIG_RD_GZIP is not set            # we ship uncompressed cpio today
+# CONFIG_RD_LZ4 is not set
+# CONFIG_RD_XZ is not set
+# CONFIG_RD_ZSTD is not set
+# Note: enable a decompressor here only if you start using a
+# compressed initramfs to save host-side disk space.
+
+# ============================================================
+# 14. Don't disable: things tinyvmm needs
+# ============================================================
+# DO NOT touch:
+#   CONFIG_X86_64=y
+#   CONFIG_PVH=y                       # tinyvmm uses PVH entry
+#   CONFIG_PARAVIRT=y / CONFIG_XEN_PVH=y  (auto-selected by PVH)
+#   CONFIG_DEVTMPFS=y                  # busybox /init mounts /dev
+#   CONFIG_DEVTMPFS_MOUNT=y
+#   CONFIG_PROC_FS=y / CONFIG_SYSFS=y
+#   CONFIG_TMPFS=y
+#   CONFIG_UNIX=y                      # afpkt sockets
+#   CONFIG_INET=y / CONFIG_NET=y       # TCP/IP
+
+# ============================================================
+# Bonus: cut .debug_* section bloat at build time
+# ============================================================
+# The 55 MB of .debug_* in your vmlinux comes from gcc's
+# -g flag, not from any Kconfig option. To skip generating
+# debug info entirely:
+#
+#   make ARCH=x86_64 KCFLAGS="-O2"     # explicitly no -g
+#
+# Or rely on `strip --strip-all vmlinux` (current behavior:
+# 78 MB -> 18 MB). The compile-time approach is faster to
+# build but loses any chance at post-mortem symbol resolution.
