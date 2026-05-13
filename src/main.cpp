@@ -647,12 +647,12 @@ int RunVirtioTest() {
 
     // Read MAC out of config space (offset 0x100..0x105). MAC is six bytes
     // wide, so spread across two dword reads.
-    std::uint32_t mac_lo = net_r32(0x100);
-    std::uint32_t mac_hi = net_r32(0x104);
-    std::uint8_t mac_seen[6];
-    std::memcpy(&mac_seen[0], &mac_lo, 4);
-    std::memcpy(&mac_seen[4], &mac_hi, 2);
-    if (std::memcmp(mac_seen, kMac.data(), 6) != 0) {
+    const std::uint32_t mac_lo = net_r32(0x100);
+    const std::uint32_t mac_hi = net_r32(0x104);
+    std::array<std::uint8_t, 6> mac_seen{};
+    std::memcpy(mac_seen.data() + 0, &mac_lo, 4);
+    std::memcpy(mac_seen.data() + 4, &mac_hi, 2);
+    if (std::memcmp(mac_seen.data(), kMac.data(), mac_seen.size()) != 0) {
         std::fprintf(stderr,
                      "[virtio-test] FAIL: MAC mismatch %02x:%02x:%02x:%02x:%02x:%02x\n",
                      mac_seen[0], mac_seen[1], mac_seen[2],

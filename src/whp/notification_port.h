@@ -59,14 +59,25 @@ public:
     std::uint64_t value() const noexcept { return value_; }
     std::uint32_t length() const noexcept { return length_; }
 
-private:
-    NotificationPort(WHV_PARTITION_HANDLE part_handle,
+    // Passkey idiom: the constructor is technically public so std::make_unique
+    // can reach it, but it takes a `PrivateTag` whose default constructor is
+    // private to NotificationPort. Net effect: only NotificationPort's own
+    // factory methods can construct one, and we avoid raw `new`.
+    struct PrivateTag {
+    private:
+        friend class NotificationPort;
+        PrivateTag() = default;
+    };
+
+    NotificationPort(PrivateTag,
+                     WHV_PARTITION_HANDLE part_handle,
                      WHV_NOTIFICATION_PORT_HANDLE port,
                      HANDLE event,
                      std::uint64_t gpa,
                      std::uint64_t value,
                      std::uint32_t length);
 
+private:
     WHV_PARTITION_HANDLE part_handle_;
     WHV_NOTIFICATION_PORT_HANDLE port_;
     HANDLE event_;

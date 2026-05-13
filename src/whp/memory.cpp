@@ -62,7 +62,12 @@ GuestMemory::GuestMemory(Partition& partition,
         host_base_ = TryAlloc(alloc_size, /*large=*/false);
         if (host_base_ == nullptr) {
             DWORD err = ::GetLastError();
-            ThrowIfFailed(HRESULT_FROM_WIN32(err), "VirtualAlloc(guest RAM)");
+            // VirtualAlloc returned nullptr -- ensure we always throw even
+            // if GetLastError() happens to be 0 (so the static analyzer can
+            // prove host_base_ is non-null after this branch).
+            throw HrError(
+                HRESULT_FROM_WIN32(err == 0 ? ERROR_NOT_ENOUGH_MEMORY : err),
+                "VirtualAlloc(guest RAM)");
         }
     }
 

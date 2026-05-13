@@ -4,7 +4,8 @@
 
 namespace tinyvmm::whp {
 
-NotificationPort::NotificationPort(WHV_PARTITION_HANDLE part_handle,
+NotificationPort::NotificationPort(PrivateTag,
+                                   WHV_PARTITION_HANDLE part_handle,
                                    WHV_NOTIFICATION_PORT_HANDLE port,
                                    HANDLE event,
                                    std::uint64_t gpa,
@@ -68,8 +69,10 @@ std::unique_ptr<NotificationPort> NotificationPort::CreateMmioDoorbell(
     HANDLE evt = CreateEventW(nullptr, /*manual reset=*/TRUE,
                               /*initially signaled=*/FALSE, nullptr);
     if (evt == nullptr) {
-        ThrowIfFailed(HRESULT_FROM_WIN32(GetLastError()),
-                      "CreateEventW for notification port");
+        DWORD err = ::GetLastError();
+        throw HrError(
+            HRESULT_FROM_WIN32(err == 0 ? ERROR_NOT_ENOUGH_MEMORY : err),
+            "CreateEventW for notification port");
     }
 
     // ---- Legacy MMIO doorbell registration ----
@@ -101,8 +104,9 @@ std::unique_ptr<NotificationPort> NotificationPort::CreateMmioDoorbell(
         ThrowIfFailed(hr, "WHvRegisterPartitionDoorbellEvent");
     }
 
-    auto np = std::unique_ptr<NotificationPort>(new NotificationPort(
-        partition.handle(), /*port=*/nullptr, evt, gpa, value, length));
+    auto np = std::make_unique<NotificationPort>(
+        NotificationPort::PrivateTag{}, partition.handle(),
+        /*port=*/nullptr, evt, gpa, value, length);
     np->registered_ = true;
     return np;
 }

@@ -492,12 +492,16 @@ int RunWintunProbe(int seconds) {
 
     std::printf("[wintun-probe] listening for %d seconds... "
                 "try `ping 10.0.0.1` from another shell\n", seconds);
-    DWORD start = ::GetTickCount();
+    const ULONGLONG start = ::GetTickCount64();
+    const ULONGLONG deadline = start + static_cast<ULONGLONG>(seconds) * 1000ull;
     int total = 0;
-    while (::GetTickCount() - start < static_cast<DWORD>(seconds) * 1000u) {
-        DWORD elapsed = ::GetTickCount() - start;
-        DWORD remaining = static_cast<DWORD>(seconds) * 1000u - elapsed;
-        DWORD wr = ::WaitForSingleObject(evt, (std::min)(remaining, DWORD{500}));
+    for (;;) {
+        const ULONGLONG now = ::GetTickCount64();
+        if (now >= deadline) break;
+        const ULONGLONG remaining = deadline - now;
+        const DWORD wait_ms =
+            (remaining > 500ull) ? DWORD{500} : static_cast<DWORD>(remaining);
+        DWORD wr = ::WaitForSingleObject(evt, wait_ms);
         if (wr != WAIT_OBJECT_0 && wr != WAIT_TIMEOUT) break;
         for (;;) {
             DWORD sz = 0;

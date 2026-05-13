@@ -10,6 +10,7 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -275,20 +276,20 @@ PvhLoadResult LoadPvh(whp::GuestMemory& ram,
             ram.WriteAt(s.paddr, mf.data() + s.file_offset, s.filesz);
         }
         if (s.memsz > s.filesz) {
-            // Avoid allocating a zeros vector that size: the guest RAM is
-            // already zero-initialized on allocation (large-page commits
-            // come up zeroed). For safety we still memset via WriteAt with
-            // a small stack scratch buffer rather than touching ram pages
-            // directly. Most kernels have <1 MiB of BSS, so this is cheap.
+            // Avoid allocating a zeros vector of size (memsz - filesz):
+            // a kernel BSS can be several MB. Stream zeros through guest RAM
+            // in fixed-size chunks. Buffer lives on the heap to keep this
+            // function's stack usage bounded (avoids /analyze C6262).
             constexpr std::size_t kZeroChunk = 64 * 1024;
-            std::array<std::uint8_t, kZeroChunk> zeros{};
+            const auto zeros = std::make_unique<std::array<std::uint8_t, kZeroChunk>>();
+            zeros->fill(0);
             std::uint64_t remaining = s.memsz - s.filesz;
             std::uint64_t off = s.paddr + s.filesz;
             while (remaining > 0) {
                 const std::size_t chunk =
                     (remaining > kZeroChunk) ? kZeroChunk
                                               : static_cast<std::size_t>(remaining);
-                ram.WriteAt(off, zeros.data(), chunk);
+                ram.WriteAt(off, zeros->data(), chunk);
                 off       += chunk;
                 remaining -= chunk;
             }

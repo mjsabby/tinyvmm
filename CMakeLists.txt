@@ -103,6 +103,21 @@ if(MSVC)
         /utf-8
         /EHsc
     )
+
+    # ----- Opt-in MSVC static analysis (Code Analysis) -----
+    # Enable by configuring with -DTINYVMM_ANALYZE=ON. Off by default because
+    # /analyze adds noticeable compile time. Catches buffer overruns, null
+    # derefs, untested error paths, unchecked truncations -- the high-signal
+    # bugs we want. The C++ Core Guidelines Checker plugin (EspXEngine.dll)
+    # is NOT enabled here: it's noisy without aggressive suppress lists and
+    # the high-value checks already live in base /analyze.
+    option(TINYVMM_ANALYZE "Enable MSVC /analyze static analysis" OFF)
+    if(TINYVMM_ANALYZE)
+        target_compile_options(tinyvmm PRIVATE
+            /analyze
+            /analyze:external-
+        )
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------

@@ -105,11 +105,13 @@ void Pic8259::HandleChip(Chip& chip, bool /*is_slave*/, bool cmd_port,
                     // OCW1: interrupt mask register.
                     const std::uint8_t prev = chip.mask;
                     chip.mask = v;
-                    if (kPicDebug && prev != v) {
-                        std::fprintf(stderr,
-                                     "[pic] %s OCW1 mask 0x%02x -> 0x%02x\n",
-                                     (&chip == &master_) ? "master" : "slave",
-                                     prev, v);
+                    if constexpr (kPicDebug) {
+                        if (prev != v) {
+                            std::fprintf(stderr,
+                                         "[pic] %s OCW1 mask 0x%02x -> 0x%02x\n",
+                                         (&chip == &master_) ? "master" : "slave",
+                                         prev, v);
+                        }
                     }
                     ReplayLocked(chip, prev);
                     break;
@@ -137,10 +139,12 @@ void Pic8259::InjectLocked(Chip& chip, int local_irq) {
     }
     const std::uint8_t vector =
         static_cast<std::uint8_t>(chip.vector_base + (local_irq & 7));
-    if (kPicDebug && local_irq != 0) {  // skip PIT spam
-        std::fprintf(stderr, "[pic] inject vector=0x%02x (%s irq %d)\n",
-                     vector, (&chip == &master_) ? "master" : "slave",
-                     local_irq);
+    if constexpr (kPicDebug) {
+        if (local_irq != 0) {  // skip PIT spam
+            std::fprintf(stderr, "[pic] inject vector=0x%02x (%s irq %d)\n",
+                         vector, (&chip == &master_) ? "master" : "slave",
+                         local_irq);
+        }
     }
     // Destination = vCPU 0. We're single-vCPU for now; if/when this grows
     // multi-vCPU the legacy PIC traditionally only steers IRQs to the BSP.
@@ -176,9 +180,11 @@ void Pic8259::Raise(int irq) {
     if (chip.mask & bit) {
         // Masked: latch and let ReplayLocked re-deliver on unmask.
         chip.irr |= bit;
-        if (kPicDebug && irq != 0) {
-            std::fprintf(stderr, "[pic] raise irq=%d MASKED (mask=0x%02x)\n",
-                         irq, chip.mask);
+        if constexpr (kPicDebug) {
+            if (irq != 0) {
+                std::fprintf(stderr, "[pic] raise irq=%d MASKED (mask=0x%02x)\n",
+                             irq, chip.mask);
+            }
         }
         return;
     }
