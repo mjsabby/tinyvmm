@@ -4,6 +4,7 @@
 #include "io_bus.h"
 
 #include <cstdio>
+#include <functional>
 #include <mutex>
 #include <string>
 
@@ -24,10 +25,18 @@ namespace tinyvmm::devices {
 //                                or sane defaults so probes don't look at
 //                                garbage.
 //
+//   * Optional IRQ raise callback (M19c). When the guest sets
+//     `IER.ETBEI=1` and the transmitter is "ready" (always, in our
+//     model), we raise IRQ 4 once. Inside the IRQ handler the guest
+//     reads IIR, sees `0x02` (THRE), drains its circ_buf via THR
+//     writes, then either issues another transmit (which re-raises) or
+//     clears ETBEI. Linux's serial driver is robust to the spurious
+//     re-fire that this edge-triggered model occasionally produces.
+//
 // Not implemented:
-//   * Receive path (no host-input mode yet)
-//   * IRQ generation (M5 + interrupt controller)
-//   * FIFO depth / FCR effects beyond storing the byte
+//   * Receive path (no host-input mode yet) -- so we never raise IRQ on
+//     RX-data-available. Easy follow-up once we wire stdin.
+//   * FIFO depth / FCR effects beyond storing the byte.
 //
 // All access goes through one mutex so a future RX thread can safely poke
 // state. For now the guest is single-threaded so the lock is uncontended.
@@ -47,6 +56,14 @@ public:
     // string).
     void SetSink(std::FILE* sink);
 
+    // Wire up the legacy-PIC IRQ. The callback is invoked with the
+    // *ISA* IRQ number (always 4 for COM1). Pass `nullptr` to detach.
+    // Without a callback, the 8250 still bookkeeps IER/IIR but never
+    // signals an interrupt -- which is fine for polled callers like
+    // boot-time printk but stalls userspace `write()` (M19c blocker).
+    using IrqRaiseFn = std::function<void(int isa_irq)>;
+    void SetIrqCallback(IrqRaiseFn fn);
+
     // Test hook: snapshot of bytes the guest has written to THR since
     // construction (if `record_to_string=true` was set).
     void EnableStringCapture() { capture_ = true; }
@@ -57,9 +74,20 @@ private:
     void HandleRead(IoAccess& acc);
     void HandleWrite(IoAccess& acc);
 
+    // Re-evaluate whether the TX-IRQ should be asserted, given current IER
+    // and pending state. Caller holds `lock_`. May invoke `irq_raise_`
+    // (which itself takes the PIC's lock; safe as long as no PIC method
+    // calls back into us).
+    void MaybeRaiseTxIrqLocked();
+
+    // The ISA IRQ assignment for COM1. Conventional; not configurable
+    // here because Linux hard-codes it for the 0x3F8 base.
+    static constexpr int kIsaIrq = 4;
+
     std::uint16_t base_;
     std::FILE* sink_;
     std::mutex lock_;
+    IrqRaiseFn irq_raise_;
 
     // Register state. All bytes; reads return the byte zero-extended into
     // `acc.value`. Names follow the 16550 datasheet.
@@ -71,8 +99,22 @@ private:
     std::uint8_t dll_ = 0;     // +0 with DLAB=1 (divisor low)
     std::uint8_t dlm_ = 0;     // +1 with DLAB=1 (divisor high)
 
+    // TX-IRQ bookkeeping. `tx_irq_pending_` is set when we've queued an
+    // injection but the guest hasn't read IIR yet; a read of IIR returns
+    // the THRE-interrupt code and clears it. We only call `irq_raise_`
+    // when transitioning false->true, so we don't burst-inject.
+    bool tx_irq_pending_ = false;
+
     bool capture_ = false;
     std::string captured_;
+
+    // Lifetime statistics: number of bytes the guest wrote to THR. Useful
+    // for confirming kernel output is reaching the UART even when stdout is
+    // captured/piped and visible bytes get lost.
+public:
+    std::uint64_t tx_bytes() const noexcept { return tx_bytes_; }
+private:
+    std::uint64_t tx_bytes_ = 0;
 };
 
 }  // namespace tinyvmm::devices

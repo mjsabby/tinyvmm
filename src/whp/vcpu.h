@@ -42,6 +42,19 @@ public:
     // building block for the PVH 32-bit entry helper.
     void SetupRealMode(std::uint64_t cs_base);
 
+    // Inject an unsynchronised fixed-priority interrupt at `vector` directly
+    // into the VP's LAPIC. With WHP's in-hypervisor x2APIC, the interrupt is
+    // queued and delivered on the next VM entry; if the guest has IF=0 the
+    // hypervisor will hold it until IF=1 (no extra exit to user mode).
+    //
+    // This is the M5 building block for delivering virtio-net RX completions
+    // from the host worker thread without taking a VM exit per packet.
+    //
+    // `dest_logical_id`: typically the target vCPU's x2APIC ID. For the
+    //  current single-vCPU bring-up we pass `index_` (== APIC ID 0).
+    void InjectFixedInterrupt(std::uint8_t vector,
+                              std::uint32_t dest_logical_id);
+
 private:
     Partition& partition_;
     std::uint32_t index_;

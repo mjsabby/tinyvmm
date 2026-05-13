@@ -1,0 +1,128 @@
+#include "block_file.h"
+
+#include <cstdio>
+#include <cstring>
+
+namespace tinyvmm::host {
+
+BlockFile::BlockFile(const std::wstring& path, bool readonly)
+    : path_(path), readonly_(readonly) {
+    const DWORD access = readonly_ ? GENERIC_READ
+                                    : (GENERIC_READ | GENERIC_WRITE);
+    const DWORD share = readonly_ ? FILE_SHARE_READ
+                                   : (FILE_SHARE_READ | FILE_SHARE_WRITE);
+    handle_ = CreateFileW(path_.c_str(), access, share, /*sa=*/nullptr,
+                          OPEN_EXISTING, FILE_FLAG_OVERLAPPED,
+                          /*tmpl=*/nullptr);
+    if (handle_ == INVALID_HANDLE_VALUE) {
+        open_hr_ = HRESULT_FROM_WIN32(GetLastError());
+        return;
+    }
+    LARGE_INTEGER li{};
+    if (!GetFileSizeEx(handle_, &li)) {
+        open_hr_ = HRESULT_FROM_WIN32(GetLastError());
+        CloseHandle(handle_);
+        handle_ = INVALID_HANDLE_VALUE;
+        return;
+    }
+    size_ = static_cast<std::uint64_t>(li.QuadPart);
+}
+
+BlockFile::~BlockFile() {
+    Stop();
+    if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_);
+    if (iocp_) CloseHandle(iocp_);
+}
+
+void BlockFile::Start() {
+    if (handle_ == INVALID_HANDLE_VALUE) {
+        Fatal("BlockFile::Start on closed file");
+    }
+    if (worker_.joinable()) return;
+    iocp_ = CreateIoCompletionPort(handle_, /*existing=*/nullptr,
+                                   /*key=*/0, /*threads=*/1);
+    if (!iocp_) {
+        Fatal("BlockFile: CreateIoCompletionPort failed");
+    }
+    stop_.store(false);
+    worker_ = std::thread([this]() { WorkerLoop(); });
+}
+
+void BlockFile::Stop() {
+    if (!worker_.joinable()) return;
+    stop_.store(true);
+    PostQueuedCompletionStatus(iocp_, 0, kShutdownKey, /*ovl=*/nullptr);
+    worker_.join();
+}
+
+bool BlockFile::Submit(Request* req) {
+    if (!req) return false;
+    submitted_.fetch_add(1);
+    req->ok = false;
+
+    if (req->op == Request::OpFlush) {
+        // Defer the (sync) FlushFileBuffers to the worker thread so we don't
+        // stall the vCPU. PostQueuedCompletionStatus with the dedicated
+        // kFlushKey lets the worker recognise the op without inspecting the
+        // OVERLAPPED.
+        std::memset(&req->ovl, 0, sizeof(OVERLAPPED));
+        if (!PostQueuedCompletionStatus(iocp_, /*bytes=*/0,
+                                         kFlushKey, &req->ovl)) {
+            errors_.fetch_add(1);
+            return false;
+        }
+        return true;
+    }
+
+    std::memset(&req->ovl, 0, sizeof(OVERLAPPED));
+    req->ovl.Offset     = static_cast<DWORD>(req->file_offset & 0xFFFFFFFFu);
+    req->ovl.OffsetHigh = static_cast<DWORD>(req->file_offset >> 32);
+
+    BOOL started = FALSE;
+    if (req->op == Request::OpRead) {
+        started = ReadFile(handle_, req->buf, req->bytes, /*read=*/nullptr,
+                            &req->ovl);
+    } else {
+        if (readonly_) {
+            errors_.fetch_add(1);
+            return false;
+        }
+        started = WriteFile(handle_, req->buf, req->bytes, /*written=*/nullptr,
+                             &req->ovl);
+    }
+    if (!started) {
+        const DWORD err = GetLastError();
+        if (err != ERROR_IO_PENDING) {
+            errors_.fetch_add(1);
+            return false;
+        }
+    }
+    return true;
+}
+
+void BlockFile::WorkerLoop() {
+    while (true) {
+        DWORD bytes = 0;
+        ULONG_PTR key = 0;
+        OVERLAPPED* ovl = nullptr;
+        const BOOL ok = GetQueuedCompletionStatus(iocp_, &bytes, &key, &ovl,
+                                                   INFINITE);
+
+        if (key == kShutdownKey) return;
+        if (!ovl) {
+            // Spurious wakeup (shouldn't happen with INFINITE) -- loop.
+            continue;
+        }
+        Request* req = CONTAINING_RECORD(ovl, Request, ovl);
+        if (key == kFlushKey || req->op == Request::OpFlush) {
+            req->ok = (FlushFileBuffers(handle_) != FALSE);
+        } else {
+            req->ok = (ok != FALSE && bytes == req->bytes);
+        }
+        if (!req->ok) errors_.fetch_add(1);
+        completed_.fetch_add(1);
+        if (complete_) complete_(req);
+    }
+}
+
+}  // namespace tinyvmm::host

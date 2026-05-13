@@ -49,10 +49,25 @@ public:
         return last_exit_;
     }
 
-    // Counters for tests / diagnostics.
-    std::uint64_t io_exits() const noexcept { return io_exits_; }
-    std::uint64_t mmio_exits() const noexcept { return mmio_exits_; }
-    std::uint64_t halt_exits() const noexcept { return halt_exits_; }
+    // Counters for tests / diagnostics. Atomic so the watchdog / telemetry
+    // thread can read them without UB (the RunLoop thread increments them).
+    std::uint64_t io_exits() const noexcept {
+        return io_exits_.load(std::memory_order_relaxed);
+    }
+    std::uint64_t mmio_exits() const noexcept {
+        return mmio_exits_.load(std::memory_order_relaxed);
+    }
+    std::uint64_t halt_exits() const noexcept {
+        return halt_exits_.load(std::memory_order_relaxed);
+    }
+    std::uint64_t cpuid_exits() const noexcept {
+        return cpuid_exits_.load(std::memory_order_relaxed);
+    }
+
+    // Trace every IO/MMIO access (claimed or not) to stderr. Useful for
+    // bring-up; very chatty in steady state.
+    void set_verbose_io(bool v) noexcept { verbose_io_ = v; }
+    void set_verbose_cpuid(bool v) noexcept { verbose_cpuid_ = v; }
 
 private:
     // Emulator callback thunks — context pointer is `this`.
@@ -81,6 +96,8 @@ private:
         const WHV_RUN_VP_EXIT_CONTEXT& exit);
     std::optional<StopReason> HandleMmioExit(
         const WHV_RUN_VP_EXIT_CONTEXT& exit);
+    std::optional<StopReason> HandleCpuidExit(
+        const WHV_RUN_VP_EXIT_CONTEXT& exit);
 
     Vcpu& vcpu_;
     devices::IoBus& io_bus_;
@@ -89,9 +106,12 @@ private:
 
     std::atomic<bool> stop_requested_{false};
     WHV_RUN_VP_EXIT_CONTEXT last_exit_ = {};
-    std::uint64_t io_exits_ = 0;
-    std::uint64_t mmio_exits_ = 0;
-    std::uint64_t halt_exits_ = 0;
+    std::atomic<std::uint64_t> io_exits_{0};
+    std::atomic<std::uint64_t> mmio_exits_{0};
+    std::atomic<std::uint64_t> halt_exits_{0};
+    std::atomic<std::uint64_t> cpuid_exits_{0};
+    bool verbose_io_ = false;
+    bool verbose_cpuid_ = false;
 };
 
 // Render a WHV exit reason as a human-readable name for logging.

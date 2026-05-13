@@ -113,4 +113,22 @@ void Vcpu::SetupRealMode(std::uint64_t cs_base) {
     SetRegisters(names, values);
 }
 
+void Vcpu::InjectFixedInterrupt(std::uint8_t vector,
+                                std::uint32_t dest_logical_id) {
+    // WHvRequestInterrupt funnels into the partition's APIC emulation; with
+    // x2APIC enabled this lands as a fixed-vector IPI at the destination VP.
+    // The call is non-blocking and does not itself force a VM exit on the
+    // target -- WHP injects on the next VM entry, or holds the vector if
+    // IF=0 and re-checks at IRET.
+    WHV_INTERRUPT_CONTROL ctrl = {};
+    ctrl.Type = WHvX64InterruptTypeFixed;
+    ctrl.DestinationMode = WHvX64InterruptDestinationModePhysical;
+    ctrl.TriggerMode = WHvX64InterruptTriggerModeEdge;
+    ctrl.Destination = dest_logical_id;
+    ctrl.Vector = vector;
+
+    HRESULT hr = WHvRequestInterrupt(partition_.handle(), &ctrl, sizeof(ctrl));
+    ThrowIfFailed(hr, "WHvRequestInterrupt");
+}
+
 }  // namespace tinyvmm::whp

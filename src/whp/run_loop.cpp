@@ -1,5 +1,7 @@
 #include "run_loop.h"
 
+#include "cpuid.h"
+
 #include <cstdio>
 #include <cstring>
 
@@ -76,7 +78,7 @@ StopReason RunLoop::Run() {
 
         switch (last_exit_.ExitReason) {
             case WHvRunVpExitReasonX64Halt: {
-                ++halt_exits_;
+                halt_exits_.fetch_add(1, std::memory_order_relaxed);
                 const bool if_set =
                     (last_exit_.VpContext.Rflags & kRflagsIf) != 0;
                 std::printf(
@@ -90,7 +92,7 @@ StopReason RunLoop::Run() {
             }
 
             case WHvRunVpExitReasonX64IoPortAccess: {
-                ++io_exits_;
+                io_exits_.fetch_add(1, std::memory_order_relaxed);
                 if (auto stop = HandleIoExit(last_exit_)) {
                     return *stop;
                 }
@@ -98,8 +100,16 @@ StopReason RunLoop::Run() {
             }
 
             case WHvRunVpExitReasonMemoryAccess: {
-                ++mmio_exits_;
+                mmio_exits_.fetch_add(1, std::memory_order_relaxed);
                 if (auto stop = HandleMmioExit(last_exit_)) {
+                    return *stop;
+                }
+                break;
+            }
+
+            case WHvRunVpExitReasonX64Cpuid: {
+                cpuid_exits_.fetch_add(1, std::memory_order_relaxed);
+                if (auto stop = HandleCpuidExit(last_exit_)) {
                     return *stop;
                 }
                 break;
@@ -171,6 +181,56 @@ std::optional<StopReason> RunLoop::HandleMmioExit(
     return std::nullopt;
 }
 
+std::optional<StopReason> RunLoop::HandleCpuidExit(
+    const WHV_RUN_VP_EXIT_CONTEXT& exit) {
+    const auto& ctx = exit.CpuidAccess;
+    const auto leaf    = static_cast<std::uint32_t>(ctx.Rax);
+    const auto subleaf = static_cast<std::uint32_t>(ctx.Rcx);
+
+    // WHP has already computed what it would natively return; layer our policy
+    // on top.
+    CpuidResult r = ResolveCpuid(
+        leaf, subleaf,
+        static_cast<std::uint32_t>(ctx.DefaultResultRax),
+        static_cast<std::uint32_t>(ctx.DefaultResultRbx),
+        static_cast<std::uint32_t>(ctx.DefaultResultRcx),
+        static_cast<std::uint32_t>(ctx.DefaultResultRdx));
+
+    if (verbose_cpuid_) {
+        std::fprintf(stderr,
+                     "[loop] cpuid leaf=0x%08x sub=0x%08x -> "
+                     "eax=0x%08x ebx=0x%08x ecx=0x%08x edx=0x%08x\n",
+                     leaf, subleaf, r.eax, r.ebx, r.ecx, r.edx);
+    }
+
+    // CPUID exits do not auto-advance RIP -- we must step over the 2-byte
+    // CPUID instruction ourselves.
+    const std::uint64_t next_rip =
+        exit.VpContext.Rip + exit.VpContext.InstructionLength;
+
+    static constexpr WHV_REGISTER_NAME kNames[] = {
+        WHvX64RegisterRax, WHvX64RegisterRbx, WHvX64RegisterRcx,
+        WHvX64RegisterRdx, WHvX64RegisterRip,
+    };
+    WHV_REGISTER_VALUE vals[5] = {};
+    vals[0].Reg64 = r.eax;
+    vals[1].Reg64 = r.ebx;
+    vals[2].Reg64 = r.ecx;
+    vals[3].Reg64 = r.edx;
+    vals[4].Reg64 = next_rip;
+
+    try {
+        vcpu_.SetRegisters(kNames, vals);
+    } catch (const HrError& e) {
+        std::fprintf(stderr,
+                     "[loop] CPUID set-regs failed at RIP=0x%llx: HRESULT=0x%08lX\n",
+                     static_cast<unsigned long long>(exit.VpContext.Rip),
+                     static_cast<unsigned long>(e.hr()));
+        return StopReason::EmulationFailure;
+    }
+    return std::nullopt;
+}
+
 // ---------------------------------------------------------------------------
 // Emulator callbacks. The emulator is single-threaded with respect to the
 // vCPU thread that called WHvEmulatorTry*Emulation, so member-state mutation
@@ -232,7 +292,15 @@ HRESULT RunLoop::OnIoPort(WHV_EMULATOR_IO_ACCESS_INFO* io) {
     acc.is_write = (io->Direction == 1);
     acc.value = io->Data;
 
-    if (!io_bus_.Dispatch(acc)) {
+    // Per-port dispatch.
+    bool claimed = io_bus_.Dispatch(acc);
+
+    if (verbose_io_) {
+        std::fprintf(stderr,
+                     "[loop] io %s port=0x%04x size=%u value=0x%08x %s\n",
+                     acc.is_write ? "OUT" : "IN ", acc.port, acc.access_size,
+                     acc.value, claimed ? "(claimed)" : "(unclaimed)");
+    } else if (!claimed) {
         // Floating-bus convention applied by IoBus::Dispatch already; just
         // log the miss so devices we forgot to register are obvious.
         std::fprintf(stderr,

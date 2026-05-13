@@ -28,9 +28,32 @@ add_executable(tinyvmm
     src/whp/memory.cpp
     src/whp/vcpu.cpp
     src/whp/run_loop.cpp
+    src/whp/cpuid.cpp
     src/devices/io_bus.cpp
     src/devices/mmio_bus.cpp
     src/devices/serial8250.cpp
+    src/devices/pit8254.cpp
+    src/devices/legacy_isa.cpp
+    src/devices/i8259.cpp
+    src/virtio/virtqueue.cpp
+    src/virtio/virtio_mmio.cpp
+    src/virtio/virtio_net.cpp
+    src/virtio/virtio_pci.cpp
+    src/virtio/virtio_blk.cpp
+    src/virtio/virtio_rng.cpp
+    src/virtio/virtio_console.cpp
+    src/virtio/net_loopback.cpp
+    src/virtio/net_xdp.cpp
+    src/host/block_file.cpp
+    src/host/rng.cpp
+    src/host/xdp_probe.cpp
+    src/whp/notification_port.cpp
+    src/whp/msi.cpp
+    src/pci/pci_device.cpp
+    src/pci/pci_bus.cpp
+    src/pci/msix.cpp
+    src/boot/pvh_loader.cpp
+    src/boot/acpi_tables.cpp
 )
 
 target_include_directories(tinyvmm PRIVATE
@@ -41,6 +64,10 @@ target_include_directories(tinyvmm PRIVATE
 target_link_libraries(tinyvmm PRIVATE
     WinHvPlatform.lib
     WinHvEmulation.lib
+    # XDP-for-Windows ships its user-mode API as inline headers that hit the
+    # XDP driver via NtCreateFile + NtDeviceIoControlFile, so we link ntdll
+    # for those Nt* exports. No xdpapi.lib required.
+    ntdll.lib
 )
 
 target_compile_definitions(tinyvmm PRIVATE
@@ -48,6 +75,14 @@ target_compile_definitions(tinyvmm PRIVATE
     NOMINMAX
     WIN32_LEAN_AND_MEAN
     UNICODE _UNICODE
+)
+
+# The XDP headers redefine STATUS_* macros that winnt.h already declared
+# (a handful of overlap entries). They're all identical numeric values
+# but /W4 turns C4005 into a warning and /WX promotes it to an error.
+# Suppress C4005 only for the XDP-touching translation unit.
+set_source_files_properties(src/virtio/net_xdp.cpp src/host/xdp_probe.cpp PROPERTIES
+    COMPILE_FLAGS "/wd4005"
 )
 
 if(MSVC)

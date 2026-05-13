@@ -37,6 +37,16 @@ void MmioBus::Register(std::uint64_t base, std::uint64_t size, std::string name,
         {base, size, std::move(name), std::move(handler)});
 }
 
+bool MmioBus::Unregister(std::uint64_t base) {
+    for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+        if (it->base == base) {
+            entries_.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
 bool MmioBus::Dispatch(MmioAccess& access) {
     for (const auto& e : entries_) {
         if (access.gpa >= e.base && access.gpa < e.base + e.size) {
