@@ -5190,9 +5190,10 @@ int main(int argc, char** argv) {
                 // supply your own cmdline via `-- ...`.
                 if (debug_boot) {
                     cmdline = "earlyprintk=ttyS0,115200 console=hvc0 "
-                              "pci=conf1,nocrs";
+                              "pci=conf1,nocrs,lastbus=0 nofb nomodeset";
                 } else {
-                    cmdline = "console=hvc0 pci=conf1,nocrs";
+                    cmdline = "console=hvc0 pci=conf1,nocrs,lastbus=0 "
+                              "nofb nomodeset";
                 }
             }
             return RunPvhRun(argv[vmlinux_arg], cmdline, with_net,
