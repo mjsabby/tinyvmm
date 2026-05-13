@@ -2264,7 +2264,46 @@ int RunPvhRun(const char* path, const std::string& cmdline,
                     const auto& k = recs[i].Event.KeyEvent;
                     if (!k.bKeyDown) continue;
                     wchar_t wc = k.uChar.UnicodeChar;
-                    if (wc == 0) continue;
+                    // Arrow keys, Home/End/PgUp/PgDn/Ins/Del, and the function
+                    // keys come through with UnicodeChar == 0 and the actual
+                    // key in wVirtualKeyCode. Translate the navigation keys
+                    // to the standard xterm/VT escape sequences so the guest
+                    // shell's line editor (busybox ash, bash, etc.) can use
+                    // up/down for history, left/right for cursor movement,
+                    // Home/End to jump within the line, etc. Modifier-key
+                    // variants (Shift+Up, Ctrl+Left, ...) are intentionally
+                    // not yet wired -- they require encoding modifiers as
+                    // `ESC [ 1 ; <m> A` and most users only need plain.
+                    if (wc == 0) {
+                        const char* seq = nullptr;
+                        switch (k.wVirtualKeyCode) {
+                        case VK_UP:     seq = "\x1b[A"; break;
+                        case VK_DOWN:   seq = "\x1b[B"; break;
+                        case VK_RIGHT:  seq = "\x1b[C"; break;
+                        case VK_LEFT:   seq = "\x1b[D"; break;
+                        case VK_HOME:   seq = "\x1b[H"; break;
+                        case VK_END:    seq = "\x1b[F"; break;
+                        case VK_INSERT: seq = "\x1b[2~"; break;
+                        case VK_DELETE: seq = "\x1b[3~"; break;
+                        case VK_PRIOR:  seq = "\x1b[5~"; break;
+                        case VK_NEXT:   seq = "\x1b[6~"; break;
+                        case VK_F1:     seq = "\x1bOP"; break;
+                        case VK_F2:     seq = "\x1bOQ"; break;
+                        case VK_F3:     seq = "\x1bOR"; break;
+                        case VK_F4:     seq = "\x1bOS"; break;
+                        case VK_F5:     seq = "\x1b[15~"; break;
+                        case VK_F6:     seq = "\x1b[17~"; break;
+                        case VK_F7:     seq = "\x1b[18~"; break;
+                        case VK_F8:     seq = "\x1b[19~"; break;
+                        case VK_F9:     seq = "\x1b[20~"; break;
+                        case VK_F10:    seq = "\x1b[21~"; break;
+                        case VK_F11:    seq = "\x1b[23~"; break;
+                        case VK_F12:    seq = "\x1b[24~"; break;
+                        default: break;
+                        }
+                        if (seq) out.append(seq);
+                        continue;
+                    }
                     // ---- Ctrl+A escape state machine ------------------
                     if (escape_armed) {
                         escape_armed = false;

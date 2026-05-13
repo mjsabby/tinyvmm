@@ -156,6 +156,7 @@ fi
 
 # Friendly banner / prompt setup on first use.
 cat > /etc/profile <<'EOF'
+export TERM=xterm-256color
 export PS1='tinyvmm# '
 export PATH=/bin:/usr/bin:/sbin:/usr/sbin
 alias ll='ls -la'
