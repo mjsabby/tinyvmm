@@ -74,7 +74,7 @@ void PrintUsage() {
         "  tinyvmm --wintun-probe [<secs>]   Bring up WinTun adapter 10.0.0.1/24 and dump RX (admin)\n"
         "  tinyvmm --pvh-info <vmlinux>      Inspect a PVH-capable ELF\n"
         "  tinyvmm --pvh-run [--net] [--net-backend loopback|xdp|wintun] [--xdp-if <idx>]\n"
-        "                   [--initrd <path>] <vmlinux> [-- <kernel cmdline...>]\n"
+        "                   [--initrd <path>] [--watchdog-secs <N>] <vmlinux> [-- <kernel cmdline...>]\n"
         "                                    Load and run a PVH kernel\n"
         "  tinyvmm --help                    Show this help\n");
 }
@@ -1836,7 +1836,8 @@ int RunPvhRun(const char* path, const std::string& cmdline,
               NetBackendKind net_backend,
               std::uint32_t xdp_if,
               std::uint32_t xdp_queue,
-              const std::string& initrd_path) {
+              const std::string& initrd_path,
+              int watchdog_secs) {
     using namespace tinyvmm;
     using namespace tinyvmm::whp;
 
@@ -1960,7 +1961,10 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     // Routes guest TX (transmitq, qidx=1) to host stdout. The kernel can
     // be told to use it via `console=hvc0`, bypassing the broken 8250
     // TX-IRQ path entirely. Single-port, no F_MULTIPORT/F_SIZE/F_EMERG_WRITE.
+    // RX (receiveq, qidx=0) carries host stdin -> guest when stdin is a
+    // TTY (see stdin_reader_thread further down).
     auto vcon = std::make_unique<virtio::ConsoleDevice>(ram, stdout);
+    virtio::ConsoleDevice* vcon_ptr = vcon.get();
     {
         virtio::PciTransport::Options copts;
         copts.subsys_id        = static_cast<std::uint16_t>(virtio::kDeviceIdConsole);
@@ -2046,19 +2050,91 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     }
 
     RunLoop loop(vp, io_bus, mmio_bus);
+
+    // ---- stdin -> virtio-console rxq forwarder ---------------------------
+    // When stdin is a real console (TTY), forward keystrokes to the guest's
+    // /dev/hvc0. Skip when stdin is redirected/piped/null so we don't burn a
+    // thread polling a pipe and so test scripts behave normally.
+    HANDLE hstdin = ::GetStdHandle(STD_INPUT_HANDLE);
+    DWORD original_console_mode = 0;
+    bool restore_console_mode = false;
+    std::atomic<bool> stdin_stop{false};
+    std::thread stdin_thread;
+    const bool stdin_is_tty = (hstdin != INVALID_HANDLE_VALUE) &&
+                              (::GetFileType(hstdin) == FILE_TYPE_CHAR);
+    if (stdin_is_tty) {
+        // Save the current mode and switch to raw: no line editing, no echo
+        // (the guest's shell echoes), no Ctrl+C handling (forward 0x03 to
+        // guest). Best-effort: if the calls fail we still read input, just
+        // line-buffered.
+        if (::GetConsoleMode(hstdin, &original_console_mode)) {
+            restore_console_mode = true;
+            ::SetConsoleMode(hstdin, ENABLE_WINDOW_INPUT);
+        }
+        // Also enable VT processing on stdout so guest ANSI escapes (color,
+        // cursor moves) render correctly. Harmless if already enabled.
+        if (HANDLE hout = ::GetStdHandle(STD_OUTPUT_HANDLE);
+            hout != INVALID_HANDLE_VALUE) {
+            DWORD om = 0;
+            if (::GetConsoleMode(hout, &om)) {
+                ::SetConsoleMode(hout, om | ENABLE_PROCESSED_OUTPUT |
+                                          ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            }
+        }
+        stdin_thread = std::thread([hstdin, vcon_ptr, &stdin_stop]() {
+            INPUT_RECORD recs[64];
+            while (!stdin_stop.load(std::memory_order_relaxed)) {
+                // 50ms wait so we can poll the stop flag.
+                DWORD wr = ::WaitForSingleObject(hstdin, 50);
+                if (wr == WAIT_TIMEOUT) continue;
+                if (wr != WAIT_OBJECT_0) break;
+                DWORD num = 0;
+                if (!::GetNumberOfConsoleInputEvents(hstdin, &num)) continue;
+                if (num == 0) continue;
+                DWORD to_read = (num < 64) ? num : 64;
+                DWORD read = 0;
+                if (!::ReadConsoleInputW(hstdin, recs, to_read, &read)) continue;
+                std::string out;
+                out.reserve(read);
+                for (DWORD i = 0; i < read; ++i) {
+                    if (recs[i].EventType != KEY_EVENT) continue;
+                    const auto& k = recs[i].Event.KeyEvent;
+                    if (!k.bKeyDown) continue;
+                    wchar_t wc = k.uChar.UnicodeChar;
+                    if (wc == 0) continue;
+                    if (wc == L'\r') { out.push_back('\n'); continue; }
+                    if (wc < 0x80) {
+                        out.push_back(static_cast<char>(wc));
+                        continue;
+                    }
+                    char mb[8] = {};
+                    int n = ::WideCharToMultiByte(CP_UTF8, 0, &wc, 1, mb,
+                                                  sizeof(mb), nullptr, nullptr);
+                    if (n > 0) out.append(mb, mb + n);
+                }
+                if (!out.empty()) {
+                    vcon_ptr->WriteHostInput(out.data(), out.size());
+                }
+            }
+        });
+    }
+
     std::puts("[pvh-run] running... (no CPUID/APIC yet, expect early exit)");
 
     // Watchdog + per-second exit-rate telemetry. We print deltas (not
     // running totals) so it's obvious whether the guest is currently
     // generating traffic in a given category, and at what rate.
-    constexpr int kWatchdogSeconds = 20;
+    // `watchdog_secs == 0` -> telemetry only, never auto-stop (default).
+    const bool watchdog_enabled = (watchdog_secs > 0);
     std::atomic<bool> watchdog_done{false};
     std::thread watchdog([&] {
         std::uint64_t prev_io = 0, prev_mmio = 0, prev_halt = 0;
         std::uint64_t prev_cpuid = 0, prev_msi = 0, prev_uart = 0;
-        for (int s = 0; s < kWatchdogSeconds && !watchdog_done.load(); ++s) {
+        int s = 0;
+        while (!watchdog_done.load()) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             if (watchdog_done.load()) return;
+            ++s;
             const std::uint64_t cur_io    = loop.io_exits();
             const std::uint64_t cur_mmio  = loop.mmio_exits();
             const std::uint64_t cur_halt  = loop.halt_exits();
@@ -2069,7 +2145,7 @@ int RunPvhRun(const char* path, const std::string& cmdline,
                 "[pvh-run] @%2ds  io=%llu(+%llu) mmio=%llu(+%llu) "
                 "cpuid=%llu(+%llu) halt=%llu(+%llu) msi=%llu(+%llu) "
                 "uart=%llu(+%llu)\n",
-                s + 1,
+                s,
                 static_cast<unsigned long long>(cur_io),
                 static_cast<unsigned long long>(cur_io - prev_io),
                 static_cast<unsigned long long>(cur_mmio),
@@ -2088,19 +2164,27 @@ int RunPvhRun(const char* path, const std::string& cmdline,
             prev_cpuid = cur_cpuid;
             prev_msi   = cur_msi;
             prev_uart  = cur_uart;
-        }
-        if (!watchdog_done.load()) {
-            std::fprintf(stderr,
-                         "[pvh-run] watchdog: %ds elapsed, requesting stop\n",
-                         kWatchdogSeconds);
-            loop.RequestStop();
+            if (watchdog_enabled && s >= watchdog_secs) {
+                std::fprintf(stderr,
+                    "[pvh-run] watchdog: %ds elapsed, requesting stop\n",
+                    watchdog_secs);
+                loop.RequestStop();
+                return;
+            }
         }
     });
 
     StopReason stop = loop.Run();
     watchdog_done.store(true);
+    stdin_stop.store(true);
     if (watchdog.joinable()) {
         watchdog.join();
+    }
+    if (stdin_thread.joinable()) {
+        stdin_thread.join();
+    }
+    if (restore_console_mode) {
+        ::SetConsoleMode(hstdin, original_console_mode);
     }
 
     // Stop the net backend (and its worker thread, if any) before we let
@@ -4923,6 +5007,7 @@ int main(int argc, char** argv) {
             std::uint32_t xdp_if = 0;
             std::uint32_t xdp_queue = 0;
             std::string initrd_path;
+            int watchdog_secs = 0;  // 0 = disabled (default; previously 20)
             int vmlinux_arg = 2;
             // Optional flags between --pvh-run and <vmlinux>.
             while (vmlinux_arg < argc &&
@@ -4975,6 +5060,15 @@ int main(int argc, char** argv) {
                     }
                     ++vmlinux_arg;
                     initrd_path = argv[vmlinux_arg];
+                } else if (f == "--watchdog-secs") {
+                    if (vmlinux_arg + 1 >= argc) {
+                        std::fputs("--pvh-run: --watchdog-secs wants a number "
+                                   "(0 = disabled)\n", stderr);
+                        return 1;
+                    }
+                    ++vmlinux_arg;
+                    watchdog_secs = std::atoi(argv[vmlinux_arg]);
+                    if (watchdog_secs < 0) watchdog_secs = 0;
                 } else {
                     std::fprintf(stderr,
                                  "--pvh-run: unknown flag '%.*s'\n",
@@ -5020,7 +5114,8 @@ int main(int argc, char** argv) {
                 cmdline = "earlyprintk=ttyS0,115200 console=hvc0 pci=conf1,nocrs";
             }
             return RunPvhRun(argv[vmlinux_arg], cmdline, with_net,
-                             net_backend, xdp_if, xdp_queue, initrd_path);
+                             net_backend, xdp_if, xdp_queue, initrd_path,
+                             watchdog_secs);
         }
         if (cmd == "--help" || cmd == "-h") {
             PrintUsage();

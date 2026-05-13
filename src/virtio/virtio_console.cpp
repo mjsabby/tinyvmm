@@ -41,13 +41,57 @@ void ConsoleDevice::NotifyQueue(std::uint32_t idx) {
         DrainTransmitQueue();
         return;
     }
-    // rxq notifies just mean "the driver added receive buffers". We have no
-    // host->guest input source in v1, so nothing to do.
+    // rxq notify = driver added receive buffers. Drain any pending host
+    // input into them.
+    if (idx == kConsoleReceiveQueueIdx) {
+        if (!rxq_.ready()) return;
+        std::lock_guard<std::mutex> lg(rx_mu_);
+        DrainReceiveQueueLocked();
+    }
+}
+
+void ConsoleDevice::WriteHostInput(const char* data, std::size_t n) {
+    if (n == 0) return;
+    std::lock_guard<std::mutex> lg(rx_mu_);
+    rx_pending_.insert(rx_pending_.end(), data, data + n);
+    if (rxq_.ready()) DrainReceiveQueueLocked();
+}
+
+void ConsoleDevice::DrainReceiveQueueLocked() {
+    // Caller holds rx_mu_. rxq_.ready() was checked by caller.
+    bool any = false;
+    while (!rx_pending_.empty()) {
+        auto chain = rxq_.Pop();
+        if (!chain) break;          // driver hasn't posted any RX buffers
+        std::uint32_t total = 0;
+        for (const auto& b : chain->bufs) {
+            if (!b.write || b.len == 0) continue;
+            char* dst = static_cast<char*>(b.host_addr);
+            std::uint32_t cap = b.len;
+            std::uint32_t i = 0;
+            while (i < cap && !rx_pending_.empty()) {
+                dst[i++] = rx_pending_.front();
+                rx_pending_.pop_front();
+            }
+            total += i;
+            if (rx_pending_.empty()) break;  // no more bytes to deliver
+        }
+        rxq_.Push(chain->head_index, total);
+        any = true;
+        if (total == 0) break;       // chain had no writable buffers; bail
+    }
+    if (any && irq_ && rxq_.ShouldInterruptDriver()) {
+        irq_(kConsoleReceiveQueueIdx);
+    }
 }
 
 void ConsoleDevice::Reset() {
     driver_ok_ = false;
     acked_features_ = 0;
+    {
+        std::lock_guard<std::mutex> lg(rx_mu_);
+        rx_pending_.clear();
+    }
 }
 
 std::uint32_t ConsoleDevice::ReadConfig(std::uint32_t offset,

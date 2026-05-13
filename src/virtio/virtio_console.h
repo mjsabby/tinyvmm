@@ -28,7 +28,9 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <functional>
+#include <mutex>
 #include <vector>
 
 namespace tinyvmm::virtio {
@@ -70,6 +72,12 @@ public:
     void SetSink(std::FILE* f) { sink_ = f; }
     void SetCapture(bool on) { capture_ = on; }
 
+    // Push host-side input bytes (e.g. from stdin) toward the guest's
+    // /dev/hvc0. Thread-safe; safe to call before DRIVER_OK (bytes are
+    // buffered until rxq is ready). After enqueueing, attempts to drain
+    // any pending bytes into the rxq if the driver has posted buffers.
+    void WriteHostInput(const char* data, std::size_t n);
+
     // ---------------------- Diagnostics -------------------------------
     bool driver_ok() const noexcept { return driver_ok_; }
     std::uint64_t acked_features() const noexcept { return acked_features_; }
@@ -85,6 +93,7 @@ public:
 
 private:
     void DrainTransmitQueue();
+    void DrainReceiveQueueLocked();
 
     Virtqueue rxq_;
     Virtqueue txq_;
@@ -97,6 +106,11 @@ private:
 
     std::atomic<std::uint64_t> tx_bytes_{0};
     std::atomic<std::uint64_t> tx_chains_{0};
+
+    // Host -> guest input buffer. Serialised by `rx_mu_` (acquired by both
+    // the stdin reader thread and the VCPU thread when it kicks rxq).
+    std::mutex             rx_mu_;
+    std::deque<char>       rx_pending_;
 
     IrqFn irq_;
 };

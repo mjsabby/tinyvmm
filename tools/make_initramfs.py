@@ -106,11 +106,9 @@ class CpioBuilder:
 INIT_SCRIPT = b"""#!/bin/busybox sh
 # tinyvmm initramfs entrypoint.
 #
-# NOTE: this is intentionally NON-INTERACTIVE. Until M19c.5 (8250 IRQ-driven
-# TX) is solved, the kernel's tty path can't drain userspace writes to
-# /dev/console -- so we log everything through /dev/kmsg (which uses the
-# kernel's polled console_write path and works today) and never block on
-# user input.
+# Output goes to /dev/kmsg (kernel polled-console) for boot logs and to
+# /dev/hvc0 for the interactive shell session. With `console=hvc0` on the
+# kernel cmdline, printk and shell stdout share the virtio-console TX queue.
 
 /bin/busybox --install -s /bin
 mount -t proc     proc  /proc    2>/dev/kmsg
@@ -122,77 +120,67 @@ log() { echo "[init] $*" > /dev/kmsg; }
 log "=== tinyvmm init starting ==="
 log "uname: $(uname -a)"
 
-# --- virtio-console verification (M20) -----------------------------------
-# Write a unique marker to /dev/hvc0 directly. Kernel printk lines also land
-# on hvc0 if `console=hvc0` is set, so to disambiguate we use a distinctive
-# tag here that no other code path emits.
-if [ -c /dev/hvc0 ]; then
-    log "/dev/hvc0 present"
-    echo "[init] HVC0_MARKER_BEGIN: virtio-console direct write works" > /dev/hvc0
-    echo "[init] HVC0_MARKER_END" > /dev/hvc0
-else
-    log "/dev/hvc0 NOT present"
-fi
-
 # --- /sys snapshot ------------------------------------------------------
-log "--- /sys/bus contents ---"
-log "$(ls /sys/bus 2>/dev/kmsg)"
-log "--- /sys/bus/pci/devices ---"
-log "$(ls /sys/bus/pci/devices 2>/dev/kmsg)"
 log "--- /sys/bus/virtio/devices ---"
 log "$(ls /sys/bus/virtio/devices 2>/dev/kmsg)"
-log "--- /proc/bus/pci/devices ---"
-log "$(cat /proc/bus/pci/devices 2>/dev/kmsg | head -n 10)"
-log "--- /proc/iomem (head) ---"
-log "$(cat /proc/iomem 2>/dev/kmsg | head -n 20)"
 
-# --- network interfaces -----------------------------------------------
-log "--- /sys/class/net ---"
-for n in /sys/class/net/*; do
-    [ -e "$n" ] || continue
-    iface=$(basename "$n")
-    addr=$(cat "$n/address" 2>/dev/null)
-    log "iface $iface mac=$addr"
-done
-
-# --- bring up loopback (always works) -----------------------------------
+# --- network interfaces -------------------------------------------------
 ip link set lo up        2>/dev/kmsg
-log "lo: $(ip -4 addr show lo | tr -d '\\n')"
-
-# --- bring up eth0 (if virtio-net bound) --------------------------------
 if [ -e /sys/class/net/eth0 ]; then
     ip link set eth0 up                       2>/dev/kmsg
     ip addr add 10.0.0.2/24 dev eth0          2>/dev/kmsg
     ip route add default via 10.0.0.1         2>/dev/kmsg
     log "eth0 up: $(ip -4 addr show eth0 | tr -d '\\n')"
+    # Best-effort DNS via the gateway (NAT'd, see `New-NetNat` on host).
+    echo 'nameserver 1.1.1.1' > /etc/resolv.conf
+    echo 'nameserver 8.8.8.8' >> /etc/resolv.conf
 else
     log "no eth0 (virtio-net driver did not bind)"
 fi
 
-# --- entropy from virtio-rng (sanity) ------------------------------------
+# --- entropy from virtio-rng (sanity) -----------------------------------
 if [ -c /dev/hwrng ]; then
     log "hwrng: $(head -c 16 /dev/hwrng | od -An -tx1 | tr -d '\\n ')"
 fi
 
-log "=== init complete; entering idle ==="
+log "=== init complete; dropping to shell on hvc0 ==="
 
-# Don't drop to shell (no working userspace TTY yet). Park in a kernel-
-# blocking wait that doesn't depend on clockevents (we deliberately turned
-# off PIT IRQ 0 to avoid the LAPIC stale-ISR issue, and tsc-deadline
-# clockevent isn't being installed by Linux -- so 'sleep' would hang).
-# read on a fifo or /dev/console blocks in the kernel's tty code without
-# burning CPU.
-exec cat
+# --- interactive shell on /dev/hvc0 -------------------------------------
+# Respawn-on-exit loop. PID 1 must never exit (kernel panics if it does).
+# `setsid -c` makes the shell the session leader and grabs hvc0 as its
+# controlling TTY so Ctrl+C / job control work.
+if [ ! -c /dev/hvc0 ]; then
+    log "FATAL: /dev/hvc0 missing, parking PID 1"
+    exec cat
+fi
+
+# Friendly banner / prompt setup on first use.
+cat > /etc/profile <<'EOF'
+export PS1='tinyvmm# '
+export PATH=/bin:/usr/bin:/sbin:/usr/sbin
+alias ll='ls -la'
+EOF
+
+while true; do
+    # Use `sh -l` so /etc/profile is sourced (PS1, PATH, aliases).
+    setsid -c /bin/busybox sh -l </dev/hvc0 >/dev/hvc0 2>&1
+    log "shell exited; respawning"
+    sleep 1 2>/dev/kmsg || /bin/busybox usleep 200000 2>/dev/kmsg
+done
 """
 
 
 BUSYBOX_APPLETS = [
     "sh", "ash", "ls", "cat", "echo", "mount", "umount", "uname", "dmesg",
-    "ip", "ping", "ifconfig", "hostname", "sleep", "true", "false", "head",
-    "tail", "ps", "kill", "mkdir", "rm", "cp", "mv", "ln", "find", "grep",
-    "sed", "awk", "vi", "more", "less", "poweroff", "reboot", "halt",
+    "ip", "ping", "ifconfig", "hostname", "sleep", "usleep", "true", "false",
+    "head", "tail", "ps", "kill", "mkdir", "rm", "cp", "mv", "ln", "find",
+    "grep", "sed", "awk", "vi", "more", "less", "poweroff", "reboot", "halt",
     "modprobe", "insmod", "lsmod", "rmmod", "switch_root", "init", "free",
     "mknod", "chmod", "chown", "df", "du", "route", "ifup", "ifdown",
+    "setsid", "tty", "stty", "env", "printenv", "clear", "od", "nslookup",
+    "wget", "telnet", "nc", "ftpget", "tar", "gzip", "gunzip", "date",
+    "uptime", "id", "whoami", "tee", "xargs", "which", "basename", "dirname",
+    "sort", "uniq", "wc", "cut", "expr", "test", "[",
 ]
 
 
@@ -224,6 +212,11 @@ def main() -> int:
     cb.add_dir("sys", mode=0o755)
     cb.add_dir("etc", mode=0o755)
     cb.add_dir("root", mode=0o700)
+    cb.add_dir("tmp", mode=0o1777)
+    cb.add_dir("usr", mode=0o755)
+    cb.add_dir("usr/bin", mode=0o755)
+    cb.add_dir("sbin", mode=0o755)
+    cb.add_dir("usr/sbin", mode=0o755)
 
     # Pre-populated device nodes. The kernel opens /dev/console as
     # stdin/stdout/stderr for the init process BEFORE running /init, so this
