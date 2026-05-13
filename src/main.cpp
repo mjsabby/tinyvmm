@@ -76,7 +76,8 @@ void PrintUsage() {
         "  tinyvmm --wintun-probe [<secs>]   Bring up WinTun adapter 10.0.0.1/24 and dump RX (admin)\n"
         "  tinyvmm --pvh-info <vmlinux>      Inspect a PVH-capable ELF\n"
         "  tinyvmm --pvh-run [--net] [--net-backend loopback|xdp|wintun] [--xdp-if <idx>]\n"
-        "                   [--initrd <path>] [--watchdog-secs <N>] <vmlinux> [-- <kernel cmdline...>]\n"
+        "                   [--initrd <path>] [--watchdog-secs <N>] [--debug-boot]\n"
+        "                   <vmlinux> [-- <kernel cmdline...>]\n"
         "                                    Load and run a PVH kernel\n"
         "  tinyvmm --help                    Show this help\n");
 }
@@ -5068,6 +5069,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
             bool with_net = false;
+            bool debug_boot = false;
             NetBackendKind net_backend = NetBackendKind::Loopback;
             std::uint32_t xdp_if = 0;
             std::uint32_t xdp_queue = 0;
@@ -5134,6 +5136,14 @@ int main(int argc, char** argv) {
                     ++vmlinux_arg;
                     watchdog_secs = std::atoi(argv[vmlinux_arg]);
                     if (watchdog_secs < 0) watchdog_secs = 0;
+                } else if (f == "--debug-boot") {
+                    // Re-enables earlyprintk=ttyS0,115200 in the default
+                    // cmdline. Useful for diagnosing kernels that fail
+                    // before virtio-console comes up, at the cost of
+                    // ~700 ms of synchronous OUTB exits per byte to the
+                    // 8250 UART. Has no effect if the user supplies
+                    // their own cmdline via `-- ...`.
+                    debug_boot = true;
                 } else {
                     std::fprintf(stderr,
                                  "--pvh-run: unknown flag '%.*s'\n",
@@ -5171,12 +5181,19 @@ int main(int argc, char** argv) {
                 }
             }
             if (cmdline.empty()) {
-                // earlyprintk uses the polled 8250 path until virtio-pci
-                // initializes virtio-console; then `console=hvc0` becomes
-                // the registered console and printk/userspace writes route
-                // through the virtio-console TX queue. No `console=ttyS0`
-                // here, so we don't dupe every line onto both 8250 + hvc0.
-                cmdline = "earlyprintk=ttyS0,115200 console=hvc0 pci=conf1,nocrs";
+                // Default: route all kernel output via virtio-console
+                // (`console=hvc0`). We deliberately do NOT enable
+                // `earlyprintk=ttyS0,115200` because every byte of
+                // earlyprintk is a synchronous OUTB->VM exit, costing
+                // ~700 ms across a typical Linux boot's printk volume.
+                // Pass `--debug-boot` to opt back into earlyprintk, or
+                // supply your own cmdline via `-- ...`.
+                if (debug_boot) {
+                    cmdline = "earlyprintk=ttyS0,115200 console=hvc0 "
+                              "pci=conf1,nocrs";
+                } else {
+                    cmdline = "console=hvc0 pci=conf1,nocrs";
+                }
             }
             return RunPvhRun(argv[vmlinux_arg], cmdline, with_net,
                              net_backend, xdp_if, xdp_queue, initrd_path,
