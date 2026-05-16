@@ -1,6 +1,6 @@
 #include "virtio_rng.h"
 
-#include "../host/rng.h"
+#include "host/rng.h"
 
 namespace tinyvmm::virtio {
 
@@ -46,9 +46,9 @@ void RngDevice::DrainRequestQueue() {
         // We ignore any read-only buffers a misbehaving driver might
         // tack on; for writable buffers we just fill with random bytes.
         for (const auto& b : chain->bufs) {
-            if (!b.write || b.len == 0) continue;
-            host::RandomFill(b.host_addr, b.len);
-            total += b.len;
+            if (!b.write || b.bytes.empty()) continue;
+            host::RandomFill(b.bytes.data(), b.bytes.size());
+            total += static_cast<std::uint32_t>(b.bytes.size());
         }
         queue_.Push(chain->head_index, total);
         bytes_out_.fetch_add(total, std::memory_order_relaxed);

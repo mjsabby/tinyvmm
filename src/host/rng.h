@@ -7,7 +7,7 @@
 // have to manage an algorithm provider handle — Windows resolves it to
 // the kernel's `SystemPrng`/`RNG` provider per call.
 
-#include "../common.h"
+#include "common.h"
 
 #include <cstddef>
 

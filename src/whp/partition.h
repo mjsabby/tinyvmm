@@ -4,7 +4,7 @@
 #include <WinHvPlatform.h>
 #include <WinHvPlatformDefs.h>
 
-#include "../common.h"
+#include "common.h"
 
 namespace tinyvmm::whp {
 

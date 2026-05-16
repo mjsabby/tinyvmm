@@ -15,7 +15,7 @@
 // queue-notify MMIO (no worker threads). That's adequate for tests; it's
 // not adequate for high-throughput use cases.
 
-#include "../common.h"
+#include "common.h"
 #include "net_backend.h"
 #include "virtio_net.h"
 

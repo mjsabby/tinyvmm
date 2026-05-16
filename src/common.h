@@ -13,6 +13,8 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <type_traits>
+#include <utility>
 
 namespace tinyvmm {
 
@@ -62,5 +64,30 @@ constexpr std::uint64_t AlignDown(std::uint64_t v, std::uint64_t a) {
 constexpr std::uint64_t AlignUp(std::uint64_t v, std::uint64_t a) {
     return AlignDown(v + a - 1, a);
 }
+
+namespace util {
+
+// Narrowing integer cast with overflow detection. Throws
+// HrError(E_INVALIDARG) if `v` cannot be represented as `To`. Use this
+// whenever a guest- or attacker-influenced integer must fit into a
+// smaller (or differently-signed) integer type before being handed to
+// a Win32 API, a printf "%.*s" width, or other downstream consumer
+// that would silently truncate.
+//
+// Implementation note: std::in_range<To>(v) from C++20 <utility>
+// already encodes all four signed/unsigned combinations correctly
+// (with sign-preserving comparisons under the hood), so we just defer
+// to it and throw on out-of-range.
+template <typename To, typename From>
+constexpr To checked_int_cast(From v) {
+    static_assert(std::is_integral_v<To> && std::is_integral_v<From>,
+                  "checked_int_cast requires integral types");
+    if (!std::in_range<To>(v)) {
+        throw HrError(E_INVALIDARG, "checked_int_cast: value out of range");
+    }
+    return static_cast<To>(v);
+}
+
+}  // namespace util
 
 }  // namespace tinyvmm

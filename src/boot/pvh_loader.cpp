@@ -1,6 +1,6 @@
 #include "pvh_loader.h"
 
-#include "../host/mapped_file.h"
+#include "host/mapped_file.h"
 #include "acpi_tables.h"
 #include "elf.h"
 #include "pvh.h"
@@ -40,13 +40,6 @@ constexpr std::uint64_t kModlistGpa    = 0x2400;
 constexpr std::uint64_t kCmdlineGpa    = 0x2800;
 constexpr std::size_t   kCmdlineMax    = 0x800;
 constexpr std::uint64_t kAcpiGpa       = 0x3000;
-
-// Map an entire file read-only. Sufficient for vmlinux-sized binaries
-// (~tens of MB); CreateFileMapping + MapViewOfFile is ~3x faster than the
-// std::ifstream read+copy path it replaced.
-host::MappedFile MapFile(const std::filesystem::path& p) {
-    return host::MappedFile(p);
-}
 
 void ValidateEhdr(const elf::Ehdr64& eh) {
     if (eh.e_ident[0] != elf::kElfMag0 || eh.e_ident[1] != elf::kElfMag1 ||
@@ -120,8 +113,9 @@ PvhInfo InspectPvhFromBytes(std::span<const std::uint8_t> bytes,
     info.path = path;
     info.e_entry = eh.e_entry;
 
-    if (eh.e_phoff + static_cast<std::uint64_t>(eh.e_phnum) * sizeof(elf::Phdr64) >
-        bytes.size()) {
+    if (eh.e_phoff > bytes.size() ||
+        static_cast<std::uint64_t>(eh.e_phnum) * sizeof(elf::Phdr64) >
+            bytes.size() - eh.e_phoff) {
         throw HrError(E_FAIL, "program headers extend past end of file");
     }
 
@@ -133,7 +127,8 @@ PvhInfo InspectPvhFromBytes(std::span<const std::uint8_t> bytes,
                     sizeof(ph));
 
         if (ph.p_type == elf::kPtNote) {
-            if (ph.p_offset + ph.p_filesz > bytes.size()) {
+            if (ph.p_offset > bytes.size() ||
+                ph.p_filesz > bytes.size() - ph.p_offset) {
                 continue;
             }
             auto e = FindPvhNoteIn(
@@ -145,8 +140,20 @@ PvhInfo InspectPvhFromBytes(std::span<const std::uint8_t> bytes,
             if (ph.p_filesz == 0 && ph.p_memsz == 0) {
                 continue;
             }
-            if (ph.p_offset + ph.p_filesz > bytes.size()) {
+            if (ph.p_offset > bytes.size() ||
+                ph.p_filesz > bytes.size() - ph.p_offset) {
                 throw HrError(E_FAIL, "PT_LOAD extends past end of file");
+            }
+            // ELF spec: a PT_LOAD's in-memory image is at least as large
+            // as its on-disk image. Reject the inverse so the BSS-zero
+            // length (memsz - filesz) below can't underflow.
+            if (ph.p_memsz < ph.p_filesz) {
+                throw HrError(E_FAIL, "PT_LOAD p_memsz < p_filesz");
+            }
+            // Reject p_paddr + p_memsz wrap so the kernel_phys_max
+            // tracking below stays sound.
+            if (ph.p_paddr > UINT64_MAX - ph.p_memsz) {
+                throw HrError(E_FAIL, "PT_LOAD p_paddr+p_memsz overflows");
             }
             LoadSegment seg{
                 .paddr = ph.p_paddr,
@@ -171,7 +178,8 @@ PvhInfo InspectPvhFromBytes(std::span<const std::uint8_t> bytes,
         eh.e_shentsize == sizeof(elf::Shdr64)) {
         const std::uint64_t sh_total =
             static_cast<std::uint64_t>(eh.e_shnum) * sizeof(elf::Shdr64);
-        if (eh.e_shoff + sh_total <= bytes.size()) {
+        if (eh.e_shoff <= bytes.size() &&
+            sh_total <= bytes.size() - eh.e_shoff) {
             for (std::uint16_t i = 0; i < eh.e_shnum; ++i) {
                 elf::Shdr64 sh{};
                 std::memcpy(&sh,
@@ -180,7 +188,8 @@ PvhInfo InspectPvhFromBytes(std::span<const std::uint8_t> bytes,
                                     sizeof(elf::Shdr64),
                             sizeof(sh));
                 if (sh.sh_type != elf::kShtNote) continue;
-                if (sh.sh_offset + sh.sh_size > bytes.size()) continue;
+                if (sh.sh_offset > bytes.size() ||
+                    sh.sh_size > bytes.size() - sh.sh_offset) continue;
                 auto e = FindPvhNoteIn(bytes.data() + sh.sh_offset,
                                        sh.sh_size);
                 if (e) {
@@ -229,7 +238,8 @@ void PrintPvhInfo(const PvhInfo& info, std::FILE* out) {
         std::fprintf(out, "[pvh] kernel paddr range: 0x%llx .. 0x%llx (%.2f MiB)\n",
                      static_cast<unsigned long long>(info.kernel_phys_min),
                      static_cast<unsigned long long>(info.kernel_phys_max),
-                     (info.kernel_phys_max - info.kernel_phys_min) / 1048576.0);
+                     static_cast<double>(info.kernel_phys_max -
+                                         info.kernel_phys_min) / 1048576.0);
     }
 }
 
@@ -308,9 +318,15 @@ PvhLoadResult LoadPvh(whp::GuestMemory& ram,
             throw HrError(E_FAIL, "initramfs file is empty");
         }
         constexpr std::uint64_t k2MiB = 2ull * 1024ull * 1024ull;
+        // Checked round-up: kernel_phys_max + (k2MiB - 1) must not wrap.
+        if (info.kernel_phys_max > UINT64_MAX - (k2MiB - 1)) {
+            throw HrError(E_FAIL,
+                "kernel_phys_max alignment would overflow");
+        }
         initramfs_gpa = (info.kernel_phys_max + k2MiB - 1) & ~(k2MiB - 1);
         if (initramfs_gpa < 0x100000ull) initramfs_gpa = 0x100000ull;
-        if (initramfs_gpa + imf.size() > cfg.ram_bytes) {
+        if (initramfs_gpa > cfg.ram_bytes ||
+            imf.size() > cfg.ram_bytes - initramfs_gpa) {
             throw HrError(E_FAIL,
                 "initramfs would extend past configured guest RAM");
         }

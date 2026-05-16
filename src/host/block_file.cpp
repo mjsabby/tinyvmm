@@ -1,5 +1,6 @@
 #include "block_file.h"
 
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 
@@ -113,7 +114,12 @@ void BlockFile::WorkerLoop() {
             // Spurious wakeup (shouldn't happen with INFINITE) -- loop.
             continue;
         }
-        Request* req = CONTAINING_RECORD(ovl, Request, ovl);
+        // The SDK's CONTAINING_RECORD macro uses the `&((T*)0)->field`
+        // idiom, which is a member-access through a null pointer and
+        // trips UBSan even though it works on every real compiler.
+        // Use standard `offsetof` for the same effect without the UB.
+        Request* req = reinterpret_cast<Request*>(
+            reinterpret_cast<char*>(ovl) - offsetof(Request, ovl));
         if (key == kFlushKey || req->op == Request::OpFlush) {
             req->ok = (FlushFileBuffers(handle_) != FALSE);
         } else {

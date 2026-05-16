@@ -14,7 +14,7 @@
 //   - VIRTIO_F_RING_EVENT_IDX (the perf bit; the transport plumbs it)
 // Notably absent: MRG_RXBUF, CTRL_VQ, MULTIQUEUE -- defer to later.
 
-#include "../whp/memory.h"
+#include "whp/memory.h"
 #include "net_backend.h"
 #include "virtio.h"
 #include "virtqueue.h"

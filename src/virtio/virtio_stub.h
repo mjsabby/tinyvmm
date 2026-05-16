@@ -7,7 +7,7 @@
 // Used by `tinyvmm --virtio-test` to exercise the wire format end-to-end
 // without booting a kernel.
 
-#include "../whp/memory.h"
+#include "whp/memory.h"
 #include "virtio.h"
 #include "virtqueue.h"
 

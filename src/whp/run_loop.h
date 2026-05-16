@@ -1,8 +1,8 @@
 #pragma once
 
-#include "../common.h"
-#include "../devices/io_bus.h"
-#include "../devices/mmio_bus.h"
+#include "common.h"
+#include "devices/io_bus.h"
+#include "devices/mmio_bus.h"
 #include "vcpu.h"
 
 #include <Windows.h>
@@ -63,6 +63,43 @@ public:
     std::uint64_t cpuid_exits() const noexcept {
         return cpuid_exits_.load(std::memory_order_relaxed);
     }
+    std::uint64_t msr_exits() const noexcept {
+        return msr_exits_.load(std::memory_order_relaxed);
+    }
+    std::uint64_t intwin_exits() const noexcept {
+        return intwin_exits_.load(std::memory_order_relaxed);
+    }
+    std::uint64_t apic_eoi_exits() const noexcept {
+        return apic_eoi_exits_.load(std::memory_order_relaxed);
+    }
+    std::uint64_t exception_exits() const noexcept {
+        return exception_exits_.load(std::memory_order_relaxed);
+    }
+    std::uint64_t cancelled_exits() const noexcept {
+        return cancelled_exits_.load(std::memory_order_relaxed);
+    }
+    std::uint64_t unsupported_exits() const noexcept {
+        return unsupported_exits_.load(std::memory_order_relaxed);
+    }
+    std::uint64_t unrecoverable_exits() const noexcept {
+        return unrecoverable_exits_.load(std::memory_order_relaxed);
+    }
+    std::uint64_t invalid_vp_reg_exits() const noexcept {
+        return invalid_vp_reg_exits_.load(std::memory_order_relaxed);
+    }
+    std::uint64_t other_exits() const noexcept {
+        return other_exits_.load(std::memory_order_relaxed);
+    }
+
+    // Total across all exit kinds.
+    std::uint64_t total_exits() const noexcept;
+
+    // Render a one-line summary of all non-zero counters to `out`. Used by
+    // shutdown paths and `--stats` to print a structured breakdown; also
+    // emitted to ETW (event "RunLoopStats", keyword Lifecycle) so WPA
+    // sessions get the same picture without scraping stderr.
+    void DumpCounters(std::FILE* out) const;
+    void EmitCountersEtw() const;
 
     // Trace every IO/MMIO access (claimed or not) to stderr. Useful for
     // bring-up; very chatty in steady state.
@@ -110,6 +147,15 @@ private:
     std::atomic<std::uint64_t> mmio_exits_{0};
     std::atomic<std::uint64_t> halt_exits_{0};
     std::atomic<std::uint64_t> cpuid_exits_{0};
+    std::atomic<std::uint64_t> msr_exits_{0};
+    std::atomic<std::uint64_t> intwin_exits_{0};
+    std::atomic<std::uint64_t> apic_eoi_exits_{0};
+    std::atomic<std::uint64_t> exception_exits_{0};
+    std::atomic<std::uint64_t> cancelled_exits_{0};
+    std::atomic<std::uint64_t> unsupported_exits_{0};
+    std::atomic<std::uint64_t> unrecoverable_exits_{0};
+    std::atomic<std::uint64_t> invalid_vp_reg_exits_{0};
+    std::atomic<std::uint64_t> other_exits_{0};
     bool verbose_io_ = false;
     bool verbose_cpuid_ = false;
 };

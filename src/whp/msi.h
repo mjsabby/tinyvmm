@@ -8,7 +8,7 @@
 // deliveries; for *host*-side injection we need to mint the same effect via
 // WHvRequestInterrupt. This header documents and implements that mapping.
 
-#include "../common.h"
+#include "common.h"
 
 #include <Windows.h>
 #include <WinHvPlatform.h>

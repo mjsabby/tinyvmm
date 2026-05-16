@@ -8,7 +8,7 @@
 // Spec references throughout are to "Virtual I/O Device (VIRTIO) Version 1.2,
 // Committee Specification 01, 1 July 2022".
 
-#include "../common.h"
+#include "common.h"
 
 #include <cstdint>
 

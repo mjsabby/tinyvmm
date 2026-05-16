@@ -1,8 +1,8 @@
 #pragma once
 
-#include "../common.h"
-#include "../whp/memory.h"
-#include "../whp/vcpu.h"
+#include "common.h"
+#include "whp/memory.h"
+#include "whp/vcpu.h"
 
 #include <cstdint>
 #include <filesystem>

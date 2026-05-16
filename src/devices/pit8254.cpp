@@ -97,6 +97,19 @@ std::uint64_t Pit8254::QpcDeltaToPitTicks(std::uint64_t delta) const noexcept {
 
 void Pit8254::ProgramChannel(int ch, std::uint8_t cw) {
     auto& c = ch_[ch];
+    if ((cw & kCwBcd) != 0) {
+        // BCD count mode (bit 0 set) is part of the 8254 spec but no
+        // mainstream OS uses it. We don't model it; warn once and treat
+        // as binary so the guest isn't silently mis-counted.
+        static bool warned = false;
+        if (!warned) {
+            std::fprintf(stderr,
+                "[pit8254] WARN: guest selected BCD count mode on ch%d "
+                "(cw=0x%02x); treating as binary.\n",
+                ch, cw);
+            warned = true;
+        }
+    }
     AccessMode acc =
         static_cast<AccessMode>((cw & kCwAccessMask) >> kCwAccessShift);
     if (acc == AccessLatch) {

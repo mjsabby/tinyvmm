@@ -21,7 +21,7 @@ void Vcpu::GetRegisters(std::span<const WHV_REGISTER_NAME> names,
     }
     HRESULT hr = WHvGetVirtualProcessorRegisters(
         partition_.handle(), index_, names.data(),
-        static_cast<UINT32>(names.size()), out_values.data());
+        util::checked_int_cast<UINT32>(names.size()), out_values.data());
     ThrowIfFailed(hr, "WHvGetVirtualProcessorRegisters");
 }
 
@@ -32,7 +32,7 @@ void Vcpu::SetRegisters(std::span<const WHV_REGISTER_NAME> names,
     }
     HRESULT hr = WHvSetVirtualProcessorRegisters(
         partition_.handle(), index_, names.data(),
-        static_cast<UINT32>(names.size()), values.data());
+        util::checked_int_cast<UINT32>(names.size()), values.data());
     ThrowIfFailed(hr, "WHvSetVirtualProcessorRegisters");
 }
 

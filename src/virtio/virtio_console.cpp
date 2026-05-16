@@ -65,15 +65,15 @@ void ConsoleDevice::DrainReceiveQueueLocked() {
         if (!chain) break;          // driver hasn't posted any RX buffers
         std::uint32_t total = 0;
         for (const auto& b : chain->bufs) {
-            if (!b.write || b.len == 0) continue;
-            char* dst = static_cast<char*>(b.host_addr);
-            std::uint32_t cap = b.len;
-            std::uint32_t i = 0;
+            if (!b.write || b.bytes.empty()) continue;
+            const std::size_t cap = b.bytes.size();
+            std::size_t i = 0;
             while (i < cap && !rx_pending_.empty()) {
-                dst[i++] = rx_pending_.front();
+                b.bytes[i++] =
+                    static_cast<std::uint8_t>(rx_pending_.front());
                 rx_pending_.pop_front();
             }
-            total += i;
+            total += static_cast<std::uint32_t>(i);
             if (rx_pending_.empty()) break;  // no more bytes to deliver
         }
         rxq_.Push(chain->head_index, total);
@@ -116,18 +116,20 @@ void ConsoleDevice::DrainTransmitQueue() {
             // Per spec §5.3.6.1 transmitq buffers are device-readable.
             // Ignore (silently) any device-writable buffer a buggy driver
             // hands us.
-            if (b.write || b.len == 0) continue;
+            if (b.write || b.bytes.empty()) continue;
+            const auto* cp =
+                reinterpret_cast<const char*>(b.bytes.data());
+            const std::size_t len = b.bytes.size();
             if (sink_ != nullptr) {
-                std::fwrite(b.host_addr, 1, b.len, sink_);
+                std::fwrite(cp, 1, len, sink_);
             }
             if (capture_) {
-                const char* p = static_cast<const char*>(b.host_addr);
-                captured_.insert(captured_.end(), p, p + b.len);
+                captured_.insert(captured_.end(), cp, cp + len);
             }
             if (byte_observer_) {
-                byte_observer_(static_cast<const char*>(b.host_addr), b.len);
+                byte_observer_(cp, static_cast<std::uint32_t>(len));
             }
-            total += b.len;
+            total += static_cast<std::uint32_t>(len);
         }
         if (sink_ != nullptr) std::fflush(sink_);
         // Spec §5.3.6.1: device writes 0 to `len` since transmitq buffers

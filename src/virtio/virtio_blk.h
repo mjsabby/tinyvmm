@@ -18,9 +18,9 @@
 // model explicit + safe under tools like TSan; ShouldInterruptDriver() is
 // always called under the same lock.
 
-#include "../common.h"
-#include "../host/block_file.h"
-#include "../whp/memory.h"
+#include "common.h"
+#include "host/block_file.h"
+#include "whp/memory.h"
 #include "virtio.h"
 #include "virtqueue.h"
 
@@ -108,7 +108,9 @@ private:
     void FinishRequest(Req* r);
     void RaiseIrqIfNeeded();
 
-    whp::GuestMemory& mem_;
+    // Held as a reference only to pass through to Virtqueue at construction;
+    // no method on BlockDevice itself accesses guest memory directly (all
+    // I/O goes through descriptor chains owned by `queue_`).
     host::BlockFile&  backend_;
     IrqFn             irq_;
 

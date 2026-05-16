@@ -3,7 +3,7 @@
 // PCI Local Bus Specification 3.0 constants. Just the bits tinyvmm needs --
 // no PCIe Extended Config, no segments, single bus 0.
 
-#include "../common.h"
+#include "common.h"
 
 #include <cstdint>
 

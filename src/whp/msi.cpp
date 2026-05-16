@@ -1,5 +1,7 @@
 #include "msi.h"
 
+#include "diag/etw.h"
+
 #include <atomic>
 
 namespace tinyvmm::whp {
@@ -57,6 +59,15 @@ HRESULT InjectMsi(WHV_PARTITION_HANDLE partition,
     if (SUCCEEDED(hr)) {
         g_msi_inject_count.fetch_add(1, std::memory_order_relaxed);
     }
+    TINYVMM_ETW_VERBOSE_KW("MsiInject", ::tinyvmm::diag::kw::Msi,
+        TraceLoggingUInt64(address,            "address"),
+        TraceLoggingUInt32(data,               "data"),
+        TraceLoggingUInt8(vector,              "vector"),
+        TraceLoggingUInt8(delivery,            "delivery"),
+        TraceLoggingUInt32(destination,        "destination"),
+        TraceLoggingUInt8(dest_logical ? 1 : 0, "logical"),
+        TraceLoggingUInt8(trig_level ? 1 : 0,  "level"),
+        TraceLoggingHResult(hr,                "hr"));
     return hr;
 }
 

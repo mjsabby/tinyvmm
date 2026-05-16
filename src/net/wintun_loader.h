@@ -9,7 +9,7 @@
 // otherwise winsock.h v1 sneaks in first and you get a cascade of
 // redefinition errors.
 
-#include "../../third_party/wintun/wintun.h"
+#include "wintun.h"
 
 #include <string>
 

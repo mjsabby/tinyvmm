@@ -74,8 +74,9 @@ void PrintUsage() {
         "  tinyvmm --cpuid-test              Verify CPUID resolver policy (M18 time hygiene)\n"
         "  tinyvmm --xdp-probe [<IfIndex>]   List host NICs / probe XDP attachment\n"
         "  tinyvmm --wintun-probe [<secs>]   Bring up WinTun adapter 10.0.0.1/24 and dump RX (admin)\n"
+        "  tinyvmm --wintun-svc-probe [<secs>] Same as --wintun-probe but via WintunSvc (no admin)\n"
         "  tinyvmm --pvh-info <vmlinux>      Inspect a PVH-capable ELF\n"
-        "  tinyvmm --pvh-run [--net] [--net-backend loopback|xdp|wintun] [--xdp-if <idx>]\n"
+        "  tinyvmm --pvh-run [--net] [--net-backend loopback|xdp|wintun|wintun-svc] [--xdp-if <idx>]\n"
         "                   [--initrd <path>] [--drive <path>[,readonly]]...\n"
         "                   [--watchdog-secs <N>] [--debug-boot]\n"
         "                   [--expose-tsc-deadline]\n"
@@ -545,7 +546,7 @@ int RunVirtioTest() {
         std::fputs("[virtio-test] FAIL: write flags wrong\n", stderr);
         return 5;
     }
-    if (std::memcmp(popped->bufs[0].host_addr, kPayload,
+    if (std::memcmp(popped->bufs[0].bytes.data(), kPayload,
                     sizeof(kPayload)) != 0) {
         std::fputs("[virtio-test] FAIL: payload mismatch\n", stderr);
         return 5;
@@ -1836,7 +1837,7 @@ int RunPvhInfo(const char* path) {
 //   "none"     : guest sees the device but no packets ever flow
 //   "loopback" : TX echoes back as RX via LoopbackNetBackend (debug)
 //   "xdp"      : AF_XDP zero-copy to host NIC queue `xdp_if`/`xdp_queue`
-enum class NetBackendKind { None, Loopback, Xdp, Wintun };
+enum class NetBackendKind { None, Loopback, Xdp, Wintun, WintunSvc };
 // One disk attached via --drive. We open with FILE_FLAG_OVERLAPPED and bind
 // to a per-disk IOCP worker thread; see host::BlockFile.
 struct DriveSpec {
@@ -1901,10 +1902,9 @@ int RunPvhRun(const char* path, const std::string& cmdline,
                 ram.size() / (1024 * 1024),
                 ram.large_pages() ? "MEM_LARGE_PAGES" : "4 KiB pages");
 
-    boot::PvhLoadConfig cfg{
-        .cmdline = cmdline,
-        .ram_bytes = ram.size(),
-    };
+    boot::PvhLoadConfig cfg;
+    cfg.cmdline   = cmdline;
+    cfg.ram_bytes = ram.size();
     if (!initrd_path.empty()) {
         cfg.initramfs = std::filesystem::path(initrd_path);
     }
@@ -2170,9 +2170,18 @@ int RunPvhRun(const char* path, const std::string& cmdline,
         }
         case NetBackendKind::Wintun: {
             virtio::WintunNetBackend::Options wo;
+            wo.kind = virtio::WintunNetBackend::BackendKind::Dll;
             net->SetBackend(std::make_unique<virtio::WintunNetBackend>(
                 *net, wo));
             backend_name = "wintun";
+            break;
+        }
+        case NetBackendKind::WintunSvc: {
+            virtio::WintunNetBackend::Options wo;
+            wo.kind = virtio::WintunNetBackend::BackendKind::Svc;
+            net->SetBackend(std::make_unique<virtio::WintunNetBackend>(
+                *net, wo));
+            backend_name = "wintun-svc";
             break;
         }
         }
@@ -2631,18 +2640,16 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     }
 
     std::printf(
-        "[pvh-run] stop=%d  io=%llu mmio=%llu halt=%llu cpuid=%llu "
-        "msi=%llu uart_tx=%llu  last_exit_reason=%s (0x%x) RIP=0x%llx\n",
+        "[pvh-run] stop=%d  msi=%llu uart_tx=%llu  "
+        "last_exit_reason=%s (0x%x) RIP=0x%llx\n",
         static_cast<int>(stop),
-        static_cast<unsigned long long>(loop.io_exits()),
-        static_cast<unsigned long long>(loop.mmio_exits()),
-        static_cast<unsigned long long>(loop.halt_exits()),
-        static_cast<unsigned long long>(loop.cpuid_exits()),
         static_cast<unsigned long long>(whp::MsiInjectCount()),
         static_cast<unsigned long long>(com1.tx_bytes()),
         ExitReasonName(loop.last_exit().ExitReason),
         static_cast<unsigned int>(loop.last_exit().ExitReason),
         static_cast<unsigned long long>(loop.last_exit().VpContext.Rip));
+    loop.DumpCounters(stdout);
+    loop.EmitCountersEtw();
 
     btimer.Mark("teardown done");
     TINYVMM_ETW_INFO("VmStop",
@@ -5115,7 +5122,8 @@ int RunCpuidTest() {
         if (r.eax != 1u) return fail("leaf 0x15: EAX != 1");
         if (r.ebx != 1u) return fail("leaf 0x15: EBX != 1");
         if (r.ecx < 100'000'000u) return fail("leaf 0x15: ECX < 100 MHz");
-        if (r.ecx > 10'000'000'000u) return fail("leaf 0x15: ECX > 10 GHz");
+        if (static_cast<std::uint64_t>(r.ecx) > 10'000'000'000ull)
+            return fail("leaf 0x15: ECX > 10 GHz");
         tsc_hz_from_15 = r.ecx;
     }
 
@@ -5265,6 +5273,14 @@ int main(int argc, char** argv) {
             }
             return tinyvmm::RunWintunProbe(seconds);
         }
+        if (cmd == "--wintun-svc-probe") {
+            int seconds = 5;
+            if (argc >= 3) {
+                seconds = std::atoi(argv[2]);
+                if (seconds <= 0) seconds = 5;
+            }
+            return tinyvmm::RunWintunSvcProbe(seconds);
+        }
         if (cmd == "--pvh-info") {
             if (argc < 3) {
                 std::fputs("--pvh-info: expected path to vmlinux\n", stderr);
@@ -5312,10 +5328,12 @@ int main(int argc, char** argv) {
                     else if (kind == "loopback") net_backend = NetBackendKind::Loopback;
                     else if (kind == "xdp")      net_backend = NetBackendKind::Xdp;
                     else if (kind == "wintun")   net_backend = NetBackendKind::Wintun;
+                    else if (kind == "wintun-svc") net_backend = NetBackendKind::WintunSvc;
                     else {
                         std::fprintf(stderr,
-                            "--pvh-run: unknown --net-backend '%.*s' (want none|loopback|xdp|wintun)\n",
-                            static_cast<int>(kind.size()), kind.data());
+                            "--pvh-run: unknown --net-backend '%.*s' (want none|loopback|xdp|wintun|wintun-svc)\n",
+                            tinyvmm::util::checked_int_cast<int>(kind.size()),
+                            kind.data());
                         return 1;
                     }
                 } else if (f == "--xdp-if") {
@@ -5374,7 +5392,8 @@ int main(int argc, char** argv) {
                                 std::fprintf(stderr,
                                     "--pvh-run: --drive: unknown option '%.*s' "
                                     "(want: readonly)\n",
-                                    static_cast<int>(kv.size()), kv.data());
+                                    tinyvmm::util::checked_int_cast<int>(kv.size()),
+                                    kv.data());
                                 return 1;
                             }
                             opts = (next == std::string_view::npos)
@@ -5425,7 +5444,8 @@ int main(int argc, char** argv) {
                 } else {
                     std::fprintf(stderr,
                                  "--pvh-run: unknown flag '%.*s'\n",
-                                 static_cast<int>(f.size()), f.data());
+                                 tinyvmm::util::checked_int_cast<int>(f.size()),
+                                 f.data());
                     return 1;
                 }
                 ++vmlinux_arg;
@@ -5441,6 +5461,11 @@ int main(int argc, char** argv) {
             }
             if (net_backend == NetBackendKind::Wintun && !with_net) {
                 std::fputs("--pvh-run: --net-backend wintun requires --net\n",
+                           stderr);
+                return 1;
+            }
+            if (net_backend == NetBackendKind::WintunSvc && !with_net) {
+                std::fputs("--pvh-run: --net-backend wintun-svc requires --net\n",
                            stderr);
                 return 1;
             }

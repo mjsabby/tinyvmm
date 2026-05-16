@@ -16,8 +16,8 @@
 // registered device), reads BAR sizes via the write-all-1s protocol, and
 // usually accepts our pre-assignment.
 
-#include "../common.h"
-#include "../devices/io_bus.h"
+#include "common.h"
+#include "devices/io_bus.h"
 #include "pci.h"
 #include "pci_device.h"
 

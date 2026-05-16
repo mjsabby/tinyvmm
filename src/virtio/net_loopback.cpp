@@ -2,6 +2,8 @@
 
 #include "virtio_pci.h"
 
+#include "diag/etw.h"
+
 #include <algorithm>
 #include <cstring>
 
@@ -49,7 +51,7 @@ void LoopbackNetBackend::DrainTx() {
         for (const auto& b : chain->bufs) {
             if (b.write) continue;
             std::size_t off = 0;
-            std::size_t len = b.len;
+            std::size_t len = b.bytes.size();
             if (hdr_remaining > 0) {
                 const std::size_t skip = std::min<std::size_t>(len, hdr_remaining);
                 hdr_remaining -= skip;
@@ -57,12 +59,15 @@ void LoopbackNetBackend::DrainTx() {
                 len -= skip;
             }
             if (len > 0) {
-                const auto* p = static_cast<const std::uint8_t*>(b.host_addr) + off;
-                pkt.insert(pkt.end(), p, p + len);
+                const auto data = b.bytes.subspan(off, len);
+                pkt.insert(pkt.end(), data.begin(), data.end());
             }
         }
         tx.Push(chain->head_index, 0);
         if (!pkt.empty()) {
+            TINYVMM_ETW_VERBOSE_KW("NetTx", ::tinyvmm::diag::kw::Net,
+                TraceLoggingString("loopback",                                "backend"),
+                TraceLoggingUInt32(static_cast<std::uint32_t>(pkt.size()),    "bytes"));
             pending_.push_back(std::move(pkt));
             tx_packets_++;
         }
@@ -87,19 +92,17 @@ void LoopbackNetBackend::DeliverRx() {
 
         for (auto& b : chain->bufs) {
             if (!b.write) continue;
-            std::uint8_t* p = static_cast<std::uint8_t*>(b.host_addr);
-            std::size_t avail = b.len;
-            if (hdr_remaining > 0 && avail > 0) {
-                const std::size_t take = std::min(avail, hdr_remaining);
-                std::memset(p, 0, take);
-                p += take;
-                avail -= take;
+            std::span<std::uint8_t> dst = b.bytes;
+            if (hdr_remaining > 0 && !dst.empty()) {
+                const std::size_t take = std::min(dst.size(), hdr_remaining);
+                std::memset(dst.data(), 0, take);
+                dst = dst.subspan(take);
                 hdr_remaining -= take;
                 total += static_cast<std::uint32_t>(take);
             }
-            if (avail > 0 && pkt_off < pkt.size()) {
-                const std::size_t take = std::min(avail, pkt.size() - pkt_off);
-                std::memcpy(p, pkt.data() + pkt_off, take);
+            if (!dst.empty() && pkt_off < pkt.size()) {
+                const std::size_t take = std::min(dst.size(), pkt.size() - pkt_off);
+                std::memcpy(dst.data(), pkt.data() + pkt_off, take);
                 pkt_off += take;
                 total += static_cast<std::uint32_t>(take);
             }
@@ -110,6 +113,10 @@ void LoopbackNetBackend::DeliverRx() {
         } else {
             rx_packets_++;
         }
+        TINYVMM_ETW_VERBOSE_KW("NetRx", ::tinyvmm::diag::kw::Net,
+            TraceLoggingString("loopback",                                  "backend"),
+            TraceLoggingUInt32(total,                                       "bytes"),
+            TraceLoggingUInt8(pkt_off < pkt.size() ? 1 : 0,                 "truncated"));
         rx.Push(chain->head_index, total);
         pending_.pop_front();
         any = true;

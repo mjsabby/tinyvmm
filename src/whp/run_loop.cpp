@@ -1,6 +1,7 @@
 #include "run_loop.h"
 
 #include "cpuid.h"
+#include "diag/etw.h"
 
 #include <cstdio>
 #include <cstring>
@@ -76,6 +77,18 @@ StopReason RunLoop::Run() {
         last_exit_ = {};
         vcpu_.Run(last_exit_);
 
+        // Per-exit VERBOSE ETW event. Compiled in unconditionally; the
+        // TraceLogging macro short-circuits when no session is listening
+        // on the VmExit keyword at TRACE_LEVEL_VERBOSE, so the hot-path
+        // cost is one pointer-load + compare.
+        TINYVMM_ETW_VERBOSE_KW("VmExit", ::tinyvmm::diag::kw::VmExit,
+            TraceLoggingUInt32(
+                static_cast<std::uint32_t>(last_exit_.ExitReason), "reason"),
+            TraceLoggingUInt64(
+                static_cast<std::uint64_t>(last_exit_.VpContext.Rip), "rip"),
+            TraceLoggingUInt32(
+                last_exit_.VpContext.InstructionLength, "ilen"));
+
         switch (last_exit_.ExitReason) {
             case WHvRunVpExitReasonX64Halt: {
                 halt_exits_.fetch_add(1, std::memory_order_relaxed);
@@ -115,13 +128,70 @@ StopReason RunLoop::Run() {
                 break;
             }
 
+            case WHvRunVpExitReasonX64MsrAccess:
+                msr_exits_.fetch_add(1, std::memory_order_relaxed);
+                // We do not service MSR accesses today; fall through to
+                // the unhandled path so the caller sees the failure.
+                std::fprintf(stderr,
+                             "[loop] unhandled MSR access at RIP=0x%llx\n",
+                             static_cast<unsigned long long>(
+                                 last_exit_.VpContext.Rip));
+                return StopReason::UnhandledExit;
+
+            case WHvRunVpExitReasonX64InterruptWindow:
+                intwin_exits_.fetch_add(1, std::memory_order_relaxed);
+                // Interrupt window opened; the IRQ injector will deliver on
+                // the next loop iteration. No work here.
+                break;
+
+            case WHvRunVpExitReasonX64ApicEoi:
+                apic_eoi_exits_.fetch_add(1, std::memory_order_relaxed);
+                // No service today; APIC EOI plumbing isn't yet wired.
+                break;
+
+            case WHvRunVpExitReasonException:
+                exception_exits_.fetch_add(1, std::memory_order_relaxed);
+                std::fprintf(stderr,
+                             "[loop] guest exception at RIP=0x%llx -- "
+                             "no handler installed\n",
+                             static_cast<unsigned long long>(
+                                 last_exit_.VpContext.Rip));
+                return StopReason::UnhandledExit;
+
+            case WHvRunVpExitReasonUnsupportedFeature:
+                unsupported_exits_.fetch_add(1, std::memory_order_relaxed);
+                std::fprintf(stderr,
+                             "[loop] WHP UnsupportedFeature at RIP=0x%llx\n",
+                             static_cast<unsigned long long>(
+                                 last_exit_.VpContext.Rip));
+                return StopReason::UnhandledExit;
+
+            case WHvRunVpExitReasonUnrecoverableException:
+                unrecoverable_exits_.fetch_add(1, std::memory_order_relaxed);
+                std::fprintf(stderr,
+                             "[loop] WHP UnrecoverableException at RIP=0x%llx\n",
+                             static_cast<unsigned long long>(
+                                 last_exit_.VpContext.Rip));
+                return StopReason::UnhandledExit;
+
+            case WHvRunVpExitReasonInvalidVpRegisterValue:
+                invalid_vp_reg_exits_.fetch_add(
+                    1, std::memory_order_relaxed);
+                std::fprintf(stderr,
+                             "[loop] InvalidVpRegisterValue at RIP=0x%llx\n",
+                             static_cast<unsigned long long>(
+                                 last_exit_.VpContext.Rip));
+                return StopReason::UnhandledExit;
+
             case WHvRunVpExitReasonCanceled:
+                cancelled_exits_.fetch_add(1, std::memory_order_relaxed);
                 // External Cancel(). If RequestStop was called, the top-of-loop
                 // check will catch it. Otherwise it was an IRQ-injection kick;
                 // fall through to next iteration.
                 break;
 
             default:
+                other_exits_.fetch_add(1, std::memory_order_relaxed);
                 std::fprintf(stderr,
                              "[loop] unhandled exit reason %s (0x%x) at "
                              "RIP=0x%llx\n",
@@ -202,6 +272,13 @@ std::optional<StopReason> RunLoop::HandleCpuidExit(
                      "eax=0x%08x ebx=0x%08x ecx=0x%08x edx=0x%08x\n",
                      leaf, subleaf, r.eax, r.ebx, r.ecx, r.edx);
     }
+    TINYVMM_ETW_VERBOSE_KW("Cpuid", ::tinyvmm::diag::kw::Cpuid,
+        TraceLoggingUInt32(leaf,    "leaf"),
+        TraceLoggingUInt32(subleaf, "subleaf"),
+        TraceLoggingUInt32(r.eax,   "eax"),
+        TraceLoggingUInt32(r.ebx,   "ebx"),
+        TraceLoggingUInt32(r.ecx,   "ecx"),
+        TraceLoggingUInt32(r.edx,   "edx"));
 
     // CPUID exits do not auto-advance RIP -- we must step over the 2-byte
     // CPUID instruction ourselves.
@@ -309,6 +386,12 @@ HRESULT RunLoop::OnIoPort(WHV_EMULATOR_IO_ACCESS_INFO* io) {
                      acc.is_write ? "OUT" : "IN", acc.port, acc.access_size,
                      acc.value);
     }
+    TINYVMM_ETW_VERBOSE_KW("Io", ::tinyvmm::diag::kw::Io,
+        TraceLoggingUInt8(acc.is_write ? 1u : 0u, "is_write"),
+        TraceLoggingUInt16(acc.port,              "port"),
+        TraceLoggingUInt16(acc.access_size,       "size"),
+        TraceLoggingUInt32(acc.value,             "value"),
+        TraceLoggingUInt8(claimed ? 1u : 0u,      "claimed"));
 
     if (!acc.is_write) {
         io->Data = acc.value;
@@ -325,18 +408,71 @@ HRESULT RunLoop::OnMemory(WHV_EMULATOR_MEMORY_ACCESS_INFO* m) {
         std::memcpy(acc.data, m->Data, m->AccessSize);
     }
 
-    if (!mmio_bus_.Dispatch(acc)) {
+    const bool claimed = mmio_bus_.Dispatch(acc);
+    if (!claimed) {
         std::fprintf(stderr,
                      "[loop] unhandled MMIO %s gpa=0x%llx size=%u\n",
                      acc.is_write ? "WR" : "RD",
                      static_cast<unsigned long long>(acc.gpa),
                      acc.access_size);
     }
+    TINYVMM_ETW_VERBOSE_KW("Mmio", ::tinyvmm::diag::kw::Mmio,
+        TraceLoggingUInt8(acc.is_write ? 1 : 0, "is_write"),
+        TraceLoggingUInt64(static_cast<std::uint64_t>(acc.gpa), "gpa"),
+        TraceLoggingUInt8(acc.access_size,                     "size"),
+        TraceLoggingUInt8(claimed ? 1 : 0,                     "claimed"));
 
     if (!acc.is_write) {
         std::memcpy(m->Data, acc.data, m->AccessSize);
     }
     return S_OK;
+}
+
+std::uint64_t RunLoop::total_exits() const noexcept {
+    return io_exits() + mmio_exits() + halt_exits() + cpuid_exits()
+         + msr_exits() + intwin_exits() + apic_eoi_exits()
+         + exception_exits() + cancelled_exits() + unsupported_exits()
+         + unrecoverable_exits() + invalid_vp_reg_exits() + other_exits();
+}
+
+void RunLoop::DumpCounters(std::FILE* out) const {
+    std::fprintf(out,
+                 "[loop] exits: total=%llu io=%llu mmio=%llu halt=%llu "
+                 "cpuid=%llu msr=%llu intwin=%llu apiceoi=%llu "
+                 "exception=%llu cancelled=%llu unsupported=%llu "
+                 "unrecoverable=%llu invalidreg=%llu other=%llu\n",
+                 static_cast<unsigned long long>(total_exits()),
+                 static_cast<unsigned long long>(io_exits()),
+                 static_cast<unsigned long long>(mmio_exits()),
+                 static_cast<unsigned long long>(halt_exits()),
+                 static_cast<unsigned long long>(cpuid_exits()),
+                 static_cast<unsigned long long>(msr_exits()),
+                 static_cast<unsigned long long>(intwin_exits()),
+                 static_cast<unsigned long long>(apic_eoi_exits()),
+                 static_cast<unsigned long long>(exception_exits()),
+                 static_cast<unsigned long long>(cancelled_exits()),
+                 static_cast<unsigned long long>(unsupported_exits()),
+                 static_cast<unsigned long long>(unrecoverable_exits()),
+                 static_cast<unsigned long long>(invalid_vp_reg_exits()),
+                 static_cast<unsigned long long>(other_exits()));
+}
+
+void RunLoop::EmitCountersEtw() const {
+    TINYVMM_ETW_INFO_KW("RunLoopStats", ::tinyvmm::diag::kw::Lifecycle,
+        TraceLoggingUInt64(total_exits(),         "total"),
+        TraceLoggingUInt64(io_exits(),            "io"),
+        TraceLoggingUInt64(mmio_exits(),          "mmio"),
+        TraceLoggingUInt64(halt_exits(),          "halt"),
+        TraceLoggingUInt64(cpuid_exits(),         "cpuid"),
+        TraceLoggingUInt64(msr_exits(),           "msr"),
+        TraceLoggingUInt64(intwin_exits(),        "intwin"),
+        TraceLoggingUInt64(apic_eoi_exits(),      "apic_eoi"),
+        TraceLoggingUInt64(exception_exits(),     "exception"),
+        TraceLoggingUInt64(cancelled_exits(),     "cancelled"),
+        TraceLoggingUInt64(unsupported_exits(),   "unsupported"),
+        TraceLoggingUInt64(unrecoverable_exits(), "unrecoverable"),
+        TraceLoggingUInt64(invalid_vp_reg_exits(), "invalid_vp_reg"),
+        TraceLoggingUInt64(other_exits(),         "other"));
 }
 
 }  // namespace tinyvmm::whp

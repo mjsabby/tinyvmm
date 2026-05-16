@@ -14,7 +14,7 @@
 //      every MMIO BAR with a sane base. (And OnBarUnmapped on the way out.)
 //   5. Subclass installs / removes its MMIO handlers in those hooks.
 
-#include "../common.h"
+#include "common.h"
 #include "pci.h"
 
 #include <array>

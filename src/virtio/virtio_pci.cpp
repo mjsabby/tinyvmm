@@ -1,6 +1,6 @@
 #include "virtio_pci.h"
 
-#include "../pci/pci.h"
+#include "pci/pci.h"
 #include "virtqueue.h"
 
 #include <algorithm>
@@ -35,6 +35,22 @@ constexpr std::uint32_t kCcQueueNotifyOff      = 0x1E;
 constexpr std::uint32_t kCcQueueDesc           = 0x20;
 constexpr std::uint32_t kCcQueueDriver         = 0x28;
 constexpr std::uint32_t kCcQueueDevice         = 0x30;
+
+// Our MMIO dispatcher works on 32-bit-aligned lanes and unpacks the
+// sub-fields by hand. The static_asserts below pin the spec offsets so
+// that if anyone "fixes" a constant or restructures the lanes, the
+// build breaks instead of silently desynchronising from the virtio
+// spec.
+static_assert(kCcMsixConfig + 2 == kCcNumQueues,
+              "num_queues must follow msix_config in the 0x10 lane");
+static_assert(kCcDeviceStatus + 1 == kCcConfigGeneration,
+              "config_generation must follow device_status");
+static_assert(kCcDeviceStatus + 2 == kCcQueueSelect,
+              "queue_select must sit at +2 in the 0x14 lane");
+static_assert(kCcQueueSize + 2 == kCcQueueMsixVector,
+              "queue_msix_vector must follow queue_size in the 0x18 lane");
+static_assert(kCcQueueEnable + 2 == kCcQueueNotifyOff,
+              "queue_notify_off must follow queue_enable in the 0x1C lane");
 
 constexpr std::uint8_t kIsrQueueBit  = 1 << 0;
 constexpr std::uint8_t kIsrConfigBit = 1 << 1;

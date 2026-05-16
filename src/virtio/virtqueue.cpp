@@ -45,42 +45,59 @@ void Virtqueue::Reset() {
 }
 
 void* Virtqueue::HostFromGpa(std::uint64_t gpa, std::uint32_t bytes) const {
-    if (gpa < mem_.gpa()) return nullptr;
-    std::uint64_t off = gpa - mem_.gpa();
-    if (off + bytes > mem_.size()) return nullptr;
+    // Subtraction-form bounds check: any guest-controlled `gpa` near
+    // UINT64_MAX would cause `off + bytes` in the natural form to wrap
+    // and pass the upper-bound check. With subtraction we never add
+    // attacker-controlled values together.
+    const std::uint64_t base = mem_.gpa();
+    if (gpa < base) return nullptr;
+    const std::uint64_t off  = gpa - base;
+    const std::uint64_t size = mem_.size();
+    if (off >= size) return nullptr;
+    if (static_cast<std::uint64_t>(bytes) > size - off) return nullptr;
     return static_cast<std::uint8_t*>(mem_.host_base()) + off;
+}
+
+// Same as HostFromGpa, but the GPA is constructed as (base_gpa + off)
+// internally. We pre-validate that the sum doesn't wrap so that callers
+// like `HostFromGpa(avail_gpa_ + slot * 2, ...)` can't sneak a wrap-
+// around past the bounds check inside `HostFromGpa`.
+void* Virtqueue::HostFromGpaOff(std::uint64_t base_gpa, std::uint64_t off,
+                                std::uint32_t bytes) const {
+    if (off > UINT64_MAX - base_gpa) return nullptr;
+    return HostFromGpa(base_gpa + off, bytes);
 }
 
 std::uint16_t Virtqueue::LoadAvailIdx() const {
     auto* p = static_cast<std::uint16_t*>(
-        HostFromGpa(avail_gpa_ + 2, sizeof(std::uint16_t)));
+        HostFromGpaOff(avail_gpa_, 2, sizeof(std::uint16_t)));
     if (!p) return last_avail_;
     return AcquireLoad16(p);
 }
 std::uint16_t Virtqueue::LoadAvailFlags() const {
     auto* p = static_cast<std::uint16_t*>(
-        HostFromGpa(avail_gpa_, sizeof(std::uint16_t)));
+        HostFromGpaOff(avail_gpa_, 0, sizeof(std::uint16_t)));
     if (!p) return 0;
     return AcquireLoad16(p);
 }
 std::uint16_t Virtqueue::LoadAvailRing(std::uint16_t slot) const {
     std::uint64_t off = 4 + sizeof(std::uint16_t) * slot;
     auto* p = static_cast<std::uint16_t*>(
-        HostFromGpa(avail_gpa_ + off, sizeof(std::uint16_t)));
+        HostFromGpaOff(avail_gpa_, off, sizeof(std::uint16_t)));
     if (!p) return 0;
     return *p;
 }
 std::uint16_t Virtqueue::LoadUsedEvent() const {
     std::uint64_t off = 4 + sizeof(std::uint16_t) * size_;
     auto* p = static_cast<std::uint16_t*>(
-        HostFromGpa(avail_gpa_ + off, sizeof(std::uint16_t)));
+        HostFromGpaOff(avail_gpa_, off, sizeof(std::uint16_t)));
     if (!p) return 0;
     return AcquireLoad16(p);
 }
 
 void Virtqueue::StoreUsedIdx(std::uint16_t idx) {
     auto* p = static_cast<std::uint16_t*>(
-        HostFromGpa(used_gpa_ + 2, sizeof(std::uint16_t)));
+        HostFromGpaOff(used_gpa_, 2, sizeof(std::uint16_t)));
     if (!p) return;
     ReleaseStore16(p, idx);
 }
@@ -88,7 +105,7 @@ void Virtqueue::StoreUsedRing(std::uint16_t slot, std::uint32_t id,
                               std::uint32_t len) {
     std::uint64_t off = 4 + sizeof(VringUsedElem) * slot;
     auto* p = static_cast<VringUsedElem*>(
-        HostFromGpa(used_gpa_ + off, sizeof(VringUsedElem)));
+        HostFromGpaOff(used_gpa_, off, sizeof(VringUsedElem)));
     if (!p) return;
     p->id = id;
     p->len = len;
@@ -99,7 +116,7 @@ void Virtqueue::StoreAvailEvent(std::uint16_t event_idx) {
     // `flags(2) + idx(2) + ring[size]*8 = 4 + 8*size` prefix.
     std::uint64_t off = 4 + sizeof(VringUsedElem) * size_;
     auto* p = static_cast<std::uint16_t*>(
-        HostFromGpa(used_gpa_ + off, sizeof(std::uint16_t)));
+        HostFromGpaOff(used_gpa_, off, sizeof(std::uint16_t)));
     if (!p) return;
     ReleaseStore16(p, event_idx);
 }
@@ -130,7 +147,14 @@ std::optional<PoppedChain> Virtqueue::Pop() {
 
     std::uint16_t cur = head;
     for (std::uint32_t hop = 0; hop < size_; ++hop) {
-        const VringDesc& d = desc_table[cur];
+        // Take a one-shot snapshot of the descriptor before any
+        // validation. The descriptor table lives in guest-shared
+        // memory and a hostile guest may mutate it between accesses,
+        // which would turn a successful bounds check on `d.next` into
+        // a use of a different `d.next` (TOCTOU) and let us index
+        // `desc_table[OOB]`. Reading once via memcpy fixes that.
+        VringDesc d;
+        std::memcpy(&d, &desc_table[cur], sizeof(d));
 
         if (d.flags & kVringDescFIndirect) {
             std::uint32_t inner_count = d.len / sizeof(VringDesc);
@@ -139,12 +163,14 @@ std::optional<PoppedChain> Virtqueue::Pop() {
             std::uint32_t i = 0;
             for (std::uint32_t step = 0; step < inner_count && step < size_;
                  ++step) {
-                const VringDesc& id = inner[i];
+                VringDesc id;
+                std::memcpy(&id, &inner[i], sizeof(id));
                 void* host = HostFromGpa(id.addr, id.len);
                 if (host) {
-                    out.bufs.push_back(
-                        ChainBuf{host, id.len,
-                                 (id.flags & kVringDescFWrite) != 0});
+                    out.bufs.push_back(ChainBuf{
+                        std::span<std::uint8_t>(
+                            static_cast<std::uint8_t*>(host), id.len),
+                        (id.flags & kVringDescFWrite) != 0});
                 }
                 if (!(id.flags & kVringDescFNext)) break;
                 if (id.next >= inner_count) break;
@@ -153,9 +179,10 @@ std::optional<PoppedChain> Virtqueue::Pop() {
         } else {
             void* host = HostFromGpa(d.addr, d.len);
             if (host) {
-                out.bufs.push_back(
-                    ChainBuf{host, d.len,
-                             (d.flags & kVringDescFWrite) != 0});
+                out.bufs.push_back(ChainBuf{
+                    std::span<std::uint8_t>(
+                        static_cast<std::uint8_t*>(host), d.len),
+                    (d.flags & kVringDescFWrite) != 0});
             }
         }
 

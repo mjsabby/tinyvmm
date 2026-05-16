@@ -16,7 +16,7 @@
 // `PciTransport::RaiseQueueInterrupt` — the actual fill runs on
 // whichever thread wrote the queue-notify MMIO (cheap, no I/O).
 
-#include "../whp/memory.h"
+#include "whp/memory.h"
 #include "virtio.h"
 #include "virtqueue.h"
 

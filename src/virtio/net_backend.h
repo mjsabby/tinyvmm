@@ -27,7 +27,7 @@
 //     PciTransport::RaiseQueueInterrupt at any time; that path is
 //     designed to be invocable from any thread.
 
-#include "../common.h"
+#include "common.h"
 
 #include <cstdint>
 

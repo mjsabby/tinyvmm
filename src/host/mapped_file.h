@@ -13,7 +13,7 @@
 // continue to overwrite the file on disk while the VMM is running (the view
 // stays consistent for the lifetime of this object).
 
-#include "../common.h"
+#include "common.h"
 
 #include <Windows.h>
 

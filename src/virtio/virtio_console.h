@@ -21,7 +21,7 @@
 // Device-config: 12 bytes; all zero when none of the gated features are on.
 // Layout (spec §5.3.4): u16 cols, u16 rows, u32 max_nr_ports, u32 emerg_wr.
 
-#include "../whp/memory.h"
+#include "whp/memory.h"
 #include "virtio.h"
 #include "virtqueue.h"
 

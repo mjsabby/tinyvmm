@@ -18,7 +18,7 @@
 // don't guarantee. The OS cache is fine for our scale. A FLUSH op forces
 // FlushFileBuffers on the worker thread.
 
-#include "../common.h"
+#include "common.h"
 
 #include <Windows.h>
 

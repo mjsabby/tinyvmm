@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  WPR recording profile for tinyvmm.
+
+  Captures the Tinyvmm-Core ETW provider plus standard CPU sample stacks.
+  Two profiles are exposed:
+    * tinyvmm.Light  - lifecycle + boot only (low volume; runs all day)
+    * tinyvmm.Verbose - lifecycle/boot/net/io/mmio/cpuid/msi/block at verbose
+                        (per-exit detail; ~100 MB / minute under load)
+
+  Usage:
+    wpr -start tools\tinyvmm.wprp!tinyvmm.Light -filemode
+    ... reproduce workload ...
+    wpr -stop tinyvmm.etl
+
+  Provider keyword bits (see README.md "Observability" for details):
+    VmExit=0x0001  Doorbell=0x0002 Virtio=0x0004 Net=0x0008
+    Mmio=0x0010    Io=0x0020       Boot=0x0040    Lifecycle=0x0080
+    Block=0x0100   Cpuid=0x0200    Msi=0x0400
+-->
+<WindowsPerformanceRecorder Version="1" Author="tinyvmm" Comments="ETW recording profile for tinyvmm">
+  <Profiles>
+
+    <EventCollector Id="EC_Tinyvmm" Name="Tinyvmm Collector">
+      <BufferSize Value="1024"/>
+      <Buffers Value="256"/>
+    </EventCollector>
+
+    <EventProvider Id="EP_TinyvmmLight"   Name="0fb6c4d5-9b9b-4e1f-9d5a-7a6d8a9b3c4d" Level="4" NonPagedMemory="false">
+      <Keywords>
+        <!-- Lifecycle | Boot -->
+        <Keyword Value="0xC0"/>
+      </Keywords>
+    </EventProvider>
+
+    <EventProvider Id="EP_TinyvmmVerbose" Name="0fb6c4d5-9b9b-4e1f-9d5a-7a6d8a9b3c4d" Level="5" NonPagedMemory="false">
+      <Keywords>
+        <!-- Everything: Lifecycle|Boot|Net|Io|Mmio|Cpuid|Msi|Block|Virtio|Doorbell|VmExit -->
+        <Keyword Value="0x07FF"/>
+      </Keywords>
+    </EventProvider>
+
+    <Profile Id="tinyvmm.Light.Verbose.File" Name="tinyvmm.Light" Description="tinyvmm lifecycle + boot only"
+             LoggingMode="File" DetailLevel="Verbose">
+      <Collectors>
+        <EventCollectorId Value="EC_Tinyvmm">
+          <EventProviders>
+            <EventProviderId Value="EP_TinyvmmLight"/>
+          </EventProviders>
+        </EventCollectorId>
+      </Collectors>
+    </Profile>
+
+    <Profile Id="tinyvmm.Verbose.Verbose.File" Name="tinyvmm.Verbose" Description="tinyvmm full instrumentation (high volume)"
+             LoggingMode="File" DetailLevel="Verbose">
+      <Collectors>
+        <EventCollectorId Value="EC_Tinyvmm">
+          <EventProviders>
+            <EventProviderId Value="EP_TinyvmmVerbose"/>
+          </EventProviders>
+        </EventCollectorId>
+      </Collectors>
+    </Profile>
+
+  </Profiles>
+</WindowsPerformanceRecorder>

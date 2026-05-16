@@ -1,6 +1,6 @@
 #include "memory.h"
 
-#include "../host/privilege.h"
+#include "host/privilege.h"
 
 #include <cstdio>
 #include <cstring>
@@ -97,19 +97,25 @@ GuestMemory::~GuestMemory() {
 }
 
 void* GuestMemory::HostPointer(std::uint64_t guest_phys) const noexcept {
-    if (guest_phys < gpa_ || guest_phys >= gpa_ + size_) {
-        return nullptr;
-    }
-    return static_cast<std::uint8_t*>(host_base_) + (guest_phys - gpa_);
+    // Subtraction-form bounds check so a `guest_phys` near UINT64_MAX
+    // can't wrap the (gpa_ + size_) upper bound.
+    if (guest_phys < gpa_) return nullptr;
+    const std::uint64_t off = guest_phys - gpa_;
+    if (off >= size_) return nullptr;
+    return static_cast<std::uint8_t*>(host_base_) + off;
 }
 
 void GuestMemory::WriteAt(std::uint64_t guest_phys, const void* src,
                           std::size_t n) {
-    void* dst = HostPointer(guest_phys);
-    if (dst == nullptr || guest_phys + n > gpa_ + size_) {
+    if (guest_phys < gpa_) {
         Fatal("GuestMemory::WriteAt out of range");
     }
-    std::memcpy(dst, src, n);
+    const std::uint64_t off = guest_phys - gpa_;
+    if (off > size_ || static_cast<std::uint64_t>(n) > size_ - off) {
+        Fatal("GuestMemory::WriteAt out of range");
+    }
+    if (n == 0) return;
+    std::memcpy(static_cast<std::uint8_t*>(host_base_) + off, src, n);
 }
 
 }  // namespace tinyvmm::whp

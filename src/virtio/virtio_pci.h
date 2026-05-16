@@ -31,12 +31,12 @@
 //   * Triggering goes through the MsiX helper, which honours MSI-X-Enable,
 //     FunctionMask, and per-vector mask + PBA replay.
 
-#include "../common.h"
-#include "../devices/mmio_bus.h"
-#include "../pci/msix.h"
-#include "../pci/pci_device.h"
-#include "../whp/notification_port.h"
-#include "../whp/partition.h"
+#include "common.h"
+#include "devices/mmio_bus.h"
+#include "pci/msix.h"
+#include "pci/pci_device.h"
+#include "whp/notification_port.h"
+#include "whp/partition.h"
 #include "virtio.h"
 
 #include <array>

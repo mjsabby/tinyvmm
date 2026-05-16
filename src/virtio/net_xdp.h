@@ -29,8 +29,8 @@
 //     GENERIC mode (still works, but the kernel TCP/IP path may double
 //     up on RX paths).
 
-#include "../common.h"
-#include "../whp/memory.h"
+#include "common.h"
+#include "whp/memory.h"
 #include "net_backend.h"
 
 #include <cstdint>

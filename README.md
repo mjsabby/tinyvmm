@@ -57,3 +57,97 @@ The `--smoke` flag runs a minimal test: create a partition, map 1 MiB of guest
 RAM at GPA 0, drop a `HLT` opcode at the reset vector, run the vCPU and verify
 we get a `WHvRunVpExitReasonX64Halt` exit. Useful for confirming the WHP stack
 is functional on the host.
+
+## Observability
+
+tinyvmm emits **ETW TraceLogging** events plus a per-shutdown summary of
+WHV exit counters. There is no manifest registration step; events are
+captured by GUID.
+
+### Provider
+
+| Field | Value |
+|-------|-------|
+| Name  | `Tinyvmm-Core` |
+| GUID  | `{0fb6c4d5-9b9b-4e1f-9d5a-7a6d8a9b3c4d}` |
+
+### Keyword taxonomy
+
+Each event is tagged with one keyword bit. Use the bitmask to enable only
+the volume you need; pass it as the `-matchanykw` argument to
+`tracelog`, the `-Keywords` argument to `wpr`/`logman`, or the equivalent
+field in any other ETW controller.
+
+| Bit       | Name        | Approx. volume               | Examples |
+|-----------|-------------|------------------------------|----------|
+| `0x0001`  | `VmExit`    | very high (per WHV exit)     | `VmExit` |
+| `0x0002`  | `Doorbell`  | medium                       | (reserved for doorbell-latency events) |
+| `0x0004`  | `Virtio`    | medium                       | (reserved for queue pop/push) |
+| `0x0008`  | `Net`       | per-packet                   | `NetTx`, `NetRx`, `NetTxDrop` |
+| `0x0010`  | `Mmio`      | high                         | `Mmio` |
+| `0x0020`  | `Io`        | high                         | `Io` |
+| `0x0040`  | `Boot`      | one-shot                     | `BootMark` |
+| `0x0080`  | `Lifecycle` | very low                     | `VmStart`, `VmStop`, `NetBackendStart`, `NetBackendStop` |
+| `0x0100`  | `Block`     | per virtio-blk request       | `BlkSubmit`, `BlkComplete` |
+| `0x0200`  | `Cpuid`     | one per CPUID exit           | `Cpuid` |
+| `0x0400`  | `Msi`       | per MSI inject               | `MsiInject` |
+
+To capture only lifecycle + boot events:
+`-matchanykw 0xC0` (Boot `0x40` | Lifecycle `0x80`).
+
+### Capture recipes
+
+**`tracelog` one-shot capture** — Boot + Lifecycle + Net at verbose:
+
+```cmd
+tracelog -start tinyvmm -guid #0fb6c4d5-9b9b-4e1f-9d5a-7a6d8a9b3c4d ^
+         -level 5 -matchanykw 0xC8 -f tinyvmm.etl
+.\build\bin\tinyvmm.exe --pvh-run --net --net-backend wintun-svc .\vmlinux
+tracelog -stop tinyvmm
+tracerpt tinyvmm.etl -o tinyvmm.csv -of CSV
+```
+
+**WPR** with a recording profile (`tools/tinyvmm.wprp`):
+
+```cmd
+wpr -start tools\tinyvmm.wprp -filemode
+... run workload ...
+wpr -stop tinyvmm.etl
+```
+
+**PerfView** with a stack-walk hint over every Net event:
+
+```cmd
+PerfView /providers="*Tinyvmm-Core:0xC8:5" ^
+         /onlyproviders /buffersize=4096 /stackcompression=on ^
+         collect tinyvmm.etl
+```
+
+Replace `0xC8` with the keyword mask you need. Set the level (`5` =
+verbose) lower to drop per-exit chatter while keeping warnings/errors.
+
+### Exit counters
+
+Every `--pvh-run` shutdown prints a one-line summary covering all
+twelve WHV exit reasons (and emits a `RunLoopStats` ETW event):
+
+```
+[loop] exits: total=2431 io=1551 mmio=413 halt=0 cpuid=466 ...
+```
+
+Useful for spotting which exits dominate a workload without an ETW
+capture.
+
+### Suggested next instrumentation hooks
+
+These call sites are intentionally not yet wired so that the default
+event mix stays compact; add them as needed during specific
+investigations:
+
+- Doorbell signal/wake latency (TSC ticks)
+- Virtio queue depth (avail head - last_used distance)
+- Virtio-blk per-request latency (submit → complete)
+- Wintun ring fill level
+- XDP ring fill level when the XDP backend is active
+- Guest console bytes in/out
+

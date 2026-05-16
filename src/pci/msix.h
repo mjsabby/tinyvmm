@@ -28,8 +28,8 @@
 //   4. From a device worker, call MsiX::Trigger(vector). The callback runs
 //      with (msg_addr, msg_data); typical impl is whp::InjectMsi.
 
-#include "../common.h"
-#include "../devices/mmio_bus.h"
+#include "common.h"
+#include "devices/mmio_bus.h"
 #include "pci.h"
 
 #include <cstdint>

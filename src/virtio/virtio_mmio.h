@@ -2,10 +2,10 @@
 
 // virtio-mmio "modern" (Version=2) transport (spec §4.2).
 
-#include "../common.h"
-#include "../devices/mmio_bus.h"
-#include "../whp/notification_port.h"
-#include "../whp/partition.h"
+#include "common.h"
+#include "devices/mmio_bus.h"
+#include "whp/notification_port.h"
+#include "whp/partition.h"
 #include "virtio.h"
 
 #include <cstdint>

@@ -10,7 +10,7 @@
 // Lifetime: the port belongs to a partition, the event handle belongs to
 // us. Destruction tears both down.
 
-#include "../common.h"
+#include "common.h"
 #include "partition.h"
 
 #include <Windows.h>

@@ -1,7 +1,52 @@
 #include "net_xdp.h"
 
-#include "../whp/notification_port.h"
-#include "../whp/partition.h"
+#ifdef TINYVMM_NO_XDP
+// ----- Stub-build path -----
+// The XDP-for-Windows headers (`afxdp.h`, `xdpapi.h`) use C-style
+// aggregate initialization that's compatible with MSVC's `cl.exe` but
+// rejected by modern clang-cl (`XSK_BIND_IN Bind = {0};` — int→enum
+// in aggregate init is a hard error in clang's C++20 mode regardless
+// of -W flags). When the build pins clang-cl (e.g. for UBSan) we
+// compile this stub instead, which keeps `XdpNetBackend` linkable but
+// always reports the backend as unavailable.
+
+#include "whp/partition.h"
+#include "virtio_pci.h"
+
+#include <string>
+
+namespace tinyvmm::virtio {
+
+struct XdpNetBackend::State {
+    long          err_hr   = 0x80004001L;  // E_NOTIMPL
+    std::string   err_phase = "TINYVMM_NO_XDP";
+};
+
+XdpNetBackend::XdpNetBackend(NetDevice& /*net*/,
+                             whp::GuestMemory& /*mem*/,
+                             const Options& /*opts*/)
+    : state_(std::make_unique<State>()) {}
+
+XdpNetBackend::~XdpNetBackend() = default;
+
+void XdpNetBackend::Start(whp::Partition& /*p*/, PciTransport& /*t*/) {}
+void XdpNetBackend::Stop() {}
+void XdpNetBackend::OnQueueNotify(std::uint32_t /*qidx*/) {}
+
+bool          XdpNetBackend::ready()              const noexcept { return false; }
+std::uint64_t XdpNetBackend::tx_packets()         const noexcept { return 0; }
+std::uint64_t XdpNetBackend::rx_packets()         const noexcept { return 0; }
+std::uint64_t XdpNetBackend::tx_dropped()         const noexcept { return 0; }
+std::uint64_t XdpNetBackend::rx_dropped()         const noexcept { return 0; }
+long          XdpNetBackend::last_setup_error()   const noexcept { return state_->err_hr; }
+const std::string& XdpNetBackend::last_setup_phase() const noexcept { return state_->err_phase; }
+
+}  // namespace tinyvmm::virtio
+
+#else  // !TINYVMM_NO_XDP
+
+#include "whp/notification_port.h"
+#include "whp/partition.h"
 #include "virtio_net.h"
 #include "virtio_pci.h"
 
@@ -324,14 +369,15 @@ void XdpNetBackend::State::RefillRxFromGuest() {
         for (auto& b : chain->bufs) {
             if (!b.write) continue;
             // GPA = host_addr - host_base. (Both pointers into mem.)
-            auto* host_p   = static_cast<std::uint8_t*>(b.host_addr);
+            auto* host_p   = b.bytes.data();
             auto* host_base = static_cast<std::uint8_t*>(mem.host_base());
             const std::uint64_t gpa =
                 static_cast<std::uint64_t>(host_p - host_base);
+            const auto buf_len = static_cast<std::uint32_t>(b.bytes.size());
             if (hdr_gpa == 0) {
-                hdr_gpa = gpa; hdr_len = b.len;
+                hdr_gpa = gpa; hdr_len = buf_len;
             } else if (payload_gpa == 0) {
-                payload_gpa = gpa; payload_len = b.len;
+                payload_gpa = gpa; payload_len = buf_len;
             }
         }
         if (payload_gpa == 0) {
@@ -400,10 +446,10 @@ void XdpNetBackend::State::PumpTx() {
         std::size_t hdr_remaining = kVirtioNetHdrSize;
         for (auto& b : chain->bufs) {
             if (b.write) continue;
-            auto* host_p   = static_cast<std::uint8_t*>(b.host_addr);
+            auto* host_p   = b.bytes.data();
             auto* host_base = static_cast<std::uint8_t*>(mem.host_base());
             std::uint64_t gpa = static_cast<std::uint64_t>(host_p - host_base);
-            std::uint32_t len = b.len;
+            std::uint32_t len = static_cast<std::uint32_t>(b.bytes.size());
             if (hdr_remaining > 0) {
                 std::uint32_t skip = static_cast<std::uint32_t>(
                     std::min<std::size_t>(hdr_remaining, len));
@@ -517,3 +563,5 @@ void XdpNetBackend::State::PumpRx() {
 }
 
 }  // namespace tinyvmm::virtio
+
+#endif  // !TINYVMM_NO_XDP

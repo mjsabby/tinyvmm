@@ -1,0 +1,18 @@
+# UBSan ignorelist for tinyvmm.
+#
+# Suppresses findings whose root cause is in third-party SDK headers
+# we cannot patch:
+#
+# - Windows SDK TraceLoggingProvider.h uses the pre-offsetof idiom
+#   `&((T*)0)->field` for provider-metadata bookkeeping. Technically
+#   member-access-through-null-pointer; works on every real compiler.
+#
+# - Windows SDK ntdef.h's CONTAINING_RECORD macro uses the same idiom.
+#   In our own code we replaced CONTAINING_RECORD with standard
+#   offsetof; this entry is here in case any vendored / third-party
+#   code re-introduces it via the SDK header.
+
+[undefined]
+src:*TraceLoggingProvider.h
+src:*tracelogging*
+src:*ntdef.h

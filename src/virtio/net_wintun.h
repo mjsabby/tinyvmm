@@ -1,21 +1,44 @@
 #pragma once
 
-// WintunNetBackend (M16).
+// WintunNetBackend (M16) — virtio-net data plane bridged through a
+// WinTun adapter (L3 TUN) to the Windows host.
 //
-// NOTE: include `wintun_loader.h` **before** any header that pulls in
-// <Windows.h> on its own, so wintun.h's `<winsock2.h>` lands first.
+// Control plane (adapter create/configure/destroy) is delegated to a
+// `net::WintunAdapterManager` (see net/wintun_adapter_mgr.h):
+//   * `BackendKind::Dll` — uses wintun.dll directly. Requires admin.
+//   * `BackendKind::Svc` — uses the wintunsvc Windows service over its
+//     named pipe; works for unelevated callers.
+//
+// Data plane uses the clean-room user-mode `wintun::session` (vendored
+// at third_party/wintunumapi/cpp) so both paths share a single ring
+// implementation.
 
-#include "../net/wintun_loader.h"
+#include "common.h"
 
-#include "../common.h"
+// Pull wintun.h first because it pins the winsock include order; the
+// rest of the headers below assume that order is already correct.
+#include "net/wintun_loader.h"
+#include "net/wintun_adapter_mgr.h"
+
 #include "net_backend.h"
 #include "virtio_net.h"
+
+// wintun_session.hpp pre-defines WIN32_LEAN_AND_MEAN that we already
+// define globally via target_compile_definitions; identical value but
+// /W4 still emits C4005. Suppress locally so callers of this header
+// don't all need /wd4005.
+#pragma warning(push)
+#pragma warning(disable: 4005)
+#include "wintun_session.hpp"
+#pragma warning(pop)
 
 #include <array>
 #include <atomic>
 #include <cstdint>
 #include <deque>
-#include <mutex>
+#include <memory>
+#include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -24,7 +47,11 @@ namespace tinyvmm::virtio {
 
 class WintunNetBackend : public NetBackend {
 public:
+    enum class BackendKind { Dll, Svc };
+
     struct Options {
+        BackendKind kind = BackendKind::Dll;
+
         // Adapter name (UTF-8). Created on Start, destroyed on Stop.
         std::string adapter_name = "tinyvmm";
 
@@ -70,21 +97,20 @@ private:
     void WorkerLoop();
     void DrainTx();
     void DeliverRx();
-    void HandleArp(const std::uint8_t* eth_frame, std::size_t len);
-    bool SendIpToWintun(const std::uint8_t* ip_pkt, std::size_t len);
-    bool ConfigureAdapterIp();
-    void CleanupAdapter();
+    void HandleArp(std::span<const std::uint8_t> eth_frame);
+    // Zero-copy IP TX: copies directly from a virtq descriptor chain
+    // (skipping the leading vhdr + Eth header) into a wintun ring slot.
+    bool SendIpFromChainToWintun(const PoppedChain& chain,
+                                  std::size_t ip_bytes);
 
     NetDevice& net_;
     Options opts_;
     PciTransport* xport_ = nullptr;
 
-    const net::WintunApi* api_ = nullptr;
-    WINTUN_ADAPTER_HANDLE adapter_ = nullptr;
-    WINTUN_SESSION_HANDLE session_ = nullptr;
+    std::unique_ptr<net::WintunAdapterManager> mgr_;
+    std::optional<net::WintunAdapter>          adapter_;
+    std::optional<wintun::session>             session_;
     HANDLE wintun_read_evt_ = nullptr;
-    NET_LUID adapter_luid_{};
-    bool adapter_ip_set_ = false;
 
     HANDLE stop_evt_     = nullptr;
     HANDLE tx_doorbell_  = nullptr;
@@ -95,9 +121,17 @@ private:
     bool ready_ = false;
     std::string last_error_;
 
-    // Pending Ethernet frames built from WinTun reads, waiting for
-    // guest rxq buffers to land.
-    std::deque<std::vector<std::uint8_t>> pending_rx_;
+    // Pending RX packets waiting for guest rxq buffers. Each entry
+    // owns either a wintun-owned span (zero-copy IPv4) OR an inline
+    // vector (synthesized ARP reply). The Ethernet header is
+    // synthesized host-side so it lives separately from the payload.
+    struct PendingRx {
+        std::array<std::uint8_t, 14> eth_hdr{};
+        std::span<const std::byte>   wintun_payload;   // wintun-owned
+        std::vector<std::uint8_t>    owned_payload;    // ARP reply, etc.
+    };
+    static constexpr std::size_t kPendingRxCap = 64;
+    std::deque<PendingRx> pending_rx_;
 
     std::atomic<std::uint64_t> tx_packets_{0};
     std::atomic<std::uint64_t> rx_packets_{0};
@@ -117,5 +151,10 @@ namespace tinyvmm {
 // wintun.dll, creates an adapter, assigns 10.0.0.1/24, runs an RX
 // loop for `seconds`, then tears the adapter down. Admin required.
 int RunWintunProbe(int seconds);
+
+// --wintun-svc-probe : same flow but driven through the wintunsvc
+// Windows service. Works for unelevated callers; requires that
+// WintunSvc be installed + running.
+int RunWintunSvcProbe(int seconds);
 
 }  // namespace tinyvmm

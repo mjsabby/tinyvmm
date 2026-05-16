@@ -5,21 +5,29 @@
 // for the rings lives in guest RAM and is dereferenced lazily via
 // GuestMemory.
 
-#include "../common.h"
-#include "../whp/memory.h"
+#include "common.h"
+#include "whp/memory.h"
 #include "virtio.h"
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace tinyvmm::virtio {
 
 // One element in a popped descriptor chain.
+//
+// `bytes` is a bounds-checked view of the guest-physical buffer mapped
+// into host VA. `write` records the direction (true = device writes
+// into this buffer, false = device reads from it). The span is built
+// from a guest-attacker-controlled (addr, len) pair, but Pop() has
+// already validated the range against the guest RAM mapping with a
+// subtraction-form bounds check, so `bytes.data()` + offsets within
+// `bytes.size()` are safe to dereference.
 struct ChainBuf {
-    void* host_addr;
-    std::uint32_t len;
-    bool write;       // device writes into this buffer
+    std::span<std::uint8_t> bytes;
+    bool write;
 };
 
 struct PoppedChain {
@@ -60,6 +68,8 @@ public:
 
 private:
     void* HostFromGpa(std::uint64_t gpa, std::uint32_t bytes) const;
+    void* HostFromGpaOff(std::uint64_t base_gpa, std::uint64_t off,
+                         std::uint32_t bytes) const;
 
     std::uint16_t LoadAvailIdx() const;
     std::uint16_t LoadAvailRing(std::uint16_t slot) const;

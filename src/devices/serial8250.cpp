@@ -9,8 +9,9 @@ namespace {
 
 constexpr std::uint8_t kLcrDlab = 0x80;
 
-// IER bits we care about.
-constexpr std::uint8_t kIerErbfi = 0x01;  // RX data-available interrupt enable
+// IER bit we actually drive. Our 8250 is TX-only (the host pushes RX bytes
+// through hvc0/virtio-console, not this UART), so bit 0 (ERBFI) of IER is
+// intentionally not modelled.
 constexpr std::uint8_t kIerEtbei = 0x02;  // TX holding-register empty interrupt
                                           // enable (drives userspace TX path)
 
