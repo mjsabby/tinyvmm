@@ -3,6 +3,7 @@
 #include "common.h"
 #include "devices/io_bus.h"
 #include "devices/mmio_bus.h"
+#include "hv_enlightenment.h"
 #include "vcpu.h"
 
 #include <Windows.h>
@@ -105,6 +106,13 @@ public:
     // bring-up; very chatty in steady state.
     void set_verbose_io(bool v) noexcept { verbose_io_ = v; }
     void set_verbose_cpuid(bool v) noexcept { verbose_cpuid_ = v; }
+    void set_verbose_msr(bool v) noexcept { verbose_msr_ = v; }
+
+    // Wire the per-VM Hyper-V enlightenment state. When non-null, the run
+    // loop services MSR exits for the small set of Hyper-V MSRs (see
+    // whp/hv_enlightenment.h) and injects #GP for everything else. When
+    // null, MSR exits remain `StopReason::UnhandledExit`.
+    void set_hv_enlightenment(HvEnlightenment* hv) noexcept { hv_ = hv; }
 
 private:
     // Emulator callback thunks — context pointer is `this`.
@@ -135,6 +143,15 @@ private:
         const WHV_RUN_VP_EXIT_CONTEXT& exit);
     std::optional<StopReason> HandleCpuidExit(
         const WHV_RUN_VP_EXIT_CONTEXT& exit);
+    std::optional<StopReason> HandleMsrExit(
+        const WHV_RUN_VP_EXIT_CONTEXT& exit);
+
+    // Inject #GP(0) at the current RIP without advancing it. Used as a
+    // "this MSR is unknown" path that mimics what WHP would have done if
+    // X64MsrExit were disabled. Returns nullopt on success (keep looping)
+    // or StopReason::EmulationFailure on register-set failure.
+    std::optional<StopReason> InjectGeneralProtectionFault(
+        const WHV_RUN_VP_EXIT_CONTEXT& exit);
 
     Vcpu& vcpu_;
     devices::IoBus& io_bus_;
@@ -158,6 +175,8 @@ private:
     std::atomic<std::uint64_t> other_exits_{0};
     bool verbose_io_ = false;
     bool verbose_cpuid_ = false;
+    bool verbose_msr_ = false;
+    HvEnlightenment* hv_ = nullptr;
 };
 
 // Render a WHV exit reason as a human-readable name for logging.

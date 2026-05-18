@@ -1,5 +1,7 @@
 #include "cpuid.h"
 
+#include "hv_enlightenment.h"
+
 #include <Windows.h>
 #include <intrin.h>
 
@@ -24,15 +26,10 @@ constexpr std::uint32_t kEdx_InvariantTsc = kBit(8);   // CPUID.80000007H:EDX[8]
 // CPUID result list.
 std::atomic<bool> g_hide_tsc_deadline{false};
 
-// Hypervisor vendor string in 0x40000000h's EBX:ECX:EDX: "TinyVMM\0\0\0\0\0".
-constexpr std::uint32_t kVendorEbx =
-    'T' | ('i' << 8) | ('n' << 16) | ('y' << 24);
-constexpr std::uint32_t kVendorEcx =
-    'V' | ('M' << 8) | ('M' << 16);
-constexpr std::uint32_t kVendorEdx = 0;
-// Interface signature in 0x40000001h's EAX: "TVMM" (no specific PV interface).
-constexpr std::uint32_t kIfaceEax =
-    'T' | ('V' << 8) | ('M' << 16) | ('M' << 24);
+// Hyper-V max-hypervisor-leaf. Must be >= 0x40000005 to clear
+// `ms_hyperv_platform()`'s HYPERV_CPUID_MIN/MAX bracket. We expose six
+// leaves (0x40000000..0x40000005) with the high leaves zeroed.
+constexpr std::uint32_t kHvMaxLeaf = 0x40000006u;
 
 // Compute the host TSC frequency, in Hz. Tries CPUID.15h on the host first,
 // then CPUID.16h, then falls back to a short QueryPerformanceCounter-based
@@ -153,29 +150,66 @@ CpuidResult ResolveCpuid(std::uint32_t leaf,
         }
 
         case 0x40000000u: {
-            // Max hypervisor leaf + 12-byte vendor string "TinyVMM\0\0\0\0\0"
-            // packed across EBX:ECX:EDX. Linux's hypervisor_cpuid_base()
-            // reads this and, finding no known match, just logs the vendor.
-            r.eax = 0x40000001u;
-            r.ebx = kVendorEbx;
-            r.ecx = kVendorEcx;
-            r.edx = kVendorEdx;
+            // Max hypervisor leaf + 12-byte vendor "Microsoft Hv" packed
+            // across EBX:ECX:EDX. Linux's `ms_hyperv_platform()` requires
+            // BOTH this exact vendor string AND a max leaf in
+            // [HYPERV_CPUID_MIN, HYPERV_CPUID_MAX] = [0x40000005, 0x4000ffff]
+            // before it will treat us as Hyper-V and route through the
+            // Reference TSC page setup.
+            r.eax = kHvMaxLeaf;
+            std::uint32_t ebx = 0, ecx = 0, edx = 0;
+            GetHvVendorEbxEcxEdx(&ebx, &ecx, &edx);
+            r.ebx = ebx;
+            r.ecx = ecx;
+            r.edx = edx;
             break;
         }
 
         case 0x40000001u: {
-            // Hypervisor interface signature. We don't implement any specific
-            // PV interface (no KVM, no Hyper-V, no Xen) -- just a sentinel so
-            // 0x40000001 isn't all zero.
-            r.eax = kIfaceEax;
+            // Hyper-V interface signature "Hv#1". `ms_hyperv_platform()`
+            // checks this with memcmp("Hv#1", &eax, 4); any deviation
+            // disables the Hyper-V path entirely.
+            r.eax = GetHvInterfaceEax();
             r.ebx = 0;
             r.ecx = 0;
             r.edx = 0;
             break;
         }
 
+        case 0x40000002u: {
+            // Hypervisor system identity (build/major/minor/service pack).
+            // Linux logs the version but does not gate behavior on it.
+            r.eax = 0; r.ebx = 0; r.ecx = 0; r.edx = 0;
+            break;
+        }
+
+        case 0x40000003u: {
+            // Feature flags. EAX advertises the four enlightenments we
+            // implement (hypercall page, VP_INDEX, Reference TSC,
+            // TSC-invariant control). EBX/ECX/EDX are zero so Linux skips
+            // hypercall-only features (FREQUENCY_MSRS, SynIC, synthetic
+            // timers, partition-reference-counter, etc.).
+            r.eax = kHvFeaturesAdvertised;
+            r.ebx = 0;
+            r.ecx = 0;
+            r.edx = 0;
+            break;
+        }
+
+        case 0x40000004u:
+        case 0x40000005u:
+        case 0x40000006u: {
+            // Recommended enlightenment hints (0x40000004) / implementation
+            // limits (0x40000005) / hardware features (0x40000006). All
+            // zero -- no PV-TLB-flush, no PV-IPI, no SynIC, no recommended
+            // hypercall paths. Linux honors this by skipping the entire
+            // Hyper-V fast-IPI / cluster-IPI plumbing.
+            r.eax = 0; r.ebx = 0; r.ecx = 0; r.edx = 0;
+            break;
+        }
+
         default: {
-            if (leaf >= 0x40000002u && leaf <= 0x400000FFu) {
+            if (leaf >= 0x40000007u && leaf <= 0x400000FFu) {
                 // Reserved hypervisor leaves -- zero everything so the guest
                 // doesn't pick up stale host CPUID fragments here.
                 r.eax = 0;
@@ -195,6 +229,10 @@ void SetHideTscDeadline(bool hide) noexcept {
 }
 bool GetHideTscDeadline() noexcept {
     return g_hide_tsc_deadline.load(std::memory_order_relaxed);
+}
+
+std::uint64_t GetCachedTscHz() noexcept {
+    return GetTscHz();
 }
 
 std::vector<WHV_X64_CPUID_RESULT> BuildStaticCpuidResultList(
@@ -273,20 +311,31 @@ std::vector<WHV_X64_CPUID_RESULT> BuildStaticCpuidResultList(
         list.push_back(entry(0x80000007u, r));
     }
     {
-        // 0x40000000: hypervisor vendor string "TinyVMM".
-        CpuidResult r{0x40000001u, kVendorEbx, kVendorEcx, kVendorEdx};
+        // 0x40000000: hypervisor max-leaf + vendor "Microsoft Hv".
+        std::uint32_t ebx = 0, ecx = 0, edx = 0;
+        GetHvVendorEbxEcxEdx(&ebx, &ecx, &edx);
+        CpuidResult r{kHvMaxLeaf, ebx, ecx, edx};
         list.push_back(entry(0x40000000u, r));
     }
     {
-        // 0x40000001: hypervisor interface signature "TVMM".
-        CpuidResult r{kIfaceEax, 0, 0, 0};
+        // 0x40000001: hypervisor interface signature "Hv#1".
+        CpuidResult r{GetHvInterfaceEax(), 0, 0, 0};
         list.push_back(entry(0x40000001u, r));
     }
-    // Mask the Hyper-V-style hypervisor leaves Linux actively probes
-    // (0x40000002..0x40000006) so the guest doesn't accidentally pick up
-    // host-injected paravirt features that we don't implement. The runtime
-    // CPUID exit handler does the same for 0x40000002..0x400000FF.
-    for (std::uint32_t leaf = 0x40000002u; leaf <= 0x40000006u; ++leaf) {
+    {
+        // 0x40000002: hypervisor build/version, all zero.
+        list.push_back(entry(0x40000002u, CpuidResult{0, 0, 0, 0}));
+    }
+    {
+        // 0x40000003: features. EAX = HYPERCALL | VP_INDEX | REFERENCE_TSC
+        //             | TSC_INVARIANT. Other registers zero.
+        CpuidResult r{kHvFeaturesAdvertised, 0, 0, 0};
+        list.push_back(entry(0x40000003u, r));
+    }
+    // Mask 0x40000004..0x40000006 (hints / impl limits / hw features) so
+    // the guest's `ms_hyperv.hints` etc. read zero, suppressing PV TLB
+    // flush, PV IPI, SynIC, and similar features we don't implement.
+    for (std::uint32_t leaf = 0x40000004u; leaf <= 0x40000006u; ++leaf) {
         list.push_back(entry(leaf, CpuidResult{0, 0, 0, 0}));
     }
 

@@ -133,15 +133,13 @@ StopReason RunLoop::Run() {
                 break;
             }
 
-            case WHvRunVpExitReasonX64MsrAccess:
+            case WHvRunVpExitReasonX64MsrAccess: {
                 msr_exits_.fetch_add(1, std::memory_order_relaxed);
-                // We do not service MSR accesses today; fall through to
-                // the unhandled path so the caller sees the failure.
-                std::fprintf(stderr,
-                             "[loop] unhandled MSR access at RIP=0x%llx\n",
-                             static_cast<unsigned long long>(
-                                 last_exit_.VpContext.Rip));
-                return StopReason::UnhandledExit;
+                if (auto stop = HandleMsrExit(last_exit_)) {
+                    return *stop;
+                }
+                break;
+            }
 
             case WHvRunVpExitReasonX64InterruptWindow:
                 intwin_exits_.fetch_add(1, std::memory_order_relaxed);
@@ -306,6 +304,133 @@ std::optional<StopReason> RunLoop::HandleCpuidExit(
     } catch (const HrError& e) {
         std::fprintf(stderr,
                      "[loop] CPUID set-regs failed at RIP=0x%llx: HRESULT=0x%08lX\n",
+                     static_cast<unsigned long long>(exit.VpContext.Rip),
+                     static_cast<unsigned long>(e.hr()));
+        return StopReason::EmulationFailure;
+    }
+    return std::nullopt;
+}
+
+std::optional<StopReason> RunLoop::HandleMsrExit(
+    const WHV_RUN_VP_EXIT_CONTEXT& exit) {
+    const auto& ctx = exit.MsrAccess;
+    const std::uint32_t msr     = ctx.MsrNumber;
+    const bool          is_wr   = (ctx.AccessInfo.IsWrite != 0);
+    const std::uint64_t wr_val  = ((ctx.Rdx & 0xFFFFFFFFull) << 32) |
+                                  (ctx.Rax & 0xFFFFFFFFull);
+
+    // If no enlightenment object is wired (e.g. unit tests bringing the
+    // partition up without a guest), fall through to unhandled so the
+    // failure is visible.
+    if (hv_ == nullptr) {
+        std::fprintf(stderr,
+                     "[loop] MSR exit with no enlightenment wired: "
+                     "%s msr=0x%08x at RIP=0x%llx\n",
+                     is_wr ? "WRMSR" : "RDMSR", msr,
+                     static_cast<unsigned long long>(exit.VpContext.Rip));
+        return StopReason::UnhandledExit;
+    }
+
+    std::uint64_t rd_val = 0;
+    MsrHandled result;
+    if (is_wr) {
+        result = hv_->HandleWrmsr(vcpu_.index(), msr, wr_val);
+    } else {
+        result = hv_->HandleRdmsr(vcpu_.index(), msr, &rd_val);
+    }
+
+    if (verbose_msr_) {
+        if (is_wr) {
+            std::fprintf(stderr,
+                         "[loop] WRMSR msr=0x%08x val=0x%016llx %s\n",
+                         msr, static_cast<unsigned long long>(wr_val),
+                         result == MsrHandled::Yes ? "(handled)" : "(#GP)");
+        } else {
+            std::fprintf(stderr,
+                         "[loop] RDMSR msr=0x%08x val=0x%016llx %s\n",
+                         msr, static_cast<unsigned long long>(rd_val),
+                         result == MsrHandled::Yes ? "(handled)" : "(#GP)");
+        }
+    }
+    TINYVMM_ETW_VERBOSE_KW("Msr", ::tinyvmm::diag::kw::VmExit,
+        TraceLoggingUInt8(is_wr ? 1u : 0u, "is_write"),
+        TraceLoggingUInt32(msr,            "msr"),
+        TraceLoggingUInt64(is_wr ? wr_val : rd_val, "value"),
+        TraceLoggingUInt8(result == MsrHandled::Yes ? 1u : 0u, "handled"));
+
+    if (result == MsrHandled::NoInjectGp) {
+        // Unknown MSR: mimic what WHP would have done without X64MsrExit by
+        // injecting #GP(0). Do NOT advance RIP -- the exception is reported
+        // as occurring at the RDMSR/WRMSR instruction itself, and Linux's
+        // EX_TABLE for `wrmsrl` / `rdmsrl` catches it.
+        return InjectGeneralProtectionFault(exit);
+    }
+
+    // Handled. For RDMSR, write the value into RAX/RDX. Advance RIP past
+    // the 2-byte WRMSR/RDMSR opcode (InstructionLength is set by WHP).
+    const std::uint64_t next_rip =
+        exit.VpContext.Rip + exit.VpContext.InstructionLength;
+
+    if (is_wr) {
+        // Only need to advance RIP.
+        static constexpr WHV_REGISTER_NAME kNames[] = { WHvX64RegisterRip };
+        WHV_REGISTER_VALUE vals[1] = {};
+        vals[0].Reg64 = next_rip;
+        try {
+            vcpu_.SetRegisters(kNames, vals);
+        } catch (const HrError& e) {
+            std::fprintf(stderr,
+                         "[loop] WRMSR set-regs failed at RIP=0x%llx: "
+                         "HRESULT=0x%08lX\n",
+                         static_cast<unsigned long long>(exit.VpContext.Rip),
+                         static_cast<unsigned long>(e.hr()));
+            return StopReason::EmulationFailure;
+        }
+        return std::nullopt;
+    }
+
+    static constexpr WHV_REGISTER_NAME kNames[] = {
+        WHvX64RegisterRax, WHvX64RegisterRdx, WHvX64RegisterRip,
+    };
+    WHV_REGISTER_VALUE vals[3] = {};
+    vals[0].Reg64 = rd_val & 0xFFFFFFFFull;
+    vals[1].Reg64 = (rd_val >> 32) & 0xFFFFFFFFull;
+    vals[2].Reg64 = next_rip;
+    try {
+        vcpu_.SetRegisters(kNames, vals);
+    } catch (const HrError& e) {
+        std::fprintf(stderr,
+                     "[loop] RDMSR set-regs failed at RIP=0x%llx: "
+                     "HRESULT=0x%08lX\n",
+                     static_cast<unsigned long long>(exit.VpContext.Rip),
+                     static_cast<unsigned long>(e.hr()));
+        return StopReason::EmulationFailure;
+    }
+    return std::nullopt;
+}
+
+std::optional<StopReason> RunLoop::InjectGeneralProtectionFault(
+    const WHV_RUN_VP_EXIT_CONTEXT& exit) {
+    WHV_X64_PENDING_INTERRUPTION_REGISTER pi = {};
+    pi.InterruptionPending = 1;
+    pi.InterruptionType    = WHvX64PendingException;   // = 3
+    pi.DeliverErrorCode    = 1;
+    pi.InterruptionVector  = 13;                       // #GP
+    pi.ErrorCode           = 0;
+    // Do NOT advance RIP -- the exception is reported at the faulting
+    // instruction.
+
+    static constexpr WHV_REGISTER_NAME kNames[] = {
+        WHvRegisterPendingInterruption,
+    };
+    WHV_REGISTER_VALUE vals[1] = {};
+    vals[0].PendingInterruption = pi;
+    try {
+        vcpu_.SetRegisters(kNames, vals);
+    } catch (const HrError& e) {
+        std::fprintf(stderr,
+                     "[loop] #GP injection set-regs failed at RIP=0x%llx: "
+                     "HRESULT=0x%08lX\n",
                      static_cast<unsigned long long>(exit.VpContext.Rip),
                      static_cast<unsigned long>(e.hr()));
         return StopReason::EmulationFailure;

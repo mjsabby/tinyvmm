@@ -58,6 +58,7 @@ add_executable(tinyvmm
     src/whp/run_loop.cpp
     src/whp/cpuid.cpp
     src/whp/cpu_affinity.cpp
+    src/whp/hv_enlightenment.cpp
     src/devices/io_bus.cpp
     src/devices/mmio_bus.cpp
     src/devices/serial8250.cpp

@@ -33,6 +33,7 @@
 #include "virtio/net_usernet.h"
 #include "whp/cpu_affinity.h"
 #include "whp/cpuid.h"
+#include "whp/hv_enlightenment.h"
 #include "whp/memory.h"
 #include "whp/msi.h"
 #include "whp/notification_port.h"
@@ -1889,10 +1890,13 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     if (vcpu_count > boot::acpi::kMaxVcpus) vcpu_count = boot::acpi::kMaxVcpus;
 
     Partition part(vcpu_count);
-    // Enable CPUID exits so we can layer tinyvmm policy (advertise
-    // invariant_tsc, ARAT, TSC frequency, mask Hyper-V leaves) on top of
-    // WHP's host-passthrough defaults. See `whp/cpuid.cpp`.
-    part.EnableExtendedExits({.cpuid = true});
+    // Enable CPUID + MSR exits. CPUID lets us layer tinyvmm policy
+    // (advertise invariant_tsc, ARAT, TSC frequency, Hyper-V vendor/iface)
+    // on top of WHP's host-passthrough defaults. MSR lets us service the
+    // Hyper-V Reference TSC page + TSC-invariant-control MSRs that Linux
+    // writes once it detects Hyper-V via the CPUID leaves. See
+    // `whp/cpuid.cpp` and `whp/hv_enlightenment.cpp`.
+    part.EnableExtendedExits({.cpuid = true, .msr = true});
     // Also publish the same overrides as a static CpuidResultList. WHP's
     // in-hypervisor LAPIC emulation makes architectural feature decisions at
     // SetupPartition time based on this list -- NOT on what our runtime
@@ -1921,6 +1925,17 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     std::printf("[pvh-run] guest RAM: %zu MiB at GPA 0 (%s)\n",
                 ram.size() / (1024 * 1024),
                 ram.large_pages() ? "MEM_LARGE_PAGES" : "4 KiB pages");
+
+    // Per-VM Hyper-V enlightenment state. Backs the Reference TSC page and
+    // the few MSRs (GUEST_OS_ID, HYPERCALL, VP_INDEX, REFERENCE_TSC,
+    // TSC_INVARIANT_CONTROL) that Linux writes/reads once it detects us
+    // via CPUID. Same TSC frequency the guest sees via CPUID.15h, so the
+    // 100ns clocksource derived from the page is consistent with TSC.
+    HvEnlightenment hv(ram, GetCachedTscHz());
+    std::printf("[pvh-run] Hyper-V enlightenment ready (tsc_hz=%llu, "
+                "scale=0x%016llx)\n",
+                static_cast<unsigned long long>(hv.tsc_hz()),
+                static_cast<unsigned long long>(hv.tsc_scale()));
 
     boot::PvhLoadConfig cfg;
     cfg.cmdline   = cmdline;
@@ -2252,6 +2267,7 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     std::deque<RunLoop> loops;
     for (std::uint32_t i = 0; i < vcpu_count; ++i) {
         loops.emplace_back(vcpus[i], io_bus, mmio_bus);
+        loops.back().set_hv_enlightenment(&hv);
     }
     RunLoop& loop = loops.front();
 
@@ -5293,39 +5309,76 @@ int RunCpuidTest() {
         if ((r.edx & (1u << 8)) == 0) return fail("leaf 0x80000007: invariant_tsc not set");
     }
 
-    // Leaf 0x40000000: vendor "TinyVMM\0\0\0\0\0" + max-leaf 0x40000001.
+    // Leaf 0x40000000: vendor "Microsoft Hv" (Linux requires this exact
+    // string to enter the Hyper-V detection path) + max-leaf >= 0x40000005.
     {
         CpuidResult r = resolve(0x40000000u);
-        if (r.eax != 0x40000001u) return fail("leaf 0x40000000: max-leaf != 0x40000001");
+        if (r.eax < 0x40000005u || r.eax > 0x4000FFFFu) {
+            std::fprintf(stderr,
+                "[cpuid-test] FAIL: leaf 0x40000000 max=0x%08x out of "
+                "Hyper-V [0x40000005, 0x4000FFFF] range\n", r.eax);
+            return 1;
+        }
         char vendor[13] = {0};
         std::memcpy(vendor + 0, &r.ebx, 4);
         std::memcpy(vendor + 4, &r.ecx, 4);
         std::memcpy(vendor + 8, &r.edx, 4);
-        if (std::strncmp(vendor, "TinyVMM", 7) != 0) {
+        if (std::memcmp(vendor, "Microsoft Hv", 12) != 0) {
             std::fprintf(stderr,
-                "[cpuid-test] FAIL: leaf 0x40000000 vendor='%s' (want 'TinyVMM')\n",
-                vendor);
+                "[cpuid-test] FAIL: leaf 0x40000000 vendor='%s' (want "
+                "'Microsoft Hv')\n", vendor);
             return 1;
         }
     }
 
-    // Leaf 0x40000001: "TVMM" interface signature.
+    // Leaf 0x40000001: "Hv#1" interface signature (0x31237648 little-endian).
     {
         CpuidResult r = resolve(0x40000001u);
         char sig[5] = {0};
         std::memcpy(sig, &r.eax, 4);
-        if (std::strncmp(sig, "TVMM", 4) != 0) {
+        if (std::memcmp(sig, "Hv#1", 4) != 0) {
             std::fprintf(stderr,
-                "[cpuid-test] FAIL: leaf 0x40000001 sig='%s' (want 'TVMM')\n", sig);
+                "[cpuid-test] FAIL: leaf 0x40000001 sig='%s' (want 'Hv#1')\n",
+                sig);
             return 1;
         }
     }
 
-    // Leaf 0x40000002: zeroed.
+    // Leaf 0x40000002: zeroed (build/version info we don't care about).
     {
         CpuidResult r = resolve(0x40000002u);
         if (r.eax || r.ebx || r.ecx || r.edx) {
             return fail("leaf 0x40000002: not zeroed");
+        }
+    }
+
+    // Leaf 0x40000003: features. EAX must advertise
+    //   HYPERCALL | VP_INDEX | REFERENCE_TSC | TSC_INVARIANT
+    // EBX/ECX/EDX zero (we don't implement any priv_high / power / misc
+    // features that Linux gates further enlightenment on).
+    {
+        CpuidResult r = resolve(0x40000003u);
+        constexpr std::uint32_t kExpected =
+            (1u << 5) | (1u << 6) | (1u << 9) | (1u << 15);
+        if ((r.eax & kExpected) != kExpected) {
+            std::fprintf(stderr,
+                "[cpuid-test] FAIL: leaf 0x40000003 EAX=0x%08x missing one "
+                "of HYPERCALL/VP_INDEX/REFERENCE_TSC/TSC_INVARIANT\n", r.eax);
+            return 1;
+        }
+        if (r.ebx || r.ecx || r.edx) {
+            return fail("leaf 0x40000003: EBX/ECX/EDX must be zero");
+        }
+    }
+
+    // Leaves 0x40000004..0x40000006: zeroed (no hints, no impl limits, no
+    // hw features -- Linux skips PV-TLB / PV-IPI / SynIC / synthetic timer).
+    for (std::uint32_t leaf = 0x40000004u; leaf <= 0x40000006u; ++leaf) {
+        CpuidResult r = resolve(leaf);
+        if (r.eax || r.ebx || r.ecx || r.edx) {
+            std::fprintf(stderr,
+                "[cpuid-test] FAIL: leaf 0x%08x: not zeroed\n", leaf);
+            return 1;
         }
     }
 
@@ -5473,6 +5526,210 @@ int RunCpuAffinityTest() {
     return 0;
 }
 
+// Host-side smoke for the Hyper-V enlightenment helpers. Does NOT touch
+// WHP -- exercises only the pure scaling math, the vendor-string helpers,
+// and the MSR dispatch path that runs in user-mode on every MSR exit.
+//
+// Coverage:
+//   1. ComputeTscScale: known frequencies -> stable, within-tolerance scale
+//      values. We assert the absolute scaling identity
+//      `(tsc_scale * tsc_hz) >> 64 ~= 10^7`.
+//   2. GetHvVendorEbxEcxEdx: round-trip to "Microsoft Hv" (12 bytes).
+//   3. GetHvInterfaceEax: equals "Hv#1" (0x31237648 little-endian).
+//   4. WrmsrlGuestOsId / TscInvariantControl: simple read/write roundtrip.
+//   5. WrmsrlReferenceTsc disabled (bit 0 == 0): page is NOT written
+//      (no host-mem access without a backing GuestMemory).
+//   6. WrmsrlReferenceTsc enabled but GPA out of range: returns Yes
+//      (writes are silently dropped on bad GPAs, matching kvm/hyperv).
+//   7. Unknown MSR (e.g. 0x40000099): returns NoInjectGp so the run-loop
+//      injects #GP into the guest instead of crashing the VMM.
+int RunHvEnlightenmentTest() {
+    using namespace tinyvmm::whp;
+
+    auto fail = [](const char* msg) -> int {
+        std::fprintf(stderr, "[hv-test] FAIL: %s\n", msg);
+        return 1;
+    };
+
+    // ---- (1) ComputeTscScale ----------------------------------------------
+    // For tsc_hz, the contract is that (rdtsc * scale) >> 64 yields 100 ns
+    // ticks. So (scale * tsc_hz) >> 64 must equal 10^7 within tight rounding.
+    auto check_scale = [&](std::uint64_t hz, std::uint64_t expected_per_sec,
+                           int tol_units) -> int {
+        std::uint64_t scale = ComputeTscScale(hz);
+        if (scale == 0) {
+            return fail("ComputeTscScale returned 0");
+        }
+        // (scale * hz) >> 64 -> 100ns ticks per second of TSC.
+        const std::uint64_t per_sec =
+            static_cast<std::uint64_t>(__umulh(scale, hz));
+        const std::int64_t delta =
+            static_cast<std::int64_t>(per_sec) -
+            static_cast<std::int64_t>(expected_per_sec);
+        const std::int64_t abs_delta = delta < 0 ? -delta : delta;
+        if (abs_delta > tol_units) {
+            std::fprintf(stderr,
+                "[hv-test] scale check fail: hz=%llu scale=0x%llx per_sec=%llu "
+                "expected=%llu delta=%lld tol=%d\n",
+                static_cast<unsigned long long>(hz),
+                static_cast<unsigned long long>(scale),
+                static_cast<unsigned long long>(per_sec),
+                static_cast<unsigned long long>(expected_per_sec),
+                static_cast<long long>(delta), tol_units);
+            return 1;
+        }
+        return 0;
+    };
+    // Expected per-second 100ns ticks = 10^7. Tolerance ±2 units (rounding).
+    if (check_scale(3'000'000'000ull, 10'000'000ull, 2)) return 1;
+    if (check_scale(2'500'000'000ull, 10'000'000ull, 2)) return 1;
+    if (check_scale(1'000'000'000ull, 10'000'000ull, 2)) return 1;
+    // Edge case: very high freq (5 GHz typical, 6 GHz overclock).
+    if (check_scale(6'000'000'000ull, 10'000'000ull, 2)) return 1;
+    // Edge case: zero -> defined behavior (returns 0, no UB).
+    if (ComputeTscScale(0) != 0)
+        return fail("ComputeTscScale(0) must return 0");
+
+    // ---- (2) Vendor / (3) Interface signature -----------------------------
+    {
+        std::uint32_t ebx{}, ecx{}, edx{};
+        GetHvVendorEbxEcxEdx(&ebx, &ecx, &edx);
+        char vendor[13] = {0};
+        std::memcpy(vendor + 0, &ebx, 4);
+        std::memcpy(vendor + 4, &ecx, 4);
+        std::memcpy(vendor + 8, &edx, 4);
+        if (std::memcmp(vendor, "Microsoft Hv", 12) != 0) {
+            std::fprintf(stderr,
+                "[hv-test] vendor='%s' (want 'Microsoft Hv')\n", vendor);
+            return 1;
+        }
+
+        const std::uint32_t iface = GetHvInterfaceEax();
+        // "Hv#1" = 'H'(0x48) 'v'(0x76) '#'(0x23) '1'(0x31)
+        // little-endian u32 = 0x31237648.
+        if (iface != 0x31237648u) {
+            std::fprintf(stderr,
+                "[hv-test] interface 0x%08x (want 0x31237648 'Hv#1')\n",
+                iface);
+            return 1;
+        }
+    }
+
+    // ---- (4)-(7) MSR dispatch ---------------------------------------------
+    // Build an HvEnlightenment via the test-only no-ram constructor. The
+    // ReferenceTsc/Hypercall page writes silently no-op in this mode -- the
+    // MSR is still accepted and remembered, which lets us validate the
+    // dispatch path independently of WHP/GuestMemory.
+    HvEnlightenment hv_nomem(/*tsc_hz=*/3'000'000'000ull);
+
+    // (4a) GuestOsId roundtrip.
+    {
+        constexpr std::uint64_t kFakeLinuxId = 0x8100'0000'0000'0001ull;
+        if (hv_nomem.HandleWrmsr(0, kHvMsrGuestOsId, kFakeLinuxId) !=
+            MsrHandled::Yes) {
+            return fail("WRMSR GUEST_OS_ID rejected");
+        }
+        std::uint64_t got = 0;
+        if (hv_nomem.HandleRdmsr(0, kHvMsrGuestOsId, &got) !=
+                MsrHandled::Yes ||
+            got != kFakeLinuxId) {
+            return fail("RDMSR GUEST_OS_ID readback mismatch");
+        }
+    }
+
+    // (4b) TscInvariantControl roundtrip (only bit 0 is architecturally
+    // defined; we mask to bit 0).
+    {
+        if (hv_nomem.HandleWrmsr(0, kHvMsrTscInvariantCtl, 1) !=
+            MsrHandled::Yes) {
+            return fail("WRMSR TSC_INVARIANT_CONTROL rejected");
+        }
+        std::uint64_t got = 0;
+        if (hv_nomem.HandleRdmsr(0, kHvMsrTscInvariantCtl, &got) !=
+                MsrHandled::Yes ||
+            (got & 1) != 1) {
+            return fail("RDMSR TSC_INVARIANT_CONTROL readback mismatch");
+        }
+    }
+
+    // (4c) VP_INDEX returns the caller's vcpu index. Read-only from guest;
+    // we don't WRMSR it.
+    {
+        std::uint64_t got = 0xDEADull;
+        if (hv_nomem.HandleRdmsr(/*vp=*/7, kHvMsrVpIndex, &got) !=
+                MsrHandled::Yes ||
+            got != 7) {
+            return fail("RDMSR VP_INDEX did not return calling vcpu index");
+        }
+    }
+
+    // (4d) TIME_REF_COUNT increases monotonically with host TSC. We can't
+    // pin the exact value but two reads spaced by a busy loop must differ.
+    {
+        std::uint64_t a = 0, b = 0;
+        if (hv_nomem.HandleRdmsr(0, kHvMsrTimeRefCount, &a) !=
+            MsrHandled::Yes) {
+            return fail("RDMSR TIME_REF_COUNT rejected");
+        }
+        // Busy-wait a fixed number of cycles to make the value advance.
+        // 1e6 iterations is ~1 ms on any reasonable host (well above the
+        // 100 ns LSB of TIME_REF_COUNT).
+        volatile std::uint64_t sink = 0;
+        for (int i = 0; i < 1'000'000; ++i) sink += static_cast<std::uint64_t>(i);
+        (void)sink;
+        if (hv_nomem.HandleRdmsr(0, kHvMsrTimeRefCount, &b) !=
+            MsrHandled::Yes) {
+            return fail("RDMSR TIME_REF_COUNT rejected (2nd)");
+        }
+        if (b <= a) {
+            std::fprintf(stderr,
+                "[hv-test] TIME_REF_COUNT non-monotonic: a=%llu b=%llu\n",
+                static_cast<unsigned long long>(a),
+                static_cast<unsigned long long>(b));
+            return 1;
+        }
+    }
+
+    // (5) ReferenceTsc disabled (bit 0 == 0): write must succeed without
+    // touching guest memory (we have none in this construction).
+    {
+        if (hv_nomem.HandleWrmsr(0, kHvMsrReferenceTsc,
+                                 /*disabled*/ 0xFFFFFFFFFFFFF000ull) !=
+            MsrHandled::Yes) {
+            return fail("WRMSR REFERENCE_TSC (disabled) rejected");
+        }
+    }
+
+    // (6) ReferenceTsc enabled but with no backing RAM: should still return
+    // Yes (write is dropped). HvEnlightenment treats nullptr ram_ as
+    // "no GuestMemory" and short-circuits the page write.
+    {
+        const std::uint64_t enabled_bad_gpa = 0xFFFFFFFFFFFFF001ull;
+        if (hv_nomem.HandleWrmsr(0, kHvMsrReferenceTsc, enabled_bad_gpa) !=
+            MsrHandled::Yes) {
+            return fail("WRMSR REFERENCE_TSC (enabled,no-ram) must not GP");
+        }
+    }
+
+    // (7) Unknown MSR in the Hyper-V range -> NoInjectGp (so the run-loop
+    // injects a #GP into the guest, matching real Hyper-V's behaviour for
+    // unimplemented MSRs).
+    {
+        std::uint64_t got = 0;
+        if (hv_nomem.HandleRdmsr(0, /*made-up*/ 0x40000099ull, &got) !=
+            MsrHandled::NoInjectGp) {
+            return fail("RDMSR unknown MSR did not return NoInjectGp");
+        }
+        if (hv_nomem.HandleWrmsr(0, 0x40000099ull, 0) !=
+            MsrHandled::NoInjectGp) {
+            return fail("WRMSR unknown MSR did not return NoInjectGp");
+        }
+    }
+
+    std::printf("[hv-test] PASS (scale-math + vendor + iface + MSR dispatch)\n");
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -5536,6 +5793,9 @@ int main(int argc, char** argv) {
         }
         if (cmd == "--cpu-affinity-test") {
             return RunCpuAffinityTest();
+        }
+        if (cmd == "--hv-test") {
+            return RunHvEnlightenmentTest();
         }
         if (cmd == "--xdp-probe") {
             int if_index = 0;

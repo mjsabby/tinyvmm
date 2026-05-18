@@ -114,19 +114,44 @@ and `p-physical` drops SMT siblings.
     --initrd initramfs.cpio vmlinux
 ```
 
-**Why pin?** On hybrid CPUs Linux's `clocksource_watchdog` marks TSC
-unstable once vCPU threads bounce across P-core and E-core boundaries
-(the watchdog samples RDTSC on different host cores and sees skew that
-doesn't reflect real drift). The kernel then silently demotes
-`clock_gettime` to a slower clocksource for the rest of the boot.
-Pinning to one class fixes this.
+**Why pin?** On hybrid CPUs Linux's `clocksource_watchdog` historically
+marked TSC unstable once vCPU threads bounced across P-core and E-core
+boundaries. tinyvmm now exposes itself as a Hyper-V guest and implements
+the TSC-invariant + Reference-TSC-page enlightenment (see "Time
+enlightenment" below), which silences the watchdog under any vCPU
+scheduling pattern -- pinning is no longer required for clock stability.
+It remains useful for predictable performance (avoiding cross-class
+latency jitter) and for keeping vCPU threads off any logicals already
+under load.
 
 ### Time enlightenment
 
-RDTSC is **not** intercepted by tinyvmm and runs natively on the host TSC with
-a Hyper-V-supplied offset (and TSC scaling on capable hardware). No host code
-runs on time queries. A future milestone will add the Hyper-V Reference TSC
-page (`HV_X64_MSR_REFERENCE_TSC`) for a fully migration-safe paravirt clock.
+RDTSC is **not** intercepted and runs natively on the host TSC. tinyvmm
+additionally advertises a Hyper-V CPUID interface ("Microsoft Hv" /
+"Hv#1") and implements four MSRs that Linux uses for time-keeping:
+
+- `HV_X64_MSR_REFERENCE_TSC` (`0x40000021`): publishes a 4 KiB Reference
+  TSC page filled with `tsc_scale = (10^7 << 64) / tsc_hz` so Linux's
+  `read_hv_clock_tsc()` reads 100 ns ticks from the host TSC with one
+  multiply-and-shift -- no exits.
+- `HV_X64_MSR_TSC_INVARIANT_CONTROL` (`0x40000118`): driving this triggers
+  Linux's `setup_force_cpu_cap(X86_FEATURE_TSC_RELIABLE)`, which disables
+  the clocksource watchdog for TSC entirely. With this in place Linux
+  keeps `current_clocksource=tsc` even under heavy multi-vCPU load,
+  including N=32 vCPUs each spinning a busy loop for 20+ seconds.
+- `HV_X64_MSR_TIME_REF_COUNT` (`0x40000020`): served live from
+  `(rdtsc * tsc_scale) >> 64` as the fallback path when the Reference
+  TSC page's sequence number reads zero.
+- `HV_X64_MSR_VP_INDEX` (`0x40000002`): per-vCPU index for percpu-init.
+- `HV_X64_MSR_GUEST_OS_ID` (`0x40000000`) and `HV_X64_MSR_HYPERCALL`
+  (`0x40000001`) are accepted; the hypercall page is filled with a
+  6-byte `mov eax, 2; ret` stub so any never-quite-issued hypercall
+  returns `HV_STATUS_INVALID_HYPERCALL_CODE` instead of executing
+  garbage. We deliberately do not implement any actual hypercalls.
+
+No `tsc=reliable` kernel cmdline workaround is needed. Verified on Linux
+7.0 with `CONFIG_SMP=y` + `CONFIG_HYPERVISOR_GUEST=y` (the only kernel
+flag required -- enabled by default on virtually every distro).
 
 ## Build
 

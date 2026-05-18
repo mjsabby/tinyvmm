@@ -202,6 +202,45 @@ EOF
     exec cat
 fi
 
+# --- optional TSC-watchdog stress mode ----------------------------------
+# Enabled via kernel cmdline marker `tinyvmm.test=tsc`. Spins one busy
+# `yes`-into-/dev/null loop on every online CPU for ~20s to give Linux's
+# clocksource watchdog (`clocksource_watchdog`, fires every 0.5 s) plenty
+# of opportunities to observe TSC vs the secondary clocksource. Then
+# dumps any watchdog/unstable/skew complaints in dmesg and the current
+# clocksource selection, and powers off. With the Hyper-V Reference TSC
+# page + HV_ACCESS_TSC_INVARIANT advertised, the kernel sets
+# X86_FEATURE_TSC_RELIABLE and the watchdog leaves TSC alone.
+if grep -q 'tinyvmm.test=tsc' /proc/cmdline 2>/dev/null; then
+    log "--- TSC-WATCHDOG-TEST start ---"
+    ncpu=$(nproc 2>/dev/null || echo 1)
+    log "+ spawning $ncpu busy loops"
+    for i in $(seq 1 "$ncpu"); do
+        ( while :; do : ; done ) &
+    done
+    # Wait long enough for several watchdog cycles (default 0.5s tick).
+    sleep 20
+    log "--- TSC-WATCHDOG-TEST checking dmesg ---"
+    # Look for the actual kernel watchdog complaints. Filter out our own
+    # `[init]` log lines (which match 'WATCHDOG' as part of the banner)
+    # before applying the substantive regex.
+    if dmesg \
+            | grep -v 'TSC-WATCHDOG-TEST' \
+            | grep -iE 'clocksource_watchdog|Marking .*tsc.* unstable|skew is too large|tsc: Marking' \
+            > /tmp/wd.log 2>&1; then
+        log "TSC-WATCHDOG: FAIL (kernel watchdog complaints below)"
+        while IFS= read -r line; do log "  $line"; done < /tmp/wd.log
+    else
+        log "TSC-WATCHDOG: no watchdog/unstable complaints (PASS)"
+    fi
+    log "current_clocksource=$(cat /sys/devices/system/clocksource/clocksource0/current_clocksource 2>/dev/null)"
+    log "available=$(cat /sys/devices/system/clocksource/clocksource0/available_clocksource 2>/dev/null)"
+    log "--- TSC-WATCHDOG-TEST end ---"
+    sync
+    poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
+    exec cat
+fi
+
 # --- interactive shell on /dev/hvc0 -------------------------------------
 # Respawn-on-exit loop. PID 1 must never exit (kernel panics if it does).
 # `setsid -c` makes the shell the session leader and grabs hvc0 as its
