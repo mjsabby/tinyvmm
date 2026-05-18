@@ -23,6 +23,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 
 namespace tinyvmm::virtio {
 
@@ -72,6 +73,11 @@ private:
 
     std::atomic<std::uint64_t> ops_done_{0};
     std::atomic<std::uint64_t> bytes_out_{0};
+
+    // Serializes DrainRequestQueue against concurrent NotifyQueue calls from
+    // multiple vCPUs. RNG has no doorbell installed, so notifications run on
+    // whichever vCPU wrote to the notify MMIO.
+    std::mutex notify_mu_;
 
     IrqFn irq_;
 };

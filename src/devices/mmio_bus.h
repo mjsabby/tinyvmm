@@ -3,6 +3,7 @@
 #include "common.h"
 
 #include <functional>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,13 @@ struct MmioAccess {
 
 // Routes MMIO accesses to device handlers by GPA range. Same shape as IoBus
 // but 64-bit and with byte-buffer payload.
+//
+// Thread-safety: Dispatch() is invoked concurrently by N vCPU threads while
+// Register()/Unregister() may be invoked from a vCPU's PCI config-write path
+// (BAR map/unmap). We use a shared_mutex: Dispatch takes a shared lock so
+// concurrent reads scale on N vCPUs; Register/Unregister take an exclusive
+// lock. BAR map/unmap is a cold event (once per device at boot), so the
+// exclusive-lock cost is paid only on cold boot.
 class MmioBus {
 public:
     using Handler = std::function<void(MmioAccess&)>;
@@ -37,7 +45,10 @@ public:
     // values during bring-up are worse than zero).
     bool Dispatch(MmioAccess& access);
 
-    std::size_t size() const noexcept { return entries_.size(); }
+    std::size_t size() const noexcept {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        return entries_.size();
+    }
 
 private:
     struct Entry {
@@ -47,6 +58,7 @@ private:
         Handler handler;
     };
 
+    mutable std::shared_mutex mu_;
     std::vector<Entry> entries_;
 };
 

@@ -2,6 +2,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <shared_mutex>
 #include <utility>
 
 namespace tinyvmm::devices {
@@ -20,6 +22,7 @@ void MmioBus::Register(std::uint64_t base, std::uint64_t size, std::string name,
     if (size == 0) {
         Fatal("MmioBus::Register: size must be > 0");
     }
+    std::unique_lock<std::shared_mutex> lk(mu_);
     for (const auto& e : entries_) {
         if (RangesOverlap(base, size, e.base, e.size)) {
             std::fprintf(stderr,
@@ -38,6 +41,7 @@ void MmioBus::Register(std::uint64_t base, std::uint64_t size, std::string name,
 }
 
 bool MmioBus::Unregister(std::uint64_t base) {
+    std::unique_lock<std::shared_mutex> lk(mu_);
     for (auto it = entries_.begin(); it != entries_.end(); ++it) {
         if (it->base == base) {
             entries_.erase(it);
@@ -48,11 +52,23 @@ bool MmioBus::Unregister(std::uint64_t base) {
 }
 
 bool MmioBus::Dispatch(MmioAccess& access) {
-    for (const auto& e : entries_) {
-        if (access.gpa >= e.base && access.gpa < e.base + e.size) {
-            e.handler(access);
-            return true;
+    // Take a copy of the matching handler under the shared lock; release the
+    // lock before invoking it. Handlers may themselves register/unregister
+    // (e.g. a BAR write that calls OnBarMapped -> MmioBus::Register), and
+    // shared->exclusive upgrade isn't supported by std::shared_mutex.
+    Handler matched;
+    {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        for (const auto& e : entries_) {
+            if (access.gpa >= e.base && access.gpa < e.base + e.size) {
+                matched = e.handler;
+                break;
+            }
         }
+    }
+    if (matched) {
+        matched(access);
+        return true;
     }
     if (!access.is_write) {
         std::memset(access.data, 0, sizeof(access.data));

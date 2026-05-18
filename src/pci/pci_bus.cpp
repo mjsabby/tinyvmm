@@ -106,6 +106,7 @@ void PciBus::AttachIoBus(devices::IoBus& io_bus) {
 }
 
 void PciBus::HandleAddress(devices::IoAccess& access) {
+    std::lock_guard<std::mutex> lk(mu_);
     // CONFIG_ADDRESS is a 32-bit register; sub-dword accesses are valid but
     // rare. Linux uses 32-bit IN/OUT exclusively.
     if (access.is_write) {
@@ -132,6 +133,7 @@ void PciBus::HandleAddress(devices::IoAccess& access) {
 }
 
 void PciBus::HandleData(devices::IoAccess& access) {
+    std::lock_guard<std::mutex> lk(mu_);
     const DecodedAddress dec = DecodeConfigAddress(config_address_);
     if (!dec.enable) {
         if (!access.is_write) access.value = 0xFFFFFFFFu;

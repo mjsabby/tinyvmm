@@ -42,6 +42,7 @@ struct PvhLoadConfig {
     std::string cmdline;       // appended NUL-terminated to guest mem
     std::uint64_t ram_bytes;   // total guest RAM size (from GuestMemory)
     std::optional<std::filesystem::path> initramfs;  // optional initrd path
+    std::uint32_t vcpu_count = 1;  // # of vCPUs, propagated into MADT
 };
 
 struct PvhLoadResult {

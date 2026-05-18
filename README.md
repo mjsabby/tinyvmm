@@ -19,8 +19,10 @@ See [docs design notes / VM-exit hot-path analysis] in the session plan.
 - **Visual Studio 2022** (build tools or Community).
 - **Windows SDK 10.0.26100** or newer (for `WinHvPlatform.h`).
 - **CMake 3.20+** (any generator; Ninja recommended).
-- **XDP for Windows** source tree at `C:\xdp-for-windows`, or override with
-  `-DXDP_ROOT=...`.
+- **XDP for Windows** public headers are vendored under
+  `third_party/xdp-for-windows/published/external` (see that directory's
+  `README.md` for provenance / refresh recipe). Override `-DXDP_ROOT=...`
+  to build against a different checkout.
 
 ### Recommended (large pages)
 
@@ -37,6 +39,87 @@ pressure and second-level page-walk cost on the hot networking path. To enable:
 
 If the privilege is not held, tinyvmm falls back to 4 KiB pages with a warning
 on stderr. Functional but slower.
+
+### Guest RAM size (`--ram-mb`)
+
+`--pvh-run --ram-mb <N>` sizes guest RAM in MiB (default 256, min 128, max
+3584). The upper bound is hard: the PCI MMIO BAR window opens at `0xE0000000`
+(3584 MiB), so any larger contiguous region would collide with virtio
+device registers. Guests larger than 3584 MiB require a low/high RAM split
+around the MMIO hole, which tinyvmm does not yet implement.
+
+```cmd
+.\build\bin\tinyvmm.exe --pvh-run --ram-mb 2048 ^
+    --initrd initramfs.cpio vmlinux
+```
+
+### Multi-vCPU (`--vcpus`)
+
+`--pvh-run --vcpus <N>` allocates `N` virtual CPUs (default 1, max 32).
+The BSP (vCPU 0) always runs on the main thread; each AP (vCPU 1..N-1)
+runs on its own host thread so vCPUs execute concurrently.
+
+```cmd
+.\build\bin\tinyvmm.exe --pvh-run --vcpus 4 ^
+    --initrd initramfs.cpio vmlinux
+```
+
+At startup the VMM publishes an ACPI MADT with one Type-9 x2APIC entry
+per vCPU (Local APIC ID == vCPU index). APs are created in WAIT_FOR_SIPI
+state; Linux's SMP bring-up sends INIT+SIPI through the LAPIC and the
+WHP in-hypervisor LAPIC services it without bubbling up.
+
+**N=1 startup cost is unchanged**: when `--vcpus 1` (the default) no AP
+threads are spawned. Per-component mutexes added for AP safety are
+uncontested at N=1 and cost ~10-20 ns each. Measured boot time
+(entering guest → /init complete) is **298 ms ± 5 ms at N=1, N=2,
+and N=4** on this box -- all three within noise of each other.
+
+**Guest kernel must be SMP-aware to actually use the APs.** Required
+kernel config:
+
+```
+CONFIG_SMP=y
+CONFIG_NR_CPUS=32             # or whatever upper bound you need
+CONFIG_ACPI=y                 # tinyvmm uses ACPI MADT to advertise APs
+CONFIG_X86_X2APIC=y           # recommended (MADT emits Type-9 x2APIC only).
+```
+
+Without `CONFIG_SMP=y` Linux ignores everything past CPU 0 and APs sit
+idle in WAIT_FOR_SIPI. Without `CONFIG_ACPI=y` Linux logs
+`APIC: ACPI MADT or MP tables are not detected` and falls back to
+virtual-wire / uniprocessor mode. (tinyvmm emits ACPI tables only, not
+Intel MP-Spec floating tables, so ACPI is the only discovery path.)
+
+### CPU affinity (`--cpu-affinity`)
+
+`--pvh-run --cpu-affinity {all|p|e|p-physical}` restricts every vCPU
+thread (BSP + APs) to a subset of the host's logical processors via
+`SetThreadSelectedCpuSets`. Default: `all` (no pinning).
+
+| Mode | What gets included |
+|------|--------------------|
+| `all` | No pinning. Windows scheduler is free to use any logical CPU. |
+| `p` | All P-core logical processors, **including SMT siblings**. |
+| `p-physical` | One logical per P-core (drops SMT siblings). Lowest contention; highest single-thread perf. |
+| `e` | All E-core logical processors. Refused on non-hybrid hosts. |
+
+On hybrid Intel CPUs (Alder/Raptor Lake) detection uses
+`GetSystemCpuSetInformation`'s `EfficiencyClass` (`0` = E, `≥1` = P).
+On non-hybrid hosts `p` resolves to every logical CPU, `e` is refused,
+and `p-physical` drops SMT siblings.
+
+```cmd
+.\build\bin\tinyvmm.exe --pvh-run --vcpus 8 --cpu-affinity p ^
+    --initrd initramfs.cpio vmlinux
+```
+
+**Why pin?** On hybrid CPUs Linux's `clocksource_watchdog` marks TSC
+unstable once vCPU threads bounce across P-core and E-core boundaries
+(the watchdog samples RDTSC on different host cores and sees skew that
+doesn't reflect real drift). The kernel then silently demotes
+`clock_gettime` to a slower clocksource for the rest of the boot.
+Pinning to one class fixes this.
 
 ### Time enlightenment
 
@@ -102,7 +185,7 @@ To capture only lifecycle + boot events:
 ```cmd
 tracelog -start tinyvmm -guid #0fb6c4d5-9b9b-4e1f-9d5a-7a6d8a9b3c4d ^
          -level 5 -matchanykw 0xC8 -f tinyvmm.etl
-.\build\bin\tinyvmm.exe --pvh-run --net --net-backend wintun-svc .\vmlinux
+.\build\bin\tinyvmm.exe --pvh-run --net --net-backend usernet .\vmlinux
 tracelog -stop tinyvmm
 tracerpt tinyvmm.etl -o tinyvmm.csv -of CSV
 ```
@@ -150,4 +233,85 @@ investigations:
 - Wintun ring fill level
 - XDP ring fill level when the XDP backend is active
 - Guest console bytes in/out
+
+## Diagnostics
+
+The binary exposes a few zero-VM diagnostic subcommands. Most need
+admin privileges (XDP and Wintun device handles are SDDL-protected).
+
+```text
+tinyvmm --xdp-probe              # probe every host NIC: native/generic/RSS caps
+tinyvmm --xdp-probe <IfIndex>    # verbose deep dive on one NIC
+tinyvmm --wintun-probe [secs]    # bring up a Wintun adapter and tail packets
+tinyvmm --wintun-svc-probe [secs] # same via the elevated wintunsvc helper
+```
+
+## Network backends
+
+`--pvh-run --net --net-backend <kind>` selects one of:
+
+| Backend     | Admin? | Status               | Notes                                          |
+|-------------|--------|----------------------|------------------------------------------------|
+| `loopback`  | no     | working              | Echoes TX back as RX. Diagnostic only.         |
+| `usernet`   | no     | **recommended**      | User-mode slirp: NAT through Winsock + iphlpapi. No driver/admin. |
+| `wintun`    | yes    | working              | Creates `tinyvmm` TUN adapter via wintun.dll.  |
+| `wintun-svc`| no¹    | working              | Same data plane, control via `WintunSvc`.      |
+| `xdp`       | yes    | working (xdpfnmp/xdpmp) | AF\_XDP zero-copy to a chosen NIC queue.   |
+
+¹ `wintun-svc` itself runs unprivileged; the one-time
+`Install-WintunSvc.ps1` and a manual outbound NAT rule
+(`New-NetNat -InternalIPInterfaceAddressPrefix 10.0.0.0/24`)
+still need admin.
+
+For day-to-day use, `--net-backend usernet` is the
+recommended path. It needs no kernel driver, no admin token,
+and no host network configuration — outbound UDP/TCP/ICMP
+flow through the host's normal Winsock + `IcmpSendEcho2`
+APIs, identical to any other user-mode application's
+traffic. Guest sees `10.0.0.2/24` with gateway `10.0.0.1`;
+the gateway is a synthetic L3 endpoint inside tinyvmm that
+terminates the guest's IP stack at L4 and proxies each
+flow as a per-tuple host socket. TCP options advertise
+`MSS=1460` plus `WScale=7` (when the guest negotiates it),
+clamp the guest's effective MSS to 1460 on inbound SYN, and
+honour wrap-safe RFC 793 §3.7 window updates.
+
+### Inbound TCP port-forward (`--portfwd`)
+
+`--portfwd` (repeatable; only valid with `--net-backend usernet`)
+opens a TCP listener on the host and proxies each accepted
+connection through to a chosen guest IP/port. Accepted forms:
+
+```text
+HOST_PORT:GUEST_PORT
+    -> listens on 127.0.0.1:HOST_PORT, forwards to 10.0.0.2:GUEST_PORT
+HOST_IP:HOST_PORT:GUEST_IP:GUEST_PORT
+    -> full control over both endpoints
+```
+
+Example: RDP into the guest from the host:
+
+```cmd
+tinyvmm.exe --pvh-run --net --net-backend usernet --portfwd 3389:3389 ^
+            --initrd initramfs.cpio vmlinux
+mstsc /v:127.0.0.1:3389
+```
+
+For each accepted host-side connection, tinyvmm originates a
+SYN toward the guest from the gateway (`10.0.0.1`) with a
+randomly chosen ephemeral source port and a separate
+sequence-number space. Listeners use `SO_EXCLUSIVEADDRUSE`
+on Windows so collisions surface as a bind error rather than
+silently sharing the port. Teardown (guest RST or handshake
+timeout) is abortive on the host socket
+(`SO_LINGER {1, 0}`) so host clients observe a real TCP RST
+instead of a half-open hang.
+
+`--xdp-probe` (no arg) walks `GetAdaptersAddresses`, opens each NIC
+via `XdpInterfaceOpen`, queries `XdpRssGetCapabilities` (RSS queue
+count + supported hash types), then attempts `XskBind` on queue 0
+with both `XSK_BIND_FLAG_NATIVE` and `XSK_BIND_FLAG_GENERIC` to
+report which attach modes the driver supports. Loopback adapters are
+skipped. The bind never calls `XskActivate`, so the data path stays
+inactive and the probe is safe on a NIC carrying live traffic.
 

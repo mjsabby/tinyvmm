@@ -1,6 +1,7 @@
 #include "net_loopback.h"
 
 #include "virtio_pci.h"
+#include "net_l2.h"
 
 #include "diag/etw.h"
 
@@ -11,9 +12,7 @@ namespace tinyvmm::virtio {
 
 namespace {
 
-// virtio_net_hdr_v1 (spec §5.1.6.2). With VERSION_1 and without MRG_RXBUF,
-// the header is still 12 bytes (num_buffers field is present but unused).
-constexpr std::size_t kVirtioNetHdrSize = 12;
+using ::tinyvmm::virtio::net_l2::kVirtioNetHdrSize;
 
 }  // namespace
 

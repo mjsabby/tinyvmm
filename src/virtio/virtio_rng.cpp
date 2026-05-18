@@ -29,6 +29,9 @@ Virtqueue* RngDevice::GetQueue(std::uint32_t idx) {
 void RngDevice::NotifyQueue(std::uint32_t idx) {
     if (idx != kRngRequestQueueIdx) return;
     if (!queue_.ready()) return;
+    // Serialize across concurrent vCPU writers; without doorbells, multiple
+    // vCPUs could race here.
+    std::lock_guard<std::mutex> lk(notify_mu_);
     DrainRequestQueue();
 }
 

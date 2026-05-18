@@ -128,10 +128,15 @@ log "$(ls /sys/bus/virtio/devices 2>/dev/kmsg)"
 ip link set lo up        2>/dev/kmsg
 if [ -e /sys/class/net/eth0 ]; then
     ip link set eth0 up                       2>/dev/kmsg
-    ip addr add 10.0.0.2/24 dev eth0          2>/dev/kmsg
+    # WinTun backend (host=10.0.0.1, M16, local only).
+    ip addr add 10.0.0.2/24  dev eth0         2>/dev/kmsg
+    # Default route via the gateway. Both wintun (host=10.0.0.1) and
+    # usernet (synthetic gateway=10.0.0.1) sit at .1, so this works
+    # for both backends.
     ip route add default via 10.0.0.1         2>/dev/kmsg
     log "eth0 up: $(ip -4 addr show eth0 | tr -d '\\n')"
-    # Best-effort DNS via the gateway (NAT'd, see `New-NetNat` on host).
+    # Best-effort DNS for any outbound traffic (NAT'd if the host has
+    # a New-NetNat rule, see README).
     echo 'nameserver 1.1.1.1' > /etc/resolv.conf
     echo 'nameserver 8.8.8.8' >> /etc/resolv.conf
 else
@@ -144,6 +149,58 @@ if [ -c /dev/hwrng ]; then
 fi
 
 log "=== init complete; dropping to shell on hvc0 ==="
+
+# --- optional automated network test mode -------------------------------
+# Enabled via kernel cmdline marker `tinyvmm.test=net`. Runs through ICMP,
+# UDP DNS, and HTTP/TCP fetches against well-known endpoints, then halts
+# so a watchdog-less host run can verify the usernet/wintun datapath
+# without an interactive shell.
+if grep -q 'tinyvmm.test=net' /proc/cmdline 2>/dev/null; then
+    log "--- NETTEST start ---"
+
+    log "+ ping -c 2 -W 2 10.0.0.1 (gateway)"
+    ping -c 2 -W 2 10.0.0.1 2>&1 | while IFS= read -r line; do log "  $line"; done
+
+    log "+ ping -c 2 -W 4 8.8.8.8 (real)"
+    ping -c 2 -W 4 8.8.8.8 2>&1 | while IFS= read -r line; do log "  $line"; done
+
+    log "+ nslookup example.com 1.1.1.1"
+    nslookup example.com 1.1.1.1 2>&1 | while IFS= read -r line; do log "  $line"; done
+
+    log "+ wget -q -O - -T 8 http://example.com/ | head -c 256"
+    wget -q -O - -T 8 http://example.com/ 2>&1 | head -c 256 | \
+        while IFS= read -r line; do log "  $line"; done
+    log "wget exit=$?"
+
+    log "--- NETTEST end ---"
+    sync
+    sleep 1
+    poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
+    # If those somehow returned, park.
+    exec cat
+fi
+
+# --- optional inbound port-forward test mode ----------------------------
+# Enabled via kernel cmdline marker `tinyvmm.test=portfwd`. Runs a tiny
+# busybox httpd on guest port 8080 serving a known-body sentinel, parks
+# for ~25s so the host side can curl http://<HOST_LISTEN>:<HOST_PORT>/
+# and verify the sentinel, then halts.
+if grep -q 'tinyvmm.test=portfwd' /proc/cmdline 2>/dev/null; then
+    log "--- PORTFWD-TEST start ---"
+    mkdir -p /tmp/www
+    cat > /tmp/www/index.html <<EOF
+tinyvmm portfwd ok
+EOF
+    log "+ httpd -p 8080 -h /tmp/www"
+    httpd -p 8080 -h /tmp/www
+    log "httpd started: $(pidof httpd)"
+    # Park for 25s; host driver curls during this window.
+    sleep 25
+    log "--- PORTFWD-TEST end ---"
+    sync
+    poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
+    exec cat
+fi
 
 # --- interactive shell on /dev/hvc0 -------------------------------------
 # Respawn-on-exit loop. PID 1 must never exit (kernel panics if it does).
@@ -181,7 +238,7 @@ BUSYBOX_APPLETS = [
     "setsid", "tty", "stty", "env", "printenv", "clear", "od", "nslookup",
     "wget", "telnet", "nc", "ftpget", "tar", "gzip", "gunzip", "date",
     "uptime", "id", "whoami", "tee", "xargs", "which", "basename", "dirname",
-    "sort", "uniq", "wc", "cut", "expr", "test", "[",
+    "sort", "uniq", "wc", "cut", "expr", "test", "[", "httpd",
 ]
 
 

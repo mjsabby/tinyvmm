@@ -1,3 +1,4 @@
+#include "boot/acpi_tables.h"
 #include "boot/pvh_loader.h"
 #include "common.h"
 #include "devices/i8259.h"
@@ -29,6 +30,8 @@
 #include "virtio/net_loopback.h"
 #include "virtio/net_xdp.h"
 #include "virtio/net_wintun.h"
+#include "virtio/net_usernet.h"
+#include "whp/cpu_affinity.h"
 #include "whp/cpuid.h"
 #include "whp/memory.h"
 #include "whp/msi.h"
@@ -41,6 +44,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -72,14 +76,20 @@ void PrintUsage() {
         "  tinyvmm --virtio-rng-test         Host-side virtio-rng + CNG entropy source\n"
         "  tinyvmm --virtio-console-test     Host-side virtio-console transmitq drain\n"
         "  tinyvmm --cpuid-test              Verify CPUID resolver policy (M18 time hygiene)\n"
-        "  tinyvmm --xdp-probe [<IfIndex>]   List host NICs / probe XDP attachment\n"
+        "  tinyvmm --xdp-probe [<IfIndex>]   Probe XDP capability on every host NIC\n"
+        "                                    (or deep-dive on one when IfIndex given)\n"
         "  tinyvmm --wintun-probe [<secs>]   Bring up WinTun adapter 10.0.0.1/24 and dump RX (admin)\n"
         "  tinyvmm --wintun-svc-probe [<secs>] Same as --wintun-probe but via WintunSvc (no admin)\n"
         "  tinyvmm --pvh-info <vmlinux>      Inspect a PVH-capable ELF\n"
-        "  tinyvmm --pvh-run [--net] [--net-backend loopback|xdp|wintun|wintun-svc] [--xdp-if <idx>]\n"
+        "  tinyvmm --pvh-run [--net] [--net-backend loopback|xdp|wintun|wintun-svc|usernet]\n"
+        "                   [--xdp-if <idx>] [--xdp-queue <q>] [--xdp-debug]\n"
         "                   [--initrd <path>] [--drive <path>[,readonly]]...\n"
         "                   [--watchdog-secs <N>] [--debug-boot]\n"
-        "                   [--expose-tsc-deadline]\n"
+        "                   [--expose-tsc-deadline] [--ram-mb <N>]\n"
+        "                   [--vcpus <N>] (1..32, default 1)\n"
+        "                   [--cpu-affinity all|p|e|p-physical]\n"
+        "                   [--portfwd HOST_PORT:GUEST_PORT |\n"
+        "                              HOST_IP:HOST_PORT:GUEST_IP:GUEST_PORT]...\n"
         "                   <vmlinux> [-- <kernel cmdline...>]\n"
         "                                    Load and run a PVH kernel\n"
         "                                    --drive may be repeated; drive N appears as /dev/vd<a+N>\n"
@@ -1837,7 +1847,7 @@ int RunPvhInfo(const char* path) {
 //   "none"     : guest sees the device but no packets ever flow
 //   "loopback" : TX echoes back as RX via LoopbackNetBackend (debug)
 //   "xdp"      : AF_XDP zero-copy to host NIC queue `xdp_if`/`xdp_queue`
-enum class NetBackendKind { None, Loopback, Xdp, Wintun, WintunSvc };
+enum class NetBackendKind { None, Loopback, Xdp, Wintun, WintunSvc, Usernet };
 // One disk attached via --drive. We open with FILE_FLAG_OVERLAPPED and bind
 // to a per-disk IOCP worker thread; see host::BlockFile.
 struct DriveSpec {
@@ -1850,10 +1860,17 @@ int RunPvhRun(const char* path, const std::string& cmdline,
               NetBackendKind net_backend,
               std::uint32_t xdp_if,
               std::uint32_t xdp_queue,
+              bool xdp_debug,
               const std::string& initrd_path,
               const std::vector<DriveSpec>& drives,
               int watchdog_secs,
-              bool hide_tsc_deadline) {
+              bool hide_tsc_deadline,
+              const std::vector<tinyvmm::virtio::UsernetBackend::PortForward>&
+                  port_forwards = {},
+              std::uint32_t ram_mb = 256,
+              std::uint32_t vcpu_count = 1,
+              tinyvmm::whp::AffinityMode affinity_mode =
+                  tinyvmm::whp::AffinityMode::All) {
     using namespace tinyvmm;
     using namespace tinyvmm::whp;
 
@@ -1866,9 +1883,12 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     std::puts("[pvh-run] WHP available");
     ReportHostCapabilities();
 
-    constexpr std::size_t kRamBytes = 256ull * 1024 * 1024;  // 256 MiB
+    const std::size_t kRamBytes = static_cast<std::size_t>(ram_mb) << 20;
 
-    Partition part(/*vcpu_count=*/1);
+    if (vcpu_count == 0) vcpu_count = 1;
+    if (vcpu_count > boot::acpi::kMaxVcpus) vcpu_count = boot::acpi::kMaxVcpus;
+
+    Partition part(vcpu_count);
     // Enable CPUID exits so we can layer tinyvmm policy (advertise
     // invariant_tsc, ARAT, TSC frequency, mask Hyper-V leaves) on top of
     // WHP's host-passthrough defaults. See `whp/cpuid.cpp`.
@@ -1905,6 +1925,7 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     boot::PvhLoadConfig cfg;
     cfg.cmdline   = cmdline;
     cfg.ram_bytes = ram.size();
+    cfg.vcpu_count = vcpu_count;
     if (!initrd_path.empty()) {
         cfg.initramfs = std::filesystem::path(initrd_path);
     }
@@ -1923,8 +1944,18 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     }
     std::printf("[pvh-run] cmdline: \"%s\"\n", cmdline.c_str());
 
-    Vcpu vp(part, 0);
+    // Per-vCPU containers. Deques give stable references; we hand
+    // `vcpus[i]` to `loops[i]`, and `loops[0]` to the BSP run path.
+    std::deque<Vcpu> vcpus;
+    for (std::uint32_t i = 0; i < vcpu_count; ++i) {
+        vcpus.emplace_back(part, i);
+    }
+    Vcpu& vp = vcpus.front();  // BSP alias for legacy dump code below.
     boot::SetupPvhEntry(vp, load);
+    // APs (index >= 1) start in the architecturally-defined wait-for-SIPI
+    // state. Linux's secondary CPU bring-up will deliver INIT+SIPI through
+    // the LAPIC; WHP services those in-hypervisor. We do NOT need to
+    // explicitly initialise AP registers here.
 
     devices::IoBus io_bus;
     devices::MmioBus mmio_bus;
@@ -2134,6 +2165,7 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     // The backend (chosen via --net-backend) is started lazily from
     // PciTransport's OnBarMapped callback -- that's the first moment we
     // know the guest has mapped the MMIO BAR and can therefore install
+    // The virtio-net device is owned here, but we need to wire up the
     // per-queue doorbells / spin up worker threads.
     std::unique_ptr<virtio::NetDevice> net;
     if (with_net) {
@@ -2163,6 +2195,7 @@ int RunPvhRun(const char* path, const std::string& cmdline,
             virtio::XdpNetBackend::Options xo;
             xo.if_index = xdp_if;
             xo.queue_id = xdp_queue;
+            xo.debug    = xdp_debug;
             net->SetBackend(std::make_unique<virtio::XdpNetBackend>(
                 *net, ram, xo));
             backend_name = "xdp";
@@ -2182,6 +2215,14 @@ int RunPvhRun(const char* path, const std::string& cmdline,
             net->SetBackend(std::make_unique<virtio::WintunNetBackend>(
                 *net, wo));
             backend_name = "wintun-svc";
+            break;
+        }
+        case NetBackendKind::Usernet: {
+            virtio::UsernetBackend::Options uo;
+            uo.port_forwards = port_forwards;
+            net->SetBackend(std::make_unique<virtio::UsernetBackend>(
+                *net, uo));
+            backend_name = "usernet";
             break;
         }
         }
@@ -2205,7 +2246,18 @@ int RunPvhRun(const char* path, const std::string& cmdline,
                     bdf.bus, bdf.device, bdf.function, backend_name);
     }
 
-    RunLoop loop(vp, io_bus, mmio_bus);
+    // Per-vCPU run loops. Each loop owns its emulator handle and counters.
+    // For N=1 the BSP runs on this thread; for N>1 we spawn N-1 AP threads
+    // each driving its own loop (BSP still runs here).
+    std::deque<RunLoop> loops;
+    for (std::uint32_t i = 0; i < vcpu_count; ++i) {
+        loops.emplace_back(vcpus[i], io_bus, mmio_bus);
+    }
+    RunLoop& loop = loops.front();
+
+    auto stop_all_loops = [&loops]() {
+        for (auto& l : loops) l.RequestStop();
+    };
 
     // ---- stdin -> virtio-console rxq forwarder ---------------------------
     // When stdin is a real console (TTY), forward keystrokes to the guest's
@@ -2251,7 +2303,7 @@ int RunPvhRun(const char* path, const std::string& cmdline,
         std::fputs("[pvh-run] interactive console -- press Ctrl+A then X "
                    "to quit, Ctrl+A H for help\n", stderr);
         stdin_thread = std::thread(
-            [hstdin, vcon_ptr, &stdin_stop, &loop]() {
+            [hstdin, vcon_ptr, &stdin_stop, &stop_all_loops]() {
             INPUT_RECORD recs[64];
             bool escape_armed = false;
             while (!stdin_stop.load(std::memory_order_relaxed)) {
@@ -2357,10 +2409,10 @@ int RunPvhRun(const char* path, const std::string& cmdline,
                     vcon_ptr->WriteHostInput(out.data(), out.size());
                 }
                 if (quit_requested) {
-                    // Ask the run loop to break out of WHvRunVirtualProcessor
+                    // Ask all run loops to break out of WHvRunVirtualProcessor
                     // and return StopReason::Cancelled. main() will then
                     // join us, restore the console mode, and tear down.
-                    loop.RequestStop();
+                    stop_all_loops();
                     return;
                 }
             }
@@ -2382,14 +2434,23 @@ int RunPvhRun(const char* path, const std::string& cmdline,
             std::uint64_t prev_io = 0, prev_mmio = 0, prev_halt = 0;
             std::uint64_t prev_cpuid = 0, prev_msi = 0, prev_uart = 0;
             int s = 0;
+            auto sum = [&loops](auto getter) -> std::uint64_t {
+                std::uint64_t v = 0;
+                for (auto& l : loops) v += getter(l);
+                return v;
+            };
             while (!watchdog_done.load()) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
                 if (watchdog_done.load()) return;
                 ++s;
-                const std::uint64_t cur_io    = loop.io_exits();
-                const std::uint64_t cur_mmio  = loop.mmio_exits();
-                const std::uint64_t cur_halt  = loop.halt_exits();
-                const std::uint64_t cur_cpuid = loop.cpuid_exits();
+                const std::uint64_t cur_io    =
+                    sum([](RunLoop& l) { return l.io_exits();    });
+                const std::uint64_t cur_mmio  =
+                    sum([](RunLoop& l) { return l.mmio_exits();  });
+                const std::uint64_t cur_halt  =
+                    sum([](RunLoop& l) { return l.halt_exits();  });
+                const std::uint64_t cur_cpuid =
+                    sum([](RunLoop& l) { return l.cpuid_exits(); });
                 const std::uint64_t cur_msi   = whp::MsiInjectCount();
                 const std::uint64_t cur_uart  = com1.tx_bytes();
                 std::fprintf(stderr,
@@ -2419,7 +2480,7 @@ int RunPvhRun(const char* path, const std::string& cmdline,
                     std::fprintf(stderr,
                         "[pvh-run] watchdog: %ds elapsed, requesting stop\n",
                         watchdog_secs);
-                    loop.RequestStop();
+                    stop_all_loops();
                     return;
                 }
             }
@@ -2430,8 +2491,72 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     TINYVMM_ETW_INFO("GuestEntry",
         TraceLoggingString(path, "kernel"),
         TraceLoggingBool(with_net, "with_net"));
-    StopReason stop = loop.Run();
+
+    // CPU-affinity policy: resolve the requested mode against the host's
+    // logical-processor topology, log what we see, and pin every vCPU
+    // thread (BSP + APs) to the resulting CPU-set IDs before its run loop
+    // starts. The pin uses `SetThreadSelectedCpuSets`, which restricts the
+    // Windows scheduler to that set but still allows scheduling within it.
+    //
+    // Motivation: on hybrid Intel CPUs (e.g. i9-14900K), Linux's
+    // `clocksource_watchdog` marks TSC unstable once vCPU threads bounce
+    // across P-core and E-core boundaries, silently demoting
+    // `clock_gettime` for the rest of the boot. Pinning to one class fixes
+    // that.
+    const auto cpu_set_ids = whp::ResolveCpuSetIds(affinity_mode);
+    {
+        const auto& top = whp::GetTopology();
+        if (top.hybrid) {
+            std::printf("[pvh-run] host topology: hybrid, %u logical "
+                        "(P=%u/%uHT, E=%u); cpu-affinity=%s "
+                        "(pinning %zu logicals)\n",
+                        top.total_logical, top.p_physical, top.p_logical,
+                        top.e_logical,
+                        whp::AffinityModeName(affinity_mode),
+                        cpu_set_ids.size());
+        } else {
+            std::printf("[pvh-run] host topology: non-hybrid, %u logical; "
+                        "cpu-affinity=%s (pinning %zu logicals)\n",
+                        top.total_logical,
+                        whp::AffinityModeName(affinity_mode),
+                        cpu_set_ids.size());
+        }
+    }
+
+    // Spawn N-1 AP threads if SMP requested. BSP runs loops[0].Run() on
+    // this thread; APs sit in WAIT_FOR_SIPI until Linux delivers INIT+SIPI
+    // through the LAPIC (WHP services those in-hypervisor).
+    std::vector<std::thread> ap_threads;
+    std::vector<std::exception_ptr> ap_excs(vcpu_count, nullptr);
+    ap_threads.reserve(vcpu_count > 0 ? vcpu_count - 1 : 0);
+    for (std::uint32_t i = 1; i < vcpu_count; ++i) {
+        ap_threads.emplace_back([i, &loops, &ap_excs, &stop_all_loops,
+                                 &cpu_set_ids] {
+            (void)whp::PinCurrentThread(cpu_set_ids);
+            try {
+                (void)loops[i].Run();
+            } catch (...) {
+                ap_excs[i] = std::current_exception();
+            }
+            // Whichever vCPU exits first signals everyone else.
+            stop_all_loops();
+        });
+    }
+
+    // Pin the BSP (this thread) just before running its loop. We
+    // deliberately pin AFTER all partition / device / memory setup so
+    // those one-time host-side bring-up steps run on the whole machine.
+    (void)whp::PinCurrentThread(cpu_set_ids);
+
+    StopReason stop = StopReason::Cancelled;
+    try {
+        stop = loop.Run();
+    } catch (...) {
+        ap_excs[0] = std::current_exception();
+    }
     btimer.Mark("guest exited");
+    // BSP returned; ask APs to wind down too.
+    stop_all_loops();
     watchdog_done.store(true);
     stdin_stop.store(true);
     if (watchdog.joinable()) {
@@ -2439,6 +2564,9 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     }
     if (stdin_thread.joinable()) {
         stdin_thread.join();
+    }
+    for (auto& t : ap_threads) {
+        if (t.joinable()) t.join();
     }
     if (restore_console_mode) {
         ::SetConsoleMode(hstdin, original_console_mode);
@@ -2648,8 +2776,28 @@ int RunPvhRun(const char* path, const std::string& cmdline,
         ExitReasonName(loop.last_exit().ExitReason),
         static_cast<unsigned int>(loop.last_exit().ExitReason),
         static_cast<unsigned long long>(loop.last_exit().VpContext.Rip));
-    loop.DumpCounters(stdout);
-    loop.EmitCountersEtw();
+    for (std::uint32_t i = 0; i < loops.size(); ++i) {
+        if (loops.size() > 1) {
+            std::printf("[pvh-run] vCPU %u counters:\n", i);
+        }
+        loops[i].DumpCounters(stdout);
+        loops[i].EmitCountersEtw();
+    }
+
+    // Surface any AP exception that didn't propagate naturally.
+    for (std::uint32_t i = 1; i < ap_excs.size(); ++i) {
+        if (ap_excs[i]) {
+            try {
+                std::rethrow_exception(ap_excs[i]);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr,
+                             "[pvh-run] vCPU %u threw: %s\n", i, e.what());
+            } catch (...) {
+                std::fprintf(stderr,
+                             "[pvh-run] vCPU %u threw unknown exception\n", i);
+            }
+        }
+    }
 
     btimer.Mark("teardown done");
     TINYVMM_ETW_INFO("VmStop",
@@ -5197,6 +5345,134 @@ int RunCpuidTest() {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// --cpu-affinity-test: validate parser, topology discovery, and pin/unpin.
+// Does not assume anything about the host beyond "GetSystemCpuSetInformation
+// returns non-empty" -- safe to run in CI on any modern Windows.
+// ---------------------------------------------------------------------------
+int RunCpuAffinityTest() {
+    using tinyvmm::whp::AffinityMode;
+    using tinyvmm::whp::ParseAffinityMode;
+    using tinyvmm::whp::AffinityModeName;
+    using tinyvmm::whp::ResolveCpuSetIds;
+    using tinyvmm::whp::GetTopology;
+    using tinyvmm::whp::PinCurrentThread;
+
+    auto fail = [](const char* m) {
+        std::fprintf(stderr, "[cpu-affinity-test] FAIL: %s\n", m);
+        return 1;
+    };
+
+    // Parser: accepted tokens.
+    {
+        struct { const char* in; AffinityMode want; } cases[] = {
+            {"all",        AffinityMode::All},
+            {"ALL",        AffinityMode::All},
+            {"p",          AffinityMode::PCore},
+            {"P",          AffinityMode::PCore},
+            {"P-Core",     AffinityMode::PCore},
+            {"e",          AffinityMode::ECore},
+            {"e-core",     AffinityMode::ECore},
+            {"p-physical", AffinityMode::PCorePhysical},
+            {"P-Phys",     AffinityMode::PCorePhysical},
+        };
+        for (const auto& c : cases) {
+            AffinityMode got{};
+            if (!ParseAffinityMode(c.in, got))
+                return fail("parser rejected a valid token");
+            if (got != c.want) return fail("parser returned wrong mode");
+        }
+    }
+    // Parser: rejected tokens.
+    {
+        const char* bad[] = {"", "x", "pe", "pcore-physical",
+                             "p_core", "all-cores"};
+        for (const char* b : bad) {
+            AffinityMode got{};
+            if (ParseAffinityMode(b, got))
+                return fail("parser accepted an invalid token");
+        }
+    }
+    // Name round-trip.
+    {
+        AffinityMode roundtrip[] = {
+            AffinityMode::All, AffinityMode::PCore,
+            AffinityMode::PCorePhysical, AffinityMode::ECore};
+        for (auto m : roundtrip) {
+            AffinityMode got{};
+            if (!ParseAffinityMode(AffinityModeName(m), got))
+                return fail("AffinityModeName produced unparseable string");
+            if (got != m) return fail("name round-trip mismatch");
+        }
+    }
+    // Topology: must report at least one logical processor.
+    const auto& top = GetTopology();
+    if (top.total_logical == 0)
+        return fail("GetTopology reported zero logicals");
+    if (top.p_logical + top.e_logical != top.total_logical)
+        return fail("p+e logicals != total");
+    if (top.p_physical > top.p_logical)
+        return fail("more physical P-cores than logical P-cores");
+    if (top.hybrid && top.e_logical == 0)
+        return fail("hybrid host but zero E-cores");
+
+    // Resolve: All -> empty, PCore -> non-empty.
+    if (!ResolveCpuSetIds(AffinityMode::All).empty())
+        return fail("AffinityMode::All must resolve to empty set");
+    auto p_ids = ResolveCpuSetIds(AffinityMode::PCore);
+    if (p_ids.empty())
+        return fail("PCore mode resolved to empty set");
+    if (p_ids.size() != top.p_logical)
+        return fail("PCore set size != p_logical");
+
+    auto p_phys = ResolveCpuSetIds(AffinityMode::PCorePhysical);
+    if (p_phys.empty())
+        return fail("PCorePhysical resolved to empty set");
+    if (p_phys.size() != top.p_physical)
+        return fail("PCorePhysical set size != p_physical");
+
+    if (top.hybrid) {
+        auto e_ids = ResolveCpuSetIds(AffinityMode::ECore);
+        if (e_ids.empty())
+            return fail("ECore mode resolved to empty set on hybrid host");
+        if (e_ids.size() != top.e_logical)
+            return fail("ECore set size != e_logical");
+        // P and E sets must be disjoint.
+        for (ULONG p : p_ids) {
+            for (ULONG e : e_ids) {
+                if (p == e) return fail("P and E sets overlap");
+            }
+        }
+    } else {
+        if (!ResolveCpuSetIds(AffinityMode::ECore).empty())
+            return fail("ECore mode must be empty on non-hybrid host");
+    }
+
+    // Pin: empty set is a no-op success.
+    if (!PinCurrentThread({})) return fail("Pin({}) returned false");
+
+    // Pin to the PCore set, then restore (pin to empty unpins, but to be
+    // safe we pin back to a single-element set covering every logical).
+    if (!PinCurrentThread(p_ids))
+        return fail("PinCurrentThread(p_ids) failed");
+    std::vector<ULONG> all_ids;
+    all_ids.reserve(top.total_logical);
+    for (ULONG id : p_ids) all_ids.push_back(id);
+    if (top.hybrid) {
+        auto e_ids = ResolveCpuSetIds(AffinityMode::ECore);
+        for (ULONG id : e_ids) all_ids.push_back(id);
+    }
+    if (!PinCurrentThread(all_ids))
+        return fail("PinCurrentThread(all_ids) restoration failed");
+
+    std::printf(
+        "[cpu-affinity-test] PASS (total=%u, hybrid=%d, P=%u/%uHT, E=%u, "
+        "P-physical=%zu)\n",
+        top.total_logical, top.hybrid ? 1 : 0,
+        top.p_physical, top.p_logical, top.e_logical, p_phys.size());
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -5258,6 +5534,9 @@ int main(int argc, char** argv) {
         if (cmd == "--cpuid-test") {
             return RunCpuidTest();
         }
+        if (cmd == "--cpu-affinity-test") {
+            return RunCpuAffinityTest();
+        }
         if (cmd == "--xdp-probe") {
             int if_index = 0;
             if (argc >= 3) {
@@ -5298,9 +5577,26 @@ int main(int argc, char** argv) {
             NetBackendKind net_backend = NetBackendKind::Loopback;
             std::uint32_t xdp_if = 0;
             std::uint32_t xdp_queue = 0;
+            bool xdp_debug = false;
             std::string initrd_path;
             std::vector<DriveSpec> drives;
             int watchdog_secs = 0;  // 0 = disabled (default; previously 20)
+            // Default 256 MiB. Min 128 MiB (Linux fails to boot below ~96 MiB
+            // once initramfs is loaded; 128 leaves headroom). Max 3584 MiB:
+            // PCI MMIO BAR window starts at 0xE0000000, so RAM above that
+            // address would collide with virtio device BARs. >4 GiB support
+            // requires a low/high RAM split around the MMIO hole; deferred.
+            std::uint32_t ram_mb = 256;
+            // Default 1 vCPU (BSP only). Range [1, kMaxVcpus=32]. For N>1 we
+            // spawn N-1 std::threads each running its own RunLoop; the BSP
+            // continues to run on the main thread. APs sit in WAIT_FOR_SIPI
+            // until Linux's secondary-CPU bring-up code delivers INIT+SIPI.
+            std::uint32_t vcpu_count = 1;
+            // CPU affinity policy for vCPU threads. Default: no pinning.
+            tinyvmm::whp::AffinityMode affinity_mode =
+                tinyvmm::whp::AffinityMode::All;
+            std::vector<tinyvmm::virtio::UsernetBackend::PortForward>
+                port_forwards;
             // Hide TSC-deadline by default: WHP's LAPIC emulation rejects
             // WRMSR 0x6E0 even when the bit is set in CpuidResultList, so
             // advertising it just causes Linux to log a 30-line `unchecked
@@ -5329,9 +5625,10 @@ int main(int argc, char** argv) {
                     else if (kind == "xdp")      net_backend = NetBackendKind::Xdp;
                     else if (kind == "wintun")   net_backend = NetBackendKind::Wintun;
                     else if (kind == "wintun-svc") net_backend = NetBackendKind::WintunSvc;
+                    else if (kind == "usernet")  net_backend = NetBackendKind::Usernet;
                     else {
                         std::fprintf(stderr,
-                            "--pvh-run: unknown --net-backend '%.*s' (want none|loopback|xdp|wintun|wintun-svc)\n",
+                            "--pvh-run: unknown --net-backend '%.*s' (want none|loopback|xdp|wintun|wintun-svc|usernet)\n",
                             tinyvmm::util::checked_int_cast<int>(kind.size()),
                             kind.data());
                         return 1;
@@ -5354,6 +5651,8 @@ int main(int argc, char** argv) {
                     ++vmlinux_arg;
                     xdp_queue = static_cast<std::uint32_t>(
                         std::strtoul(argv[vmlinux_arg], nullptr, 0));
+                } else if (f == "--xdp-debug") {
+                    xdp_debug = true;
                 } else if (f == "--initrd") {
                     if (vmlinux_arg + 1 >= argc) {
                         std::fputs("--pvh-run: --initrd wants a path\n",
@@ -5422,6 +5721,110 @@ int main(int argc, char** argv) {
                     ++vmlinux_arg;
                     watchdog_secs = std::atoi(argv[vmlinux_arg]);
                     if (watchdog_secs < 0) watchdog_secs = 0;
+                } else if (f == "--ram-mb") {
+                    if (vmlinux_arg + 1 >= argc) {
+                        std::fputs("--pvh-run: --ram-mb wants a positive "
+                                   "integer in MiB (128-3584)\n", stderr);
+                        return 1;
+                    }
+                    ++vmlinux_arg;
+                    std::string_view rs(argv[vmlinux_arg]);
+                    // Strict decimal parse (no atoi: it silently truncates
+                    // garbage and returns 0 which we'd then reject as below
+                    // min, masking the real "you typed something wrong" cause).
+                    unsigned long long v = 0;
+                    if (rs.empty()) {
+                        std::fputs("--pvh-run: --ram-mb: empty argument\n",
+                                   stderr);
+                        return 1;
+                    }
+                    for (char c : rs) {
+                        if (c < '0' || c > '9' || v > 0xFFFFFFull) {
+                            std::fprintf(stderr,
+                                "--pvh-run: --ram-mb: invalid '%.*s' (want "
+                                "positive integer in MiB)\n",
+                                tinyvmm::util::checked_int_cast<int>(rs.size()),
+                                rs.data());
+                            return 1;
+                        }
+                        v = v * 10 + static_cast<unsigned long long>(c - '0');
+                    }
+                    // PCI MMIO window opens at 0xE0000000 = 3584 MiB. RAM
+                    // up to (but not including) that boundary is safe.
+                    constexpr unsigned long long kMinMb = 128;
+                    constexpr unsigned long long kMaxMb = 3584;
+                    if (v < kMinMb || v > kMaxMb) {
+                        std::fprintf(stderr,
+                            "--pvh-run: --ram-mb: %llu out of range "
+                            "[%llu..%llu] MiB (>3584 needs a low/high RAM "
+                            "split around the PCI MMIO hole; not yet "
+                            "supported)\n",
+                            v, kMinMb, kMaxMb);
+                        return 1;
+                    }
+                    ram_mb = static_cast<std::uint32_t>(v);
+                } else if (f == "--vcpus") {
+                    if (vmlinux_arg + 1 >= argc) {
+                        std::fputs("--pvh-run: --vcpus wants a positive "
+                                   "integer (1-16)\n", stderr);
+                        return 1;
+                    }
+                    ++vmlinux_arg;
+                    std::string_view vs(argv[vmlinux_arg]);
+                    unsigned long long v = 0;
+                    if (vs.empty()) {
+                        std::fputs("--pvh-run: --vcpus: empty argument\n",
+                                   stderr);
+                        return 1;
+                    }
+                    for (char c : vs) {
+                        if (c < '0' || c > '9' || v > 0xFFFFu) {
+                            std::fprintf(stderr,
+                                "--pvh-run: --vcpus: invalid '%.*s' (want "
+                                "positive integer 1..32)\n",
+                                tinyvmm::util::checked_int_cast<int>(vs.size()),
+                                vs.data());
+                            return 1;
+                        }
+                        v = v * 10 + static_cast<unsigned long long>(c - '0');
+                    }
+                    constexpr unsigned long long kMinVcpus = 1;
+                    const unsigned long long kMaxVcpusU =
+                        tinyvmm::boot::acpi::kMaxVcpus;
+                    if (v < kMinVcpus || v > kMaxVcpusU) {
+                        std::fprintf(stderr,
+                            "--pvh-run: --vcpus: %llu out of range "
+                            "[%llu..%llu]\n",
+                            v, kMinVcpus, kMaxVcpusU);
+                        return 1;
+                    }
+                    vcpu_count = static_cast<std::uint32_t>(v);
+                } else if (f == "--cpu-affinity") {
+                    if (vmlinux_arg + 1 >= argc) {
+                        std::fputs("--pvh-run: --cpu-affinity wants one of "
+                                   "all|p|e|p-physical\n", stderr);
+                        return 1;
+                    }
+                    ++vmlinux_arg;
+                    std::string_view as(argv[vmlinux_arg]);
+                    if (!tinyvmm::whp::ParseAffinityMode(as,
+                                                        affinity_mode)) {
+                        std::fprintf(stderr,
+                            "--pvh-run: --cpu-affinity: invalid '%.*s' "
+                            "(want all|p|e|p-physical)\n",
+                            tinyvmm::util::checked_int_cast<int>(as.size()),
+                            as.data());
+                        return 1;
+                    }
+                    // E-core mode requires a hybrid host; refuse early
+                    // rather than silently producing an empty pin set.
+                    if (affinity_mode == tinyvmm::whp::AffinityMode::ECore
+                        && !tinyvmm::whp::GetTopology().hybrid) {
+                        std::fputs(
+                            "--pvh-run: --cpu-affinity e: host is not "
+                            "hybrid (no E-cores detected)\n", stderr);
+                        return 1;
+                    }
                 } else if (f == "--debug-boot") {
                     // Re-enables earlyprintk=ttyS0,115200 in the default
                     // cmdline. Useful for diagnosing kernels that fail
@@ -5441,6 +5844,94 @@ int main(int argc, char** argv) {
                     // only for probing whether WHP gained TSC-deadline
                     // support in a newer Windows build.
                     hide_tsc_deadline = false;
+                } else if (f == "--portfwd") {
+                    // Forms accepted (all ports are decimal, IPs dotted-quad):
+                    //   HOST_PORT:GUEST_PORT
+                    //     -> 127.0.0.1:HOST_PORT  ->  10.0.0.2:GUEST_PORT
+                    //   HOST_IP:HOST_PORT:GUEST_IP:GUEST_PORT
+                    // Repeatable. Only used by --net-backend usernet.
+                    if (vmlinux_arg + 1 >= argc) {
+                        std::fputs("--pvh-run: --portfwd wants HOST_PORT:GUEST_PORT "
+                                   "or HOST_IP:HOST_PORT:GUEST_IP:GUEST_PORT\n",
+                                   stderr);
+                        return 1;
+                    }
+                    ++vmlinux_arg;
+                    std::string_view arg(argv[vmlinux_arg]);
+                    std::vector<std::string_view> parts;
+                    {
+                        std::size_t start = 0;
+                        for (std::size_t i = 0; i <= arg.size(); ++i) {
+                            if (i == arg.size() || arg[i] == ':') {
+                                parts.push_back(arg.substr(start, i - start));
+                                start = i + 1;
+                            }
+                        }
+                    }
+                    tinyvmm::virtio::UsernetBackend::PortForward pf{};
+                    auto parse_port = [](std::string_view s,
+                                          std::uint16_t& out) -> bool {
+                        if (s.empty() || s.size() > 5) return false;
+                        unsigned long v = 0;
+                        for (char c : s) {
+                            if (c < '0' || c > '9') return false;
+                            v = v * 10 + static_cast<unsigned long>(c - '0');
+                            if (v > 65535) return false;
+                        }
+                        if (v == 0) return false;
+                        out = static_cast<std::uint16_t>(v);
+                        return true;
+                    };
+                    auto parse_ip = [](std::string_view s,
+                                        std::uint32_t& out_be) -> bool {
+                        // InetPtonA needs NUL-terminated input.
+                        std::string tmp(s);
+                        IN_ADDR a{};
+                        if (::InetPtonA(AF_INET, tmp.c_str(), &a) != 1) {
+                            return false;
+                        }
+                        out_be = a.s_addr;
+                        return true;
+                    };
+                    if (parts.size() == 2) {
+                        std::uint16_t hp = 0, gp = 0;
+                        if (!parse_port(parts[0], hp) ||
+                            !parse_port(parts[1], gp)) {
+                            std::fprintf(stderr,
+                                "--pvh-run: --portfwd: invalid HOST_PORT:GUEST_PORT '%s'\n",
+                                argv[vmlinux_arg]);
+                            return 1;
+                        }
+                        IN_ADDR loop{};
+                        ::InetPtonA(AF_INET, "127.0.0.1", &loop);
+                        IN_ADDR guest{};
+                        ::InetPtonA(AF_INET, "10.0.0.2", &guest);
+                        pf.host_addr_be = loop.s_addr;
+                        pf.host_port    = hp;
+                        pf.guest_ip_be  = guest.s_addr;
+                        pf.guest_port   = gp;
+                    } else if (parts.size() == 4) {
+                        std::uint16_t hp = 0, gp = 0;
+                        if (!parse_ip(parts[0], pf.host_addr_be) ||
+                            !parse_port(parts[1], hp) ||
+                            !parse_ip(parts[2], pf.guest_ip_be) ||
+                            !parse_port(parts[3], gp)) {
+                            std::fprintf(stderr,
+                                "--pvh-run: --portfwd: invalid "
+                                "HOST_IP:HOST_PORT:GUEST_IP:GUEST_PORT '%s'\n",
+                                argv[vmlinux_arg]);
+                            return 1;
+                        }
+                        pf.host_port  = hp;
+                        pf.guest_port = gp;
+                    } else {
+                        std::fprintf(stderr,
+                            "--pvh-run: --portfwd: expected 2 or 4 colon-"
+                            "separated fields, got %zu in '%s'\n",
+                            parts.size(), argv[vmlinux_arg]);
+                        return 1;
+                    }
+                    port_forwards.push_back(pf);
                 } else {
                     std::fprintf(stderr,
                                  "--pvh-run: unknown flag '%.*s'\n",
@@ -5467,6 +5958,17 @@ int main(int argc, char** argv) {
             if (net_backend == NetBackendKind::WintunSvc && !with_net) {
                 std::fputs("--pvh-run: --net-backend wintun-svc requires --net\n",
                            stderr);
+                return 1;
+            }
+            if (net_backend == NetBackendKind::Usernet && !with_net) {
+                std::fputs("--pvh-run: --net-backend usernet requires --net\n",
+                           stderr);
+                return 1;
+            }
+            if (!port_forwards.empty() &&
+                net_backend != NetBackendKind::Usernet) {
+                std::fputs("--pvh-run: --portfwd only supported with "
+                           "--net-backend usernet\n", stderr);
                 return 1;
             }
             std::string cmdline;
@@ -5500,8 +6002,10 @@ int main(int argc, char** argv) {
                 }
             }
             return RunPvhRun(argv[vmlinux_arg], cmdline, with_net,
-                             net_backend, xdp_if, xdp_queue, initrd_path,
-                             drives, watchdog_secs, hide_tsc_deadline);
+                             net_backend, xdp_if, xdp_queue, xdp_debug,
+                             initrd_path, drives, watchdog_secs,
+                             hide_tsc_deadline, port_forwards, ram_mb,
+                             vcpu_count, affinity_mode);
         }
         if (cmd == "--help" || cmd == "-h") {
             PrintUsage();

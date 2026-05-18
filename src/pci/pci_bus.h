@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 namespace tinyvmm::pci {
@@ -79,6 +80,13 @@ private:
     std::vector<Slot>   devices_;
     std::uint64_t       cfg_reads_  = 0;
     std::uint64_t       cfg_writes_ = 0;
+
+    // Serializes 0xCF8 (CONFIG_ADDRESS) writes against 0xCFC (CONFIG_DATA)
+    // accesses on multi-vCPU partitions. Linux already takes its own pci
+    // lock on the guest side so contention is essentially zero in practice;
+    // this guards against torn reads/writes of config_address_ and against
+    // concurrent ConfigRead/ConfigWrite delivery if the guest ever races us.
+    std::mutex          mu_;
 
     // Bump-pointer allocators for pre-assigned BAR layout.
     std::uint64_t       mmio_next_ = kMmioWindowBase;

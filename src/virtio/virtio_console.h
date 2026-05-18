@@ -115,6 +115,13 @@ private:
     std::atomic<std::uint64_t> tx_bytes_{0};
     std::atomic<std::uint64_t> tx_chains_{0};
 
+    // Serialises DrainTransmitQueue across N vCPU threads. No doorbell is
+    // installed for the console TX queue, so concurrent writes to its
+    // notify register run on whichever vCPU performed the MMIO. Also
+    // serialises the host-side ByteObserver callback + capture_/captured_
+    // mutations.
+    std::mutex tx_mu_;
+
     // Host -> guest input buffer. Serialised by `rx_mu_` (acquired by both
     // the stdin reader thread and the VCPU thread when it kicks rxq).
     std::mutex             rx_mu_;

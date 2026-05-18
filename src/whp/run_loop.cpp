@@ -94,13 +94,18 @@ StopReason RunLoop::Run() {
                 halt_exits_.fetch_add(1, std::memory_order_relaxed);
                 const bool if_set =
                     (last_exit_.VpContext.Rflags & kRflagsIf) != 0;
+                if (if_set) {
+                    // Normal idle: guest executed sti+hlt waiting for an IRQ.
+                    // WHP's APIC emulation usually services pending interrupts
+                    // in-hypervisor without exiting to user-mode; if it does
+                    // bubble up, just re-enter the run loop and let WHP block
+                    // on a pending interrupt.
+                    break;
+                }
+                // IF=0: this is a real terminal halt (panic / shutdown).
                 std::printf(
-                    "[loop] HLT at RIP=0x%llx (IF=%d) -- treating as terminal "
-                    "for now\n",
-                    static_cast<unsigned long long>(last_exit_.VpContext.Rip),
-                    if_set ? 1 : 0);
-                // M5 will re-enter the loop here once we can wait for IRQs;
-                // for now any HLT ends the run.
+                    "[loop] HLT at RIP=0x%llx (IF=0) -- treating as terminal\n",
+                    static_cast<unsigned long long>(last_exit_.VpContext.Rip));
                 return StopReason::GuestHalted;
             }
 

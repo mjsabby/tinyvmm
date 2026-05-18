@@ -176,29 +176,47 @@ HANDLE PciTransport::InstallQueueDoorbell(whp::Partition& partition,
 }
 
 void PciTransport::RaiseQueueInterrupt(std::uint32_t qidx) {
-    isr_status_ |= kIsrQueueBit;
-    if (qidx < queues_.size()) {
-        const std::uint16_t v = queues_[qidx].msix_vector;
-        if (v != 0xFFFF) msix_.Trigger(v);
+    isr_status_.fetch_or(kIsrQueueBit, std::memory_order_relaxed);
+    std::uint16_t v = 0xFFFF;
+    {
+        std::lock_guard<std::mutex> lk(cfg_mu_);
+        if (qidx < queues_.size()) v = queues_[qidx].msix_vector;
     }
+    if (v != 0xFFFF) msix_.Trigger(v);
 }
 
 void PciTransport::RaiseConfigChangeInterrupt() {
-    isr_status_ |= kIsrConfigBit;
-    ++config_generation_;
-    if (msix_config_ != 0xFFFF) msix_.Trigger(msix_config_);
+    isr_status_.fetch_or(kIsrConfigBit, std::memory_order_relaxed);
+    std::uint16_t cfg_vec = 0xFFFF;
+    {
+        std::lock_guard<std::mutex> lk(cfg_mu_);
+        ++config_generation_;
+        cfg_vec = msix_config_;
+    }
+    if (cfg_vec != 0xFFFF) msix_.Trigger(cfg_vec);
 }
 
 // ---- COMMON_CFG handler. Driver accesses are well-formed: aligned reads /
 // writes of natural-width fields (1, 2, 4, 8 bytes). Sub-dword reads/writes
 // route through Read/Write of an aligned 32-bit chunk + shift/mask, mirroring
 // the MMIO transport.
+//
+// Thread-safety: the common-cfg state machine is touched both by N concurrent
+// vCPU threads (this handler) and by worker threads via
+// `RaiseQueueInterrupt`/`RaiseConfigChangeInterrupt` which sample
+// queue_msix_vector / msix_config under `cfg_mu_`. We take cfg_mu_ for the
+// duration of one MMIO transaction (very short -- a couple of memory writes).
+// The deadlock risk is `ApplyStatusWrite` -> device callbacks
+// (`SetDriverFeatures`, `Reset`, `DriverOk`); none of those re-enter the
+// transport (they only touch their own device state), so holding cfg_mu_
+// across them is safe.
 void PciTransport::HandleCommonCfg(devices::MmioAccess& access) {
+    std::lock_guard<std::mutex> lk(cfg_mu_);
     const std::uint32_t off =
         static_cast<std::uint32_t>(access.gpa - (bar_gpa_ + kOffCommonCfg));
 
     if (access.is_write) {
-        writes_++;
+        writes_.fetch_add(1, std::memory_order_relaxed);
         // Special-case 8-byte writes (the queue_desc/driver/device fields).
         if (access.access_size == 8 && (off & 0x7u) == 0) {
             std::uint64_t v = 0;
@@ -228,7 +246,7 @@ void PciTransport::HandleCommonCfg(devices::MmioAccess& access) {
         return;
     }
 
-    reads_++;
+    reads_.fetch_add(1, std::memory_order_relaxed);
     if (access.access_size == 8 && (off & 0x7u) == 0) {
         const std::uint64_t lo = ReadCommonCfg32(off);
         const std::uint64_t hi = ReadCommonCfg32(off + 4);
@@ -450,7 +468,7 @@ void PciTransport::ApplyStatusWrite(std::uint8_t new_status) {
     if (new_status == 0) {
         // Reset.
         status_ = 0;
-        isr_status_ = 0;
+        isr_status_.store(0, std::memory_order_relaxed);
         device_feature_select_ = 0;
         driver_feature_select_ = 0;
         driver_features_ = 0;
@@ -481,13 +499,13 @@ void PciTransport::ApplyStatusWrite(std::uint8_t new_status) {
 void PciTransport::HandleIsr(devices::MmioAccess& access) {
     if (access.is_write) {
         // Spec: ISR writes ignored.
-        writes_++;
+        writes_.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    reads_++;
-    // Read-and-clear: snapshot then clear.
-    const std::uint32_t snap = isr_status_;
-    isr_status_ = 0;
+    reads_.fetch_add(1, std::memory_order_relaxed);
+    // Read-and-clear: atomic exchange snapshots+clears in one step.
+    const std::uint32_t snap =
+        isr_status_.exchange(0, std::memory_order_acq_rel);
     std::memset(access.data, 0, sizeof(access.data));
     std::memcpy(access.data, &snap,
                 std::min<std::size_t>(access.access_size, 4));
@@ -496,12 +514,12 @@ void PciTransport::HandleIsr(devices::MmioAccess& access) {
 void PciTransport::HandleNotify(devices::MmioAccess& access) {
     if (!access.is_write) {
         // Reads of notify region return 0.
-        reads_++;
+        reads_.fetch_add(1, std::memory_order_relaxed);
         std::memset(access.data, 0, sizeof(access.data));
         return;
     }
-    writes_++;
-    notify_count_++;
+    writes_.fetch_add(1, std::memory_order_relaxed);
+    notify_count_.fetch_add(1, std::memory_order_relaxed);
     const std::uint32_t off =
         static_cast<std::uint32_t>(access.gpa - (bar_gpa_ + kOffNotify));
     // Without VIRTIO_F_NOTIFICATION_DATA, the value is the queue index. We
@@ -518,6 +536,8 @@ void PciTransport::HandleNotify(devices::MmioAccess& access) {
         std::memcpy(&v, access.data, 4);
         qidx = v;
     }
+    // Deliberately NOT holding cfg_mu_: the device's NotifyQueue may call
+    // back into RaiseQueueInterrupt which acquires cfg_mu_.
     dev_.NotifyQueue(qidx);
 }
 
@@ -525,14 +545,14 @@ void PciTransport::HandleDeviceCfg(devices::MmioAccess& access) {
     const std::uint32_t off =
         static_cast<std::uint32_t>(access.gpa - (bar_gpa_ + kOffDeviceCfg));
     if (access.is_write) {
-        writes_++;
+        writes_.fetch_add(1, std::memory_order_relaxed);
         std::uint32_t v = 0;
         std::memcpy(&v, access.data,
                     std::min<std::size_t>(access.access_size, 4));
         dev_.WriteConfig(off, access.access_size, v);
         return;
     }
-    reads_++;
+    reads_.fetch_add(1, std::memory_order_relaxed);
     const std::uint32_t v = dev_.ReadConfig(off, access.access_size);
     std::memset(access.data, 0, sizeof(access.data));
     std::memcpy(access.data, &v,

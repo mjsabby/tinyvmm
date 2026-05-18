@@ -1,6 +1,7 @@
 #include "net_wintun.h"
 
 #include "virtio_pci.h"
+#include "net_l2.h"
 
 #include "net/wintun_device_path.h"
 
@@ -56,46 +57,17 @@ namespace tinyvmm::virtio {
 
 namespace {
 
-constexpr std::size_t kVirtioNetHdrSize = 12;
-constexpr std::size_t kEthHdrSize       = 14;
-constexpr std::uint16_t kEthTypeIp4     = 0x0800;
-constexpr std::uint16_t kEthTypeArp     = 0x0806;
-
-// Wire-layout POD for the Ethernet II header. `ether_type` is stored
-// big-endian on the wire; callers use Be16/Wr16Be on its bytes.
-#pragma pack(push, 1)
-struct EthHeader {
-    std::uint8_t dst[6];
-    std::uint8_t src[6];
-    std::uint8_t ether_type_be[2];
-};
-static_assert(sizeof(EthHeader) == 14);
-
-// Wire-layout POD for an IPv4-over-Ethernet ARP packet (RFC 826 §2.2
-// with the ARPHRD_ETHER / ETH_P_IP specialization). All multi-byte
-// integer fields are big-endian on the wire.
-struct ArpIpv4 {
-    std::uint8_t htype_be[2];   // 1 = Ethernet
-    std::uint8_t ptype_be[2];   // 0x0800 = IPv4
-    std::uint8_t hlen;          // 6
-    std::uint8_t plen;          // 4
-    std::uint8_t opcode_be[2];  // 1 = request, 2 = reply
-    std::uint8_t sha[6];        // sender MAC
-    std::uint8_t spa[4];        // sender IPv4
-    std::uint8_t tha[6];        // target MAC
-    std::uint8_t tpa[4];        // target IPv4
-};
-static_assert(sizeof(ArpIpv4) == 28);
-#pragma pack(pop)
-
-constexpr std::uint16_t Be16(std::span<const std::uint8_t, 2> p) {
-    return static_cast<std::uint16_t>(
-        (static_cast<std::uint16_t>(p[0]) << 8) | p[1]);
-}
-constexpr void Wr16Be(std::span<std::uint8_t, 2> p, std::uint16_t v) {
-    p[0] = static_cast<std::uint8_t>(v >> 8);
-    p[1] = static_cast<std::uint8_t>(v & 0xFF);
-}
+using ::tinyvmm::virtio::net_l2::kVirtioNetHdrSize;
+using ::tinyvmm::virtio::net_l2::kEthHdrSize;
+using ::tinyvmm::virtio::net_l2::kEthTypeIp4;
+using ::tinyvmm::virtio::net_l2::kEthTypeArp;
+using ::tinyvmm::virtio::net_l2::EthHeader;
+using ::tinyvmm::virtio::net_l2::ArpIpv4;
+using ::tinyvmm::virtio::net_l2::Be16;
+using ::tinyvmm::virtio::net_l2::Wr16Be;
+using ::tinyvmm::virtio::net_l2::ReadableSummary;
+using ::tinyvmm::virtio::net_l2::SummarizeReadable;
+using ::tinyvmm::virtio::net_l2::CopyReadable;
 
 std::wstring Utf8ToWide(const std::string& s) {
     if (s.empty()) return {};
@@ -111,52 +83,6 @@ bool ParseIpv4(const std::string& s, std::uint32_t* out_be) {
     if (::InetPtonA(AF_INET, s.c_str(), &a) != 1) return false;
     *out_be = a.s_addr;  // already network byte order
     return true;
-}
-
-// Walk the readable buffers of a chain, summing total bytes and copying
-// up to `peek.size()` bytes of the prefix into `peek`. Used to inspect
-// the first vhdr+Eth header without materializing the whole frame.
-struct ReadableSummary { std::size_t total; std::size_t peeked; };
-ReadableSummary SummarizeReadable(const PoppedChain& chain,
-                                   std::span<std::uint8_t> peek) {
-    ReadableSummary s{};
-    for (const auto& b : chain.bufs) {
-        if (b.write) continue;
-        const auto sz = b.bytes.size();
-        if (s.peeked < peek.size()) {
-            const std::size_t take = std::min(peek.size() - s.peeked, sz);
-            std::memcpy(peek.data() + s.peeked, b.bytes.data(), take);
-            s.peeked += take;
-        }
-        s.total += sz;
-    }
-    return s;
-}
-
-// Copy the readable buffers of a chain (concatenated) starting at
-// logical offset `skip` into `dst`. Returns bytes copied (clamped to
-// dst.size()).
-std::size_t CopyReadable(const PoppedChain& chain,
-                          std::size_t skip,
-                          std::span<std::uint8_t> dst) {
-    std::size_t logical = 0;
-    std::size_t written = 0;
-    for (const auto& b : chain.bufs) {
-        if (b.write) continue;
-        const auto sz = b.bytes.size();
-        if (logical + sz <= skip) {
-            logical += sz;
-            continue;
-        }
-        const std::size_t src_off = (skip > logical) ? (skip - logical) : 0;
-        const std::size_t avail   = sz - src_off;
-        const std::size_t take    = std::min(avail, dst.size() - written);
-        std::memcpy(dst.data() + written, b.bytes.data() + src_off, take);
-        written += take;
-        logical += sz;
-        if (written == dst.size()) break;
-    }
-    return written;
 }
 
 }  // namespace

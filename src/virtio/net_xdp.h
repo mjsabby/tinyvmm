@@ -48,7 +48,13 @@ public:
         std::uint32_t queue_id   = 0;
         std::uint32_t ring_size  = 256;
         bool require_native      = false;   // XSK_BIND_FLAG_NATIVE (ZC)
-        bool install_xdp_program = true;    // create REDIRECT-ALL program
+        bool install_xdp_program = true;    // create the XDP program
+
+        // When `debug` is true, the worker thread logs a stats line every
+        // 2 seconds (iters, tx_pops/sub/done, rx_done, drop counters,
+        // inflight). Off by default; enable via `--xdp-debug` to diagnose
+        // a wedged data path.
+        bool debug = false;
     };
 
     XdpNetBackend(NetDevice& net,

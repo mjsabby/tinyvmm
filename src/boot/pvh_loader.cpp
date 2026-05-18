@@ -372,7 +372,7 @@ PvhLoadResult LoadPvh(whp::GuestMemory& ram,
         if (host == nullptr) {
             throw HrError(E_FAIL, "ACPI staging area not in guest RAM");
         }
-        rsdp_gpa = acpi::Build(host, kAcpiGpa);
+        rsdp_gpa = acpi::Build(host, kAcpiGpa, cfg.vcpu_count);
     }
 
     // E820 layout. We must expose enough sub-1MB conventional RAM that the

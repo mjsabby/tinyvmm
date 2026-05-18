@@ -11,11 +11,39 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # ---------------------------------------------------------------------------
 # External dependency locations
+#
+# XDP for Windows public headers are vendored under
+# third_party/xdp-for-windows/published/external pinned to the v1.3.0 tag
+# (see that directory's README.md for provenance). The vendored headers
+# must match the runtime driver version, because the device name layout
+# changed AFTER v1.3.0 -- post-v1.3.0 trees route per-object-type opens
+# to \Device\xdpapi\{xsk,program,interface} which the v1.3.0 driver does
+# not register. Override XDP_ROOT only if you have a tree pinned to the
+# exact same upstream tag as the installed driver.
 # ---------------------------------------------------------------------------
-set(XDP_ROOT "C:/xdp-for-windows" CACHE PATH "Path to the XDP for Windows source tree")
+set(XDP_ROOT "${CMAKE_SOURCE_DIR}/third_party/xdp-for-windows"
+    CACHE PATH "Path to the XDP for Windows source tree")
 set(XDP_INCLUDE_DIR "${XDP_ROOT}/published/external")
 if(NOT EXISTS "${XDP_INCLUDE_DIR}/xdpapi.h")
-    message(WARNING "XDP headers not found at ${XDP_INCLUDE_DIR}; XDP-backed devices will not build")
+    message(WARNING
+        "XDP headers not found at ${XDP_INCLUDE_DIR}; XDP-backed devices will "
+        "not build. Set -DXDP_ROOT=<path> to override.")
+endif()
+# Refuse to build against a post-v1.3.0 tree -- those headers route XSK
+# opens to a device path the v1.3.0 driver does not register, and
+# XskCreate fails at runtime with STATUS_OBJECT_PATH_NOT_FOUND.
+if(EXISTS "${XDP_INCLUDE_DIR}/xdp/details/ioctldef.h")
+    file(READ "${XDP_INCLUDE_DIR}/xdp/details/ioctldef.h" _xdp_ioctldef)
+    if(_xdp_ioctldef MATCHES "XDP_XSK_DEVICE_NAME")
+        message(FATAL_ERROR
+            "XDP_ROOT=${XDP_ROOT} points at a post-v1.3.0 header tree (it "
+            "defines XDP_XSK_DEVICE_NAME, introduced in upstream commit "
+            "18e6adc 'Add device objects per XDP object type'). The runtime "
+            "v1.3.0 driver only registers \\Device\\xdp; XskCreate would "
+            "fail at runtime. Set XDP_ROOT to the vendored "
+            "third_party/xdp-for-windows tree, or upgrade your installed "
+            "driver and refresh the vendored headers.")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -29,6 +57,7 @@ add_executable(tinyvmm
     src/whp/vcpu.cpp
     src/whp/run_loop.cpp
     src/whp/cpuid.cpp
+    src/whp/cpu_affinity.cpp
     src/devices/io_bus.cpp
     src/devices/mmio_bus.cpp
     src/devices/serial8250.cpp
@@ -45,6 +74,7 @@ add_executable(tinyvmm
     src/virtio/net_loopback.cpp
     src/virtio/net_xdp.cpp
     src/virtio/net_wintun.cpp
+    src/virtio/net_usernet.cpp
     src/net/wintun_loader.cpp
     src/net/wintun_adapter_mgr.cpp
     src/net/wintun_device_path.cpp

@@ -1,5 +1,29 @@
 #include "xdp_probe.h"
 
+#ifdef TINYVMM_NO_XDP
+// ----- Stub-build path -----
+// The XDP-for-Windows headers (`afxdp.h`, `xdpapi.h`) use C-style
+// aggregate initialization that's compatible with MSVC's `cl.exe` but
+// rejected by modern clang-cl (`XSK_BIND_IN Bind = {0};` is an
+// int->enum hard error in clang's C++20 mode regardless of -W flags).
+// When the build pins clang-cl (e.g. for UBSan) we compile this stub
+// instead so `--xdp-probe` stays linkable and reports the backend as
+// unavailable.
+
+#include <cstdio>
+
+namespace tinyvmm::host {
+
+int RunXdpProbe(int /*ifindex*/) {
+    std::printf("[xdp-probe] XDP support disabled in this build "
+                "(TINYVMM_NO_XDP). Rebuild without UBSan to enable.\n");
+    return 1;
+}
+
+}  // namespace tinyvmm::host
+
+#else  // !TINYVMM_NO_XDP
+
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
@@ -157,3 +181,5 @@ int RunXdpProbe(int ifindex) {
 }
 
 }  // namespace tinyvmm::host
+
+#endif  // !TINYVMM_NO_XDP

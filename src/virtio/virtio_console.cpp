@@ -38,6 +38,7 @@ Virtqueue* ConsoleDevice::GetQueue(std::uint32_t idx) {
 void ConsoleDevice::NotifyQueue(std::uint32_t idx) {
     if (idx == kConsoleTransmitQueueIdx) {
         if (!txq_.ready()) return;
+        std::lock_guard<std::mutex> lg(tx_mu_);
         DrainTransmitQueue();
         return;
     }

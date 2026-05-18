@@ -32,8 +32,10 @@
 #include "devices/mmio_bus.h"
 #include "pci.h"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <vector>
 
 namespace tinyvmm::pci {
@@ -84,7 +86,9 @@ public:
     bool Trigger(std::uint32_t vector);
 
     // Diagnostics / tests.
-    std::uint64_t injected_count() const { return injected_count_; }
+    std::uint64_t injected_count() const {
+        return injected_count_.load(std::memory_order_relaxed);
+    }
     bool MsiXEnabled()    const;
     bool FunctionMasked() const;
     bool VectorMasked(std::uint32_t vector) const;
@@ -118,7 +122,13 @@ private:
     std::uint64_t bar_base_gpa_ = 0;
     bool          mapped_ = false;
 
-    std::uint64_t injected_count_ = 0;
+    // Serializes table_/pba_ mutation against worker-thread Trigger() and
+    // concurrent vCPU-thread MMIO accesses. Held during DoInject() to keep
+    // the (addr,data) snapshot consistent with the per-vector mask check;
+    // the inject_ callback is whp::InjectMsi (a WHvRequestInterrupt call)
+    // and does NOT re-enter MsiX, so no deadlock.
+    mutable std::mutex     mu_;
+    std::atomic<std::uint64_t> injected_count_{0};
 };
 
 }  // namespace tinyvmm::pci

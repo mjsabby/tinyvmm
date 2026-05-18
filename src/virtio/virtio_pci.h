@@ -40,9 +40,11 @@
 #include "virtio.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -78,11 +80,22 @@ public:
     pci::MsiX& msix() noexcept { return msix_; }
 
     // Diagnostics.
-    std::uint64_t reads()        const noexcept { return reads_; }
-    std::uint64_t writes()       const noexcept { return writes_; }
-    std::uint64_t notify_count() const noexcept { return notify_count_; }
-    std::uint8_t  status()       const noexcept { return status_; }
-    std::uint32_t isr()          const noexcept { return isr_status_; }
+    std::uint64_t reads()        const noexcept {
+        return reads_.load(std::memory_order_relaxed);
+    }
+    std::uint64_t writes()       const noexcept {
+        return writes_.load(std::memory_order_relaxed);
+    }
+    std::uint64_t notify_count() const noexcept {
+        return notify_count_.load(std::memory_order_relaxed);
+    }
+    std::uint8_t  status()       const noexcept {
+        std::lock_guard<std::mutex> lk(cfg_mu_);
+        return status_;
+    }
+    std::uint32_t isr()          const noexcept {
+        return isr_status_.load(std::memory_order_relaxed);
+    }
 
     // ---- Device -> transport interrupt signals.
     // RaiseQueueInterrupt: indicates the device added to qidx's used ring.
@@ -173,10 +186,19 @@ private:
     };
     std::vector<QueueState> queues_;
 
-    std::uint32_t isr_status_ = 0;
-    std::uint64_t reads_ = 0;
-    std::uint64_t writes_ = 0;
-    std::uint64_t notify_count_ = 0;
+    // Atomic across N vCPU + worker threads. ISR is read-and-clear from a
+    // single guest reader, and OR'd by RaiseQueueInterrupt / RaiseConfigChange
+    // on worker threads.
+    std::atomic<std::uint32_t> isr_status_{0};
+    std::atomic<std::uint64_t> reads_{0};
+    std::atomic<std::uint64_t> writes_{0};
+    std::atomic<std::uint64_t> notify_count_{0};
+
+    // Serializes COMMON_CFG state mutations + reads from RaiseQueueInterrupt /
+    // RaiseConfigChangeInterrupt. Held briefly to snapshot a single field;
+    // never held across calls into Device callbacks or msix_.Trigger() to
+    // avoid deadlock (Device IRQ callbacks re-enter RaiseQueueInterrupt).
+    mutable std::mutex cfg_mu_;
 
     std::vector<std::unique_ptr<whp::NotificationPort>> doorbells_;
     OnBarMappedFn on_bar_mapped_cb_;

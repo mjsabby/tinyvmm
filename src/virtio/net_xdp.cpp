@@ -49,6 +49,9 @@ const std::string& XdpNetBackend::last_setup_phase() const noexcept { return sta
 #include "whp/partition.h"
 #include "virtio_net.h"
 #include "virtio_pci.h"
+#include "net_l2.h"
+
+#include "diag/etw.h"
 
 // IMPORTANT: include order matters. The XDP headers need windows.h,
 // winternl.h and ntstatus.h pulled in first; ask wincommon.h to do
@@ -62,6 +65,7 @@ const std::string& XdpNetBackend::last_setup_phase() const noexcept { return sta
 #include <xdp/apiversion.h>
 #define XDP_API_VERSION XDP_API_VERSION_3
 #include <xdp/wincommon.h>
+#include <xdp/hookid.h>
 #include <xdpapi.h>
 #include <afxdp.h>
 #include <afxdp_helper.h>
@@ -71,12 +75,13 @@ const std::string& XdpNetBackend::last_setup_phase() const noexcept { return sta
 #include <cstring>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace tinyvmm::virtio {
 
 namespace {
 
-constexpr std::size_t kVirtioNetHdrSize = 12;
+using ::tinyvmm::virtio::net_l2::kVirtioNetHdrSize;
 constexpr std::uint32_t kPageSize       = 4096;
 
 // Encode a guest GPA into XDP's split (BaseAddress:48, Offset:16) form.
@@ -140,6 +145,16 @@ struct XdpNetBackend::State {
     std::atomic<std::uint64_t> rx_packets{0};
     std::atomic<std::uint64_t> tx_dropped{0};
     std::atomic<std::uint64_t> rx_dropped{0};
+
+    // Submission-vs-completion counters surfaced under --xdp-debug.
+    // tx_submitted bumps every time PumpTx posts a desc to the XSK TX
+    // ring; tx_packets only bumps when the corresponding completion
+    // comes back from the kernel. A gap between the two means the
+    // XDP hook is accepting frames but never completing them (a sign
+    // that the bound miniport's TX completion path is dead).
+    std::atomic<std::uint64_t> tx_pops{0};
+    std::atomic<std::uint64_t> tx_submitted{0};
+    std::atomic<std::uint64_t> worker_iters{0};
 
     HRESULT setup_error = S_OK;
     std::string setup_phase;
@@ -298,15 +313,17 @@ bool XdpNetBackend::State::OpenAndConfigureSocket() {
     XskRingInitialize(&tx_comp_ring, &ring_info.Completion);
 
     if (opts.install_xdp_program) {
-        const XDP_HOOK_ID hook_rx_l2_inspect = {
-            XDP_HOOK_L2, XDP_HOOK_RX, XDP_HOOK_INSPECT,
-        };
+        XDP_HOOK_ID prog_hook{};
+        prog_hook.Layer     = XDP_HOOK_L2;
+        prog_hook.Direction = XDP_HOOK_RX;      // wire inbound
+        prog_hook.SubLayer  = XDP_HOOK_INSPECT;
+
         XDP_RULE rule{};
         rule.Match = XDP_MATCH_ALL;
         rule.Action = XDP_PROGRAM_ACTION_REDIRECT;
         rule.Redirect.TargetType = XDP_REDIRECT_TARGET_TYPE_XSK;
         rule.Redirect.Target = socket;
-        hr = XdpCreateProgram(opts.if_index, &hook_rx_l2_inspect,
+        hr = XdpCreateProgram(opts.if_index, &prog_hook,
                               opts.queue_id, XDP_CREATE_PROGRAM_FLAG_NONE,
                               &rule, 1, &program);
         if (FAILED(hr)) return fail("XdpCreateProgram", hr);
@@ -329,17 +346,50 @@ void XdpNetBackend::State::WorkerLoop() {
     HANDLE waits[3] = { stop_evt, tx_doorbell_evt, rx_doorbell_evt };
     const DWORD n_waits = 3;
 
+    // Periodic diagnostic stats, gated by --xdp-debug.
+    ULONGLONG last_stats_ms = GetTickCount64();
+
     while (running.load()) {
         // 1 ms poll keeps us responsive without spinning. With a real
         // workload the doorbell signals usually fire first.
         DWORD wr = WaitForMultipleObjectsEx(n_waits, waits, FALSE, 1, FALSE);
         if (wr == WAIT_OBJECT_0) break;  // stop
         (void)wr;
+        worker_iters.fetch_add(1, std::memory_order_relaxed);
 
         RefillRxFromGuest();
-        PumpTx();
         PumpRx();
+        PumpTx();
         PumpTxCompletion();
+
+        const ULONGLONG now_ms = GetTickCount64();
+        if (opts.debug && now_ms - last_stats_ms >= 2000) {
+            const std::uint64_t tx    = tx_packets.load();
+            const std::uint64_t rx    = rx_packets.load();
+            const std::uint64_t txd   = tx_dropped.load();
+            const std::uint64_t rxd   = rx_dropped.load();
+            const std::uint64_t pops  = tx_pops.load();
+            const std::uint64_t subs  = tx_submitted.load();
+            const std::uint64_t iters = worker_iters.load();
+            const bool txr = net.tx_queue().ready();
+            const bool rxr = net.rx_queue().ready();
+            std::fprintf(stderr,
+                "[xdp-net] iters=%llu txq.ready=%d rxq.ready=%d "
+                "tx_pops=%llu tx_sub=%llu tx_done=%llu rx_done=%llu "
+                "tx_drop=%llu rx_drop=%llu inflight_tx=%zu "
+                "inflight_rx=%zu\n",
+                (unsigned long long)iters,
+                txr ? 1 : 0, rxr ? 1 : 0,
+                (unsigned long long)pops,
+                (unsigned long long)subs,
+                (unsigned long long)tx,
+                (unsigned long long)rx,
+                (unsigned long long)txd,
+                (unsigned long long)rxd,
+                tx_inflight.size(),
+                rx_inflight.size());
+            last_stats_ms = now_ms;
+        }
     }
 }
 
@@ -433,10 +483,12 @@ void XdpNetBackend::State::PumpTx() {
         &tx_ring, tx_ring.Size, &producer_idx);
     if (free_slots == 0) return;
 
+    auto* host_base = static_cast<std::uint8_t*>(mem.host_base());
     UINT32 reserved = 0;
     while (reserved < free_slots) {
         auto chain = txq.Pop();
         if (!chain) break;
+        tx_pops.fetch_add(1, std::memory_order_relaxed);
 
         // Linux virtio-net (without MRG_RXBUF or hdr_data merging on TX)
         // sends [hdr_desc (read-only, 12B), payload_desc (read-only)].
@@ -447,7 +499,6 @@ void XdpNetBackend::State::PumpTx() {
         for (auto& b : chain->bufs) {
             if (b.write) continue;
             auto* host_p   = b.bytes.data();
-            auto* host_base = static_cast<std::uint8_t*>(mem.host_base());
             std::uint64_t gpa = static_cast<std::uint64_t>(host_p - host_base);
             std::uint32_t len = static_cast<std::uint32_t>(b.bytes.size());
             if (hdr_remaining > 0) {
@@ -486,6 +537,7 @@ void XdpNetBackend::State::PumpTx() {
 
     if (reserved > 0) {
         XskRingProducerSubmit(&tx_ring, reserved);
+        tx_submitted.fetch_add(reserved, std::memory_order_relaxed);
         if (XskRingProducerNeedPoke(&tx_ring)) {
             XSK_NOTIFY_RESULT_FLAGS r{};
             XskNotifySocket(socket, XSK_NOTIFY_FLAG_POKE_TX, 0, &r);

@@ -96,36 +96,41 @@ constexpr std::uint64_t kMadtOffset = 0x80;
 
 }  // namespace
 
-std::uint64_t Build(std::uint8_t* host_base, std::uint64_t gpa_base) {
+std::uint64_t Build(std::uint8_t* host_base, std::uint64_t gpa_base,
+                    std::uint32_t vcpu_count) {
+    if (vcpu_count == 0 || vcpu_count > kMaxVcpus) {
+        // Caller error: clamp to sane bounds.
+        vcpu_count = (vcpu_count == 0) ? 1u : kMaxVcpus;
+    }
+
     // Zero the whole footprint so any padding between structures reads back
     // as zero (Linux skips zero entries cleanly).
     std::memset(host_base, 0, kFootprint);
 
     // ---- MADT ----
+    // We emit ONLY Type 9 (Local x2APIC) processor entries, one per vCPU,
+    // with apic_id == processor_uid == vCPU index. Linux's MADT parser walks
+    // both Type 0 (LAPIC) and Type 9 (x2APIC) entries; emitting both would
+    // duplicate enabled processor UIDs which is risky. x2APIC entries cover
+    // all 32-bit APIC IDs cleanly.
     auto* madt = reinterpret_cast<MadtFixed*>(host_base + kMadtOffset);
-    auto* lapic = reinterpret_cast<MadtLocalApic*>(
+    auto* x2apic_arr = reinterpret_cast<MadtLocalX2Apic*>(
         host_base + kMadtOffset + sizeof(MadtFixed));
-    auto* x2apic = reinterpret_cast<MadtLocalX2Apic*>(
-        host_base + kMadtOffset + sizeof(MadtFixed) + sizeof(MadtLocalApic));
 
     std::uint32_t madt_len = static_cast<std::uint32_t>(
-        sizeof(MadtFixed) + sizeof(MadtLocalApic) + sizeof(MadtLocalX2Apic));
+        sizeof(MadtFixed) + vcpu_count * sizeof(MadtLocalX2Apic));
     FillHeader(madt->header, "APIC", madt_len, /*rev=*/5, "MADT    ");
     madt->local_apic_address = 0xFEE00000u;
     madt->flags = 1;  // PCAT_COMPAT: we still have an 8259 around (i8259.cpp)
 
-    lapic->type = 0;
-    lapic->length = sizeof(MadtLocalApic);
-    lapic->acpi_processor_uid = 0;
-    lapic->apic_id = 0;
-    lapic->flags = 1;  // enabled
-
-    x2apic->type = 9;
-    x2apic->length = sizeof(MadtLocalX2Apic);
-    x2apic->reserved = 0;
-    x2apic->local_apic_id = 0;
-    x2apic->flags = 1;  // enabled
-    x2apic->acpi_processor_uid = 0;
+    for (std::uint32_t i = 0; i < vcpu_count; ++i) {
+        x2apic_arr[i].type = 9;
+        x2apic_arr[i].length = sizeof(MadtLocalX2Apic);
+        x2apic_arr[i].reserved = 0;
+        x2apic_arr[i].local_apic_id = i;
+        x2apic_arr[i].flags = 1;  // enabled
+        x2apic_arr[i].acpi_processor_uid = i;
+    }
 
     madt->header.checksum = Checksum(reinterpret_cast<std::uint8_t*>(madt),
                                      madt_len);
