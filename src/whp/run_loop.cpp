@@ -36,8 +36,10 @@ const char* ExitReasonName(WHV_RUN_VP_EXIT_REASON reason) noexcept {
     }
 }
 
-RunLoop::RunLoop(Vcpu& vcpu, devices::IoBus& io_bus, devices::MmioBus& mmio_bus)
-    : vcpu_(vcpu), io_bus_(io_bus), mmio_bus_(mmio_bus) {
+RunLoop::RunLoop(Vcpu& vcpu, devices::IoBus& io_bus, devices::MmioBus& mmio_bus,
+                 std::uint32_t vcpu_count)
+    : vcpu_(vcpu), io_bus_(io_bus), mmio_bus_(mmio_bus),
+      vcpu_count_(vcpu_count == 0 ? 1u : vcpu_count) {
     WHV_EMULATOR_CALLBACKS cbs = {};
     cbs.Size = sizeof(cbs);
     cbs.WHvEmulatorIoPortCallback = &RunLoop::OnIoPortThunk;
@@ -262,12 +264,14 @@ std::optional<StopReason> RunLoop::HandleCpuidExit(
 
     // WHP has already computed what it would natively return; layer our policy
     // on top.
+    const CpuidContext vctx{vcpu_.index(), vcpu_count_};
     CpuidResult r = ResolveCpuid(
         leaf, subleaf,
         static_cast<std::uint32_t>(ctx.DefaultResultRax),
         static_cast<std::uint32_t>(ctx.DefaultResultRbx),
         static_cast<std::uint32_t>(ctx.DefaultResultRcx),
-        static_cast<std::uint32_t>(ctx.DefaultResultRdx));
+        static_cast<std::uint32_t>(ctx.DefaultResultRdx),
+        vctx);
 
     if (verbose_cpuid_) {
         std::fprintf(stderr,

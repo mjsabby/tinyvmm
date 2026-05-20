@@ -2284,7 +2284,7 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     // each driving its own loop (BSP still runs here).
     std::deque<RunLoop> loops;
     for (std::uint32_t i = 0; i < vcpu_count; ++i) {
-        loops.emplace_back(vcpus[i], io_bus, mmio_bus);
+        loops.emplace_back(vcpus[i], io_bus, mmio_bus, vcpu_count);
         loops.back().set_hv_enlightenment(&hv);
     }
     RunLoop& loop = loops.front();
@@ -5474,6 +5474,7 @@ int RunVirtioConsoleTest() {
 // PIT calibration via CPUID.15h, (c) program LAPIC via tsc-deadline, and
 // (d) see a sensible hypervisor vendor signature.
 int RunCpuidTest() {
+    using tinyvmm::whp::CpuidContext;
     using tinyvmm::whp::CpuidResult;
     using tinyvmm::whp::ResolveCpuid;
 
@@ -5483,15 +5484,19 @@ int RunCpuidTest() {
     };
 
     // Default-in values mimic a "WHP returned zero" baseline so we can see
-    // exactly what our policy injects on top.
-    auto resolve = [](std::uint32_t leaf) {
-        return ResolveCpuid(leaf, 0, 0, 0, 0, 0);
+    // exactly what our policy injects on top. Default per-vCPU context is
+    // BSP (vcpu_index=0) of a 1-vCPU partition; the per-vCPU APIC ID block
+    // below exercises non-default contexts explicitly.
+    auto resolve = [](std::uint32_t leaf, std::uint32_t subleaf = 0,
+                      const CpuidContext& ctx = CpuidContext{0u, 1u}) {
+        return ResolveCpuid(leaf, subleaf, 0, 0, 0, 0, ctx);
     };
 
-    // Leaf 0x00: max-standard-leaf raised to at least 0x16.
+    // Leaf 0x00: max-standard-leaf raised to at least 0x1F (so the guest
+    // can reach the synthesized 0x0B / 0x1F topology leaves).
     {
         CpuidResult r = resolve(0x00000000u);
-        if (r.eax < 0x16u) return fail("leaf 0: max-leaf < 0x16");
+        if (r.eax < 0x1Fu) return fail("leaf 0: max-leaf < 0x1F");
     }
 
     // Leaf 0x01: tsc-deadline + hypervisor-present.
@@ -5626,10 +5631,95 @@ int RunCpuidTest() {
     // Pass-through sanity: an arbitrary leaf returns the host defaults
     // unchanged. We supply non-zero defaults and check they survive.
     {
-        CpuidResult r = ResolveCpuid(0x00000007u, 0, 0xDEAD0007u, 0xCAFEu, 0xBEEFu, 0x1234u);
+        CpuidContext ctx{0u, 1u};
+        CpuidResult r = ResolveCpuid(0x00000007u, 0, 0xDEAD0007u, 0xCAFEu,
+                                     0xBEEFu, 0x1234u, ctx);
         if (r.eax != 0xDEAD0007u || r.ebx != 0xCAFEu ||
             r.ecx != 0xBEEFu || r.edx != 0x1234u) {
             return fail("leaf 0x07: defaults not passed through");
+        }
+    }
+
+    // --- Per-vCPU CPUID block: leaves 0x01, 0x0B, 0x1F must each carry
+    // the per-vCPU APIC ID (matching what we publish in the MADT) so
+    // Linux's SMP bring-up doesn't log "[Firmware Bug] APIC ID mismatch".
+    {
+        // Leaf 0x01 EBX[31:24] = vcpu_index, [23:16] = vcpu_count.
+        // Default EBX = 0; lower 16 bits must be preserved unchanged.
+        for (std::uint32_t idx : {0u, 1u, 5u, 31u, 255u}) {
+            CpuidContext c{idx, 32u};
+            CpuidResult r = ResolveCpuid(0x00000001u, 0,
+                                         0u, 0x0000AABBu, 0u, 0u, c);
+            const std::uint32_t apic_id = (r.ebx >> 24) & 0xFFu;
+            const std::uint32_t max_per_pkg = (r.ebx >> 16) & 0xFFu;
+            if (apic_id != (idx & 0xFFu)) {
+                std::fprintf(stderr,
+                    "[cpuid-test] FAIL: leaf 1 idx=%u: apic_id=%u (want %u)\n",
+                    idx, apic_id, idx & 0xFFu);
+                return 1;
+            }
+            if (max_per_pkg != 32u) {
+                return fail("leaf 1: max-logical-per-package wrong");
+            }
+            if ((r.ebx & 0x0000FFFFu) != 0xAABBu) {
+                return fail("leaf 1: EBX[15:0] not preserved");
+            }
+        }
+    }
+    {
+        // Leaves 0x0B and 0x1F: SMT subleaf 0, Core subleaf 1, Invalid
+        // subleaf >=2. EDX must equal vcpu_index in every subleaf so the
+        // Linux x2APIC walk picks up the right ID regardless of where it
+        // stops scanning.
+        for (std::uint32_t leaf : {0x0000000Bu, 0x0000001Fu}) {
+            for (std::uint32_t idx : {0u, 3u, 7u, 31u}) {
+                CpuidContext c{idx, 8u};
+                // Subleaf 0: SMT level (1 thread per core).
+                {
+                    CpuidResult r = resolve(leaf, 0u, c);
+                    if (r.edx != idx) {
+                        std::fprintf(stderr,
+                            "[cpuid-test] FAIL: leaf 0x%x sub0 idx=%u: edx=%u\n",
+                            leaf, idx, r.edx);
+                        return 1;
+                    }
+                    if (r.eax != 0u || r.ebx != 1u) {
+                        return fail("leaf 0x0B/0x1F sub0: shape wrong");
+                    }
+                    if ((r.ecx & 0xFFu) != 0u ||
+                        ((r.ecx >> 8) & 0xFFu) != 1u /* SMT */) {
+                        return fail("leaf 0x0B/0x1F sub0: ECX level wrong");
+                    }
+                }
+                // Subleaf 1: Core level (vcpu_count cores).
+                {
+                    CpuidResult r = resolve(leaf, 1u, c);
+                    if (r.edx != idx) {
+                        return fail("leaf 0x0B/0x1F sub1: EDX != vcpu_index");
+                    }
+                    if (r.eax != 5u || r.ebx != 8u) {
+                        return fail("leaf 0x0B/0x1F sub1: shape wrong");
+                    }
+                    if ((r.ecx & 0xFFu) != 1u ||
+                        ((r.ecx >> 8) & 0xFFu) != 2u /* Core */) {
+                        return fail("leaf 0x0B/0x1F sub1: ECX level wrong");
+                    }
+                }
+                // Subleaf 2+: Invalid terminator.
+                for (std::uint32_t sub : {2u, 3u, 7u}) {
+                    CpuidResult r = resolve(leaf, sub, c);
+                    if (r.edx != idx) {
+                        return fail("leaf 0x0B/0x1F sub>=2: EDX != vcpu_index");
+                    }
+                    if (r.eax != 0u || r.ebx != 0u) {
+                        return fail("leaf 0x0B/0x1F sub>=2: EAX/EBX != 0");
+                    }
+                    if ((r.ecx & 0xFFu) != sub ||
+                        ((r.ecx >> 8) & 0xFFu) != 0u /* Invalid */) {
+                        return fail("leaf 0x0B/0x1F sub>=2: ECX wrong");
+                    }
+                }
+            }
         }
     }
 

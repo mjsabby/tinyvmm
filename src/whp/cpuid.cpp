@@ -74,19 +74,38 @@ std::uint64_t GetTscHz() noexcept {
 }  // namespace
 
 CpuidResult ResolveCpuid(std::uint32_t leaf,
-                         std::uint32_t /*subleaf*/,
+                         std::uint32_t subleaf,
                          std::uint32_t default_eax,
                          std::uint32_t default_ebx,
                          std::uint32_t default_ecx,
-                         std::uint32_t default_edx) noexcept {
+                         std::uint32_t default_edx,
+                         const CpuidContext& vctx) noexcept {
     CpuidResult r{default_eax, default_ebx, default_ecx, default_edx};
+
+    // Clamp / normalize the per-vCPU context defensively. Callers should
+    // always pass values in range, but ResolveCpuid is also used directly
+    // from --cpuid-test which exercises edge cases.
+    const std::uint32_t vcpu_index =
+        (vctx.vcpu_index < 256) ? vctx.vcpu_index : 0;
+    const std::uint32_t vcpu_count =
+        (vctx.vcpu_count >= 1 && vctx.vcpu_count <= 256)
+            ? vctx.vcpu_count : 1;
+    // Number of bits to shift x2APIC ID right to reach the package level
+    // from the Core level. We always advertise the kMaxVcpus ceiling (5
+    // bits covers 0..31) so the topology shape is stable regardless of
+    // how many vCPUs were actually spawned. This is the same trick KVM
+    // and most other VMMs use; the actual count of online CPUs comes from
+    // the MADT, not from CPUID.
+    constexpr std::uint32_t kCoreShift = 5;  // ceil(log2(32))
 
     switch (leaf) {
         case 0x00000000u: {
             // Ensure max-standard-leaf is high enough for leaves 0x15 / 0x16
-            // (which Linux uses to skip PIT calibration). Modern hosts already
-            // report >= 0x16; this is just a safety raise.
-            if (r.eax < 0x16u) r.eax = 0x16u;
+            // (which Linux uses to skip PIT calibration) AND 0x1F / 0x0B
+            // (x2APIC extended topology, which our handler synthesizes
+            // below). Modern hosts already report >= 0x1F; this is just a
+            // safety raise.
+            if (r.eax < 0x1Fu) r.eax = 0x1Fu;
             break;
         }
 
@@ -102,6 +121,23 @@ CpuidResult ResolveCpuid(std::uint32_t leaf,
                 r.ecx &= ~kEcx_TscDeadline;
             }
             r.ecx |= kEcx_Hypervisor;
+
+            // EBX layout for leaf 0x01:
+            //   [7:0]   brand index            -- preserve host
+            //   [15:8]  CLFLUSH line size / 8  -- preserve host
+            //   [23:16] max logical procs / package -- we own this
+            //   [31:24] initial APIC ID (8-bit) -- we own this
+            //
+            // Without rewriting [31:24], MADT says vCPU N has APIC ID N but
+            // CPUID returns the *host* CPU's APIC ID (whatever core happens
+            // to be running this vCPU thread), and Linux logs
+            // `[Firmware Bug]: CPU N: APIC ID mismatch`. Linux also uses
+            // [23:16] for "smp_num_siblings" / max-logical-per-package as
+            // a legacy fallback before reading 0x0B/0x1F, so we set that
+            // to vcpu_count for coherence.
+            r.ebx = (r.ebx & 0x0000FFFFu) |
+                    ((vcpu_count & 0xFFu) << 16) |
+                    ((vcpu_index & 0xFFu) << 24);
             break;
         }
 
@@ -110,6 +146,64 @@ CpuidResult ResolveCpuid(std::uint32_t leaf,
             // running (doesn't stop in deep C-states). Setting this avoids
             // Linux falling back to slower clock sources for hrtimers.
             r.eax |= kEax_Arat;
+            break;
+        }
+
+        case 0x0000000Bu:
+        case 0x0000001Fu: {
+            // x2APIC extended topology enumeration. Leaf 0x1F is the v2
+            // version of 0x0B; both share the same shape for the levels
+            // we model (SMT and Core). Linux's
+            // `arch/x86/kernel/cpu/topology_common.c::topo_get_cpuid()`
+            // walks subleaves until ECX[15:8] returns 0 (invalid). For
+            // every subleaf the per-vCPU x2APIC ID is reported in EDX,
+            // which is what fixes the APIC-ID-mismatch firmware-bug
+            // message.
+            //
+            // Register layout per subleaf:
+            //   EAX [4:0]   bits to shift x2APIC ID right to reach the
+            //               next-level ID (typed by ECX[15:8])
+            //   EBX [15:0]  number of logical processors at this level
+            //   ECX [7:0]   subleaf number (echoed back)
+            //   ECX [15:8]  level type (0=Invalid, 1=SMT, 2=Core,
+            //               3=Module, 4=Tile, 5=Die)
+            //   EDX         32-bit x2APIC ID of the current logical proc
+            constexpr std::uint8_t kLevelInvalid = 0;
+            constexpr std::uint8_t kLevelSmt     = 1;
+            constexpr std::uint8_t kLevelCore    = 2;
+
+            std::uint32_t eax = 0, ebx = 0, level = kLevelInvalid;
+            switch (subleaf) {
+                case 0: {
+                    // SMT level: 1 thread per core (no hyperthreading).
+                    eax   = 0;
+                    ebx   = 1;
+                    level = kLevelSmt;
+                    break;
+                }
+                case 1: {
+                    // Core level: vcpu_count cores per package. We always
+                    // shift by kCoreShift bits so the topology shape is
+                    // stable across --vcpus values; package ID is
+                    // x2apic_id >> kCoreShift.
+                    eax   = kCoreShift;
+                    ebx   = vcpu_count;
+                    level = kLevelCore;
+                    break;
+                }
+                default: {
+                    // Invalid-level terminator. EAX/EBX zero, ECX echoes
+                    // back the subleaf with level=Invalid.
+                    eax   = 0;
+                    ebx   = 0;
+                    level = kLevelInvalid;
+                    break;
+                }
+            }
+            r.eax = eax;
+            r.ebx = ebx & 0xFFFFu;
+            r.ecx = (subleaf & 0xFFu) | (static_cast<std::uint32_t>(level) << 8);
+            r.edx = vcpu_index;
             break;
         }
 
@@ -265,9 +359,19 @@ std::vector<WHV_X64_CPUID_RESULT> BuildStaticCpuidResultList(
     // the same overrides as the runtime path. This keeps the static
     // architectural model WHP sees consistent with what the guest reads at
     // runtime via the CPUID exit handler.
+    //
+    // The CpuidResultList is per-partition (one entry per leaf shared by
+    // all vCPUs), so we encode the BSP (vcpu_index=0) values here. The
+    // runtime CPUID exit handler always wins at execution time and
+    // returns the actual per-vCPU values; this static list is only used
+    // by WHP for internal architectural decisions taken at SetupPartition
+    // time. Leaves 0x0B / 0x1F (per-vCPU topology) are intentionally
+    // omitted -- their subleaf-shaped, vCPU-specific output cannot be
+    // expressed in a static partition-wide table, so we let the runtime
+    // path handle them every time.
     {
         CpuidResult r0 = host(0x00000000u);
-        if (r0.eax < 0x16u) r0.eax = 0x16u;
+        if (r0.eax < 0x1Fu) r0.eax = 0x1Fu;
         list.push_back(entry(0x00000000u, r0));
     }
     {
@@ -278,6 +382,11 @@ std::vector<WHV_X64_CPUID_RESULT> BuildStaticCpuidResultList(
             r1.ecx &= ~kEcx_TscDeadline;
         }
         r1.ecx |= kEcx_Hypervisor;
+        // Static-model EBX[31:24] = 0 (BSP APIC ID), EBX[23:16] = 1
+        // (single logical processor per package fallback). The runtime
+        // exit handler overrides both with the actual vcpu_index and
+        // vcpu_count.
+        r1.ebx = (r1.ebx & 0x0000FFFFu) | (1u << 16) | (0u << 24);
         list.push_back(entry(0x00000001u, r1));
     }
     {

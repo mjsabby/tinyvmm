@@ -32,7 +32,8 @@ enum class StopReason {
 // loop; that triggers WHvCancelRunVirtualProcessor under the hood.
 class RunLoop {
 public:
-    RunLoop(Vcpu& vcpu, devices::IoBus& io_bus, devices::MmioBus& mmio_bus);
+    RunLoop(Vcpu& vcpu, devices::IoBus& io_bus, devices::MmioBus& mmio_bus,
+            std::uint32_t vcpu_count = 1);
     ~RunLoop();
 
     RunLoop(const RunLoop&) = delete;
@@ -177,6 +178,7 @@ private:
     bool verbose_cpuid_ = false;
     bool verbose_msr_ = false;
     HvEnlightenment* hv_ = nullptr;
+    std::uint32_t vcpu_count_ = 1;
 };
 
 // Render a WHV exit reason as a human-readable name for logging.
