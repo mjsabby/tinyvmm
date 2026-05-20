@@ -21,3 +21,6 @@ pvh.log
 trace.txt
 ubsan_build.log
 vmlinux*
+tools/__pycache__/
+__pycache__/
+*.pyc

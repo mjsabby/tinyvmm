@@ -166,6 +166,60 @@ RAM at GPA 0, drop a `HLT` opcode at the reset vector, run the vCPU and verify
 we get a `WHvRunVpExitReasonX64Halt` exit. Useful for confirming the WHP stack
 is functional on the host.
 
+## Booting unmodified Ubuntu (live-server ISO)
+
+tinyvmm is PVH-only — there is no BIOS, no UEFI, and no boot-sector code
+path. Distro install ISOs assume GRUB and a firmware/disk boot, so they
+won't boot directly. The `tools/ubuntu_iso_boot.py` helper adapts the
+Ubuntu live-server amd64 ISO into a PVH-friendly shape and launches
+tinyvmm:
+
+```powershell
+# Subiquity (text TUI installer) over hvc0.
+python tools\ubuntu_iso_boot.py `
+    --iso .\ubuntu-24.04.3-live-server-amd64.iso `
+    --disk .\install.img --disk-size-gb 16 `
+    --ram-mb 3072 --vcpus 2
+```
+
+What it does:
+
+1. Mounts the ISO via PowerShell `Mount-DiskImage` (no admin needed).
+2. Copies `casper/vmlinuz` + `casper/initrd` to a workspace under
+   `%TEMP%`.
+3. Dismounts the ISO.
+4. Decompresses the bzImage to the raw inner ELF (the kernel build
+   embeds the compressed vmlinux behind a small setup header; we
+   scan for `gzip`/`xz`/`bz2`/`zstd`/`lzma-alone` frame magic and
+   stream-decompress at each match — Ubuntu 22.04+ uses zstd in
+   streaming mode without `Frame_Content_Size`, so we use the
+   streaming decompressor class).
+5. Creates the target disk as a genuinely sparse NTFS file (logical
+   size = `--disk-size-gb`, on-disk usage starts at zero and grows
+   only as the installer writes).
+6. Launches tinyvmm with two virtio-blk drives — the ISO mounted
+   read-only as `/dev/vda` (so casper finds its
+   `casper/filesystem.squashfs`) and the install target as
+   `/dev/vdb` — plus a virtio-net backend (default `usernet` so
+   the installer can fetch apt mirrors without any host network
+   config) and a cmdline of `console=hvc0 boot=casper
+   live-media=/dev/vda pci=conf1,nocrs,lastbus=0 nofb nomodeset
+   fsck.mode=skip ipv6.disable=1`.
+
+The subiquity TUI lands on hvc0 via the virtio-console device; host
+stdin is forwarded as the keyboard. RAM defaults to 3 GiB because
+subiquity + snap + squashfs overlay needs ~2 GiB minimum.
+
+For an unattended install with cloud-init `user-data`, pass the
+extra cmdline through:
+
+```powershell
+python tools\ubuntu_iso_boot.py --iso ... --disk ... `
+    --cmdline-extra "autoinstall ds=nocloud;s=http://10.0.2.2/"
+```
+
+(seeding the cloud-init source is the user's responsibility.)
+
 ## Observability
 
 tinyvmm emits **ETW TraceLogging** events plus a per-shutdown summary of
