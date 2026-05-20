@@ -241,6 +241,326 @@ if grep -q 'tinyvmm.test=tsc' /proc/cmdline 2>/dev/null; then
     exec cat
 fi
 
+# --- optional virtio-blk real-workload test mode ------------------------
+# Enabled via kernel cmdline marker `tinyvmm.test=blk`. The host harness
+# attaches:
+#   --drive <writable>           -> /dev/vda   (target for mkfs/dd/etc)
+#   --drive <readonly>,readonly  -> /dev/vdb   (EROFS error-path test)
+# Skips RO-specific phases if vdb isn't present. Exercises:
+#   A. Raw R/W round-trip      (md5sum-verified integrity)
+#   B. Seq throughput          (1 MiB writes + reads, conv=fsync)
+#   C. Concurrent queue depth  (8 parallel dd writers; IOCP backpressure)
+#   D. Random small-block I/O  (4 KiB writes at random offsets, fsync each)
+#   E. ext2 round-trip         (mkfs + mount + write + sync + umount +
+#                                remount + verify -- flush/barrier)
+#   F. Read-only EROFS         (write to RO block dev -> EIO; mount RO +
+#                                attempt write -> EROFS)
+# Each phase logs `BLK <PHASE>: PASS` or `BLK <PHASE>: FAIL <reason>`.
+# Final line is `BLK SUMMARY: <pass>/<total> phases passed`. The host
+# driver greps for `BLK SUMMARY:` and asserts the counts match.
+if grep -q 'tinyvmm.test=blk' /proc/cmdline 2>/dev/null; then
+    log "--- BLK-TEST start ---"
+
+    BLK_PASS=0
+    BLK_FAIL=0
+    pass() { log "BLK $1: PASS${2:+ ($2)}"; BLK_PASS=$((BLK_PASS+1)); }
+    fail() { log "BLK $1: FAIL $2"; BLK_FAIL=$((BLK_FAIL+1)); }
+
+    # Best-effort drive discovery.
+    DRV_RW=/dev/vda
+    DRV_RO=/dev/vdb
+
+    if [ ! -b "$DRV_RW" ]; then
+        log "BLK FATAL: no writable virtio-blk at $DRV_RW"
+        log "available block devices: $(ls /dev/vd? 2>/dev/null)"
+        log "BLK SUMMARY: 0/0 phases passed (no target disk)"
+        sync
+        poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
+        exec cat
+    fi
+
+    RW_SIZE_BYTES=$(blockdev --getsize64 "$DRV_RW" 2>/dev/null || echo 0)
+    RW_SIZE_MB=$((RW_SIZE_BYTES / 1024 / 1024))
+    log "target: $DRV_RW ($RW_SIZE_MB MiB)"
+    if [ -b "$DRV_RO" ]; then
+        RO_SIZE_BYTES=$(blockdev --getsize64 "$DRV_RO" 2>/dev/null || echo 0)
+        log "ro-target: $DRV_RO ($((RO_SIZE_BYTES/1024/1024)) MiB, sysfs ro=$(cat /sys/class/block/vdb/ro 2>/dev/null))"
+    else
+        log "ro-target: <none> (phase F partially skipped)"
+    fi
+
+    # ---- Phase A: Raw R/W round-trip ----
+    # Write 16 MiB pseudo-random pattern, fsync, drop the guest page
+    # cache, then read back -- so the readback bytes must come from
+    # virtio-blk IN requests rather than the guest cache. busybox dd in
+    # this build does not support iflag/oflag=direct, so we use
+    # drop_caches instead of O_DIRECT.
+    log "+ phase A: raw R/W round-trip (16 MiB, drop_caches readback)"
+    A_BYTES=$((16 * 1024 * 1024))
+    if [ "$RW_SIZE_BYTES" -lt "$A_BYTES" ]; then
+        fail A "disk too small ($RW_SIZE_BYTES < $A_BYTES)"
+    else
+        dd if=/dev/urandom of=/tmp/A.pat bs=1M count=16 status=none 2>/dev/kmsg
+        SRC_MD5=$(md5sum /tmp/A.pat | awk '{print $1}')
+        if ! dd if=/tmp/A.pat of="$DRV_RW" bs=1M count=16 conv=fsync \
+                status=none 2>/dev/kmsg; then
+            fail A "write to $DRV_RW errored"
+        else
+            sync
+            echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+            DST_MD5=$(dd if="$DRV_RW" bs=1M count=16 \
+                        status=none 2>/dev/kmsg | md5sum | awk '{print $1}')
+            if [ "$SRC_MD5" = "$DST_MD5" ]; then
+                pass A "md5=$SRC_MD5"
+            else
+                fail A "md5 mismatch src=$SRC_MD5 dst=$DST_MD5"
+            fi
+        fi
+        rm -f /tmp/A.pat
+    fi
+
+    # ---- Phase B: Sequential throughput ----
+    # 64 MiB seq write with conv=fsync then drop_caches + read.
+    log "+ phase B: sequential throughput (conv=fsync + drop_caches)"
+    B_TARGET_MB=64
+    if [ "$RW_SIZE_MB" -lt "$B_TARGET_MB" ]; then B_TARGET_MB=$RW_SIZE_MB; fi
+    if [ "$B_TARGET_MB" -lt 4 ]; then
+        fail B "disk too small ($B_TARGET_MB MiB)"
+    else
+        WSTART=$(cat /proc/uptime | awk '{print $1}')
+        if dd if=/dev/zero of="$DRV_RW" bs=1M count="$B_TARGET_MB" \
+                conv=fsync status=none 2>/dev/kmsg; then
+            WEND=$(cat /proc/uptime | awk '{print $1}')
+            WMS=$(awk -v a="$WSTART" -v b="$WEND" 'BEGIN{printf "%.0f", (b-a)*1000}')
+
+            sync
+            echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+            RSTART=$(cat /proc/uptime | awk '{print $1}')
+            if dd if="$DRV_RW" of=/dev/null bs=1M count="$B_TARGET_MB" \
+                    status=none 2>/dev/kmsg; then
+                REND=$(cat /proc/uptime | awk '{print $1}')
+                RMS=$(awk -v a="$RSTART" -v b="$REND" 'BEGIN{printf "%.0f", (b-a)*1000}')
+                # Avoid divide-by-zero in busybox awk integer mode.
+                WMBS=$(awk -v mb="$B_TARGET_MB" -v ms="$WMS" \
+                        'BEGIN{if(ms<=0)ms=1; printf "%.1f", mb*1000/ms}')
+                RMBS=$(awk -v mb="$B_TARGET_MB" -v ms="$RMS" \
+                        'BEGIN{if(ms<=0)ms=1; printf "%.1f", mb*1000/ms}')
+                pass B "w=${WMBS}MB/s r=${RMBS}MB/s (${B_TARGET_MB}MiB)"
+            else
+                fail B "read errored"
+            fi
+        else
+            fail B "write errored"
+        fi
+    fi
+
+    # ---- Phase C: Concurrent queue-depth stress ----
+    # 8 parallel dd writers, each writes 4 MiB at a distinct offset with
+    # conv=fsync. All 8 fsyncs land roughly together, so the host
+    # backend should see multiple in-flight FLUSH ops -- and the
+    # writeback ops behind them may also be concurrent. The host
+    # backend's max-outstanding-requests counter is logged at shutdown
+    # so the host harness can assert `max_inflight > 1` actually
+    # happened.
+    log "+ phase C: concurrent writers (queue depth)"
+    NPAR=8
+    SLICE_MB=4
+    NEED_MB=$((NPAR * SLICE_MB))
+    if [ "$RW_SIZE_MB" -lt "$NEED_MB" ]; then
+        fail C "disk too small (need $NEED_MB MiB)"
+    else
+        mkdir -p /tmp/C
+        rm -f /tmp/C/*
+        for i in $(seq 0 $((NPAR-1))); do
+            (
+                dd if=/dev/urandom of="/tmp/C/p$i.bin" bs=1M count="$SLICE_MB" \
+                    status=none 2>/dev/null
+                dd if="/tmp/C/p$i.bin" of="$DRV_RW" bs=1M count="$SLICE_MB" \
+                    seek="$((i * SLICE_MB))" conv=fsync \
+                    status=none 2>/dev/null
+                echo "$?" > "/tmp/C/exit$i"
+            ) &
+        done
+        wait
+        sync
+        echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+        C_FAIL=""
+        for i in $(seq 0 $((NPAR-1))); do
+            ec=$(cat "/tmp/C/exit$i" 2>/dev/null)
+            if [ "$ec" != "0" ]; then C_FAIL="$C_FAIL writer$i=$ec"; fi
+        done
+        if [ -n "$C_FAIL" ]; then
+            fail C "writer error:$C_FAIL"
+        else
+            C_MISMATCH=""
+            for i in $(seq 0 $((NPAR-1))); do
+                src_md5=$(md5sum "/tmp/C/p$i.bin" | awk '{print $1}')
+                dst_md5=$(dd if="$DRV_RW" bs=1M count="$SLICE_MB" \
+                            skip="$((i * SLICE_MB))" \
+                            status=none 2>/dev/null | \
+                          md5sum | awk '{print $1}')
+                if [ "$src_md5" != "$dst_md5" ]; then
+                    C_MISMATCH="$C_MISMATCH slice$i"
+                fi
+            done
+            if [ -n "$C_MISMATCH" ]; then
+                fail C "verify mismatch:$C_MISMATCH"
+            else
+                pass C "$NPAR writers @ ${SLICE_MB}MiB each, all md5 OK"
+            fi
+        fi
+        rm -rf /tmp/C
+    fi
+
+    # ---- Phase D: Random small-block I/O ----
+    # 64 random 4 KiB writes at fsync'd offsets, each verified after a
+    # cache drop. Random offsets come from /dev/urandom (not awk's
+    # srand() which can return the same value within a single second).
+    log "+ phase D: random 4 KiB writes (64 ops)"
+    if [ "$RW_SIZE_BYTES" -lt $((1024 * 1024)) ]; then
+        fail D "disk too small"
+    else
+        D_NUMOPS=64
+        D_BLK_BYTES=4096
+        D_NUM_BLOCKS=$((RW_SIZE_BYTES / D_BLK_BYTES))
+        # Generate $D_NUMOPS random 4-byte values from /dev/urandom, convert
+        # each to an offset in [0, D_NUM_BLOCKS).
+        D_OFFSETS=$(dd if=/dev/urandom bs=4 count=$D_NUMOPS status=none 2>/dev/null \
+                    | od -An -tu4 -w4 \
+                    | awk -v n="$D_NUM_BLOCKS" '{print $1 % n}')
+        D_FAIL=""
+        i=0
+        for OFF in $D_OFFSETS; do
+            i=$((i+1))
+            dd if=/dev/urandom of=/tmp/D.blk bs="$D_BLK_BYTES" count=1 \
+                status=none 2>/dev/null
+            if ! dd if=/tmp/D.blk of="$DRV_RW" bs="$D_BLK_BYTES" count=1 \
+                    seek="$OFF" conv=fsync status=none 2>/dev/null; then
+                D_FAIL="op$i:write_err_at_$OFF"; break
+            fi
+            echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+            S=$(md5sum /tmp/D.blk | awk '{print $1}')
+            D=$(dd if="$DRV_RW" bs="$D_BLK_BYTES" count=1 skip="$OFF" \
+                    status=none 2>/dev/null | md5sum | awk '{print $1}')
+            if [ "$S" != "$D" ]; then
+                D_FAIL="op$i:mismatch_at_$OFF"; break
+            fi
+        done
+        rm -f /tmp/D.blk
+        if [ -n "$D_FAIL" ]; then
+            fail D "$D_FAIL"
+        else
+            pass D "$D_NUMOPS random 4KiB writes verified"
+        fi
+    fi
+
+    # ---- Phase E: ext2 mkfs + mount + flush + remount + verify ----
+    # Tests filesystem-level flush/barrier: any data we wrote then
+    # synced must survive an umount + remount cycle. The host harness
+    # additionally verifies the marker.txt content in the raw disk
+    # image after VM exit (proves data made it past the host page cache
+    # to the BlockFile backing file).
+    log "+ phase E: ext2 mkfs + flush + remount round-trip"
+    if ! mkfs.ext2 -F -q "$DRV_RW" > /dev/null 2>/tmp/E.err; then
+        fail E "mkfs.ext2 failed: $(cat /tmp/E.err | head -1)"
+    else
+        mkdir -p /mnt/E
+        if ! mount -t ext2 "$DRV_RW" /mnt/E 2>/tmp/E.err; then
+            fail E "mount: $(cat /tmp/E.err | head -1)"
+        else
+            # Marker is a fixed sentinel the host harness can grep for in
+            # the raw disk image (proves data hit the host file, not just
+            # the guest cache).
+            echo 'TINYVMM_BLK_TEST_MARKER_v1' > /mnt/E/marker.txt
+            dd if=/dev/urandom of=/mnt/E/payload.bin bs=1M count=4 \
+                status=none 2>/dev/null
+            MARK_MD5=$(md5sum /mnt/E/marker.txt | awk '{print $1}')
+            PAY_MD5=$(md5sum /mnt/E/payload.bin | awk '{print $1}')
+            sync
+            if ! umount /mnt/E 2>/tmp/E.err; then
+                fail E "umount: $(cat /tmp/E.err | head -1)"
+            else
+                if ! mount -t ext2 "$DRV_RW" /mnt/E 2>/tmp/E.err; then
+                    fail E "remount: $(cat /tmp/E.err | head -1)"
+                else
+                    MARK2=$(md5sum /mnt/E/marker.txt 2>/dev/null | awk '{print $1}')
+                    PAY2=$(md5sum /mnt/E/payload.bin 2>/dev/null | awk '{print $1}')
+                    if [ "$MARK_MD5" != "$MARK2" ] || [ "$PAY_MD5" != "$PAY2" ]; then
+                        fail E "verify mismatch marker=$MARK_MD5/$MARK2 pay=$PAY_MD5/$PAY2"
+                    else
+                        if ! umount /mnt/E 2>/dev/null; then
+                            fail E "second umount"
+                        elif ! mount -t ext2 -o ro "$DRV_RW" /mnt/E 2>/tmp/E.err; then
+                            fail E "ro-mount: $(cat /tmp/E.err | head -1)"
+                        else
+                            if echo x > /mnt/E/should_fail.txt 2>/dev/null; then
+                                fail E "write succeeded on -o ro mount"
+                            else
+                                pass E "remount verified + -o ro -> EROFS"
+                            fi
+                            umount /mnt/E 2>/dev/null
+                        fi
+                    fi
+                fi
+            fi
+        fi
+        rm -f /tmp/E.err
+    fi
+
+    # ---- Phase F: Read-only block-device error paths (guest-visible) ----
+    # NOTE: virtio-blk advertises the RO feature bit so Linux's block
+    # layer marks /dev/vdc read-only and refuses writes there BEFORE
+    # they reach virtio. The actual backend reject path
+    # (`type == OUT && backend.readonly()`) is covered by the host-side
+    # `--virtio-blk-ro-test` mode, not here. This phase only validates
+    # guest-visible RO surfaces.
+    log "+ phase F: read-only error paths (guest-visible)"
+    if [ ! -b "$DRV_RO" ]; then
+        log "  $DRV_RO absent; phase F skipped (no RO drive)"
+        log "BLK F: SKIP (no RO drive)"
+    else
+        F_SYSFS_RO=$(cat /sys/class/block/vdb/ro 2>/dev/null)
+        if [ "$F_SYSFS_RO" != "1" ]; then
+            fail F "sysfs ro=$F_SYSFS_RO (expected 1)"
+        else
+            F_ERR=""
+            # Raw write to the RO block device must fail. Linux gates on
+            # the RO bit in the block-layer submit path.
+            if dd if=/dev/zero of="$DRV_RO" bs=512 count=1 status=none 2>/dev/null; then
+                F_ERR="${F_ERR}direct-write-succeeded "
+            fi
+            # blockdev --getro must also report 1.
+            BD_RO=$(blockdev --getro "$DRV_RO" 2>/dev/null)
+            if [ "$BD_RO" != "1" ]; then
+                F_ERR="${F_ERR}blockdev-getro=$BD_RO "
+            fi
+            # A READ from the RO device must succeed (just verifies the
+            # backend's IN path still works on a RO file).
+            if ! dd if="$DRV_RO" of=/dev/null bs=512 count=1 status=none 2>/dev/null; then
+                F_ERR="${F_ERR}read-failed "
+            fi
+            if [ -n "$F_ERR" ]; then
+                fail F "$F_ERR"
+            else
+                pass F "sysfs-ro=1 + blockdev-getro=1 + write refused + read OK"
+            fi
+        fi
+    fi
+
+    log "--- BLK-TEST end ---"
+    log "BLK SUMMARY: ${BLK_PASS}/$((BLK_PASS + BLK_FAIL)) phases passed"
+    sync
+    sleep 1
+    # Ask tinyvmm to shut down cleanly via the host-side hvc0 sentinel
+    # detector. This works even when the kernel was built without ACPI
+    # (i.e. `poweroff` falls back to STI;HLT and never produces a real
+    # halt VM-exit, leaving tinyvmm spinning idle indefinitely).
+    log "=== tinyvmm shutdown requested ==="
+    sleep 1
+    poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
+    exec cat
+fi
+
 # --- interactive shell on /dev/hvc0 -------------------------------------
 # Respawn-on-exit loop. PID 1 must never exit (kernel panics if it does).
 # `setsid -c` makes the shell the session leader and grabs hvc0 as its
@@ -278,6 +598,10 @@ BUSYBOX_APPLETS = [
     "wget", "telnet", "nc", "ftpget", "tar", "gzip", "gunzip", "date",
     "uptime", "id", "whoami", "tee", "xargs", "which", "basename", "dirname",
     "sort", "uniq", "wc", "cut", "expr", "test", "[", "httpd",
+    # virtio-blk test surface
+    "dd", "md5sum", "sha256sum", "cmp", "sync", "fsync", "mkfs.ext2",
+    "mke2fs", "mountpoint", "stat", "truncate", "blkid", "blockdev",
+    "nproc", "seq", "time", "printf",
 ]
 
 

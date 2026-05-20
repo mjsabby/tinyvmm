@@ -79,6 +79,7 @@ public:
     std::uint64_t submitted() const { return submitted_.load(); }
     std::uint64_t completed() const { return completed_.load(); }
     std::uint64_t errors()    const { return errors_.load(); }
+    std::uint64_t max_inflight() const { return max_inflight_.load(); }
 
 private:
     void WorkerLoop();
@@ -100,6 +101,8 @@ private:
     std::atomic<std::uint64_t> submitted_{0};
     std::atomic<std::uint64_t> completed_{0};
     std::atomic<std::uint64_t> errors_{0};
+    std::atomic<std::uint64_t> inflight_{0};       // currently outstanding
+    std::atomic<std::uint64_t> max_inflight_{0};   // high-water mark
 };
 
 }  // namespace tinyvmm::host

@@ -72,6 +72,7 @@ void PrintUsage() {
         "  tinyvmm --msix-inject-test        Drive WHvRequestInterrupt into a guest IDT\n"
         "  tinyvmm --virtio-pci-test         Host-side virtio-PCI modern transport\n"
         "  tinyvmm --virtio-blk-test         Host-side virtio-blk via IOCP backend\n"
+        "  tinyvmm --virtio-blk-ro-test      Backend readonly reject path (OpWrite rejected)\n"
         "  tinyvmm --virtio-net-pci-test     Host-side virtio-net on the PCI transport\n"
         "  tinyvmm --virtio-net-loopback-test Echo a TX packet back as RX via LoopbackNetBackend\n"
         "  tinyvmm --virtio-rng-test         Host-side virtio-rng + CNG entropy source\n"
@@ -2068,12 +2069,25 @@ int RunPvhRun(const char* path, const std::string& cmdline,
         "guest: /init complete",
     };
     static_assert(std::size(kMarkers) == std::size(kMarkerLabels));
+    // The guest can request a clean tinyvmm shutdown by printing this exact
+    // sentinel on hvc0. The default /init does this after running any
+    // `tinyvmm.test=...` block, so non-interactive harness scripts don't
+    // have to rely on `poweroff` actually triggering an HLT-with-IF=0 path
+    // (Linux's poweroff-without-ACPI falls back to STI;HLT, which we treat
+    // as normal idle and continue waiting on -- a perfectly correct policy
+    // for interactive use but useless for tests). The shutdown watcher
+    // thread (further down) checks the flag and invokes stop_all_loops().
+    static constexpr const char* kShutdownSentinel =
+        "[init] === tinyvmm shutdown requested ===";
     auto marker_state = std::make_shared<std::array<bool, std::size(kMarkers)>>();
     auto pending_buf  = std::make_shared<std::string>();
     auto pending_mu   = std::make_shared<std::mutex>();
     auto first_byte   = std::make_shared<std::atomic<bool>>(false);
+    auto shutdown_requested =
+        std::make_shared<std::atomic<bool>>(false);
     auto btimer_ptr   = &btimer;
-    vcon->SetByteObserver([marker_state, pending_buf, pending_mu, first_byte, btimer_ptr]
+    vcon->SetByteObserver([marker_state, pending_buf, pending_mu, first_byte,
+                           shutdown_requested, btimer_ptr]
                           (const char* d, std::size_t n) {
         if (!first_byte->exchange(true)) {
             btimer_ptr->Mark("guest: first hvc0 byte");
@@ -2090,6 +2104,10 @@ int RunPvhRun(const char* path, const std::string& cmdline,
                 (*marker_state)[i] = true;
                 btimer_ptr->Mark(kMarkerLabels[i]);
             }
+        }
+        if (!shutdown_requested->load(std::memory_order_relaxed) &&
+            pending_buf->find(kShutdownSentinel) != std::string::npos) {
+            shutdown_requested->store(true, std::memory_order_release);
         }
     });
     {
@@ -2274,6 +2292,27 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     auto stop_all_loops = [&loops]() {
         for (auto& l : loops) l.RequestStop();
     };
+
+    // Guest-driven shutdown sentinel watcher. The byte observer (set up
+    // way above on the virtio-console) flips `shutdown_requested` to true
+    // when /init prints the `[init] === tinyvmm shutdown requested ===`
+    // line. This tiny thread polls the flag and triggers a graceful
+    // tinyvmm exit, so test harnesses don't have to rely on `poweroff`
+    // actually halting the vCPU. Always-on (no `--watchdog-secs`
+    // dependency).
+    std::atomic<bool> shutdown_watcher_done{false};
+    std::thread shutdown_watcher([&shutdown_watcher_done, shutdown_requested,
+                                   &stop_all_loops]() {
+        while (!shutdown_watcher_done.load(std::memory_order_relaxed)) {
+            if (shutdown_requested->load(std::memory_order_acquire)) {
+                std::fputs("[pvh-run] guest requested shutdown via "
+                           "hvc0 sentinel; stopping vCPU loops\n", stderr);
+                stop_all_loops();
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    });
 
     // ---- stdin -> virtio-console rxq forwarder ---------------------------
     // When stdin is a real console (TTY), forward keystrokes to the guest's
@@ -2574,9 +2613,13 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     // BSP returned; ask APs to wind down too.
     stop_all_loops();
     watchdog_done.store(true);
+    shutdown_watcher_done.store(true);
     stdin_stop.store(true);
     if (watchdog.joinable()) {
         watchdog.join();
+    }
+    if (shutdown_watcher.joinable()) {
+        shutdown_watcher.join();
     }
     if (stdin_thread.joinable()) {
         stdin_thread.join();
@@ -2602,6 +2645,27 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     // fine if the destructor runs Stop() again.
     for (auto& b : blk_backends) {
         b->Stop();
+    }
+
+    // Per-disk shutdown summary. `max_inflight` is the high-water mark of
+    // outstanding ops the IOCP worker ever saw; the blk-test harness
+    // asserts max_inflight > 1 to prove its concurrent-writer phase
+    // actually reached parallel queue depth from the backend's view.
+    for (std::size_t i = 0; i < blk_backends.size(); ++i) {
+        auto& b = blk_backends[i];
+        auto& d = blk_devices[i];
+        std::printf("[pvh-run] virtio-blk[%zu] stats: submitted=%llu "
+                    "completed=%llu errors=%llu max_inflight=%llu "
+                    "(virtio in=%llu out=%llu flush=%llu err=%llu)\n",
+                    i,
+                    static_cast<unsigned long long>(b->submitted()),
+                    static_cast<unsigned long long>(b->completed()),
+                    static_cast<unsigned long long>(b->errors()),
+                    static_cast<unsigned long long>(b->max_inflight()),
+                    static_cast<unsigned long long>(d->ops_in()),
+                    static_cast<unsigned long long>(d->ops_out()),
+                    static_cast<unsigned long long>(d->ops_flush()),
+                    static_cast<unsigned long long>(d->ops_err()));
     }
 
     // Dump the guest's view of itself at the moment we stopped, so we can
@@ -3759,6 +3823,183 @@ int RunVirtioBlkTest() {
                 static_cast<unsigned long long>(blk_ptr->ops_done()),
                 static_cast<unsigned long long>(blk_ptr->ops_err()));
     cleanup_img();
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// --virtio-blk-ro-test
+// Host-side test of the readonly path in tinyvmm::host::BlockFile. The
+// guest-side `tinyvmm.test=blk` Phase F only validates that Linux's block
+// layer correctly refuses writes to a device that advertises the VIRTIO_BLK
+// RO feature bit -- the OUT request never reaches the host. This test
+// covers the actual backend reject path: open the file with readonly=true,
+// submit an OpRead (must succeed), an OpWrite (must fail synchronously),
+// and an OpFlush (must succeed -- FlushFileBuffers on a read-only handle
+// is legal and is what the guest will see when its kernel issues a
+// REQ_PREFLUSH on a readonly mount).
+int RunVirtioBlkRoTest() {
+    namespace fs = std::filesystem;
+    namespace h  = tinyvmm::host;
+
+    std::puts("[virtio-blk-ro-test] starting (host-side; no WHP)");
+
+    // 1) Create a small deterministic file in TEMP.
+    fs::path img = fs::temp_directory_path() / "tinyvmm-blk-ro.img";
+    constexpr std::uint64_t kSize = 64 * 1024;     // 64 KiB
+    {
+        std::vector<std::uint8_t> seed(kSize);
+        for (std::size_t i = 0; i < seed.size(); ++i)
+            seed[i] = static_cast<std::uint8_t>((i ^ 0x5A) & 0xFFu);
+        std::ofstream ofs(img, std::ios::binary | std::ios::trunc);
+        ofs.write(reinterpret_cast<const char*>(seed.data()),
+                  static_cast<std::streamsize>(seed.size()));
+    }
+    auto cleanup = [&]() {
+        std::error_code ec;
+        fs::remove(img, ec);
+    };
+
+    // 2) Open readonly.
+    h::BlockFile backend(img.wstring(), /*readonly=*/true);
+    if (!backend.open()) {
+        std::fprintf(stderr,
+                     "[virtio-blk-ro-test] FAIL: open hr=0x%08lx\n",
+                     static_cast<unsigned long>(backend.open_hr()));
+        cleanup(); return 13;
+    }
+    if (!backend.readonly()) {
+        std::fputs("[virtio-blk-ro-test] FAIL: readonly() returned false\n",
+                   stderr);
+        cleanup(); return 13;
+    }
+    if (backend.size() != kSize) {
+        std::fprintf(stderr,
+                     "[virtio-blk-ro-test] FAIL: size=%llu (want %llu)\n",
+                     static_cast<unsigned long long>(backend.size()),
+                     static_cast<unsigned long long>(kSize));
+        cleanup(); return 13;
+    }
+
+    // 3) Completion recorder.
+    std::atomic<std::size_t> done{0};
+    backend.SetCompletionCallback(
+        [&](h::BlockFile::Request*) { done.fetch_add(1); });
+
+    backend.Start();
+    auto stop_backend = [&]() { backend.Stop(); cleanup(); };
+
+    // 4) OpRead - must succeed (Submit returns true, completion fires,
+    //    ok=true, bytes match).
+    std::vector<std::uint8_t> read_buf(4096, 0);
+    h::BlockFile::Request rd{};
+    rd.op = h::BlockFile::Request::OpRead;
+    rd.file_offset = 0;
+    rd.buf = read_buf.data();
+    rd.bytes = static_cast<std::uint32_t>(read_buf.size());
+
+    if (!backend.Submit(&rd)) {
+        std::puts("[virtio-blk-ro-test] FAIL: OpRead submit returned false");
+        stop_backend(); return 13;
+    }
+    // Spin briefly for the completion. The worker is a single thread on
+    // a 4 KiB read -- this should complete in microseconds.
+    for (int i = 0; i < 1000 && done.load() < 1; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (done.load() != 1 || !rd.ok) {
+        std::printf("[virtio-blk-ro-test] FAIL: OpRead done=%zu ok=%d\n",
+                    done.load(), static_cast<int>(rd.ok));
+        stop_backend(); return 13;
+    }
+    // Verify content matches the seed pattern.
+    for (std::size_t i = 0; i < read_buf.size(); ++i) {
+        const std::uint8_t want = static_cast<std::uint8_t>((i ^ 0x5A) & 0xFFu);
+        if (read_buf[i] != want) {
+            std::printf("[virtio-blk-ro-test] FAIL: read data[%zu]=0x%02x want 0x%02x\n",
+                        i, read_buf[i], want);
+            stop_backend(); return 13;
+        }
+    }
+    std::puts("[virtio-blk-ro-test] OpRead: OK");
+
+    // 5) OpWrite - MUST be rejected. Submit returns false and errors
+    //    increments by 1 immediately (no completion).
+    const auto err_before = backend.errors();
+    const auto done_before = done.load();
+    std::vector<std::uint8_t> write_buf(4096, 0xFFu);
+    h::BlockFile::Request wr{};
+    wr.op = h::BlockFile::Request::OpWrite;
+    wr.file_offset = 0;
+    wr.buf = write_buf.data();
+    wr.bytes = static_cast<std::uint32_t>(write_buf.size());
+
+    if (backend.Submit(&wr)) {
+        std::puts("[virtio-blk-ro-test] FAIL: OpWrite submit returned true (must reject)");
+        stop_backend(); return 13;
+    }
+    // Give a chance for any spurious completion (there shouldn't be one).
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    if (done.load() != done_before) {
+        std::printf("[virtio-blk-ro-test] FAIL: OpWrite produced %zu completions (must produce 0)\n",
+                    done.load() - done_before);
+        stop_backend(); return 13;
+    }
+    if (backend.errors() != err_before + 1) {
+        std::printf("[virtio-blk-ro-test] FAIL: errors counter %llu (want %llu)\n",
+                    static_cast<unsigned long long>(backend.errors()),
+                    static_cast<unsigned long long>(err_before + 1));
+        stop_backend(); return 13;
+    }
+    // Confirm the host file is unchanged: byte 0 must still be the seed
+    // value (0x5A from the (i^0x5A) seed), not 0xFF from write_buf.
+    {
+        std::ifstream ifs(img, std::ios::binary);
+        std::uint8_t b{};
+        ifs.read(reinterpret_cast<char*>(&b), 1);
+        if (b != 0x5A) {
+            std::printf("[virtio-blk-ro-test] FAIL: file byte[0]=0x%02x (want 0x5A; file mutated)\n", b);
+            stop_backend(); return 13;
+        }
+    }
+    std::puts("[virtio-blk-ro-test] OpWrite: rejected (errors+1, file unchanged)");
+
+    // 6) OpFlush - submit must succeed (the request reaches the worker)
+    //    but FlushFileBuffers on a Windows GENERIC_READ-only handle
+    //    fails with ERROR_ACCESS_DENIED, so req->ok ends up false. That
+    //    is the correct passthrough: a misbehaving guest sending a
+    //    FLUSH to a readonly device sees a clean kBlkStatusIoErr instead
+    //    of any host-side crash or stall. Linux's block layer normally
+    //    masks FLUSH on RO mounts so this path is rarely exercised in
+    //    practice -- but it must not wedge.
+    h::BlockFile::Request fl{};
+    fl.op = h::BlockFile::Request::OpFlush;
+    const auto done_before_flush = done.load();
+    const auto err_before_flush  = backend.errors();
+    if (!backend.Submit(&fl)) {
+        std::puts("[virtio-blk-ro-test] FAIL: OpFlush submit returned false");
+        stop_backend(); return 13;
+    }
+    for (int i = 0; i < 1000 && done.load() < done_before_flush + 1; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (done.load() != done_before_flush + 1) {
+        std::printf("[virtio-blk-ro-test] FAIL: OpFlush no completion (done=%zu)\n",
+                    done.load() - done_before_flush);
+        stop_backend(); return 13;
+    }
+    // Whichever way FlushFileBuffers went, the worker properly reported
+    // it via the completion callback; that's the property we're
+    // testing. The errors counter tracks ok==false so it tells us which
+    // result we got -- log it for visibility.
+    std::printf("[virtio-blk-ro-test] OpFlush: dispatched (ok=%d, errors_delta=%llu)\n",
+                static_cast<int>(fl.ok),
+                static_cast<unsigned long long>(backend.errors() - err_before_flush));
+
+    std::printf("[virtio-blk-ro-test] PASS (submitted=%llu completed=%llu errors=%llu "
+                "max_inflight=%llu)\n",
+                static_cast<unsigned long long>(backend.submitted()),
+                static_cast<unsigned long long>(backend.completed()),
+                static_cast<unsigned long long>(backend.errors()),
+                static_cast<unsigned long long>(backend.max_inflight()));
+    stop_backend();
     return 0;
 }
 
@@ -5775,6 +6016,9 @@ int main(int argc, char** argv) {
         }
         if (cmd == "--virtio-blk-test") {
             return RunVirtioBlkTest();
+        }
+        if (cmd == "--virtio-blk-ro-test") {
+            return RunVirtioBlkRoTest();
         }
         if (cmd == "--virtio-net-pci-test") {
             return RunVirtioNetPciTest();

@@ -61,6 +61,19 @@ bool BlockFile::Submit(Request* req) {
     submitted_.fetch_add(1);
     req->ok = false;
 
+    // Track high-water mark of outstanding requests. This is the bound
+    // on virtio-blk queue depth actually reached against this disk; the
+    // blk-test asserts max_inflight > 1 to prove its parallel writers
+    // were actually parallel from the backend's point of view.
+    const std::uint64_t cur = inflight_.fetch_add(1) + 1;
+    std::uint64_t prev = max_inflight_.load(std::memory_order_relaxed);
+    while (cur > prev &&
+           !max_inflight_.compare_exchange_weak(prev, cur,
+                                                std::memory_order_relaxed)) {
+        // prev was updated by compare_exchange_weak; retry until cur <= prev
+        // or the CAS sticks.
+    }
+
     if (req->op == Request::OpFlush) {
         // Defer the (sync) FlushFileBuffers to the worker thread so we don't
         // stall the vCPU. PostQueuedCompletionStatus with the dedicated
@@ -69,6 +82,7 @@ bool BlockFile::Submit(Request* req) {
         std::memset(&req->ovl, 0, sizeof(OVERLAPPED));
         if (!PostQueuedCompletionStatus(iocp_, /*bytes=*/0,
                                          kFlushKey, &req->ovl)) {
+            inflight_.fetch_sub(1);
             errors_.fetch_add(1);
             return false;
         }
@@ -85,6 +99,7 @@ bool BlockFile::Submit(Request* req) {
                             &req->ovl);
     } else {
         if (readonly_) {
+            inflight_.fetch_sub(1);
             errors_.fetch_add(1);
             return false;
         }
@@ -94,6 +109,7 @@ bool BlockFile::Submit(Request* req) {
     if (!started) {
         const DWORD err = GetLastError();
         if (err != ERROR_IO_PENDING) {
+            inflight_.fetch_sub(1);
             errors_.fetch_add(1);
             return false;
         }
@@ -127,6 +143,7 @@ void BlockFile::WorkerLoop() {
         }
         if (!req->ok) errors_.fetch_add(1);
         completed_.fetch_add(1);
+        inflight_.fetch_sub(1);
         if (complete_) complete_(req);
     }
 }
