@@ -72,6 +72,7 @@ add_executable(tinyvmm
     src/virtio/virtio_blk.cpp
     src/virtio/virtio_rng.cpp
     src/virtio/virtio_console.cpp
+    src/virtio/virtio_9p.cpp
     src/virtio/net_loopback.cpp
     src/virtio/net_xdp.cpp
     src/virtio/net_wintun.cpp

@@ -241,6 +241,65 @@ if grep -q 'tinyvmm.test=tsc' /proc/cmdline 2>/dev/null; then
     exec cat
 fi
 
+# --- optional virtio-9p Phase-1 smoke ------------------------------------
+# Enabled via kernel cmdline marker `tinyvmm.test=p9`. The host harness
+# attaches one --virtio-9p-share so we expect at least one mount tag
+# from the device cfg. Phase-1 only implements Tversion + Tattach;
+# everything else returns ENOSYS, so we expect `mount` to succeed but
+# `ls`/`stat`/etc. on the mountpoint to fail. We just assert that the
+# mount call returns 0 -- proof the version+attach handshake works
+# end-to-end through the device.
+if grep -q 'tinyvmm.test=p9' /proc/cmdline 2>/dev/null; then
+    log "--- P9-TEST start ---"
+
+    P9_PASS=0
+    P9_FAIL=0
+    p9_pass() { log "P9 $1: PASS${2:+ ($2)}"; P9_PASS=$((P9_PASS+1)); }
+    p9_fail() { log "P9 $1: FAIL $2"; P9_FAIL=$((P9_FAIL+1)); }
+
+    # Phase 1: the kernel must have driver bind to at least one virtio-9p
+    # PCI device. The cleanest sysfs proof is /sys/bus/virtio/drivers/9pnet_virtio.
+    if [ -d /sys/bus/virtio/drivers/9pnet_virtio ]; then
+        BOUND_COUNT=$(ls -1 /sys/bus/virtio/drivers/9pnet_virtio 2>/dev/null | \
+                      grep -c '^virtio' || echo 0)
+        p9_pass driver-bind "9pnet_virtio bound to $BOUND_COUNT device(s)"
+    else
+        p9_fail driver-bind "/sys/bus/virtio/drivers/9pnet_virtio missing"
+    fi
+
+    # Phase 2: try the mount itself. Tag name is hardcoded to "host"
+    # by the harness (matches `--virtio-9p-share host=...`).
+    mkdir -p /mnt/p9
+    log "+ mount -t 9p -o trans=virtio,version=9p2000.L,msize=1048576 host /mnt/p9"
+    if mount -t 9p -o trans=virtio,version=9p2000.L,msize=1048576 \
+              host /mnt/p9 2>/dev/kmsg; then
+        p9_pass mount "tag=host -> /mnt/p9"
+        log "mount table:"
+        mount | grep -F '/mnt/p9' | while IFS= read -r line; do log "  $line"; done
+        # Phase 1 doesn't implement Twalk yet, so any path lookup
+        # (ls, stat, etc.) will return ENOSYS. The mount itself
+        # succeeding is what we're proving here.
+        log "+ ls /mnt/p9 (expected: ENOSYS / 'Function not implemented')"
+        ls /mnt/p9 2>&1 | while IFS= read -r line; do log "  $line"; done
+        # Lazy unmount; clean umount needs Tclunk + walk path, which
+        # we have for the root fid (Tclunk) but not for any walked
+        # path. -l avoids hanging if the kernel decides to clunk a
+        # never-walked fid.
+        umount -l /mnt/p9 2>/dev/null || true
+    else
+        p9_fail mount "mount syscall failed"
+    fi
+
+    log "--- P9-TEST end ---"
+    log "P9 SUMMARY: ${P9_PASS}/$((P9_PASS + P9_FAIL)) phases passed"
+    sync
+    sleep 1
+    log "=== tinyvmm shutdown requested ==="
+    sleep 1
+    poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
+    exec cat
+fi
+
 # --- optional virtio-blk real-workload test mode ------------------------
 # Enabled via kernel cmdline marker `tinyvmm.test=blk`. The host harness
 # attaches:

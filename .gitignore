@@ -17,6 +17,7 @@ busybox-x86_64
 dbg_*
 guest_ram.bin
 initramfs*
+p9-test/
 pvh.log
 trace.txt
 ubsan_build.log

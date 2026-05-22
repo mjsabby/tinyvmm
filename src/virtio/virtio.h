@@ -24,6 +24,7 @@ inline constexpr std::uint32_t kDeviceIdNet = 1;
 inline constexpr std::uint32_t kDeviceIdBlk = 2;
 inline constexpr std::uint32_t kDeviceIdConsole = 3;
 inline constexpr std::uint32_t kDeviceIdRng = 4;
+inline constexpr std::uint32_t kDeviceIdP9 = 9;
 
 // Status field bits (spec §2.1).
 inline constexpr std::uint8_t kStatusAcknowledge = 1;

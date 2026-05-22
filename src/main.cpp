@@ -24,6 +24,7 @@
 #include "virtio/virtio_net.h"
 #include "virtio/virtio_pci.h"
 #include "virtio/virtio_rng.h"
+#include "virtio/virtio_9p.h"
 #include "virtio/virtio_stub.h"
 #include "virtio/virtqueue.h"
 #include "virtio/net_backend.h"
@@ -86,6 +87,7 @@ void PrintUsage() {
         "  tinyvmm --pvh-run [--net] [--net-backend loopback|xdp|wintun|wintun-svc|usernet]\n"
         "                   [--xdp-if <idx>] [--xdp-queue <q>] [--xdp-debug]\n"
         "                   [--initrd <path>] [--drive <path>[,readonly]]...\n"
+        "                   [--virtio-9p-share <tag>=<host_path>[,ro]]...\n"
         "                   [--watchdog-secs <N>] [--debug-boot]\n"
         "                   [--expose-tsc-deadline] [--ram-mb <N>]\n"
         "                   [--vcpus <N>] (1..32, default 1)\n"
@@ -1857,6 +1859,16 @@ struct DriveSpec {
     bool        readonly = false;
 };
 
+// One host directory exposed to the guest via virtio-9p (M32).
+// One ShareSpec per --virtio-9p-share flag. Path is canonicalised at
+// startup so guest-visible operations never see relative or symlinked
+// host paths.
+struct P9ShareSpec {
+    std::string             tag;
+    std::filesystem::path   host_root;
+    bool                    readonly = false;
+};
+
 int RunPvhRun(const char* path, const std::string& cmdline,
               bool with_net,
               NetBackendKind net_backend,
@@ -1865,6 +1877,7 @@ int RunPvhRun(const char* path, const std::string& cmdline,
               bool xdp_debug,
               const std::string& initrd_path,
               const std::vector<DriveSpec>& drives,
+              const std::vector<P9ShareSpec>& p9_shares,
               int watchdog_secs,
               bool hide_tsc_deadline,
               const std::vector<tinyvmm::virtio::UsernetBackend::PortForward>&
@@ -2191,6 +2204,55 @@ int RunPvhRun(const char* path, const std::string& cmdline,
                     static_cast<double>(backend->size()) / (1024.0 * 1024.0));
         blk_backends.push_back(std::move(backend));
         blk_devices .push_back(std::move(blk));
+    }
+
+
+    // --- virtio-9p (M32, optional, repeatable via --virtio-9p-share) ---
+    // Each --virtio-9p-share becomes one virtio-9p PCI device exposing
+    // one host directory. Mount tag from the spec lives in the device's
+    // PCI device-config space; the guest mounts via
+    //   mount -t 9p -o trans=virtio,version=9P2000.L <tag> /mnt/...
+    //
+    // Phase 1: Tversion + Tattach implemented; everything else returns
+    // Rlerror(ENOSYS). Phase 2+ will implement the file ops.
+    //
+    // Lifetime: P9Device must outlive the PciTransport that references
+    // it. Hold owning ptrs here so destruction order is "PCI bus first,
+    // then devices" (pbus is reset before this vector goes out of
+    // scope at function exit).
+    std::vector<std::unique_ptr<virtio::P9Device>> p9_devices;
+    p9_devices.reserve(p9_shares.size());
+    for (std::size_t i = 0; i < p9_shares.size(); ++i) {
+        const auto& s = p9_shares[i];
+        virtio::P9Share share{
+            /*.tag=*/      s.tag,
+            /*.host_root=*/s.host_root,
+            /*.readonly=*/ s.readonly,
+        };
+        auto dev = std::make_unique<virtio::P9Device>(ram, std::move(share));
+
+        virtio::PciTransport::Options popts;
+        popts.subsys_id        = static_cast<std::uint16_t>(virtio::kDeviceIdP9);
+        popts.num_msix_vectors = 2;     // requestq + config-change
+        popts.pci_class        = 0xFF;  // Unassigned / Other
+        popts.pci_subclass     = 0x00;
+        auto pxport = std::make_unique<virtio::PciTransport>(
+            *dev, popts, mmio_bus, inject_fn);
+        virtio::PciTransport* pxp = pxport.get();
+        dev->SetIrqCallback(
+            [pxp](std::uint32_t q) { pxp->RaiseQueueInterrupt(q); });
+
+        char nbuf[40];
+        std::snprintf(nbuf, sizeof(nbuf), "virtio-pci-9p[%zu]", i);
+        pxport->set_name(nbuf);
+
+        const pci::Bdf pbdf = pbus->AddDevice(std::move(pxport));
+        std::printf("[pvh-run] virtio-9p[%zu] on PCI %02x:%02x.%u "
+                    "tag=%s host=%s%s\n",
+                    i, pbdf.bus, pbdf.device, pbdf.function,
+                    s.tag.c_str(), s.host_root.string().c_str(),
+                    s.readonly ? " (ro)" : "");
+        p9_devices.push_back(std::move(dev));
     }
 
 
@@ -6174,6 +6236,7 @@ int main(int argc, char** argv) {
             bool xdp_debug = false;
             std::string initrd_path;
             std::vector<DriveSpec> drives;
+            std::vector<P9ShareSpec> p9_shares;
             int watchdog_secs = 0;  // 0 = disabled (default; previously 20)
             // Default 256 MiB. Min 128 MiB (Linux fails to boot below ~96 MiB
             // once initramfs is loaded; 128 leaves headroom). Max 3584 MiB:
@@ -6306,6 +6369,108 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                     drives.push_back(std::move(ds));
+                } else if (f == "--virtio-9p-share") {
+                    if (vmlinux_arg + 1 >= argc) {
+                        std::fputs(
+                            "--pvh-run: --virtio-9p-share wants "
+                            "<tag>=<host_path>[,ro]\n", stderr);
+                        return 1;
+                    }
+                    ++vmlinux_arg;
+                    std::string_view spec(argv[vmlinux_arg]);
+                    const auto eq = spec.find('=');
+                    if (eq == std::string_view::npos) {
+                        std::fputs(
+                            "--pvh-run: --virtio-9p-share: missing '=' "
+                            "(want <tag>=<host_path>[,ro])\n", stderr);
+                        return 1;
+                    }
+                    P9ShareSpec sh;
+                    sh.tag = std::string(spec.substr(0, eq));
+                    if (sh.tag.empty() || sh.tag.size() > 256) {
+                        std::fputs(
+                            "--pvh-run: --virtio-9p-share: tag must be "
+                            "1..256 bytes\n", stderr);
+                        return 1;
+                    }
+                    std::string_view rest = spec.substr(eq + 1);
+                    // Comma options (ro / readonly) parsed identically
+                    // to --drive. Path is the first comma-delimited
+                    // field so Windows drive letters (`C:`) are safe.
+                    std::string_view path_sv = rest;
+                    const auto comma = rest.find(',');
+                    if (comma != std::string_view::npos) {
+                        path_sv = rest.substr(0, comma);
+                        std::string_view opts = rest.substr(comma + 1);
+                        while (!opts.empty()) {
+                            const auto next = opts.find(',');
+                            std::string_view kv =
+                                (next == std::string_view::npos)
+                                    ? opts : opts.substr(0, next);
+                            if (kv == "readonly" || kv == "ro") {
+                                sh.readonly = true;
+                            } else {
+                                std::fprintf(stderr,
+                                    "--pvh-run: --virtio-9p-share: "
+                                    "unknown option '%.*s' (want: ro)\n",
+                                    tinyvmm::util::checked_int_cast<int>(
+                                        kv.size()),
+                                    kv.data());
+                                return 1;
+                            }
+                            opts = (next == std::string_view::npos)
+                                       ? std::string_view{}
+                                       : opts.substr(next + 1);
+                        }
+                    }
+                    if (path_sv.empty()) {
+                        std::fputs(
+                            "--pvh-run: --virtio-9p-share: empty host "
+                            "path\n", stderr);
+                        return 1;
+                    }
+                    // Canonicalise the host path now so any later
+                    // backend code can trust it (Phase 3+). We resolve
+                    // here at startup so the user gets a clean error
+                    // up front for typos / missing paths.
+                    std::error_code ec;
+                    std::filesystem::path host =
+                        std::filesystem::canonical(
+                            std::filesystem::path(path_sv), ec);
+                    if (ec) {
+                        std::fprintf(stderr,
+                            "--pvh-run: --virtio-9p-share: cannot "
+                            "resolve host path '%.*s': %s\n",
+                            tinyvmm::util::checked_int_cast<int>(
+                                path_sv.size()),
+                            path_sv.data(), ec.message().c_str());
+                        return 1;
+                    }
+                    if (!std::filesystem::is_directory(host, ec) || ec) {
+                        std::fprintf(stderr,
+                            "--pvh-run: --virtio-9p-share: host path "
+                            "is not a directory: %s\n",
+                            host.string().c_str());
+                        return 1;
+                    }
+                    // Reject duplicate mount tags so the guest is
+                    // unambiguous about which device serves which tag.
+                    for (const auto& prior : p9_shares) {
+                        if (prior.tag == sh.tag) {
+                            std::fprintf(stderr,
+                                "--pvh-run: --virtio-9p-share: "
+                                "duplicate tag '%s'\n", sh.tag.c_str());
+                            return 1;
+                        }
+                    }
+                    if (p9_shares.size() >= 8) {
+                        std::fputs(
+                            "--pvh-run: --virtio-9p-share: max 8 "
+                            "shares supported\n", stderr);
+                        return 1;
+                    }
+                    sh.host_root = std::move(host);
+                    p9_shares.push_back(std::move(sh));
                 } else if (f == "--watchdog-secs") {
                     if (vmlinux_arg + 1 >= argc) {
                         std::fputs("--pvh-run: --watchdog-secs wants a number "
@@ -6597,7 +6762,7 @@ int main(int argc, char** argv) {
             }
             return RunPvhRun(argv[vmlinux_arg], cmdline, with_net,
                              net_backend, xdp_if, xdp_queue, xdp_debug,
-                             initrd_path, drives, watchdog_secs,
+                             initrd_path, drives, p9_shares, watchdog_secs,
                              hide_tsc_deadline, port_forwards, ram_mb,
                              vcpu_count, affinity_mode);
         }
