@@ -241,14 +241,14 @@ if grep -q 'tinyvmm.test=tsc' /proc/cmdline 2>/dev/null; then
     exec cat
 fi
 
-# --- optional virtio-9p Phase-1 smoke ------------------------------------
+# --- optional virtio-9p Phase-2 file-ops smoke ----------------------------
 # Enabled via kernel cmdline marker `tinyvmm.test=p9`. The host harness
-# attaches one --virtio-9p-share so we expect at least one mount tag
-# from the device cfg. Phase-1 only implements Tversion + Tattach;
-# everything else returns ENOSYS, so we expect `mount` to succeed but
-# `ls`/`stat`/etc. on the mountpoint to fail. We just assert that the
-# mount call returns 0 -- proof the version+attach handshake works
-# end-to-end through the device.
+# attaches one --virtio-9p-share host=p9-test/ exposing a fixture with:
+#   foo.txt           - hello-from-host text
+#   bar.txt           - second-file text
+#   subdir/nested.txt - nested text
+# Phase 2 implements the full Win32-backed protocol; this block exercises
+# ls/cat/echo/mkdir/rm/rename round-trip in both directions.
 if grep -q 'tinyvmm.test=p9' /proc/cmdline 2>/dev/null; then
     log "--- P9-TEST start ---"
 
@@ -257,8 +257,7 @@ if grep -q 'tinyvmm.test=p9' /proc/cmdline 2>/dev/null; then
     p9_pass() { log "P9 $1: PASS${2:+ ($2)}"; P9_PASS=$((P9_PASS+1)); }
     p9_fail() { log "P9 $1: FAIL $2"; P9_FAIL=$((P9_FAIL+1)); }
 
-    # Phase 1: the kernel must have driver bind to at least one virtio-9p
-    # PCI device. The cleanest sysfs proof is /sys/bus/virtio/drivers/9pnet_virtio.
+    # Phase 1: driver bind.
     if [ -d /sys/bus/virtio/drivers/9pnet_virtio ]; then
         BOUND_COUNT=$(ls -1 /sys/bus/virtio/drivers/9pnet_virtio 2>/dev/null | \
                       grep -c '^virtio' || echo 0)
@@ -267,8 +266,7 @@ if grep -q 'tinyvmm.test=p9' /proc/cmdline 2>/dev/null; then
         p9_fail driver-bind "/sys/bus/virtio/drivers/9pnet_virtio missing"
     fi
 
-    # Phase 2: try the mount itself. Tag name is hardcoded to "host"
-    # by the harness (matches `--virtio-9p-share host=...`).
+    # Phase 2: mount.
     mkdir -p /mnt/p9
     log "+ mount -t 9p -o trans=virtio,version=9p2000.L,msize=1048576 host /mnt/p9"
     if mount -t 9p -o trans=virtio,version=9p2000.L,msize=1048576 \
@@ -276,16 +274,75 @@ if grep -q 'tinyvmm.test=p9' /proc/cmdline 2>/dev/null; then
         p9_pass mount "tag=host -> /mnt/p9"
         log "mount table:"
         mount | grep -F '/mnt/p9' | while IFS= read -r line; do log "  $line"; done
-        # Phase 1 doesn't implement Twalk yet, so any path lookup
-        # (ls, stat, etc.) will return ENOSYS. The mount itself
-        # succeeding is what we're proving here.
-        log "+ ls /mnt/p9 (expected: ENOSYS / 'Function not implemented')"
-        ls /mnt/p9 2>&1 | while IFS= read -r line; do log "  $line"; done
-        # Lazy unmount; clean umount needs Tclunk + walk path, which
-        # we have for the root fid (Tclunk) but not for any walked
-        # path. -l avoids hanging if the kernel decides to clunk a
-        # never-walked fid.
-        umount -l /mnt/p9 2>/dev/null || true
+
+        # Phase 3: ls must show the fixture entries.
+        LS_OUT=$(ls /mnt/p9 2>&1)
+        log "+ ls /mnt/p9:"
+        echo "$LS_OUT" | while IFS= read -r line; do log "  $line"; done
+        if echo "$LS_OUT" | grep -q foo.txt && \
+           echo "$LS_OUT" | grep -q bar.txt && \
+           echo "$LS_OUT" | grep -q subdir; then
+            p9_pass readdir "foo.txt + bar.txt + subdir all visible"
+        else
+            p9_fail readdir "missing one or more fixture entries"
+        fi
+
+        # Phase 4: cat must read host file content correctly.
+        FOO=$(cat /mnt/p9/foo.txt 2>/dev/kmsg)
+        if [ "$FOO" = "hello from host" ]; then
+            p9_pass read-host "foo.txt content matches"
+        else
+            p9_fail read-host "got [$FOO]"
+        fi
+
+        # Phase 5: recursive read of subdir.
+        NESTED=$(cat /mnt/p9/subdir/nested.txt 2>/dev/kmsg)
+        if [ "$NESTED" = "nested" ]; then
+            p9_pass walk-subdir "subdir/nested.txt readable via Twalk"
+        else
+            p9_fail walk-subdir "got [$NESTED]"
+        fi
+
+        # Phase 6: guest creates a file; host should see it. We also
+        # remove it at end so this whole test is rerunnable on the
+        # same host fixture without permanently mutating it.
+        if echo "guest-wrote" > /mnt/p9/guest.txt 2>/dev/kmsg && \
+           [ "$(cat /mnt/p9/guest.txt 2>/dev/null)" = "guest-wrote" ]; then
+            p9_pass write-create "guest.txt created + readback ok"
+        else
+            p9_fail write-create "could not create or readback guest.txt"
+        fi
+
+        # Phase 7: mkdir + rmdir.
+        if mkdir /mnt/p9/newdir 2>/dev/kmsg && \
+           [ -d /mnt/p9/newdir ] && \
+           rmdir /mnt/p9/newdir 2>/dev/kmsg && \
+           [ ! -d /mnt/p9/newdir ]; then
+            p9_pass mkdir-rmdir "newdir create+remove ok"
+        else
+            p9_fail mkdir-rmdir "mkdir/rmdir round-trip failed"
+        fi
+
+        # Phase 8: rename via mv, then rm (round-trip; leaves no debris).
+        if [ -f /mnt/p9/guest.txt ] && \
+           mv /mnt/p9/guest.txt /mnt/p9/renamed.txt 2>/dev/kmsg && \
+           [ -f /mnt/p9/renamed.txt ] && \
+           [ ! -f /mnt/p9/guest.txt ] && \
+           rm /mnt/p9/renamed.txt 2>/dev/kmsg && \
+           [ ! -f /mnt/p9/renamed.txt ]; then
+            p9_pass rename-unlink "guest.txt -> renamed.txt + rm ok"
+        else
+            p9_fail rename-unlink "rename or unlink failed"
+            rm -f /mnt/p9/guest.txt /mnt/p9/renamed.txt 2>/dev/null || true
+        fi
+
+        # Phase 9: clean umount (no -l: requires real Tclunk on each fid).
+        if umount /mnt/p9 2>/dev/kmsg; then
+            p9_pass umount "clean umount"
+        else
+            p9_fail umount "umount failed (likely a fid leak)"
+            umount -l /mnt/p9 2>/dev/null || true
+        fi
     else
         p9_fail mount "mount syscall failed"
     fi
