@@ -357,6 +357,257 @@ if grep -q 'tinyvmm.test=p9' /proc/cmdline 2>/dev/null; then
     exec cat
 fi
 
+# --- optional virtio-9p end-to-end harness mode ---------------------------
+# Enabled via kernel cmdline marker `tinyvmm.test=9p` (note: distinct from
+# the older `tinyvmm.test=p9` smoke block, which targets the hand-staged
+# p9-test/ fixture). This block is driven by tools/p9_test.py which stages
+# a deterministic tree under workdir/p9-share/ plus a sha256sum manifest
+# at .manifest.sha256:
+#
+#   .manifest.sha256                  -- 105 lines, busybox sha256sum -c format
+#   empty.bin                         -- 0 bytes
+#   one.bin                           -- 1 byte
+#   small.bin                         -- 4096 bytes (page boundary)
+#   large.bin                         -- 1 MiB (crosses msize=512000 cap)
+#   many/file000.bin .. file099.bin   -- 100 files (readdir + open stress)
+#   subdir/nested.bin                 -- nested-dir walk target
+#
+# Test phases (15 total):
+#   1.  driver-bind     -- 9pnet_virtio bound to >= 1 device
+#   2.  mount           -- mount -t 9p succeeds
+#   3.  manifest-readable -- .manifest.sha256 exists and is non-empty
+#   4.  sha256-bulk     -- sha256sum -c .manifest.sha256 returns 0 +
+#                          ": OK$" line count == 105
+#   5.  empty-file      -- stat size == 0
+#   6.  large-file      -- re-hash 1 MiB file matches manifest
+#   7.  many-files      -- ls many/ count == 100
+#   8.  nested-dir      -- sha256 of subdir/nested.bin matches manifest
+#   9.  write-create    -- echo > guest_wrote.txt + readback (host-visible)
+#   10. create-delete   -- touch + rm round-trip
+#   11. mkdir-rmdir     -- mkdir + rmdir round-trip
+#   12. rename-roundtrip-- mv a -> b + rm b
+#   13. truncate        -- printf > f; : > f; stat size == 0 (Tsetattr size)
+#   14. append          -- printf > f; printf >> f; readback (O_APPEND)
+#   15. umount          -- clean umount, no -l fallback
+#
+# Prints `9P SUMMARY: X/Y phases passed` and the tinyvmm shutdown sentinel.
+if grep -q 'tinyvmm.test=9p' /proc/cmdline 2>/dev/null; then
+    log "--- 9P-HARNESS start ---"
+
+    NP_PASS=0
+    NP_FAIL=0
+    np_pass() { log "P9 $1: PASS${2:+ ($2)}"; NP_PASS=$((NP_PASS+1)); }
+    np_fail() { log "P9 $1: FAIL $2"; NP_FAIL=$((NP_FAIL+1)); }
+
+    EXPECTED_MANIFEST_LINES=105
+
+    # Phase 1: driver-bind.
+    if [ -d /sys/bus/virtio/drivers/9pnet_virtio ]; then
+        BOUND=$(ls -1 /sys/bus/virtio/drivers/9pnet_virtio 2>/dev/null | \
+                grep -c '^virtio' || echo 0)
+        if [ "$BOUND" -ge 1 ]; then
+            np_pass driver-bind "$BOUND device(s)"
+        else
+            np_fail driver-bind "0 devices bound"
+        fi
+    else
+        np_fail driver-bind "/sys/bus/virtio/drivers/9pnet_virtio missing"
+    fi
+
+    # Phase 2: mount.
+    mkdir -p /mnt/p9
+    log "+ mount -t 9p -o trans=virtio,version=9p2000.L,msize=1048576 host /mnt/p9"
+    if mount -t 9p -o trans=virtio,version=9p2000.L,msize=1048576 \
+              host /mnt/p9 2>/dev/kmsg; then
+        np_pass mount "tag=host -> /mnt/p9"
+    else
+        np_fail mount "mount syscall failed"
+        log "9P SUMMARY: ${NP_PASS}/$((NP_PASS + NP_FAIL)) phases passed"
+        sync
+        sleep 1
+        log "=== tinyvmm shutdown requested ==="
+        sleep 1
+        poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
+        exec cat
+    fi
+
+    cd /mnt/p9 || true
+
+    # Phase 3: manifest-readable.
+    if [ -s /mnt/p9/.manifest.sha256 ]; then
+        MLINES=$(wc -l < /mnt/p9/.manifest.sha256)
+        if [ "$MLINES" -eq "$EXPECTED_MANIFEST_LINES" ]; then
+            np_pass manifest-readable "$MLINES lines"
+        else
+            np_fail manifest-readable \
+                "got $MLINES lines (want $EXPECTED_MANIFEST_LINES)"
+        fi
+    else
+        np_fail manifest-readable ".manifest.sha256 missing or empty"
+    fi
+
+    # Phase 4: sha256-bulk. Adopt rubber-duck recommendation: gate on
+    # BOTH busybox sha256sum -c exit status AND ": OK$" line count.
+    # That catches missing files, hash mismatches, and read errors that
+    # busybox might report without the literal "FAILED" token.
+    SHA_RC=0
+    sha256sum -c /mnt/p9/.manifest.sha256 > /tmp/sha.out 2>&1 || SHA_RC=$?
+    if [ "$SHA_RC" -eq 0 ]; then
+        OK_COUNT=$(grep -c ': OK$' /tmp/sha.out || true)
+        if [ "$OK_COUNT" -eq "$EXPECTED_MANIFEST_LINES" ]; then
+            np_pass sha256-bulk "$OK_COUNT/$EXPECTED_MANIFEST_LINES OK"
+        else
+            np_fail sha256-bulk \
+                "got $OK_COUNT OK lines (want $EXPECTED_MANIFEST_LINES)"
+            head -n 10 /tmp/sha.out | while IFS= read -r line; do log "  $line"; done
+        fi
+    else
+        np_fail sha256-bulk "sha256sum -c exit=$SHA_RC"
+        head -n 10 /tmp/sha.out | while IFS= read -r line; do log "  $line"; done
+    fi
+
+    # Phase 5: empty-file.
+    if [ -f /mnt/p9/empty.bin ] && \
+       [ "$(stat -c %s /mnt/p9/empty.bin)" = "0" ] && \
+       [ -z "$(cat /mnt/p9/empty.bin)" ]; then
+        np_pass empty-file "size=0"
+    else
+        np_fail empty-file "stat or cat unexpected"
+    fi
+
+    # Phase 6: large-file (1 MiB). The manifest already covers this in
+    # sha256-bulk, but re-hash explicitly so failures are attributed
+    # to the large-file path (Tread chunking past 512000 msize cap).
+    LARGE_EXPECT=$(grep '  large.bin$' /mnt/p9/.manifest.sha256 | awk '{print $1}')
+    LARGE_ACTUAL=$(sha256sum /mnt/p9/large.bin | awk '{print $1}')
+    if [ -n "$LARGE_EXPECT" ] && [ "$LARGE_EXPECT" = "$LARGE_ACTUAL" ]; then
+        np_pass large-file "1 MiB sha256 matches"
+    else
+        np_fail large-file "expect=$LARGE_EXPECT actual=$LARGE_ACTUAL"
+    fi
+
+    # Phase 7: many-files (100 entries).
+    if [ -d /mnt/p9/many ]; then
+        MANY_COUNT=$(ls -1 /mnt/p9/many 2>/dev/null | wc -l)
+        if [ "$MANY_COUNT" -eq 100 ]; then
+            np_pass many-files "100 entries"
+        else
+            np_fail many-files "ls count=$MANY_COUNT (want 100)"
+        fi
+    else
+        np_fail many-files "/mnt/p9/many missing"
+    fi
+
+    # Phase 8: nested-dir.
+    NESTED_EXPECT=$(grep '  subdir/nested.bin$' /mnt/p9/.manifest.sha256 | \
+                    awk '{print $1}')
+    NESTED_ACTUAL=$(sha256sum /mnt/p9/subdir/nested.bin 2>/dev/null | \
+                    awk '{print $1}')
+    if [ -n "$NESTED_EXPECT" ] && [ "$NESTED_EXPECT" = "$NESTED_ACTUAL" ]; then
+        np_pass nested-dir "subdir/nested.bin sha256 matches"
+    else
+        np_fail nested-dir "expect=$NESTED_EXPECT actual=$NESTED_ACTUAL"
+    fi
+
+    # Phase 9: write-create (guest -> host visibility). Host harness
+    # asserts the file exists with the exact expected content after
+    # the VM exits. The known sha256 of "guest-wrote\\n" is checked
+    # here too so a flush failure is caught immediately.
+    GUEST_WROTE_SHA="faed973bf80505e70fc0dd5ebcd1bacc7d1af74c686d285160d3531ef1d13f1a"
+    rm -f /mnt/p9/guest_wrote.txt 2>/dev/null || true
+    if echo "guest-wrote" > /mnt/p9/guest_wrote.txt 2>/dev/kmsg && \
+       [ "$(cat /mnt/p9/guest_wrote.txt)" = "guest-wrote" ] && \
+       [ "$(sha256sum /mnt/p9/guest_wrote.txt | awk '{print $1}')" = \
+         "$GUEST_WROTE_SHA" ]; then
+        np_pass write-create "guest_wrote.txt sha256 matches"
+    else
+        np_fail write-create "echo/cat/sha256 unexpected"
+    fi
+
+    # Phase 10: create-delete cycle. Host post-check requires the
+    # file is gone after the run.
+    if touch /mnt/p9/guest_tmp.txt 2>/dev/kmsg && \
+       [ -f /mnt/p9/guest_tmp.txt ] && \
+       rm /mnt/p9/guest_tmp.txt 2>/dev/kmsg && \
+       [ ! -f /mnt/p9/guest_tmp.txt ]; then
+        np_pass create-delete "touch + rm ok"
+    else
+        np_fail create-delete "create or delete failed"
+        rm -f /mnt/p9/guest_tmp.txt 2>/dev/null || true
+    fi
+
+    # Phase 11: mkdir-rmdir.
+    if mkdir /mnt/p9/new_dir 2>/dev/kmsg && \
+       [ -d /mnt/p9/new_dir ] && \
+       rmdir /mnt/p9/new_dir 2>/dev/kmsg && \
+       [ ! -d /mnt/p9/new_dir ]; then
+        np_pass mkdir-rmdir "ok"
+    else
+        np_fail mkdir-rmdir "mkdir or rmdir failed"
+        rmdir /mnt/p9/new_dir 2>/dev/null || true
+    fi
+
+    # Phase 12: rename-roundtrip.
+    if echo a > /mnt/p9/rename_a.txt 2>/dev/kmsg && \
+       mv /mnt/p9/rename_a.txt /mnt/p9/rename_b.txt 2>/dev/kmsg && \
+       [ -f /mnt/p9/rename_b.txt ] && \
+       [ ! -f /mnt/p9/rename_a.txt ] && \
+       rm /mnt/p9/rename_b.txt 2>/dev/kmsg && \
+       [ ! -f /mnt/p9/rename_b.txt ]; then
+        np_pass rename-roundtrip "mv a->b + rm ok"
+    else
+        np_fail rename-roundtrip "rename or unlink failed"
+        rm -f /mnt/p9/rename_a.txt /mnt/p9/rename_b.txt 2>/dev/null || true
+    fi
+
+    # Phase 13: truncate (exercises Tsetattr size). `: > f` triggers
+    # truncate(2) -> Tsetattr with kP9SetattrSize and size=0.
+    if printf 'abcdef' > /mnt/p9/trunc.txt 2>/dev/kmsg && \
+       [ "$(stat -c %s /mnt/p9/trunc.txt)" = "6" ] && \
+       : > /mnt/p9/trunc.txt 2>/dev/kmsg && \
+       [ "$(stat -c %s /mnt/p9/trunc.txt)" = "0" ] && \
+       rm /mnt/p9/trunc.txt 2>/dev/kmsg; then
+        np_pass truncate "abcdef -> 0 bytes ok"
+    else
+        np_fail truncate "size transition unexpected"
+        rm -f /mnt/p9/trunc.txt 2>/dev/null || true
+    fi
+
+    # Phase 14: append (exercises Twrite with O_APPEND -> backend
+    # honors OVERLAPPED.Offset = 0xFFFFFFFFu).
+    if printf 'aaa' > /mnt/p9/append.txt 2>/dev/kmsg && \
+       printf 'bbb' >> /mnt/p9/append.txt 2>/dev/kmsg && \
+       [ "$(cat /mnt/p9/append.txt)" = "aaabbb" ] && \
+       rm /mnt/p9/append.txt 2>/dev/kmsg; then
+        np_pass append "aaa + bbb = aaabbb"
+    else
+        np_fail append "append did not concatenate correctly"
+        rm -f /mnt/p9/append.txt 2>/dev/null || true
+    fi
+
+    cd / || true
+    sync
+
+    # Phase 15: umount. No -l fallback in the primary assertion --
+    # a clean umount requires all fids were Tclunked, which proves
+    # we did not leak any references.
+    if umount /mnt/p9 2>/dev/kmsg; then
+        np_pass umount "clean umount"
+    else
+        np_fail umount "umount failed (likely fid leak)"
+        umount -l /mnt/p9 2>/dev/null || true
+    fi
+
+    log "--- 9P-HARNESS end ---"
+    log "9P SUMMARY: ${NP_PASS}/$((NP_PASS + NP_FAIL)) phases passed"
+    sync
+    sleep 1
+    log "=== tinyvmm shutdown requested ==="
+    sleep 1
+    poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
+    exec cat
+fi
+
 # --- optional virtio-blk real-workload test mode ------------------------
 # Enabled via kernel cmdline marker `tinyvmm.test=blk`. The host harness
 # attaches:

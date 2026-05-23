@@ -220,7 +220,84 @@ python tools\ubuntu_iso_boot.py --iso ... --disk ... `
 
 (seeding the cloud-init source is the user's responsibility.)
 
-## Observability
+## Shared folder (virtio-9p)
+
+`--virtio-9p-share <tag>=<host-path>[,ro]` exposes a host directory to
+the guest as a 9P2000.L file system. The implementation is a Win32
+backend that maps every 9p message to a single Windows system call
+(`CreateFileW` / `ReadFile` / `WriteFile` / `FindFirstFileW` /
+`MoveFileExW` / `DeleteFileW` / `FlushFileBuffers` / etc.). No FUSE
+server, no in-guest agent, no Linux-only daemon.
+
+```powershell
+# One read-write share, exposing C:\Users\me\code under the
+# mount tag "code".
+.\build\bin\tinyvmm.exe --pvh-run --ram-mb 256 `
+    --virtio-9p-share code=C:\Users\me\code `
+    --initrd initramfs.cpio.gz vmlinux
+
+# In the guest (busybox + 9pnet_virtio):
+mkdir -p /mnt/code
+mount -t 9p -o trans=virtio,version=9p2000.L,msize=1048576 \
+      code /mnt/code
+```
+
+You can repeat the flag up to 8 times to attach multiple shares; each
+gets its own virtio-9p PCI device with a distinct mount tag:
+
+```powershell
+.\build\bin\tinyvmm.exe --pvh-run --ram-mb 256 `
+    --virtio-9p-share alpha=C:\Users\me\projects-a `
+    --virtio-9p-share beta=C:\Users\me\projects-b,ro `
+    --initrd initramfs.cpio.gz vmlinux
+```
+
+`,ro` flips the device into read-only mode: every Tlopen with
+write access, Twrite, Tlcreate, Tremove, Tmkdir, Trename, Trenameat,
+Tunlinkat, and Tsetattr returns `EROFS` to the guest. The guest sees
+a normal-looking file system that just refuses mutations.
+
+**Bidirectional file sharing works.** Concrete operations covered:
+
+| Guest command                | What hits the host                                        |
+|------------------------------|-----------------------------------------------------------|
+| `ls /mnt/code`               | `Twalk` (root) + `Treaddir` -> `FindFirstFileW` loop      |
+| `cat foo.txt`                | `Twalk` + `Tlopen(O_RDONLY)` + `Tread` -> `ReadFile`     |
+| `echo hi > foo.txt`          | `Tlcreate(O_TRUNC)` -> `CreateFileW(CREATE_ALWAYS)` + `WriteFile` |
+| `echo hi >> foo.txt`         | `Tlopen(O_APPEND)` + `Twrite` -> `WriteFile` w/ append OVERLAPPED |
+| `: > foo.txt`                | `Tsetattr(size=0)` -> `SetFilePointerEx` + `SetEndOfFile` |
+| `mkdir d; rmdir d`           | `Tmkdir` -> `CreateDirectoryW`; `Tunlinkat(AT_REMOVEDIR)` -> `RemoveDirectoryW` |
+| `mv a b`                     | `Trenameat` -> `MoveFileExW(MOVE_COPY_ALLOWED \| REPLACE_EXISTING)` |
+| `rm foo.txt`                 | `Tunlinkat(0)` -> `DeleteFileW`                           |
+| `sync`                       | `Tfsync` -> `FlushFileBuffers`                            |
+| `umount /mnt/code`           | `Tclunk` for every open fid -> `CloseHandle`              |
+
+**Path safety.** Every guest-supplied path component is canonicalised
+(`std::filesystem::weakly_canonical`) and then compared lexically
+against the share root (case-insensitive, with `/` -> `\` normalisation)
+before any Win32 call. Walking out of the share with `..` is rejected
+with `EACCES`. Windows-reserved name fragments (`CON`, `PRN`, `AUX`,
+`NUL`, `COM1..9`, `LPT1..9`, names with `:*?"<>|` or trailing `.`/
+space) are rejected with `EINVAL` before they reach the host file
+system.
+
+**End-to-end test:** `python tools\p9_test.py` stages a deterministic
+105-file tree (empty file, 1 byte, 4 KiB, 1 MiB, 100 small files,
+nested dir) plus a sha256sum manifest, launches tinyvmm with the share,
+runs a 15-phase guest harness (mount, sha256 verify, write/create,
+mkdir/rmdir, rename, truncate, append, clean umount), then verifies on
+the host: every fixture file is still byte-identical, the guest's
+write is visible with correct content, and every transient file the
+guest created has been removed.
+
+**Linux msize cap.** Modern Linux `9pnet_virtio` clamps `msize` to
+512000 bytes regardless of what the device advertises, so even though
+tinyvmm allows up to 1 MiB messages the wire-level transfer unit is
+~512 KiB. With the default `cache=none` mount option each guest read
+becomes one Tread per kernel-side syscall; pass `cache=loose` if you
+want client-side page-cache for re-reads of the same file.
+
+
 
 tinyvmm emits **ETW TraceLogging** events plus a per-shutdown summary of
 WHV exit counters. There is no manifest registration step; events are

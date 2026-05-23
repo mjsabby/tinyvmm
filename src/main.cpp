@@ -2213,8 +2213,10 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     // PCI device-config space; the guest mounts via
     //   mount -t 9p -o trans=virtio,version=9P2000.L <tag> /mnt/...
     //
-    // Phase 1: Tversion + Tattach implemented; everything else returns
-    // Rlerror(ENOSYS). Phase 2+ will implement the file ops.
+    // 9P2000.L Win32 backend (Phase 2, committed at 47bae43): 19
+    // handlers covering Tversion/Tattach/Twalk/Tlopen/Tlcreate/Tread/
+    // Twrite/Tgetattr/Tsetattr/Treaddir/Tclunk/Tremove/Tfsync/Tflush/
+    // Tmkdir/Trename/Trenameat/Tunlinkat/Tstatfs.
     //
     // Lifetime: P9Device must outlive the PciTransport that references
     // it. Hold owning ptrs here so destruction order is "PCI bus first,
