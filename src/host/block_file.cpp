@@ -3,6 +3,9 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+
+#include <winioctl.h>
 
 namespace tinyvmm::host {
 
@@ -32,8 +35,7 @@ BlockFile::BlockFile(const std::wstring& path, bool readonly)
 BlockFile::~BlockFile() {
     Stop();
     if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_);
-    if (iocp_) CloseHandle(iocp_);
-}
+    if (iocp_) CloseHandle(iocp_);}
 
 void BlockFile::Start() {
     if (handle_ == INVALID_HANDLE_VALUE) {
@@ -54,6 +56,38 @@ void BlockFile::Stop() {
     stop_.store(true);
     PostQueuedCompletionStatus(iocp_, 0, kShutdownKey, /*ovl=*/nullptr);
     worker_.join();
+}
+
+bool BlockFile::ZeroRange(std::uint64_t offset, std::uint64_t length) {
+    if (readonly_ || handle_ == INVALID_HANDLE_VALUE) return false;
+    if (length == 0) return true;
+    // Bounds: refuse if the range escapes the file. (Caller should have
+    // already bounds-checked, but a defensive 2nd check is cheap.)
+    if (offset > size_ || length > size_ - offset) return false;
+
+    // Mark the file sparse on first use so SET_ZERO_DATA actually
+    // deallocates clusters instead of writing physical zeros.
+    // FSCTL_SET_SPARSE on a non-NTFS volume (e.g. FAT32) fails with
+    // ERROR_INVALID_FUNCTION; we treat that as a soft failure and
+    // continue -- SET_ZERO_DATA still works, it just writes zeros.
+    std::call_once(sparse_once_, [this]() {
+        FILE_SET_SPARSE_BUFFER sb{};
+        sb.SetSparse = TRUE;
+        DWORD ret = 0;
+        BOOL ok = DeviceIoControl(handle_, FSCTL_SET_SPARSE,
+                                   &sb, sizeof(sb), nullptr, 0,
+                                   &ret, /*lpOverlapped=*/nullptr);
+        sparse_ok_.store(ok == TRUE, std::memory_order_release);
+    });
+
+    FILE_ZERO_DATA_INFORMATION zd{};
+    zd.FileOffset.QuadPart      = static_cast<LONGLONG>(offset);
+    zd.BeyondFinalZero.QuadPart = static_cast<LONGLONG>(offset + length);
+    DWORD ret = 0;
+    BOOL ok = DeviceIoControl(handle_, FSCTL_SET_ZERO_DATA,
+                               &zd, sizeof(zd), nullptr, 0,
+                               &ret, /*lpOverlapped=*/nullptr);
+    return ok == TRUE;
 }
 
 bool BlockFile::Submit(Request* req) {

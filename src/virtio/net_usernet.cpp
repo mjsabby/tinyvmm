@@ -1,4 +1,5 @@
 #include "net_usernet.h"
+#include "net_usernet_tsi.h"
 
 #include "virtio_pci.h"
 #include "net_l2.h"
@@ -22,7 +23,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <random>
 #include <span>
 #include <string>
 #include <thread>
@@ -56,23 +56,13 @@ using ::tinyvmm::virtio::net_l2::SummarizeReadable;
 using ::tinyvmm::virtio::net_l2::CopyReadable;
 
 constexpr std::size_t   kIp4HdrMinSize    = 20;
-constexpr std::size_t   kTcpHdrMinSize    = 20;
 constexpr std::size_t   kUdpHdrSize       = 8;
 constexpr std::size_t   kIcmpHdrSize      = 8;
 constexpr std::uint16_t kIpv4Mtu          = 1500;
-constexpr std::uint16_t kAdvertisedMss    = 1460;
-constexpr std::uint8_t  kAdvertisedWscale = 7;
-constexpr std::size_t   kTcpRxBufCap      = 256 * 1024;
-constexpr std::size_t   kTcpTxBufCap      = 256 * 1024;
-constexpr std::size_t   kPendingRxCap     = 256;
+constexpr std::size_t   kPendingRxCap     = 4096;
 constexpr std::uint8_t  kIpProtoIcmp = 1;
 constexpr std::uint8_t  kIpProtoTcp  = 6;
 constexpr std::uint8_t  kIpProtoUdp  = 17;
-constexpr std::uint8_t  kTcpFin = 0x01;
-constexpr std::uint8_t  kTcpSyn = 0x02;
-constexpr std::uint8_t  kTcpRst = 0x04;
-constexpr std::uint8_t  kTcpPsh = 0x08;
-constexpr std::uint8_t  kTcpAck = 0x10;
 constexpr std::uint8_t  kIcmpEchoRequest = 8;
 constexpr std::uint8_t  kIcmpEchoReply   = 0;
 
@@ -84,28 +74,8 @@ constexpr std::uint8_t  kIcmpEchoReply   = 0;
 constexpr std::span<const std::uint8_t, 2> S2(const std::uint8_t* p) {
     return std::span<const std::uint8_t, 2>{p, 2};
 }
-constexpr std::span<const std::uint8_t, 4> S4(const std::uint8_t* p) {
-    return std::span<const std::uint8_t, 4>{p, 4};
-}
 constexpr std::span<std::uint8_t, 2> S2(std::uint8_t* p) {
     return std::span<std::uint8_t, 2>{p, 2};
-}
-constexpr std::span<std::uint8_t, 4> S4(std::uint8_t* p) {
-    return std::span<std::uint8_t, 4>{p, 4};
-}
-
-// ---- TCP sequence-number-space comparisons (RFC 1323 §4.3) ----
-inline bool SeqLt(std::uint32_t a, std::uint32_t b) {
-    return static_cast<std::int32_t>(a - b) < 0;
-}
-inline bool SeqLe(std::uint32_t a, std::uint32_t b) {
-    return static_cast<std::int32_t>(a - b) <= 0;
-}
-inline bool SeqGt(std::uint32_t a, std::uint32_t b) {
-    return static_cast<std::int32_t>(a - b) > 0;
-}
-[[maybe_unused]] inline bool SeqGe(std::uint32_t a, std::uint32_t b) {
-    return static_cast<std::int32_t>(a - b) >= 0;
 }
 
 // ---- Internet checksum (RFC 1071) ----
@@ -179,60 +149,7 @@ struct UdpConn {
     ConnKey key{};
 };
 
-// ---- TCP per-connection state ----
-enum class TcpState : std::uint8_t {
-    Connecting,   // outbound: non-blocking connect() outstanding
-    SynRcvd,      // outbound: SYN-ACK sent, awaiting guest's ACK of SYN
-    GuestSynSent, // inbound: SYN emitted toward guest, awaiting SYN-ACK
-    Established,
-    FinWait1,     // we sent FIN; awaiting ACK of FIN (and possibly guest FIN)
-    CloseWait,    // guest sent FIN; still draining rx_buf to host
-    LastAck,      // we sent FIN after CloseWait; awaiting ACK of FIN
-    Closed,       // marked-for-erase; ExpireIdle sweeps
-};
-
-struct TcpConn {
-    ConnKey key{};
-    SOCKET  host_fd = INVALID_SOCKET;
-    TcpState state = TcpState::Connecting;
-
-    // Sequence-number space.
-    std::uint32_t snd_una   = 0;   // first unacked byte (= ISN until acked)
-    std::uint32_t snd_nxt   = 0;   // next byte to send (ISN+1 after SYN-ACK)
-    std::uint32_t snd_wnd   = 65535; // effective send window (already scaled)
-    std::uint8_t  snd_wscale = 0;  // guest's window scale (0 = none)
-    bool          ws_negotiated = false; // guest sent WSopt in SYN
-
-    std::uint32_t snd_wl1 = 0;     // seq of last segment that updated snd_wnd
-    std::uint32_t snd_wl2 = 0;     // ack of last segment that updated snd_wnd
-
-    std::uint32_t rcv_nxt = 0;     // next byte we expect from guest
-    std::uint16_t guest_mss = 536;
-
-    // tx_buf[0] corresponds to seq=snd_una; inflight = snd_nxt - snd_una.
-    std::deque<std::uint8_t> tx_buf;
-    std::deque<std::uint8_t> rx_buf;
-
-    bool guest_fin_seen = false;   // guest sent FIN (rcv_nxt already incremented)
-    bool host_eof_seen  = false;
-    bool fin_sent       = false;   // FIN occupies seq snd_nxt-1
-    bool host_send_shut = false;   // we've called shutdown(SD_SEND)
-    bool delayed_ack    = false;   // pending ACK we owe the guest
-
-    // Retransmission.
-    std::chrono::steady_clock::time_point last_send{};
-    std::uint32_t rto_ms  = 200;
-    std::uint8_t  retries = 0;
-
-    std::chrono::steady_clock::time_point connect_deadline{};
-
-    std::chrono::steady_clock::time_point last_use{};
-
-    // True iff this conn was created by accepting an inbound host
-    // listener (port forward). Drives abortive close on teardown so
-    // host clients observe RST instead of half-open silence.
-    bool is_inbound = false;
-};
+// ---- TCP per-connection state was here; moved to TsiTcpEngine (M34.8). ----
 
 // ---- ICMP echo work item ----
 struct IcmpRequest {
@@ -285,7 +202,6 @@ struct UsernetBackend::State {
     std::deque<PendingRx> pending_rx;
 
     std::unordered_map<ConnKey, UdpConn, ConnKeyHash> udp_conns;
-    std::unordered_map<ConnKey, TcpConn, ConnKeyHash> tcp_conns;
 
     // Inbound port-forward listeners (1:1 with opts.port_forwards after
     // Start; entries whose bind() failed are recorded as INVALID_SOCKET so
@@ -296,6 +212,11 @@ struct UsernetBackend::State {
         UsernetBackend::PortForward rule{};
     };
     std::vector<Listener> listeners;
+
+    // M34.8: TSI (tcp-sans-io) TCP engine. Always constructed in
+    // Start(); the legacy hand-rolled C++ TCP state machine was deleted
+    // in M34.8 along with the --net-usernet-tcp runtime switch.
+    std::unique_ptr<TsiTcpEngine> tsi_engine;
 
     std::atomic<std::uint16_t> ip_id_counter{1};
 
@@ -311,22 +232,17 @@ struct UsernetBackend::State {
     std::vector<std::thread> icmp_workers;
     std::atomic<std::uint32_t> icmp_inflight{0};
 
-    std::mt19937 rng;
-
     // Counters.
     std::atomic<std::uint64_t> tx_packets{0};
     std::atomic<std::uint64_t> rx_packets{0};
     std::atomic<std::uint64_t> tx_dropped{0};
     std::atomic<std::uint64_t> rx_dropped{0};
     std::atomic<std::uint64_t> arp_replies{0};
-    std::atomic<std::uint64_t> tcp_conns_total{0};
     std::atomic<std::uint64_t> udp_conns_total{0};
     std::atomic<std::uint64_t> icmp_echoes_total{0};
 
     explicit State(NetDevice& n, const UsernetBackend::Options& o)
-        : net(n), opts(o),
-          rng(static_cast<std::uint32_t>(::GetTickCount64() ^
-                                          ::GetCurrentThreadId())) {}
+        : net(n), opts(o) {}
 
     // ---- Lifecycle ----
     void Start(whp::Partition& p, PciTransport& t);
@@ -361,43 +277,21 @@ struct UsernetBackend::State {
                                    std::uint16_t id, std::uint16_t seq,
                                    const std::uint8_t* payload, std::size_t n);
 
-    // ---- TCP ----
-    void HandleTcpFromGuest(std::uint32_t src_ip_be, std::uint32_t dst_ip_be,
-                            const std::uint8_t* tcp, std::size_t tcp_len);
-    void TcpStartConnect(const ConnKey& key, std::uint32_t guest_isn,
-                          std::uint16_t guest_mss,
-                          std::uint8_t guest_wscale, bool ws_negotiated,
-                          std::uint16_t guest_wnd);
-    void TcpHandleConnectResult(TcpConn& c);
-    void TcpDrainHostRecvIntoTxBuf(TcpConn& c);
-    void TcpDrainRxBufToHost(TcpConn& c);
-    void TcpDrainSendBuffer(TcpConn& c);
-    void TcpEmitSegment(TcpConn& c, std::uint8_t flags,
-                        std::uint32_t seq, std::uint32_t ack,
-                        const std::uint8_t* opts, std::size_t opts_len,
-                        const std::uint8_t* data, std::size_t data_len);
-    void TcpEmitSynAck(TcpConn& c);
-    void TcpEmitAck(TcpConn& c);
-    void TcpEmitFin(TcpConn& c);
-    void TcpEmitRst(std::uint32_t src_ip_be, std::uint32_t dst_ip_be,
-                    std::uint16_t src_port_be, std::uint16_t dst_port_be,
-                    std::uint32_t seq, std::uint32_t ack, bool ack_valid);
-    void TcpClose(TcpConn& c);
-    void TcpPumpRetransmits();
-    std::uint16_t TcpAdvertisedWindow(const TcpConn& c) const;
+    // ---- TCP terminates inside TsiTcpEngine (M34.8); no methods here. ----
 
     // ---- Inbound port-forward ----
     void StartListeners();
     void StopListeners();
     void AcceptOnListener(Listener& L);
-    void TcpAcceptInbound(SOCKET host_sock,
-                          const UsernetBackend::PortForward& rule);
-    void TcpEmitSyn(TcpConn& c);
-    bool AllocateEphemPort(std::uint32_t guest_ip_be,
-                           std::uint32_t gw_ip_be,
-                           std::uint16_t guest_port_be,
-                           std::uint16_t& out_ephem_port_be);
     static void AbortiveCloseSocket(SOCKET& s);
+
+    // M34.4: monotonic clock in milliseconds. TsiTcpEngine uses this
+    // for tcp_inject_packet/tcp_tick deadlines.
+    std::uint64_t NowMs() const {
+        using namespace std::chrono;
+        return (std::uint64_t)duration_cast<milliseconds>(
+            steady_clock::now().time_since_epoch()).count();
+    }
 
     // ---- Frame synthesis ----
     void PushPendingRx(std::vector<std::uint8_t> frame);
@@ -451,7 +345,8 @@ std::uint64_t UsernetBackend::arp_replies() const noexcept {
     return state_ ? state_->arp_replies.load() : 0;
 }
 std::uint64_t UsernetBackend::tcp_conns_total() const noexcept {
-    return state_ ? state_->tcp_conns_total.load() : 0;
+    return (state_ && state_->tsi_engine)
+        ? state_->tsi_engine->total_conns() : 0;
 }
 std::uint64_t UsernetBackend::udp_conns_total() const noexcept {
     return state_ ? state_->udp_conns_total.load() : 0;
@@ -523,14 +418,51 @@ void UsernetBackend::State::Start(whp::Partition& p, PciTransport& t) {
         icmp_workers.emplace_back([this] { IcmpWorkerLoop(); });
     }
 
-    std::printf("[usernet] up: gateway=%s mtu=%u tcp_mss=%u ws=%u\n",
+    // M34.8: TSI (tcp-sans-io) is the only TCP engine. Construct it
+    // unconditionally; the legacy runtime switch and C++ state machine
+    // were deleted along with --net-usernet-tcp.
+    {
+        TsiTcpEngine::EmitCtx ec{};
+        // Emit a fully-built IPv4+TCP datagram from the TCB to the guest.
+        // Just prepend a 14-byte Ethernet header and queue on pending_rx.
+        // Do NOT call EmitIpv4 (that would add a second IP header);
+        // tcp-sans-io's tcp_extract_packet already produced a valid
+        // IPv4+TCP datagram with both checksums computed.
+        ec.push_ipv4_to_guest =
+            [this](const std::uint8_t* ip, std::size_t n) {
+                if (!guest_mac_learned) return;
+                if (n > kIpv4Mtu)       return;
+                std::vector<std::uint8_t> frame(kEthHdrSize + n);
+                std::memcpy(frame.data() + 0, guest_mac.data(),         6);
+                std::memcpy(frame.data() + 6, opts.backend_mac.data(),  6);
+                frame[12] = 0x08;
+                frame[13] = 0x00;
+                std::memcpy(frame.data() + kEthHdrSize, ip, n);
+                PushPendingRx(std::move(frame));
+            };
+        ec.now_ms        = [this]{ return NowMs(); };
+        ec.backend_mac   = opts.backend_mac;
+        ec.guest_mac     = guest_mac;
+        ec.gateway_ip_be = gateway_ip_be;
+        // 2.18 MiB per TCB -> cap aggressively for v1. opts.max_tcp_conns
+        // (1024 default) is the user-visible knob; the TSI engine should
+        // not aim for that scale until snapshot/resume + per-conn
+        // accounting are in place.
+        ec.max_conns     = std::min<std::size_t>(opts.max_tcp_conns, 64);
+        // M34.6: 10-min idle (spec), 30-s half-close watchdog.
+        ec.idle_ms       = 10ull * 60ull * 1000ull;
+        ec.connect_ms    = 10ull * 1000ull;
+        ec.half_close_ms = 30ull * 1000ull;
+        tsi_engine       = std::make_unique<TsiTcpEngine>(std::move(ec));
+    }
+
+    std::printf("[usernet] up: gateway=%s mtu=%u tcp_engine=tcp-sans-io\n",
                 opts.gateway_ipv4.c_str(),
-                static_cast<unsigned>(kIpv4Mtu),
-                static_cast<unsigned>(kAdvertisedMss),
-                static_cast<unsigned>(kAdvertisedWscale));
+                static_cast<unsigned>(kIpv4Mtu));
     TINYVMM_ETW_INFO_KW("NetBackendStart", ::tinyvmm::diag::kw::Lifecycle,
-        TraceLoggingString("usernet",                "backend"),
-        TraceLoggingString(opts.gateway_ipv4.c_str(), "gateway"));
+        TraceLoggingString("usernet",                 "backend"),
+        TraceLoggingString(opts.gateway_ipv4.c_str(), "gateway"),
+        TraceLoggingString("tcp-sans-io",             "tcp_engine"));
 }
 
 void UsernetBackend::State::Stop() {
@@ -557,14 +489,41 @@ void UsernetBackend::State::Stop() {
         if (c.sock != INVALID_SOCKET) ::closesocket(c.sock);
     }
     udp_conns.clear();
-    for (auto& [k, c] : tcp_conns) {
-        if (c.host_fd != INVALID_SOCKET) {
-            if (c.is_inbound) AbortiveCloseSocket(c.host_fd);
-            else              ::closesocket(c.host_fd), c.host_fd = INVALID_SOCKET;
-        }
-    }
-    tcp_conns.clear();
     StopListeners();
+    if (tsi_engine) {
+        // M34.6 (rubber-duck blocking #1): worker thread has already
+        // been joined above, so reading tsi_engine internal counters
+        // here is race-free. Emit a summary ETW event before tearing
+        // down the engine. conn_count() reads `conns.size()` which is
+        // NOT atomic, so this MUST happen after the worker.join().
+        TINYVMM_ETW_INFO_KW("NetTsiSummary", ::tinyvmm::diag::kw::Lifecycle,
+            TraceLoggingString("usernet",                       "backend"),
+            TraceLoggingUInt64(tsi_engine->total_conns(),       "total_conns"),
+            TraceLoggingUInt64(static_cast<std::uint64_t>(
+                                  tsi_engine->conn_count()),    "live_at_stop"),
+            TraceLoggingUInt64(tsi_engine->segments_rx(),       "segments_rx"),
+            TraceLoggingUInt64(tsi_engine->segments_tx(),       "segments_tx"),
+            TraceLoggingUInt64(tsi_engine->aborts(),            "aborts"),
+            TraceLoggingUInt64(tsi_engine->graceful_closes(),   "graceful_closes"),
+            TraceLoggingUInt64(tsi_engine->rsts_sent(),         "rsts_sent"));
+        std::printf(
+            "[usernet-tsi] summary: total=%llu live=%zu seg_rx=%llu seg_tx=%llu "
+            "aborts=%llu graceful=%llu rsts=%llu | usernet tx_pkts=%llu "
+            "rx_pkts=%llu tx_drop=%llu rx_drop=%llu\n",
+            (unsigned long long)tsi_engine->total_conns(),
+            tsi_engine->conn_count(),
+            (unsigned long long)tsi_engine->segments_rx(),
+            (unsigned long long)tsi_engine->segments_tx(),
+            (unsigned long long)tsi_engine->aborts(),
+            (unsigned long long)tsi_engine->graceful_closes(),
+            (unsigned long long)tsi_engine->rsts_sent(),
+            (unsigned long long)tx_packets.load(),
+            (unsigned long long)rx_packets.load(),
+            (unsigned long long)tx_dropped.load(),
+            (unsigned long long)rx_dropped.load());
+        tsi_engine->Shutdown();
+        tsi_engine.reset();
+    }
     pending_rx.clear();
 
     if (stop_evt)        { ::CloseHandle(stop_evt);       stop_evt = nullptr; }
@@ -591,8 +550,8 @@ void UsernetBackend::State::WorkerLoop() {
 
         DrainGuestTx();
         DrainHostSockets();
+        tsi_engine->Tick(NowMs());
         PumpIcmpReplies();
-        TcpPumpRetransmits();
         ExpireIdle();
         DeliverPendingRx();
     }
@@ -742,7 +701,7 @@ void UsernetBackend::State::HandleIpFromGuest(const std::uint8_t* ip,
         HandleUdpFromGuest(src_ip_be, dst_ip_be, l4, l4_len);
         break;
     case kIpProtoTcp:
-        HandleTcpFromGuest(src_ip_be, dst_ip_be, l4, l4_len);
+        tsi_engine->OnGuestTcpPacket(NowMs(), ip, total_len);
         break;
     case kIpProtoIcmp:
         HandleIcmpFromGuest(src_ip_be, dst_ip_be, l4, l4_len);
@@ -932,7 +891,7 @@ void UsernetBackend::State::HandleUdpFromGuest(std::uint32_t src_ip_be,
         udp_conns_total.fetch_add(1, std::memory_order_relaxed);
     }
     it->second.last_use = std::chrono::steady_clock::now();
-    // send() — non-blocking; ENOBUFS / WSAEWOULDBLOCK both drop silently.
+    // send() ? non-blocking; ENOBUFS / WSAEWOULDBLOCK both drop silently.
     int sent = ::send(it->second.sock,
                        reinterpret_cast<const char*>(payload),
                        static_cast<int>(payload_len), 0);
@@ -1147,681 +1106,6 @@ void UsernetBackend::State::EmitIcmpEchoReplyToGuest(
     EmitIpv4(src_ip_be, dst_ip_be, kIpProtoIcmp, icmp.data(), total);
 }
 
-// ============================================================
-// Phase D: TCP
-// ============================================================
-std::uint16_t UsernetBackend::State::TcpAdvertisedWindow(
-        const TcpConn& c) const {
-    const std::size_t free_space =
-        (c.rx_buf.size() < kTcpRxBufCap) ? (kTcpRxBufCap - c.rx_buf.size()) : 0;
-    if (!c.ws_negotiated) {
-        return static_cast<std::uint16_t>(std::min<std::size_t>(free_space, 65535));
-    }
-    const std::size_t scaled = free_space >> kAdvertisedWscale;
-    return static_cast<std::uint16_t>(std::min<std::size_t>(scaled, 65535));
-}
-
-void UsernetBackend::State::TcpEmitSegment(TcpConn& c, std::uint8_t flags,
-                                            std::uint32_t seq, std::uint32_t ack,
-                                            const std::uint8_t* opts_data,
-                                            std::size_t opts_len,
-                                            const std::uint8_t* data,
-                                            std::size_t data_len) {
-    if (opts_len % 4 != 0 || opts_len > 40) return;
-    const std::size_t hdr_len = kTcpHdrMinSize + opts_len;
-    const std::size_t total   = hdr_len + data_len;
-    if (total + kIp4HdrMinSize > kIpv4Mtu) return;
-
-    std::vector<std::uint8_t> seg(total);
-    std::memcpy(seg.data() + 0, &c.key.dst_port_be,   2);  // src = host's port
-    std::memcpy(seg.data() + 2, &c.key.guest_port_be, 2);  // dst = guest's port
-    Wr32Be(S4(seg.data() + 4), seq);
-    Wr32Be(S4(seg.data() + 8), ack);
-    seg[12] = static_cast<std::uint8_t>((hdr_len / 4) << 4);
-    seg[13] = flags;
-    Wr16Be(S2(seg.data() + 14), TcpAdvertisedWindow(c));
-    Wr16Be(S2(seg.data() + 16), 0);   // checksum placeholder
-    Wr16Be(S2(seg.data() + 18), 0);   // urgent ptr
-    if (opts_len) std::memcpy(seg.data() + kTcpHdrMinSize, opts_data, opts_len);
-    if (data_len) std::memcpy(seg.data() + hdr_len, data, data_len);
-
-    // src/dst IP for the L4 checksum are: src = the host we connected to
-    // (dst_ip_be of the conn), dst = guest_ip_be.
-    std::uint32_t ph = PseudoHdrSum(c.key.dst_ip_be, c.key.guest_ip_be,
-                                     kIpProtoTcp, static_cast<std::uint16_t>(total));
-    Wr16Be(S2(seg.data() + 16), InetCksum(seg.data(), total, ph));
-
-    EmitIpv4(c.key.dst_ip_be, c.key.guest_ip_be, kIpProtoTcp,
-             seg.data(), total);
-
-    c.last_send = std::chrono::steady_clock::now();
-    c.delayed_ack = false;
-}
-
-void UsernetBackend::State::TcpEmitSynAck(TcpConn& c) {
-    // SYN-ACK options: MSS=1460 (always) + WS=7 (only if guest negotiated WS).
-    std::uint8_t opts_buf[8];
-    std::size_t opts_len = 0;
-    opts_buf[0] = 2; opts_buf[1] = 4;
-    Wr16Be(S2(opts_buf + 2), kAdvertisedMss);
-    opts_len = 4;
-    if (c.ws_negotiated) {
-        opts_buf[4] = 1;             // NOP for 4-byte alignment
-        opts_buf[5] = 3;             // WSopt
-        opts_buf[6] = 3;
-        opts_buf[7] = kAdvertisedWscale;
-        opts_len = 8;
-    }
-    // SYN-ACK occupies one sequence number; sent at snd_una (= ISN).
-    TcpEmitSegment(c, kTcpSyn | kTcpAck, c.snd_una, c.rcv_nxt,
-                   opts_buf, opts_len, nullptr, 0);
-    c.rto_ms = 200;
-}
-
-void UsernetBackend::State::TcpEmitAck(TcpConn& c) {
-    TcpEmitSegment(c, kTcpAck, c.snd_nxt, c.rcv_nxt, nullptr, 0, nullptr, 0);
-}
-
-void UsernetBackend::State::TcpEmitFin(TcpConn& c) {
-    // FIN occupies one sequence number; sent at snd_nxt, snd_nxt++.
-    TcpEmitSegment(c, kTcpFin | kTcpAck, c.snd_nxt, c.rcv_nxt,
-                   nullptr, 0, nullptr, 0);
-    c.snd_nxt += 1;
-    c.fin_sent = true;
-}
-
-void UsernetBackend::State::TcpEmitRst(std::uint32_t src_ip_be,
-                                        std::uint32_t dst_ip_be,
-                                        std::uint16_t src_port_be,
-                                        std::uint16_t dst_port_be,
-                                        std::uint32_t seq, std::uint32_t ack,
-                                        bool ack_valid) {
-    std::uint8_t flags = kTcpRst | (ack_valid ? kTcpAck : 0);
-    std::uint8_t seg[kTcpHdrMinSize]{};
-    std::memcpy(seg + 0, &src_port_be, 2);
-    std::memcpy(seg + 2, &dst_port_be, 2);
-    Wr32Be(S4(seg + 4), seq);
-    Wr32Be(S4(seg + 8), ack);
-    seg[12] = static_cast<std::uint8_t>((kTcpHdrMinSize / 4) << 4);
-    seg[13] = flags;
-    Wr16Be(S2(seg + 14), 0);   // window 0 in RST
-    Wr16Be(S2(seg + 16), 0);
-    Wr16Be(S2(seg + 18), 0);
-
-    std::uint32_t ph = PseudoHdrSum(src_ip_be, dst_ip_be, kIpProtoTcp,
-                                     kTcpHdrMinSize);
-    Wr16Be(S2(seg + 16), InetCksum(seg, kTcpHdrMinSize, ph));
-    EmitIpv4(src_ip_be, dst_ip_be, kIpProtoTcp, seg, kTcpHdrMinSize);
-}
-
-void UsernetBackend::State::TcpClose(TcpConn& c) {
-    if (c.host_fd != INVALID_SOCKET) {
-        // For inbound port-forward flows, close abortively so the host
-        // client observes a reset (TCP RST) instead of a graceful FIN
-        // when we tear down (guest sent RST, handshake timed out, or
-        // we hit the per-conn cap).
-        if (c.is_inbound) {
-            AbortiveCloseSocket(c.host_fd);
-        } else {
-            ::closesocket(c.host_fd);
-            c.host_fd = INVALID_SOCKET;
-        }
-    }
-    c.state = TcpState::Closed;
-}
-
-void UsernetBackend::State::TcpStartConnect(const ConnKey& key,
-                                              std::uint32_t guest_isn,
-                                              std::uint16_t guest_mss,
-                                              std::uint8_t guest_wscale,
-                                              bool ws_negotiated,
-                                              std::uint16_t guest_wnd) {
-    SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) {
-        TcpEmitRst(key.dst_ip_be, key.guest_ip_be,
-                   key.dst_port_be, key.guest_port_be,
-                   0, guest_isn + 1, true);
-        return;
-    }
-    BOOL nodelay = TRUE;
-    ::setsockopt(s, IPPROTO_TCP, TCP_NODELAY,
-                  reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
-    if (!SetNonBlocking(s)) {
-        ::closesocket(s);
-        TcpEmitRst(key.dst_ip_be, key.guest_ip_be,
-                   key.dst_port_be, key.guest_port_be,
-                   0, guest_isn + 1, true);
-        return;
-    }
-    sockaddr_in sa{};
-    sa.sin_family = AF_INET;
-    sa.sin_port   = key.dst_port_be;
-    sa.sin_addr.s_addr = key.dst_ip_be;
-    int crc = ::connect(s, reinterpret_cast<sockaddr*>(&sa), sizeof(sa));
-    int cerr = (crc == SOCKET_ERROR) ? ::WSAGetLastError() : 0;
-    if (crc == SOCKET_ERROR && cerr != WSAEWOULDBLOCK) {
-        ::closesocket(s);
-        TcpEmitRst(key.dst_ip_be, key.guest_ip_be,
-                   key.dst_port_be, key.guest_port_be,
-                   0, guest_isn + 1, true);
-        return;
-    }
-
-    TcpConn c{};
-    c.key       = key;
-    c.host_fd   = s;
-    c.state     = TcpState::Connecting;
-    c.snd_una   = static_cast<std::uint32_t>(rng());
-    c.snd_nxt   = c.snd_una;
-    c.snd_wscale = guest_wscale;
-    c.ws_negotiated = ws_negotiated;
-    c.guest_mss  = guest_mss ? guest_mss : 536;
-    c.snd_wnd    = static_cast<std::uint32_t>(guest_wnd) <<
-                   (ws_negotiated ? guest_wscale : 0);
-    c.rcv_nxt    = guest_isn + 1;
-    c.last_use   = std::chrono::steady_clock::now();
-    c.connect_deadline = c.last_use + std::chrono::seconds(10);
-
-    if (crc == 0) {
-        // Connect already completed (rare on non-blocking).
-        c.state = TcpState::SynRcvd;
-        TcpEmitSynAck(c);
-        c.snd_nxt = c.snd_una + 1;
-    }
-    tcp_conns.emplace(key, std::move(c));
-    tcp_conns_total.fetch_add(1, std::memory_order_relaxed);
-}
-
-void UsernetBackend::State::TcpHandleConnectResult(TcpConn& c) {
-    int err = 0;
-    int len = sizeof(err);
-    if (::getsockopt(c.host_fd, SOL_SOCKET, SO_ERROR,
-                      reinterpret_cast<char*>(&err), &len) == SOCKET_ERROR) {
-        err = ::WSAGetLastError();
-    }
-    if (err != 0) {
-        // connect failure → RST to guest, drop conn.
-        TcpEmitRst(c.key.dst_ip_be, c.key.guest_ip_be,
-                   c.key.dst_port_be, c.key.guest_port_be,
-                   c.snd_una, c.rcv_nxt, true);
-        TcpClose(c);
-        return;
-    }
-    c.state = TcpState::SynRcvd;
-    TcpEmitSynAck(c);
-    // SYN-ACK consumes one sequence number.
-    c.snd_nxt = c.snd_una + 1;
-}
-
-void UsernetBackend::State::HandleTcpFromGuest(std::uint32_t src_ip_be,
-                                                 std::uint32_t dst_ip_be,
-                                                 const std::uint8_t* tcp,
-                                                 std::size_t tcp_len) {
-    if (tcp_len < kTcpHdrMinSize) return;
-    const std::uint16_t src_port_be = *reinterpret_cast<const std::uint16_t*>(tcp);
-    const std::uint16_t dst_port_be = *reinterpret_cast<const std::uint16_t*>(tcp + 2);
-    const std::uint32_t seq = Be32(S4(tcp + 4));
-    const std::uint32_t ack = Be32(S4(tcp + 8));
-    const std::uint8_t  doff_b = tcp[12];
-    const std::size_t   hdr_len = (doff_b >> 4) * 4u;
-    if (hdr_len < kTcpHdrMinSize || hdr_len > tcp_len) return;
-    const std::uint8_t flags = tcp[13];
-    const std::uint16_t wnd  = Be16(S2(tcp + 14));
-
-    std::uint32_t ph = PseudoHdrSum(src_ip_be, dst_ip_be, kIpProtoTcp,
-                                     static_cast<std::uint16_t>(tcp_len));
-    if (InetCksum(tcp, tcp_len, ph) != 0) {
-        tx_dropped.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-
-    ConnKey key{src_ip_be, dst_ip_be, src_port_be, dst_port_be};
-    auto it = tcp_conns.find(key);
-
-    // --- New connection: SYN (no ACK) opens a TcpConn. ---
-    if (it == tcp_conns.end()) {
-        if ((flags & (kTcpSyn | kTcpAck | kTcpRst)) == kTcpSyn) {
-            if (tcp_conns.size() >= opts.max_tcp_conns) {
-                TcpEmitRst(dst_ip_be, src_ip_be, dst_port_be, src_port_be,
-                           0, seq + 1, true);
-                return;
-            }
-            // Parse options (MSS + WS only).
-            std::uint16_t guest_mss = 536;
-            std::uint8_t  guest_ws  = 0;
-            bool          have_ws   = false;
-            std::size_t o = kTcpHdrMinSize;
-            while (o < hdr_len) {
-                std::uint8_t kind = tcp[o];
-                if (kind == 0) break;                       // EOL
-                if (kind == 1) { o += 1; continue; }        // NOP
-                if (o + 1 >= hdr_len) break;
-                std::uint8_t olen = tcp[o + 1];
-                if (olen < 2 || o + olen > hdr_len) break;
-                if (kind == 2 && olen == 4) {
-                    guest_mss = Be16(S2(tcp + o + 2));
-                    if (guest_mss > 1460) guest_mss = 1460;
-                } else if (kind == 3 && olen == 3) {
-                    guest_ws  = tcp[o + 2];
-                    if (guest_ws > 14) guest_ws = 14;
-                    have_ws   = true;
-                }
-                o += olen;
-            }
-            TcpStartConnect(key, seq, guest_mss, guest_ws, have_ws, wnd);
-            return;
-        }
-        // Unknown 4-tuple, not a SYN → RST per RFC.
-        if (!(flags & kTcpRst)) {
-            std::uint32_t rst_seq = (flags & kTcpAck) ? ack : 0;
-            std::uint32_t rst_ack = (flags & kTcpAck) ? 0u :
-                seq + ((flags & (kTcpSyn | kTcpFin)) ? 1u : 0u) +
-                static_cast<std::uint32_t>(tcp_len - hdr_len);
-            TcpEmitRst(dst_ip_be, src_ip_be, dst_port_be, src_port_be,
-                       rst_seq, rst_ack, !(flags & kTcpAck));
-        }
-        return;
-    }
-
-    TcpConn& c = it->second;
-    c.last_use = std::chrono::steady_clock::now();
-
-    if (flags & kTcpRst) {
-        // For inbound flows, TcpClose() will abortively close host_fd
-        // (SO_LINGER {1,0}) so the host client observes a real reset.
-        TcpClose(c);
-        return;
-    }
-
-    // Inbound port-forward handshake: we sent SYN, expect SYN+ACK.
-    if (c.state == TcpState::GuestSynSent) {
-        // SYN-ACK check tolerates ECN flags (CWR/ECE) in flags[7..6]; we
-        // only insist on SYN+ACK being set and RST being clear.
-        if ((flags & (kTcpSyn | kTcpAck | kTcpRst)) != (kTcpSyn | kTcpAck)) {
-            // Drop silently. rcv_nxt is undefined until we see the guest's
-            // SYN, so we cannot emit a dup-ACK -- it would advertise
-            // rcv_nxt=0 which the guest would treat as invalid.
-            return;
-        }
-        if (ack != c.snd_nxt) {
-            // ACK doesn't acknowledge our SYN: blow away the conn.
-            TcpEmitRst(c.key.dst_ip_be, c.key.guest_ip_be,
-                       c.key.dst_port_be, c.key.guest_port_be,
-                       ack, 0, false);
-            TcpClose(c);
-            return;
-        }
-        // Parse guest's MSS / WS from SYN-ACK options. The guest only
-        // honors WS if we offered one; we always offer WS=kAdvertisedWscale,
-        // so c.ws_negotiated stays true on the inbound conn iff the
-        // guest mirrored it.
-        std::uint16_t guest_mss = 536;
-        std::uint8_t  guest_ws  = 0;
-        bool          have_ws   = false;
-        std::size_t o = kTcpHdrMinSize;
-        while (o < hdr_len) {
-            std::uint8_t kind = tcp[o];
-            if (kind == 0) break;                       // EOL
-            if (kind == 1) { o += 1; continue; }        // NOP
-            if (o + 1 >= hdr_len) break;
-            std::uint8_t olen = tcp[o + 1];
-            if (olen < 2 || o + olen > hdr_len) break;
-            if (kind == 2 && olen == 4) {
-                guest_mss = Be16(S2(tcp + o + 2));
-                if (guest_mss > 1460) guest_mss = 1460;
-            } else if (kind == 3 && olen == 3) {
-                guest_ws = tcp[o + 2];
-                if (guest_ws > 14) guest_ws = 14;
-                have_ws  = true;
-            }
-            o += olen;
-        }
-        c.guest_mss     = guest_mss;
-        c.ws_negotiated = have_ws;
-        c.snd_wscale    = have_ws ? guest_ws : 0;
-        c.snd_una       = ack;
-        c.rcv_nxt       = seq + 1;
-        c.snd_wnd       = static_cast<std::uint32_t>(wnd) <<
-                          (c.ws_negotiated ? c.snd_wscale : 0);
-        c.snd_wl1       = seq;
-        c.snd_wl2       = ack;
-        c.rto_ms        = 200;
-        c.retries       = 0;
-        c.state         = TcpState::Established;
-        TcpEmitAck(c);
-        // Hand off to the regular per-conn pumping: any bytes the host
-        // client already sent will get pulled into tx_buf and shipped
-        // toward the guest now that rcv_nxt/snd_wnd are defined.
-        TcpDrainHostRecvIntoTxBuf(c);
-        TcpDrainSendBuffer(c);
-        return;
-    }
-
-    // Duplicate SYN (no ACK) while we're already mid-handshake: idempotent.
-    if ((flags & kTcpSyn) && !(flags & kTcpAck)) {
-        if (c.state == TcpState::SynRcvd) {
-            TcpEmitSynAck(c);
-        }
-        return;
-    }
-
-    // ACK processing.
-    if (flags & kTcpAck) {
-        if (c.state == TcpState::SynRcvd) {
-            // Acceptable ACK of SYN: ack == snd_nxt (which is ISN+1).
-            if (ack == c.snd_nxt) {
-                c.snd_una = ack;
-                c.state = TcpState::Established;
-                c.snd_wnd = static_cast<std::uint32_t>(wnd) <<
-                            (c.ws_negotiated ? c.snd_wscale : 0);
-                c.snd_wl1 = seq;
-                c.snd_wl2 = ack;
-                c.rto_ms = 200;
-                c.retries = 0;
-                // Fall through to process payload/FIN in the same segment.
-            } else if (SeqLe(ack, c.snd_una) || SeqGt(ack, c.snd_nxt)) {
-                // Unacceptable ACK → drop.
-                return;
-            } else {
-                // Mid-handshake odd ACK; ignore until correct one arrives.
-                return;
-            }
-        } else if (c.state == TcpState::Established ||
-                   c.state == TcpState::FinWait1   ||
-                   c.state == TcpState::CloseWait  ||
-                   c.state == TcpState::LastAck) {
-            if (SeqGt(ack, c.snd_nxt)) {
-                // ACKing data we never sent: dup-ACK back and drop.
-                TcpEmitAck(c);
-                return;
-            }
-            if (SeqGt(ack, c.snd_una)) {
-                std::uint32_t acked = ack - c.snd_una;
-                // FIN consumes one byte of ack space; subtract before popping tx_buf.
-                bool fin_acked = false;
-                if (c.fin_sent && acked > 0) {
-                    const std::uint32_t inflight = c.snd_nxt - c.snd_una;
-                    // FIN is the last byte: present at snd_nxt-1, not in tx_buf.
-                    if (acked == inflight) {
-                        fin_acked = true;
-                        acked -= 1;
-                    }
-                }
-                if (acked > c.tx_buf.size()) acked = static_cast<std::uint32_t>(c.tx_buf.size());
-                for (std::uint32_t i = 0; i < acked; ++i) c.tx_buf.pop_front();
-                c.snd_una = ack;
-                c.rto_ms  = 200;
-                c.retries = 0;
-
-                if (fin_acked) {
-                    if (c.state == TcpState::FinWait1 && c.guest_fin_seen) {
-                        TcpClose(c);
-                        return;
-                    } else if (c.state == TcpState::FinWait1) {
-                        // Wait for guest FIN (peer-close); rely on host_eof
-                        // already seen since we're past CloseWait skip.
-                    } else if (c.state == TcpState::LastAck) {
-                        TcpClose(c);
-                        return;
-                    }
-                }
-            }
-            // SND.WND update (RFC 793 §3.7, with WL1/WL2 protection).
-            if (SeqLt(c.snd_wl1, seq) ||
-                (c.snd_wl1 == seq && SeqLe(c.snd_wl2, ack))) {
-                c.snd_wnd = static_cast<std::uint32_t>(wnd) <<
-                            (c.ws_negotiated ? c.snd_wscale : 0);
-                c.snd_wl1 = seq;
-                c.snd_wl2 = ack;
-            }
-        }
-    }
-
-    // ---- Data + FIN processing (RFC 793 §3.9, "SEGMENT ARRIVES") ----
-    // Only after SynRcvd/Established and friends.
-    if (c.state == TcpState::Established ||
-        c.state == TcpState::FinWait1   ||
-        c.state == TcpState::CloseWait  ||
-        c.state == TcpState::LastAck) {
-
-        const std::uint8_t* payload = tcp + hdr_len;
-        const std::size_t   payload_len = tcp_len - hdr_len;
-
-        if (payload_len > 0) {
-            const std::uint32_t seq_end =
-                seq + static_cast<std::uint32_t>(payload_len);
-            // Partial-overlap trimming.
-            if (SeqLt(seq_end, c.rcv_nxt) || seq_end == c.rcv_nxt) {
-                // Entirely already-received.
-                TcpEmitAck(c);
-            } else if (SeqGt(seq, c.rcv_nxt)) {
-                // Future (no OOO buffer).
-                TcpEmitAck(c);
-            } else {
-                std::size_t trim_left = 0;
-                if (SeqLt(seq, c.rcv_nxt)) {
-                    trim_left = c.rcv_nxt - seq;
-                }
-                const std::size_t accept_len = payload_len - trim_left;
-                // RX backpressure: take min(accept_len, rx_buf_free).
-                const std::size_t free_space =
-                    (c.rx_buf.size() < kTcpRxBufCap) ?
-                        (kTcpRxBufCap - c.rx_buf.size()) : 0;
-                const std::size_t take = std::min(accept_len, free_space);
-                if (take > 0) {
-                    c.rx_buf.insert(c.rx_buf.end(),
-                                     payload + trim_left,
-                                     payload + trim_left + take);
-                    c.rcv_nxt += static_cast<std::uint32_t>(take);
-                }
-                // ACK whatever we managed to take (also handles take==0).
-                TcpEmitAck(c);
-                // Try to forward to host immediately.
-                TcpDrainRxBufToHost(c);
-            }
-        }
-
-        if (flags & kTcpFin) {
-            // FIN is valid only at seq == rcv_nxt + payload_len-trim_left
-            // (we already advanced rcv_nxt above on accepted data). Use the
-            // simpler check: FIN-byte is the byte immediately after data.
-            const std::uint32_t fin_seq = seq + static_cast<std::uint32_t>(payload_len);
-            if (fin_seq == c.rcv_nxt && !c.guest_fin_seen) {
-                c.guest_fin_seen = true;
-                c.rcv_nxt += 1;
-                if (c.state == TcpState::Established) {
-                    c.state = TcpState::CloseWait;
-                }
-                TcpEmitAck(c);
-                // Try to flush rx_buf then shutdown(SD_SEND).
-                TcpDrainRxBufToHost(c);
-                if (c.rx_buf.empty() && !c.host_send_shut &&
-                    c.host_fd != INVALID_SOCKET) {
-                    ::shutdown(c.host_fd, SD_SEND);
-                    c.host_send_shut = true;
-                }
-            }
-        }
-
-        // Try to make forward progress on the send buffer (drives ACK-clocked sends).
-        TcpDrainSendBuffer(c);
-    }
-}
-
-void UsernetBackend::State::TcpDrainSendBuffer(TcpConn& c) {
-    while (true) {
-        const std::uint32_t inflight = c.snd_nxt - c.snd_una;
-        const std::uint32_t cap = std::min<std::uint32_t>(c.snd_wnd,
-                                    static_cast<std::uint32_t>(c.tx_buf.size()));
-        if (inflight >= cap) break;
-        std::uint32_t avail = cap - inflight;
-        if (avail == 0) break;
-        std::uint32_t mss = c.guest_mss ? c.guest_mss : 536;
-        if (mss > kAdvertisedMss) mss = kAdvertisedMss;
-        std::uint32_t take = std::min(avail, mss);
-        // tx_buf[0] is at snd_una. We want bytes [inflight, inflight+take).
-        if (inflight + take > c.tx_buf.size()) {
-            take = static_cast<std::uint32_t>(c.tx_buf.size() - inflight);
-            if (take == 0) break;
-        }
-        std::vector<std::uint8_t> tmp(take);
-        for (std::uint32_t i = 0; i < take; ++i) {
-            tmp[i] = c.tx_buf[inflight + i];
-        }
-        TcpEmitSegment(c, kTcpAck | kTcpPsh, c.snd_nxt, c.rcv_nxt,
-                       nullptr, 0, tmp.data(), take);
-        c.snd_nxt += take;
-        if (c.retries == 0) c.rto_ms = 200;
-    }
-
-    // If host has signalled EOF and tx_buf is fully drained (inflight==0
-    // means snd_una==snd_nxt; all data acked, nothing in flight), send FIN.
-    if (c.host_eof_seen && !c.fin_sent &&
-        c.tx_buf.empty() && c.snd_una == c.snd_nxt &&
-        (c.state == TcpState::Established || c.state == TcpState::CloseWait)) {
-        TcpEmitFin(c);
-        c.state = (c.state == TcpState::CloseWait) ?
-                  TcpState::LastAck : TcpState::FinWait1;
-    }
-}
-
-void UsernetBackend::State::TcpDrainRxBufToHost(TcpConn& c) {
-    while (!c.rx_buf.empty() && c.host_fd != INVALID_SOCKET) {
-        // send() needs a contiguous buffer; pull a chunk out.
-        const std::size_t chunk =
-            std::min<std::size_t>(c.rx_buf.size(), 16 * 1024);
-        std::vector<std::uint8_t> tmp(chunk);
-        for (std::size_t i = 0; i < chunk; ++i) tmp[i] = c.rx_buf[i];
-        int sent = ::send(c.host_fd,
-                           reinterpret_cast<const char*>(tmp.data()),
-                           static_cast<int>(chunk), 0);
-        if (sent == SOCKET_ERROR) {
-            int e = ::WSAGetLastError();
-            if (e == WSAEWOULDBLOCK) return;
-            // Treat any other error as connection reset.
-            TcpEmitRst(c.key.dst_ip_be, c.key.guest_ip_be,
-                       c.key.dst_port_be, c.key.guest_port_be,
-                       c.snd_nxt, c.rcv_nxt, true);
-            TcpClose(c);
-            return;
-        }
-        if (sent <= 0) return;
-        for (int i = 0; i < sent; ++i) c.rx_buf.pop_front();
-    }
-    if (c.guest_fin_seen && c.rx_buf.empty() && !c.host_send_shut &&
-        c.host_fd != INVALID_SOCKET) {
-        ::shutdown(c.host_fd, SD_SEND);
-        c.host_send_shut = true;
-    }
-}
-
-void UsernetBackend::State::TcpDrainHostRecvIntoTxBuf(TcpConn& c) {
-    while (c.host_fd != INVALID_SOCKET &&
-           c.tx_buf.size() < kTcpTxBufCap &&
-           !c.host_eof_seen) {
-        const std::size_t cap_left = kTcpTxBufCap - c.tx_buf.size();
-        const std::size_t chunk = std::min<std::size_t>(cap_left, 16 * 1024);
-        std::uint8_t tmp[16 * 1024];
-        int n = ::recv(c.host_fd, reinterpret_cast<char*>(tmp),
-                        static_cast<int>(chunk), 0);
-        if (n == SOCKET_ERROR) {
-            int e = ::WSAGetLastError();
-            if (e == WSAEWOULDBLOCK) return;
-            // ECONNRESET etc → RST to guest, drop.
-            TcpEmitRst(c.key.dst_ip_be, c.key.guest_ip_be,
-                       c.key.dst_port_be, c.key.guest_port_be,
-                       c.snd_nxt, c.rcv_nxt, true);
-            TcpClose(c);
-            return;
-        }
-        if (n == 0) {
-            c.host_eof_seen = true;
-            return;
-        }
-        c.tx_buf.insert(c.tx_buf.end(), tmp, tmp + n);
-    }
-}
-
-void UsernetBackend::State::TcpPumpRetransmits() {
-    const auto now = std::chrono::steady_clock::now();
-    for (auto& [k, c] : tcp_conns) {
-        if (c.state == TcpState::Closed) continue;
-        if (c.state == TcpState::Connecting) {
-            if (now > c.connect_deadline) {
-                TcpEmitRst(c.key.dst_ip_be, c.key.guest_ip_be,
-                           c.key.dst_port_be, c.key.guest_port_be,
-                           c.snd_una, c.rcv_nxt, true);
-                TcpClose(c);
-            }
-            continue;
-        }
-        if (c.state == TcpState::SynRcvd) {
-            auto since = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - c.last_send).count();
-            if (since >= static_cast<long long>(c.rto_ms)) {
-                if (c.retries >= 5) {
-                    TcpEmitRst(c.key.dst_ip_be, c.key.guest_ip_be,
-                               c.key.dst_port_be, c.key.guest_port_be,
-                               c.snd_una, c.rcv_nxt, true);
-                    TcpClose(c);
-                    continue;
-                }
-                c.retries += 1;
-                c.rto_ms = std::min<std::uint32_t>(c.rto_ms * 2, 3200);
-                TcpEmitSynAck(c);
-            }
-            continue;
-        }
-        if (c.state == TcpState::GuestSynSent) {
-            auto since = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - c.last_send).count();
-            if (since >= static_cast<long long>(c.rto_ms)) {
-                if (c.retries >= 5) {
-                    // Handshake failed: abortive close on host_fd so the
-                    // host client sees RST, not graceful EOF.
-                    TcpClose(c);
-                    continue;
-                }
-                c.retries += 1;
-                c.rto_ms = std::min<std::uint32_t>(c.rto_ms * 2, 3200);
-                TcpEmitSyn(c);
-            }
-            continue;
-        }
-        // Established / FinWait1 / CloseWait / LastAck: data or FIN in flight.
-        const bool inflight = (c.snd_nxt != c.snd_una);
-        if (!inflight) continue;
-        auto since = std::chrono::duration_cast<std::chrono::milliseconds>(
-            now - c.last_send).count();
-        if (since < static_cast<long long>(c.rto_ms)) continue;
-        if (c.retries >= 5) {
-            TcpEmitRst(c.key.dst_ip_be, c.key.guest_ip_be,
-                       c.key.dst_port_be, c.key.guest_port_be,
-                       c.snd_nxt, c.rcv_nxt, true);
-            TcpClose(c);
-            continue;
-        }
-        c.retries += 1;
-        c.rto_ms = std::min<std::uint32_t>(c.rto_ms * 2, 3200);
-
-        // Retransmit oldest unacked: either tx_buf prefix or FIN.
-        const std::uint32_t want = c.snd_nxt - c.snd_una;
-        std::uint32_t data_to_resend = static_cast<std::uint32_t>(c.tx_buf.size());
-        if (data_to_resend > want) data_to_resend = want;
-        std::uint32_t mss = c.guest_mss ? c.guest_mss : 536;
-        if (mss > kAdvertisedMss) mss = kAdvertisedMss;
-        std::uint32_t take = std::min(data_to_resend, mss);
-        if (take > 0) {
-            std::vector<std::uint8_t> tmp(take);
-            for (std::uint32_t i = 0; i < take; ++i) tmp[i] = c.tx_buf[i];
-            TcpEmitSegment(c, kTcpAck | kTcpPsh, c.snd_una, c.rcv_nxt,
-                           nullptr, 0, tmp.data(), take);
-        } else if (c.fin_sent) {
-            TcpEmitSegment(c, kTcpFin | kTcpAck, c.snd_nxt - 1, c.rcv_nxt,
-                           nullptr, 0, nullptr, 0);
-        }
-    }
-}
 
 // ============================================================
 // State::AbortiveCloseSocket
@@ -1927,62 +1211,12 @@ void UsernetBackend::State::StopListeners() {
 }
 
 // ============================================================
-// State::AllocateEphemPort
-// ============================================================
-// Pick a free ephemeral port (in network byte order) for use as the
-// guest-side source port of an inbound forwarded connection. Range is
-// IANA-recommended 49152-65535. Avoids any port already in use by an
-// existing tcp_conn with the same {guest_ip, gw_ip, guest_port} 3-tuple.
-// Returns false if all 16384 candidates are taken.
-bool UsernetBackend::State::AllocateEphemPort(
-    std::uint32_t guest_ip_be,
-    std::uint32_t gw_ip_be,
-    std::uint16_t guest_port_be,
-    std::uint16_t& out_ephem_port_be) {
-    constexpr std::uint16_t kLow  = 49152;
-    constexpr std::uint16_t kHigh = 65535;
-    constexpr std::uint32_t kRange = kHigh - kLow + 1u;
-
-    std::uint32_t start = static_cast<std::uint32_t>(rng()) % kRange;
-    for (std::uint32_t i = 0; i < kRange; ++i) {
-        std::uint16_t cand_host = static_cast<std::uint16_t>(
-            kLow + ((start + i) % kRange));
-        std::uint16_t cand_be = ::htons(cand_host);
-        ConnKey k{guest_ip_be, gw_ip_be, cand_be, guest_port_be};
-        if (tcp_conns.find(k) == tcp_conns.end()) {
-            out_ephem_port_be = cand_be;
-            return true;
-        }
-    }
-    return false;
-}
-
-// ============================================================
-// State::TcpEmitSyn  (inbound port-forward only)
-// ============================================================
-// Originates a SYN from the gateway toward the guest. MSS+WS options
-// match what we expect the guest to mirror back in its SYN-ACK.
-void UsernetBackend::State::TcpEmitSyn(TcpConn& c) {
-    std::uint8_t opts_buf[8];
-    opts_buf[0] = 2; opts_buf[1] = 4;
-    Wr16Be(S2(opts_buf + 2), kAdvertisedMss);
-    opts_buf[4] = 1;                  // NOP for 4-byte alignment
-    opts_buf[5] = 3;                  // WSopt
-    opts_buf[6] = 3;
-    opts_buf[7] = kAdvertisedWscale;
-    // SYN occupies one sequence number; sent at snd_una (= ISN).
-    TcpEmitSegment(c, kTcpSyn, c.snd_una, 0,
-                   opts_buf, sizeof(opts_buf), nullptr, 0);
-    c.rto_ms = 200;
-}
-
-// ============================================================
 // State::AcceptOnListener
 // ============================================================
 void UsernetBackend::State::AcceptOnListener(Listener& L) {
     if (L.sock == INVALID_SOCKET) return;
     // Cap accepts per cycle so one busy listener can't starve the rest
-    // of the worker loop (UDP, ICMP, retransmits) on a SYN flood.
+    // of the worker loop (UDP, ICMP, TSI tick) on a SYN flood.
     constexpr int kAcceptBurstCap = 16;
     for (int i = 0; i < kAcceptBurstCap; ++i) {
         sockaddr_in peer{};
@@ -1994,67 +1228,16 @@ void UsernetBackend::State::AcceptOnListener(Listener& L) {
             (void)e;  // WSAEWOULDBLOCK is normal: ring is drained.
             return;
         }
-        TcpAcceptInbound(s, L.rule);
+        // M34.5 + M34.8: hand the host_sock off to the TSI engine. If
+        // the engine refuses (cap-exceeded, gateway_ip_be==0, etc.),
+        // abortive-close so the client observes RST instead of half-
+        // open silence.
+        const std::uint16_t guest_port_be = ::htons(L.rule.guest_port);
+        if (!tsi_engine->StartInboundConn(s, L.rule.guest_ip_be,
+                                            guest_port_be)) {
+            AbortiveCloseSocket(s);
+        }
     }
-}
-
-// ============================================================
-// State::TcpAcceptInbound
-// ============================================================
-// Newly-accepted host_sock corresponds to a freshly opened client
-// connection that we are going to proxy through to the guest. We
-// originate a SYN to the guest from (gateway_ip, ephem_port) ->
-// (rule.guest_ip, rule.guest_port).
-void UsernetBackend::State::TcpAcceptInbound(
-    SOCKET host_sock, const UsernetBackend::PortForward& rule) {
-    BOOL nodelay = TRUE;
-    ::setsockopt(host_sock, IPPROTO_TCP, TCP_NODELAY,
-                  reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
-    if (!SetNonBlocking(host_sock)) {
-        AbortiveCloseSocket(host_sock);
-        return;
-    }
-    if (tcp_conns.size() >= opts.max_tcp_conns) {
-        AbortiveCloseSocket(host_sock);
-        return;
-    }
-
-    const std::uint32_t gw_ip_be    = gateway_ip_be;
-    const std::uint32_t gst_ip_be   = rule.guest_ip_be;
-    const std::uint16_t gst_port_be = ::htons(rule.guest_port);
-    std::uint16_t ephem_be = 0;
-    if (!AllocateEphemPort(gst_ip_be, gw_ip_be, gst_port_be, ephem_be)) {
-        AbortiveCloseSocket(host_sock);
-        return;
-    }
-
-    // ConnKey convention: src=guest, dst=peer. For an inbound conn,
-    // the "peer" from the guest's perspective is the gateway at
-    // (gw_ip_be, ephem_be) and the "guest endpoint" is
-    // (gst_ip_be, gst_port_be).
-    ConnKey key{gst_ip_be, gw_ip_be, gst_port_be, ephem_be};
-
-    TcpConn c{};
-    c.key            = key;
-    c.host_fd        = host_sock;
-    c.state          = TcpState::GuestSynSent;
-    c.snd_una        = static_cast<std::uint32_t>(rng());
-    c.snd_nxt        = c.snd_una + 1;       // SYN consumes one seq
-    c.snd_wscale     = 0;
-    c.ws_negotiated  = false;               // settled when SYN-ACK arrives
-    c.guest_mss      = 536;
-    c.snd_wnd        = 65535;               // tentative
-    c.rcv_nxt        = 0;                   // undefined until SYN-ACK
-    c.last_use       = std::chrono::steady_clock::now();
-    c.is_inbound     = true;
-
-    auto [it, ok] = tcp_conns.emplace(key, std::move(c));
-    if (!ok) {
-        AbortiveCloseSocket(host_sock);
-        return;
-    }
-    TcpEmitSyn(it->second);
-    tcp_conns_total.fetch_add(1, std::memory_order_relaxed);
 }
 
 // ============================================================
@@ -2062,30 +1245,23 @@ void UsernetBackend::State::TcpAcceptInbound(
 // ============================================================
 void UsernetBackend::State::DrainHostSockets() {
     // Count active listeners up front; they always need POLLRDNORM and
-    // are independent of the udp/tcp conn maps. (Without this, an
-    // otherwise-idle backend that only has port-forward listeners
-    // installed would never poll them.)
+    // are independent of the udp conn map. (Without this, an otherwise-
+    // idle backend that only has port-forward listeners installed would
+    // never poll them.)
+    //
+    // M34.8: TCP host sockets are owned by TsiTcpEngine, which runs its
+    // own WSAPoll on them in Tick(). This routine handles only UDP and
+    // listener-accept polling now.
     std::size_t active_listeners = 0;
     for (const auto& L : listeners) {
         if (L.sock != INVALID_SOCKET) ++active_listeners;
     }
-    if (udp_conns.empty() && tcp_conns.empty() && active_listeners == 0) return;
+    if (udp_conns.empty() && active_listeners == 0) return;
 
-    // Build the poll set. For TCP, request POLLOUT only when we need it:
-    //   - Connecting (waiting for connect to complete)
-    //   - rx_buf has data to push to host
-    // Always request POLLRDNORM when the conn could receive (i.e. not
-    // closed and tx_buf isn't at cap).
-    //
-    // GuestSynSent conns are deliberately excluded from per-conn polling:
-    // their host socket can be readable (the client's data already sits
-    // in the kernel buffer), but we mustn't drain it until the guest
-    // completes the handshake -- otherwise we'd emit data toward the
-    // guest with rcv_nxt=0, breaking the 3WHS.
     std::vector<WSAPOLLFD> fds;
-    fds.reserve(udp_conns.size() + tcp_conns.size() + active_listeners);
+    fds.reserve(udp_conns.size() + active_listeners);
 
-    enum class SlotKind : std::uint8_t { Udp, Tcp, Listener };
+    enum class SlotKind : std::uint8_t { Udp, Listener };
     struct Slot { SlotKind kind; ConnKey key; std::size_t listener_idx; };
     std::vector<Slot> slots;
     slots.reserve(fds.capacity());
@@ -2096,26 +1272,6 @@ void UsernetBackend::State::DrainHostSockets() {
         f.events = POLLRDNORM;
         fds.push_back(f);
         slots.push_back({SlotKind::Udp, k, 0});
-    }
-    for (auto& [k, c] : tcp_conns) {
-        if (c.state == TcpState::Closed || c.host_fd == INVALID_SOCKET) continue;
-        if (c.state == TcpState::GuestSynSent) continue;
-        WSAPOLLFD f{};
-        f.fd = c.host_fd;
-        f.events = 0;
-        if (c.state == TcpState::Connecting) {
-            f.events |= POLLWRNORM;
-        } else {
-            if (c.tx_buf.size() < kTcpTxBufCap && !c.host_eof_seen) {
-                f.events |= POLLRDNORM;
-            }
-            if (!c.rx_buf.empty() && !c.host_send_shut) {
-                f.events |= POLLWRNORM;
-            }
-        }
-        if (f.events == 0) continue;
-        fds.push_back(f);
-        slots.push_back({SlotKind::Tcp, k, 0});
     }
     for (std::size_t i = 0; i < listeners.size(); ++i) {
         if (listeners[i].sock == INVALID_SOCKET) continue;
@@ -2140,33 +1296,11 @@ void UsernetBackend::State::DrainHostSockets() {
             }
             continue;
         }
-        if (slot.kind == SlotKind::Udp) {
-            auto it = udp_conns.find(slot.key);
-            if (it == udp_conns.end()) continue;
-            if (rev & (POLLRDNORM | POLLERR | POLLHUP)) {
-                PumpUdpSocket(it->second);
-            }
-        } else {
-            auto it = tcp_conns.find(slot.key);
-            if (it == tcp_conns.end()) continue;
-            TcpConn& c = it->second;
-            if (c.state == TcpState::Connecting) {
-                if (rev & (POLLWRNORM | POLLERR | POLLHUP)) {
-                    TcpHandleConnectResult(c);
-                }
-                continue;
-            }
-            if (rev & (POLLERR | POLLHUP)) {
-                // Surfaces as connection-reset or graceful peer close;
-                // recv() will distinguish.
-            }
-            if (rev & POLLWRNORM) {
-                TcpDrainRxBufToHost(c);
-            }
-            if (rev & POLLRDNORM) {
-                TcpDrainHostRecvIntoTxBuf(c);
-            }
-            TcpDrainSendBuffer(c);
+        // SlotKind::Udp
+        auto it = udp_conns.find(slot.key);
+        if (it == udp_conns.end()) continue;
+        if (rev & (POLLRDNORM | POLLERR | POLLHUP)) {
+            PumpUdpSocket(it->second);
         }
     }
 }
@@ -2175,20 +1309,15 @@ void UsernetBackend::State::DrainHostSockets() {
 // State::ExpireIdle
 // ============================================================
 void UsernetBackend::State::ExpireIdle() {
+    // M34.8: TCP conn lifecycle is owned by TsiTcpEngine (idle reap +
+    // half-close watchdog + shim reconcile). Only UDP needs sweeping
+    // here.
     const auto now = std::chrono::steady_clock::now();
     const auto udp_timeout = std::chrono::milliseconds(opts.udp_idle_ms);
     for (auto it = udp_conns.begin(); it != udp_conns.end(); ) {
         if (now - it->second.last_use > udp_timeout) {
             if (it->second.sock != INVALID_SOCKET) ::closesocket(it->second.sock);
             it = udp_conns.erase(it);
-        } else {
-            ++it;
-        }
-    }
-    // Sweep marked-closed TCP conns.
-    for (auto it = tcp_conns.begin(); it != tcp_conns.end(); ) {
-        if (it->second.state == TcpState::Closed) {
-            it = tcp_conns.erase(it);
         } else {
             ++it;
         }

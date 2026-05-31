@@ -25,6 +25,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -64,6 +65,19 @@ public:
 
     void SetCompletionCallback(CompleteFn fn) { complete_ = std::move(fn); }
 
+    // Synchronous range-zero. Used by virtio-blk DISCARD /
+    // WRITE_ZEROES (M34.x add-on). On first call, marks the file
+    // sparse via FSCTL_SET_SPARSE; subsequent calls only issue
+    // FSCTL_SET_ZERO_DATA which on a sparse NTFS file deallocates
+    // the underlying clusters in addition to zeroing the byte range.
+    // Returns true on success. No-op on read-only files (returns
+    // false).
+    //
+    // Synchronous and thread-safe (the FSCTL itself serialises via
+    // the file handle's mutex, but we also wrap any sparse-init
+    // state in a std::call_once).
+    bool ZeroRange(std::uint64_t offset, std::uint64_t length);
+
     // Spin up the IOCP worker. Must be called before Submit.
     void Start();
 
@@ -80,6 +94,7 @@ public:
     std::uint64_t completed() const { return completed_.load(); }
     std::uint64_t errors()    const { return errors_.load(); }
     std::uint64_t max_inflight() const { return max_inflight_.load(); }
+    std::uint64_t inflight()  const { return inflight_.load(); }
 
 private:
     void WorkerLoop();
@@ -103,6 +118,13 @@ private:
     std::atomic<std::uint64_t> errors_{0};
     std::atomic<std::uint64_t> inflight_{0};       // currently outstanding
     std::atomic<std::uint64_t> max_inflight_{0};   // high-water mark
+
+    // ZeroRange() / DISCARD support: marks the file sparse on first
+    // call so subsequent FSCTL_SET_ZERO_DATA invocations deallocate
+    // backing clusters in addition to logically zeroing bytes. We use
+    // a once_flag so multiple concurrent ZeroRange calls cooperate.
+    std::once_flag    sparse_once_;
+    std::atomic<bool> sparse_ok_{false};
 };
 
 }  // namespace tinyvmm::host

@@ -266,4 +266,28 @@ MsrHandled HvEnlightenment::HandleRdmsr(std::uint32_t vp_index,
     }
 }
 
+// M33.3 save/restore: snapshot of guest-visible MSR state.
+HvEnlightenment::State HvEnlightenment::CaptureState() {
+    std::lock_guard<std::mutex> lock(mu_);
+    State s{};
+    s.guest_os_id       = guest_os_id_;
+    s.hypercall_msr     = hypercall_msr_;
+    s.reference_tsc_msr = reference_tsc_msr_;
+    s.tsc_invariant_ctl = tsc_invariant_ctl_;
+    return s;
+}
+
+void HvEnlightenment::ApplyState(const State& s) {
+    std::lock_guard<std::mutex> lock(mu_);
+    // Bypass the WRMSR side-effects (publishing the hypercall page /
+    // reference TSC page) — those pages are part of the saved RAM image
+    // and were written there at original-boot WRMSR time. Re-publishing
+    // them here would also work, but doing it via the saved RAM keeps
+    // restore deterministic (RAM bytes are authoritative).
+    guest_os_id_       = s.guest_os_id;
+    hypercall_msr_     = s.hypercall_msr;
+    reference_tsc_msr_ = s.reference_tsc_msr;
+    tsc_invariant_ctl_ = s.tsc_invariant_ctl;
+}
+
 }  // namespace tinyvmm::whp

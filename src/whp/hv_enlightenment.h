@@ -110,6 +110,25 @@ public:
     std::uint64_t tsc_scale() const noexcept { return tsc_scale_; }
     std::uint64_t tsc_hz() const noexcept { return tsc_hz_; }
 
+    // M33.3 save/restore: snapshot of the MSR cache. The four values are
+    // raw guest-visible MSR contents; restoring them with ApplyState is
+    // equivalent to having seen the guest WRMSR each one in order.
+    // ApplyState does NOT republish the Reference TSC page or the
+    // hypercall page — the saved guest RAM bytes already contain them,
+    // and the scale recomputed from `tsc_hz_` (passed at construction)
+    // must match the captured save (Phase 33.6 callers must validate
+    // host_tsc_hz before constructing HvEnlightenment).
+    struct State {
+        std::uint64_t guest_os_id;
+        std::uint64_t hypercall_msr;
+        std::uint64_t reference_tsc_msr;
+        std::uint64_t tsc_invariant_ctl;
+    };
+    static_assert(sizeof(State) == 32, "HvEnlightenment::State must be 32 bytes");
+
+    State CaptureState();
+    void  ApplyState(const State& s);
+
 private:
     // Write the Reference TSC page at the given guest PFN. The page is
     // expected to live inside the guest's primary RAM region. Returns false

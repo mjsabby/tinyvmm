@@ -1,6 +1,7 @@
 #include "run_loop.h"
 
 #include "cpuid.h"
+#include "snapshot.h"
 #include "diag/etw.h"
 
 #include <cstdio>
@@ -261,6 +262,88 @@ std::optional<StopReason> RunLoop::HandleCpuidExit(
     const auto& ctx = exit.CpuidAccess;
     const auto leaf    = static_cast<std::uint32_t>(ctx.Rax);
     const auto subleaf = static_cast<std::uint32_t>(ctx.Rcx);
+
+    // M33 Phase 33.1: intercept the magic snapshot leaf BEFORE the generic
+    // CPUID resolution. The leaf sits in the Hyper-V range (0x4000DE57) so
+    // it never collides with anything WHP / Linux / real hardware uses.
+    //
+    // Behaviour:
+    //   1. Always (whether `--save` is active or not) return the snapshot
+    //      signature so guests can detect support safely with a single
+    //      probe.
+    //   2. Advance RIP past the 2-byte CPUID instruction (using the
+    //      hardware-reported `InstructionLength`, which always matches 2
+    //      for the CPUID encoding but we use the field for safety against
+    //      future prefixed encodings) so the guest never re-triggers on
+    //      restore.
+    //   3. If the snapshot trigger is armed (`--save <path>` parsed
+    //      earlier), record the requesting vp_index and return
+    //      `StopReason::SnapshotRequested`. The RunLoop tail-call path
+    //      in `RunLoop::Run()` propagates this out so the main thread
+    //      can act.
+    //
+    // Multi-vCPU consideration: any vCPU may execute the magic CPUID (the
+    // Linux scheduler picks where /init's helper process runs). The first
+    // vCPU to fire it wins; subsequent ones (e.g. APs racing into the same
+    // CPUID before the host's stop request lands) will observe
+    // `snapshot::IsArmed()` still true but only the first compare_exchange
+    // on `requested` succeeds. The losers also stop with SnapshotRequested
+    // — semantically the same outcome.
+    if (leaf == ::tinyvmm::whp::snapshot::kMagicLeaf) {
+        const std::uint64_t next_rip =
+            exit.VpContext.Rip + exit.VpContext.InstructionLength;
+
+        static constexpr WHV_REGISTER_NAME kSigNames[] = {
+            WHvX64RegisterRax, WHvX64RegisterRbx, WHvX64RegisterRcx,
+            WHvX64RegisterRdx, WHvX64RegisterRip,
+        };
+        WHV_REGISTER_VALUE sig_vals[5] = {};
+        sig_vals[0].Reg64 = ::tinyvmm::whp::snapshot::kSignatureEax;
+        sig_vals[1].Reg64 = ::tinyvmm::whp::snapshot::kSignatureEbx;
+        sig_vals[2].Reg64 = ::tinyvmm::whp::snapshot::kSignatureEcx;
+        sig_vals[3].Reg64 = ::tinyvmm::whp::snapshot::kSignatureEdx;
+        sig_vals[4].Reg64 = next_rip;
+
+        try {
+            vcpu_.SetRegisters(kSigNames, sig_vals);
+        } catch (const HrError& e) {
+            std::fprintf(
+                stderr,
+                "[loop] snapshot CPUID set-regs failed at RIP=0x%llx: "
+                "HRESULT=0x%08lX\n",
+                static_cast<unsigned long long>(exit.VpContext.Rip),
+                static_cast<unsigned long>(e.hr()));
+            return StopReason::EmulationFailure;
+        }
+
+        if (::tinyvmm::whp::snapshot::IsArmed()) {
+            auto& st = ::tinyvmm::whp::snapshot::State();
+            bool expected = false;
+            // First-writer-wins on the requested flag; we deliberately
+            // overwrite requesting_vp_index AFTER the CAS so diagnostics
+            // identify the actual winner.
+            if (st.requested.compare_exchange_strong(
+                    expected, true, std::memory_order_acq_rel)) {
+                st.requesting_vp_index.store(
+                    vcpu_.index(), std::memory_order_release);
+                std::fprintf(stderr,
+                             "[loop] snapshot trigger fired: vp=%u RIP=0x%llx "
+                             "(armed=true) -- stopping run loop\n",
+                             vcpu_.index(),
+                             static_cast<unsigned long long>(next_rip));
+            }
+            return StopReason::SnapshotRequested;
+        }
+
+        // Disarmed path: signature was returned, just continue normally.
+        if (verbose_cpuid_) {
+            std::fprintf(stderr,
+                         "[loop] snapshot magic CPUID at RIP=0x%llx (disarmed); "
+                         "returned signature\n",
+                         static_cast<unsigned long long>(exit.VpContext.Rip));
+        }
+        return std::nullopt;
+    }
 
     // WHP has already computed what it would natively return; layer our policy
     // on top.

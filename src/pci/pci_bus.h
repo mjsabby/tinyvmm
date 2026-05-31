@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <vector>
 
 namespace tinyvmm::pci {
@@ -59,10 +60,43 @@ public:
     // Look up a device by BDF. Returns nullptr if absent. For tests only.
     PciDevice* Find(Bdf bdf) const;
 
+    // Enumerate every device in insertion order. Callback receives
+    // (Bdf, PciDevice&). Used by Phase 33.6 save/restore to walk the
+    // bus once for per-device snapshot capture or apply.
+    template <typename F>
+    void ForEachDevice(F&& f) const {
+        for (const auto& s : devices_) {
+            f(s.bdf, *s.dev);
+        }
+    }
+
     // Diagnostics.
     std::uint64_t cfg_reads()  const noexcept { return cfg_reads_; }
     std::uint64_t cfg_writes() const noexcept { return cfg_writes_; }
     std::size_t   device_count() const noexcept { return devices_.size(); }
+
+    // ---- Phase 33.5 host-bridge save/restore ------------------------------
+    //
+    // PciBus has exactly one piece of guest-visible state: the latched
+    // CONFIG_ADDRESS register at 0xCF8. The device list, BAR-allocator
+    // cursors, and read/write counters are NOT persisted: per-device state
+    // is handled by PciDevice::CaptureState (Phase 33.4), the allocator is
+    // monotonic from construction and the devices already have their BAR
+    // assignments, and the counters are diagnostic-only.
+    struct State {
+        std::uint32_t config_address = 0;
+    };
+
+    // Encoded payload size: 4 bytes (one u32 LE). Singleton legacy section
+    // -- payload carries the State bytes directly with no BDF prefix.
+    static constexpr std::size_t kEncodedSize = 4u;
+
+    State CaptureState() const;
+    void  ApplyState(const State& s);
+
+    static std::size_t EncodeState(const State& s,
+                                   std::span<std::uint8_t> out);
+    static State       DecodeState(std::span<const std::uint8_t> bytes);
 
 private:
     struct Slot {
@@ -86,7 +120,9 @@ private:
     // lock on the guest side so contention is essentially zero in practice;
     // this guards against torn reads/writes of config_address_ and against
     // concurrent ConfigRead/ConfigWrite delivery if the guest ever races us.
-    std::mutex          mu_;
+    // Mutable because CaptureState() is const but must lock to read
+    // config_address_ atomically.
+    mutable std::mutex          mu_;
 
     // Bump-pointer allocators for pre-assigned BAR layout.
     std::uint64_t       mmio_next_ = kMmioWindowBase;

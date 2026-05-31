@@ -45,6 +45,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -142,6 +143,54 @@ public:
     static constexpr std::uint32_t kOffMsixTable      = 0x3000;
     static constexpr std::uint32_t kOffMsixPba        = 0x3800;
 
+    // ----- M33.4 save/restore -------------------------------------------
+    //
+    // Captures all per-instance transport state. The constructor-time
+    // configuration (num_msix_vectors, device topology, etc.) is
+    // reconstructed by the restore code re-running the constructor with
+    // identical Options + Device. ApplyState fills in the runtime state
+    // and, if `bar_mapped` was true at capture, re-registers the four
+    // MMIO regions via the private InstallBarHandlers_ helper. It
+    // deliberately does NOT invoke the user-supplied
+    // on_bar_mapped_cb_() (which is the cold-boot path's hook to install
+    // partition doorbells + start worker threads); restore-time devices
+    // have no worker waiting on a doorbell so installing one would
+    // swallow guest notify-MMIO writes silently.
+    struct QueueState {
+        std::uint16_t msix_vector = 0xFFFF;
+        std::uint16_t enable      = 0;
+        std::uint64_t desc        = 0;
+        std::uint64_t driver      = 0;
+        std::uint64_t device      = 0;
+        std::uint16_t size        = 0;
+    };
+    struct State {
+        std::uint32_t device_feature_select = 0;
+        std::uint32_t driver_feature_select = 0;
+        std::uint64_t driver_features       = 0;
+        std::uint16_t msix_config           = 0xFFFF;
+        std::uint8_t  status                = 0;
+        std::uint8_t  config_generation     = 0;
+        std::uint16_t queue_select          = 0;
+        std::uint8_t  bar_mapped            = 0;
+        std::uint64_t bar_gpa               = 0;
+        std::uint32_t isr_status            = 0;
+        std::vector<QueueState> queues;
+    };
+
+    // Encoded payload size: 40-byte fixed header + 32*num_queues.
+    static constexpr std::size_t kEncodedHeaderSize = 40;
+    static std::size_t EncodedSize(std::size_t num_queues) noexcept {
+        return kEncodedHeaderSize + 32ull * num_queues;
+    }
+
+    State CaptureState() const;
+    void  ApplyState(const State& s);
+
+    static std::size_t EncodeState(const State& s,
+                                   std::vector<std::uint8_t>& out);
+    static State       DecodeState(std::span<const std::uint8_t> bytes);
+
 protected:
     void OnBarMapped(int idx, std::uint64_t gpa,
                      std::uint32_t size) override;
@@ -157,6 +206,15 @@ private:
     void          WriteCommonCfg32(std::uint32_t off, std::uint32_t value);
 
     void ApplyStatusWrite(std::uint8_t new_status);
+
+    // Registers the four BAR0 MMIO regions (COMMON_CFG, ISR, NOTIFY,
+    // DEVICE_CFG) and calls msix_.Install(). Used by both the regular
+    // OnBarMapped cold-boot path and PciTransport::ApplyState restore
+    // path. Does NOT invoke on_bar_mapped_cb_ or install partition
+    // doorbells — both of those are the cold-boot path's responsibility.
+    // Caller must hold no PciTransport lock and must have already set
+    // bar_gpa_ = gpa, bar_mapped_ = true.
+    void InstallBarHandlers_(std::uint64_t gpa);
 
     Device& dev_;
     Options opts_;
@@ -176,19 +234,13 @@ private:
     std::uint8_t  config_generation_     = 0;
     std::uint16_t queue_select_          = 0;
 
-    struct QueueState {
-        std::uint16_t msix_vector = 0xFFFF;
-        std::uint16_t enable      = 0;
-        std::uint64_t desc        = 0;
-        std::uint64_t driver      = 0;
-        std::uint64_t device      = 0;
-        std::uint16_t size        = 0;
-    };
+    // Per-queue stub state. Public type lives in the State struct above so
+    // CaptureState / ApplyState can round-trip it directly.
     std::vector<QueueState> queues_;
 
     // Atomic across N vCPU + worker threads. ISR is read-and-clear from a
-    // single guest reader, and OR'd by RaiseQueueInterrupt / RaiseConfigChange
-    // on worker threads.
+    // single guest reader, and OR'd by RaiseQueueInterrupt /
+    // RaiseConfigChangeInterrupt on worker threads.
     std::atomic<std::uint32_t> isr_status_{0};
     std::atomic<std::uint64_t> reads_{0};
     std::atomic<std::uint64_t> writes_{0};

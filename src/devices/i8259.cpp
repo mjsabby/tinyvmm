@@ -1,6 +1,8 @@
 #include "i8259.h"
+#include "../whp/snapshot_file.h"
 
 #include <cstdio>
+#include <stdexcept>
 
 namespace tinyvmm::devices {
 
@@ -202,6 +204,128 @@ void Pic8259::Raise(int irq) {
     }
 
     InjectLocked(chip, local);
+}
+
+// ---- Phase 33.5 save/restore ---------------------------------------------
+
+namespace {
+
+void ChipToBytes(const Pic8259::ChipState& c, std::uint8_t* p) {
+    p[0] = c.vector_base;
+    p[1] = c.mask;
+    p[2] = c.irr;
+    p[3] = c.icw1;
+    p[4] = c.icw3;
+    p[5] = c.icw4;
+    p[6] = c.step;
+    p[7] = c.expect_icw4 ? 1u : 0u;
+}
+
+Pic8259::ChipState ChipFromBytes(const std::uint8_t* p) {
+    Pic8259::ChipState c;
+    c.vector_base = p[0];
+    c.mask        = p[1];
+    c.irr         = p[2];
+    c.icw1        = p[3];
+    c.icw3        = p[4];
+    c.icw4        = p[5];
+    c.step        = p[6];
+    c.expect_icw4 = (p[7] != 0) ? 1u : 0u;
+    return c;
+}
+
+}  // namespace
+
+Pic8259::State Pic8259::CaptureState() const {
+    std::lock_guard<std::mutex> lk(lock_);
+    auto snap = [](const Chip& src) {
+        ChipState d;
+        d.vector_base = src.vector_base;
+        d.mask        = src.mask;
+        d.irr         = src.irr;
+        d.icw1        = src.icw1;
+        d.icw3        = src.icw3;
+        d.icw4        = src.icw4;
+        d.step        = static_cast<std::uint8_t>(src.step);
+        d.expect_icw4 = src.expect_icw4 ? 1u : 0u;
+        return d;
+    };
+    State s;
+    s.master = snap(master_);
+    s.slave  = snap(slave_);
+    return s;
+}
+
+void Pic8259::ApplyState(const Pic8259::State& s) {
+    std::lock_guard<std::mutex> lk(lock_);
+    auto restore = [](Chip& dst, const ChipState& src) {
+        dst.vector_base = src.vector_base;
+        dst.mask        = src.mask;
+        dst.irr         = src.irr;
+        dst.icw1        = src.icw1;
+        dst.icw3        = src.icw3;
+        dst.icw4        = src.icw4;
+        dst.step        = static_cast<IcwStep>(src.step);
+        dst.expect_icw4 = (src.expect_icw4 != 0);
+    };
+    restore(master_, s.master);
+    restore(slave_,  s.slave);
+    // Deferred: re-inject deliverable IRR bits in ResumeRuntime so we
+    // never call inject_ from inside Apply (which Phase 33.6 may invoke
+    // before all other devices' Apply have completed).
+}
+
+void Pic8259::ResumeRuntime() {
+    std::lock_guard<std::mutex> lk(lock_);
+    // Master: deliverable = unmasked IRR.
+    {
+        const std::uint8_t deliverable =
+            static_cast<std::uint8_t>(master_.irr & ~master_.mask);
+        for (int i = 0; i < 8; ++i) {
+            const std::uint8_t bit = static_cast<std::uint8_t>(1u << i);
+            if (deliverable & bit) {
+                master_.irr &= static_cast<std::uint8_t>(~bit);
+                InjectLocked(master_, i);
+            }
+        }
+    }
+    // Slave: deliverable requires the slave-local bit be unmasked AND
+    // the master cascade line (IRQ2) be unmasked too. Otherwise the IRQ
+    // would not reach the CPU even if injected, so leave it latched.
+    const std::uint8_t kCascadeBit = 0x04;
+    if ((master_.mask & kCascadeBit) == 0) {
+        const std::uint8_t deliverable =
+            static_cast<std::uint8_t>(slave_.irr & ~slave_.mask);
+        for (int i = 0; i < 8; ++i) {
+            const std::uint8_t bit = static_cast<std::uint8_t>(1u << i);
+            if (deliverable & bit) {
+                slave_.irr &= static_cast<std::uint8_t>(~bit);
+                InjectLocked(slave_, i);
+            }
+        }
+    }
+}
+
+std::size_t Pic8259::EncodeState(const Pic8259::State& s,
+                                 std::span<std::uint8_t> out) {
+    if (out.size() < kEncodedSize) {
+        throw std::runtime_error(
+            "Pic8259::EncodeState: output span smaller than kEncodedSize");
+    }
+    ChipToBytes(s.master, out.data() + 0);
+    ChipToBytes(s.slave,  out.data() + 8);
+    return kEncodedSize;
+}
+
+Pic8259::State Pic8259::DecodeState(std::span<const std::uint8_t> bytes) {
+    if (bytes.size() < kEncodedSize) {
+        throw std::runtime_error(
+            "Pic8259::DecodeState: payload smaller than kEncodedSize");
+    }
+    State s;
+    s.master = ChipFromBytes(bytes.data() + 0);
+    s.slave  = ChipFromBytes(bytes.data() + 8);
+    return s;
 }
 
 }  // namespace tinyvmm::devices

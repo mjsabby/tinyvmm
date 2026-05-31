@@ -37,6 +37,15 @@ public:
     };
 
     void EnableExtendedExits(const ExtendedExits& bits);
+
+    // Bitmap of x86 exception vectors WHP should surface to the host
+    // via WHvRunVpExitReasonException. Bit N corresponds to vector N
+    // (bit 1 = #DB, bit 3 = #BP, bit 14 = #PF, etc.). Used by the
+    // GDB stub (M35) to intercept #DB (single-step) and #BP (int3
+    // software breakpoint). Must be called before Setup() AND only
+    // when EnableExtendedExits.exception is also true.
+    void SetExceptionExitBitmap(std::uint64_t bitmap);
+
     void SetLocalApicEmulation(WHV_X64_LOCAL_APIC_EMULATION_MODE mode);
 
     // Register a list of static CPUID leaf values. WHP reads this list at

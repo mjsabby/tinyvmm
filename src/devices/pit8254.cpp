@@ -1,8 +1,10 @@
 #include "pit8254.h"
+#include "../whp/snapshot_file.h"
 
 #include <profileapi.h>
 
 #include <cstdio>
+#include <stdexcept>
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
@@ -421,6 +423,216 @@ void Pit8254::IrqThreadMain() {
             break;
         }
     }
+}
+
+// ---- Phase 33.5 save/restore ---------------------------------------------
+
+namespace {
+
+// Convert PIT ticks to QPC ticks safely (no u64 overflow for any realistic
+// uptime). Used during ApplyState to rebase start_qpc so ReadCount returns
+// the same phase the snapshot saw.
+//
+// Formula: qpc = pit_ticks * qpc_freq / kPitHz, computed div-first via
+// (pit / k) * q + (pit % k) * q / k to avoid the (pit * q) overflow trap
+// for u64 pit values approaching 2^40 with q ~= 10^7.
+std::uint64_t PitTicksToQpcDelta(std::uint64_t pit_ticks,
+                                 std::uint64_t qpc_freq) noexcept {
+    if (qpc_freq == 0) return 0;
+    const std::uint64_t kPit = 1193182;
+    const std::uint64_t q = pit_ticks / kPit;
+    const std::uint64_t r = pit_ticks % kPit;
+    return q * qpc_freq + (r * qpc_freq) / kPit;
+}
+
+void WriteLe16(std::uint8_t* p, std::uint16_t v) {
+    p[0] = static_cast<std::uint8_t>(v & 0xFFu);
+    p[1] = static_cast<std::uint8_t>((v >> 8) & 0xFFu);
+}
+
+std::uint16_t ReadLe16(const std::uint8_t* p) {
+    return static_cast<std::uint16_t>(
+        static_cast<std::uint16_t>(p[0]) |
+        (static_cast<std::uint16_t>(p[1]) << 8));
+}
+
+void WriteLe64(std::uint8_t* p, std::uint64_t v) {
+    for (int i = 0; i < 8; ++i) {
+        p[i] = static_cast<std::uint8_t>((v >> (8 * i)) & 0xFFu);
+    }
+}
+
+std::uint64_t ReadLe64(const std::uint8_t* p) {
+    std::uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) {
+        v |= static_cast<std::uint64_t>(p[i]) << (8 * i);
+    }
+    return v;
+}
+
+void EncodeChannel(const Pit8254::ChannelState& c, std::uint8_t* p) {
+    p[0]  = c.access;
+    p[1]  = c.mode;
+    WriteLe16(p + 2, c.reload);
+    p[4]  = c.reload_have_lsb ? 1u : 0u;
+    p[5]  = c.reload_lsb;
+    p[6]  = c.read_msb_next ? 1u : 0u;
+    p[7]  = c.latch_valid ? 1u : 0u;
+    WriteLe16(p + 8, c.latched);
+    p[10] = c.latched_msb_next ? 1u : 0u;
+    p[11] = c.gate ? 1u : 0u;
+    p[12] = c.running ? 1u : 0u;
+    p[13] = 0;
+    p[14] = 0;
+    p[15] = 0;
+    WriteLe64(p + 16, c.elapsed_pit_ticks);
+}
+
+Pit8254::ChannelState DecodeChannel(const std::uint8_t* p) {
+    Pit8254::ChannelState c;
+    c.access            = p[0];
+    c.mode              = p[1];
+    c.reload            = ReadLe16(p + 2);
+    c.reload_have_lsb   = (p[4] != 0) ? 1u : 0u;
+    c.reload_lsb        = p[5];
+    c.read_msb_next     = (p[6] != 0) ? 1u : 0u;
+    c.latch_valid       = (p[7] != 0) ? 1u : 0u;
+    c.latched           = ReadLe16(p + 8);
+    c.latched_msb_next  = (p[10] != 0) ? 1u : 0u;
+    c.gate              = (p[11] != 0) ? 1u : 0u;
+    c.running           = (p[12] != 0) ? 1u : 0u;
+    if (p[13] != 0 || p[14] != 0 || p[15] != 0) {
+        throw std::runtime_error(
+            "Pit8254::DecodeState: channel reserved bytes non-zero");
+    }
+    c.elapsed_pit_ticks = ReadLe64(p + 16);
+    return c;
+}
+
+}  // namespace
+
+Pit8254::State Pit8254::CaptureState() const {
+    std::lock_guard<std::mutex> lk(lock_);
+    State s;
+    s.port61 = port61_;
+    const std::uint64_t now = QpcNow();
+    for (int i = 0; i < 3; ++i) {
+        const Channel& src = ch_[i];
+        ChannelState& d = s.ch[i];
+        d.access            = static_cast<std::uint8_t>(src.access);
+        d.mode              = src.mode;
+        d.reload            = src.reload;
+        d.reload_have_lsb   = src.reload_have_lsb ? 1u : 0u;
+        d.reload_lsb        = src.reload_lsb;
+        d.read_msb_next     = src.read_msb_next ? 1u : 0u;
+        d.latch_valid       = src.latch_valid ? 1u : 0u;
+        d.latched           = src.latched;
+        d.latched_msb_next  = src.latched_msb_next ? 1u : 0u;
+        d.gate              = src.gate ? 1u : 0u;
+        d.running           = src.running ? 1u : 0u;
+        // Persist elapsed PIT ticks (not raw start_qpc) so Apply can
+        // rebase to the local QPC clock without losing phase.
+        if (src.running && now >= src.start_qpc) {
+            d.elapsed_pit_ticks =
+                QpcDeltaToPitTicks(now - src.start_qpc);
+        } else {
+            d.elapsed_pit_ticks = 0;
+        }
+    }
+    s.ch0_irq_reload = ch0_irq_reload_;
+    s.ch0_irq_mode   = ch0_irq_mode_;
+    s.ch0_irq_armed  = ch0_irq_armed_ ? 1u : 0u;
+    return s;
+}
+
+void Pit8254::ApplyState(const Pit8254::State& s) {
+    std::lock_guard<std::mutex> lk(lock_);
+    port61_ = s.port61;
+    const std::uint64_t now = QpcNow();
+    for (int i = 0; i < 3; ++i) {
+        const ChannelState& src = s.ch[i];
+        Channel& d = ch_[i];
+        d.access            = static_cast<AccessMode>(src.access);
+        d.mode              = src.mode;
+        d.reload            = src.reload;
+        d.reload_have_lsb   = (src.reload_have_lsb != 0);
+        d.reload_lsb        = src.reload_lsb;
+        d.read_msb_next     = (src.read_msb_next != 0);
+        d.latch_valid       = (src.latch_valid != 0);
+        d.latched           = src.latched;
+        d.latched_msb_next  = (src.latched_msb_next != 0);
+        d.gate              = (src.gate != 0);
+        d.running           = (src.running != 0);
+        // Rebase start_qpc so ReadCount() returns the same phase the
+        // snapshot saw at capture time.
+        const std::uint64_t qpc_delta =
+            PitTicksToQpcDelta(src.elapsed_pit_ticks, qpc_freq_);
+        d.start_qpc = (now >= qpc_delta) ? (now - qpc_delta) : 0;
+    }
+    ch0_irq_reload_ = s.ch0_irq_reload;
+    ch0_irq_mode_   = s.ch0_irq_mode;
+    ch0_irq_armed_  = (s.ch0_irq_armed != 0);
+    // Do NOT start the IRQ thread here -- defer to ResumeRuntime() so
+    // the PIC is guaranteed to be applied + wired before we deliver any
+    // edges.
+}
+
+void Pit8254::ResumeRuntime() {
+    std::lock_guard<std::mutex> lk(lock_);
+    if (!ch0_irq_armed_) {
+        return;
+    }
+    EnsureIrqThreadStarted();
+    if (irq_reprogram_event_) {
+        SetEvent(irq_reprogram_event_);
+    }
+}
+
+std::size_t Pit8254::EncodeState(const Pit8254::State& s,
+                                 std::span<std::uint8_t> out) {
+    if (out.size() < kEncodedSize) {
+        throw std::runtime_error(
+            "Pit8254::EncodeState: output span smaller than kEncodedSize");
+    }
+    std::uint8_t* p = out.data();
+    p[0] = s.port61;
+    for (int i = 1; i < 8; ++i) p[i] = 0;
+    EncodeChannel(s.ch[0], p + 8);
+    EncodeChannel(s.ch[1], p + 32);
+    EncodeChannel(s.ch[2], p + 56);
+    WriteLe16(p + 80, s.ch0_irq_reload);
+    p[82] = s.ch0_irq_mode;
+    p[83] = s.ch0_irq_armed ? 1u : 0u;
+    p[84] = 0; p[85] = 0; p[86] = 0; p[87] = 0;
+    return kEncodedSize;
+}
+
+Pit8254::State Pit8254::DecodeState(std::span<const std::uint8_t> bytes) {
+    if (bytes.size() < kEncodedSize) {
+        throw std::runtime_error(
+            "Pit8254::DecodeState: payload smaller than kEncodedSize");
+    }
+    State s;
+    s.port61 = bytes[0];
+    for (int i = 1; i < 8; ++i) {
+        if (bytes[i] != 0) {
+            throw std::runtime_error(
+                "Pit8254::DecodeState: header reserved byte non-zero");
+        }
+    }
+    s.ch[0] = DecodeChannel(bytes.data() + 8);
+    s.ch[1] = DecodeChannel(bytes.data() + 32);
+    s.ch[2] = DecodeChannel(bytes.data() + 56);
+    s.ch0_irq_reload = ReadLe16(bytes.data() + 80);
+    s.ch0_irq_mode   = bytes[82];
+    s.ch0_irq_armed  = (bytes[83] != 0) ? 1u : 0u;
+    for (int i = 84; i < 88; ++i) {
+        if (bytes[i] != 0) {
+            throw std::runtime_error(
+                "Pit8254::DecodeState: trailer reserved byte non-zero");
+        }
+    }
+    return s;
 }
 
 }  // namespace tinyvmm::devices

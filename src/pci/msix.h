@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <span>
 #include <vector>
 
 namespace tinyvmm::pci {
@@ -95,6 +96,45 @@ public:
     bool PbaBit(std::uint32_t vector) const;
     std::uint64_t entry_addr(std::uint32_t v) const;
     std::uint32_t entry_data(std::uint32_t v) const;
+
+    // ----- M33.4 save/restore -------------------------------------------
+    //
+    // Persists the per-vector table entries and the PBA. The configuration
+    // fields set once at AddCapability (num_vectors_, bar_idx_,
+    // table_offset_, pba_offset_, cap_off_, dev_) are reconstructed by the
+    // restore code re-running the device's constructor with identical
+    // arguments. The (mapped_, bar_base_gpa_) pair is RE-ESTABLISHED by
+    // Install() being re-invoked from PciTransport::InstallBarHandlers_
+    // during ApplyState; this struct carries them for cross-section
+    // validation only — ApplyState does NOT write them.
+    struct EntryState {
+        std::uint32_t addr_lo = 0;
+        std::uint32_t addr_hi = 0;
+        std::uint32_t data    = 0;
+        std::uint32_t ctrl    = 1;
+    };
+    struct State {
+        std::uint32_t num_vectors  = 0;     // sanity check vs constructor
+        std::uint64_t bar_base_gpa = 0;     // informational only on apply
+        std::uint8_t  mapped       = 0;     // informational only on apply
+        std::vector<EntryState>    table;
+        std::vector<std::uint64_t> pba;
+    };
+
+    State CaptureState() const;
+    void  ApplyState(const State& s);
+
+    // Encoded payload size: 24 byte fixed header + 16*N table + 8*pba_words.
+    // The constant header is u32 num_vectors + u32 reserved=0 + u64
+    // bar_base_gpa + u8 mapped + u8 pad[7].
+    static constexpr std::size_t kEncodedHeaderSize = 24;
+    static std::size_t EncodedSize(std::uint32_t num_vectors) noexcept {
+        return kEncodedHeaderSize + 16ull * num_vectors +
+               8ull * ((num_vectors + 63) / 64);
+    }
+    static std::size_t EncodeState(const State& s,
+                                   std::vector<std::uint8_t>& out);
+    static State       DecodeState(std::span<const std::uint8_t> bytes);
 
 private:
     void HandleTable(devices::MmioAccess& access);

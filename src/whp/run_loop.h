@@ -21,6 +21,12 @@ enum class StopReason {
     Cancelled,          // External RequestStop().
     UnhandledExit,      // Saw an exit reason we don't yet support.
     EmulationFailure,   // WHvEmulatorTry*Emulation reported failure.
+    // M33 save/restore (Phase 33.1): guest fired the magic CPUID leaf
+    // (whp::snapshot::kMagicLeaf) while `--save` was active. The run loop
+    // has already advanced RIP past the CPUID instruction and recorded the
+    // requesting vp_index in `whp::snapshot::State()`. Main is responsible
+    // for joining all RunLoops, quiescing devices, and writing the file.
+    SnapshotRequested,
 };
 
 // Drives a single vCPU's exit loop. Owns a WHV emulator handle for instruction

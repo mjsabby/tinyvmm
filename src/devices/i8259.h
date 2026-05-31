@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <span>
 
 namespace tinyvmm::devices {
 
@@ -69,6 +70,42 @@ public:
     std::uint8_t master_mask() const noexcept { return master_.mask; }
     std::uint8_t slave_mask()  const noexcept { return slave_.mask; }
 
+    // ---- Phase 33.5 save/restore -----------------------------------------
+    //
+    // Full PIC state for both chips. Snapshots the ICW programming, OCW1
+    // masks, latched IRR bits, and (for safety) the mid-init step machine
+    // in case the guest is snapshotted between ICW writes.
+    //
+    // ResumeRuntime() re-injects deliverable IRR bits (unmasked + cascaded)
+    // exactly like ReplayLocked() does on a mask-clear edge, clearing each
+    // IRR bit it injects so the same vector is not double-delivered. Called
+    // after Apply (and after `inject_` is wired, which is always true since
+    // it's set at construction).
+    struct ChipState {
+        std::uint8_t vector_base  = 0;
+        std::uint8_t mask         = 0xFF;
+        std::uint8_t irr          = 0;
+        std::uint8_t icw1         = 0;
+        std::uint8_t icw3         = 0;
+        std::uint8_t icw4         = 0;
+        std::uint8_t step         = 0;   // IcwStep cast as u8
+        std::uint8_t expect_icw4  = 0;   // 0/1
+    };
+    struct State {
+        ChipState master;
+        ChipState slave;
+    };
+
+    static constexpr std::size_t kEncodedSize = 16u;
+
+    State CaptureState() const;
+    void  ApplyState(const State& s);
+    void  ResumeRuntime();
+
+    static std::size_t EncodeState(const State& s,
+                                   std::span<std::uint8_t> out);
+    static State       DecodeState(std::span<const std::uint8_t> bytes);
+
 private:
     // ICW programming state machine. Each chip runs its own state.
     enum class IcwStep : std::uint8_t {
@@ -106,7 +143,7 @@ private:
     void ReplayLocked(Chip& chip, std::uint8_t prev_mask);
 
     InjectFn inject_;
-    std::mutex lock_;
+    mutable std::mutex lock_;
     Chip master_;
     Chip slave_;
 };

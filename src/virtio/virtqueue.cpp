@@ -1,7 +1,10 @@
 #include "virtqueue.h"
 
+#include "whp/snapshot_file.h"
+
 #include <atomic>
 #include <cstring>
+#include <stdexcept>
 
 namespace tinyvmm::virtio {
 
@@ -231,6 +234,84 @@ bool Virtqueue::ShouldInterruptDriver() {
         return VringNeedEvent(used_event, new_used, old_used);
     }
     return (LoadAvailFlags() & 1) == 0;
+}
+
+// ----------------------- M33.4 save/restore ---------------------------
+
+Virtqueue::State Virtqueue::CaptureState() const {
+    State s;
+    s.size               = size_;
+    s.ready              = ready_ ? 1u : 0u;
+    s.event_idx          = event_idx_ ? 1u : 0u;
+    s.desc_gpa           = desc_gpa_;
+    s.avail_gpa          = avail_gpa_;
+    s.used_gpa           = used_gpa_;
+    s.last_avail         = last_avail_;
+    s.last_used_idx      = last_used_idx_;
+    s.last_used_signaled = last_used_signaled_;
+    return s;
+}
+
+void Virtqueue::ApplyState(const State& s) {
+    size_                = s.size;
+    ready_               = s.ready != 0;
+    event_idx_           = s.event_idx != 0;
+    desc_gpa_            = s.desc_gpa;
+    avail_gpa_           = s.avail_gpa;
+    used_gpa_            = s.used_gpa;
+    last_avail_          = s.last_avail;
+    last_used_idx_       = s.last_used_idx;
+    last_used_signaled_  = s.last_used_signaled;
+}
+
+std::size_t Virtqueue::EncodeState(const State& s,
+                                   std::vector<std::uint8_t>& out) {
+    using namespace tinyvmm::whp::snapshot;
+    const std::size_t start = out.size();
+    out.resize(start + kEncodedSize, 0);
+    std::uint8_t* p = out.data() + start;
+    WriteLe32(p +  0, s.size);
+    p[4] = s.ready;
+    p[5] = s.event_idx;
+    // p[6..7] = u16 pad (already zero)
+    WriteLe64(p +  8, s.desc_gpa);
+    WriteLe64(p + 16, s.avail_gpa);
+    WriteLe64(p + 24, s.used_gpa);
+    // p[32..33] = u16 last_avail
+    p[32] = static_cast<std::uint8_t>(s.last_avail        & 0xFF);
+    p[33] = static_cast<std::uint8_t>((s.last_avail >> 8) & 0xFF);
+    p[34] = static_cast<std::uint8_t>(s.last_used_idx        & 0xFF);
+    p[35] = static_cast<std::uint8_t>((s.last_used_idx >> 8) & 0xFF);
+    p[36] = static_cast<std::uint8_t>(s.last_used_signaled        & 0xFF);
+    p[37] = static_cast<std::uint8_t>((s.last_used_signaled >> 8) & 0xFF);
+    // p[38..39] = u16 pad (already zero)
+    return kEncodedSize;
+}
+
+Virtqueue::State Virtqueue::DecodeState(std::span<const std::uint8_t> bytes) {
+    using namespace tinyvmm::whp::snapshot;
+    if (bytes.size() < kEncodedSize) {
+        throw std::runtime_error(
+            "Virtqueue::DecodeState: payload too small");
+    }
+    const std::uint8_t* p = bytes.data();
+    State s;
+    s.size               = ReadLe32(p + 0);
+    s.ready              = p[4];
+    s.event_idx          = p[5];
+    if (p[6] != 0 || p[7] != 0) {
+        throw std::runtime_error("Virtqueue::DecodeState: nonzero pad@6");
+    }
+    s.desc_gpa           = ReadLe64(p +  8);
+    s.avail_gpa          = ReadLe64(p + 16);
+    s.used_gpa           = ReadLe64(p + 24);
+    s.last_avail         = static_cast<std::uint16_t>(p[32] | (p[33] << 8));
+    s.last_used_idx      = static_cast<std::uint16_t>(p[34] | (p[35] << 8));
+    s.last_used_signaled = static_cast<std::uint16_t>(p[36] | (p[37] << 8));
+    if (p[38] != 0 || p[39] != 0) {
+        throw std::runtime_error("Virtqueue::DecodeState: nonzero pad@38");
+    }
+    return s;
 }
 
 }  // namespace tinyvmm::virtio

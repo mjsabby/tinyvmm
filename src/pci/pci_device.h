@@ -19,7 +19,9 @@
 
 #include <array>
 #include <cstdint>
+#include <span>
 #include <string>
+#include <vector>
 
 namespace tinyvmm::pci {
 
@@ -91,6 +93,42 @@ public:
     void set_writable_byte(std::uint32_t offset, std::uint8_t mask) {
         writable_mask_[offset] |= mask;
     }
+
+    // ----- M33.4 save/restore -------------------------------------------
+    //
+    // Persists the 256-byte cfg buffer, the per-byte writable mask, all 6
+    // BAR descriptors, and the capability allocation pointer. ApplyState
+    // writes fields DIRECTLY into bars_[] without invoking the
+    // OnBarMapped / OnBarUnmapped hooks (the subclass-specific
+    // installation of MMIO handlers is the subclass's responsibility, and
+    // for virtio-pci it happens via PciTransport::InstallBarHandlers_
+    // called from PciTransport::ApplyState).
+    struct BarState {
+        std::uint8_t  type         = 0;   // BarType
+        std::uint8_t  prefetchable = 0;
+        std::uint32_t size         = 0;
+        std::uint32_t value_lo     = 0;
+        std::uint32_t value_hi     = 0;
+        std::uint8_t  mapped       = 0;
+        std::uint64_t mapped_gpa   = 0;
+    };
+    struct State {
+        std::uint8_t  cfg[kCfgSpaceSize]            = {};
+        std::uint8_t  writable_mask[kCfgSpaceSize]  = {};
+        std::array<BarState, 6> bars{};
+        std::uint32_t cap_next_alloc                = 0;
+    };
+
+    // Encoded payload size: 256 + 256 + 6*32 + 4 = 708 bytes.
+    static constexpr std::size_t kEncodedSize =
+        kCfgSpaceSize + kCfgSpaceSize + 6u * 32u + 4u;
+
+    State CaptureState() const;
+    void  ApplyState(const State& s);
+
+    static std::size_t EncodeState(const State& s,
+                                   std::vector<std::uint8_t>& out);
+    static State       DecodeState(std::span<const std::uint8_t> bytes);
 
 protected:
     PciDevice() = default;

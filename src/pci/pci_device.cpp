@@ -1,8 +1,11 @@
 #include "pci_device.h"
 
+#include "whp/snapshot_file.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 
 namespace tinyvmm::pci {
 
@@ -364,6 +367,119 @@ void PciDevice::ConfigWrite(std::uint32_t offset, std::uint32_t size,
                              std::uint32_t value) {
     if (offset + size > kCfgSpaceSize) return;  // out of range: ignore
     WriteConfigImpl(offset, size, value);
+}
+
+// ----------------------- M33.4 save/restore ---------------------------
+
+PciDevice::State PciDevice::CaptureState() const {
+    State s;
+    std::memcpy(s.cfg, cfg_, kCfgSpaceSize);
+    std::memcpy(s.writable_mask, writable_mask_, kCfgSpaceSize);
+    for (int i = 0; i < 6; ++i) {
+        const Bar& b = bars_[i];
+        BarState& bs = s.bars[static_cast<std::size_t>(i)];
+        bs.type         = static_cast<std::uint8_t>(b.type);
+        bs.prefetchable = b.prefetchable ? 1u : 0u;
+        bs.size         = b.size;
+        bs.value_lo     = b.value_lo;
+        bs.value_hi     = b.value_hi;
+        bs.mapped       = b.mapped ? 1u : 0u;
+        bs.mapped_gpa   = b.mapped_gpa;
+    }
+    s.cap_next_alloc = cap_next_alloc_;
+    return s;
+}
+
+void PciDevice::ApplyState(const State& s) {
+    // Direct field writes: NO OnBarMapped / OnBarUnmapped invocation.
+    // Subclass-specific MMIO handler (re-)installation happens via the
+    // subclass's own ApplyState path (e.g. PciTransport::ApplyState
+    // calls InstallBarHandlers_ if bar_mapped was true).
+    std::memcpy(cfg_, s.cfg, kCfgSpaceSize);
+    std::memcpy(writable_mask_, s.writable_mask, kCfgSpaceSize);
+    for (int i = 0; i < 6; ++i) {
+        const BarState& bs = s.bars[static_cast<std::size_t>(i)];
+        Bar& b = bars_[i];
+        // BarType (saved) must match the type the subclass ctor declared
+        // — if not, the subclass was constructed with different arguments
+        // than at capture-time.
+        const auto saved_type = static_cast<BarType>(bs.type);
+        if (saved_type != b.type) {
+            throw std::runtime_error(
+                "PciDevice::ApplyState: BAR type mismatch");
+        }
+        if (bs.size != b.size) {
+            throw std::runtime_error(
+                "PciDevice::ApplyState: BAR size mismatch");
+        }
+        b.prefetchable = bs.prefetchable != 0;
+        b.value_lo     = bs.value_lo;
+        b.value_hi     = bs.value_hi;
+        b.mapped       = bs.mapped != 0;
+        b.mapped_gpa   = bs.mapped_gpa;
+    }
+    cap_next_alloc_ = s.cap_next_alloc;
+}
+
+std::size_t PciDevice::EncodeState(const State& s,
+                                   std::vector<std::uint8_t>& out) {
+    using namespace tinyvmm::whp::snapshot;
+    const std::size_t start = out.size();
+    out.resize(start + kEncodedSize, 0);
+    std::uint8_t* p = out.data() + start;
+    std::memcpy(p + 0, s.cfg, kCfgSpaceSize);
+    std::memcpy(p + kCfgSpaceSize, s.writable_mask, kCfgSpaceSize);
+    std::size_t off = kCfgSpaceSize + kCfgSpaceSize;
+    for (int i = 0; i < 6; ++i) {
+        const BarState& b = s.bars[static_cast<std::size_t>(i)];
+        p[off + 0] = b.type;
+        p[off + 1] = b.prefetchable;
+        // p[off+2..3] u16 pad
+        WriteLe32(p + off +  4, b.size);
+        WriteLe32(p + off +  8, b.value_lo);
+        WriteLe32(p + off + 12, b.value_hi);
+        p[off + 16] = b.mapped;
+        // p[off+17..23] u8 pad[7]
+        WriteLe64(p + off + 24, b.mapped_gpa);
+        off += 32;
+    }
+    WriteLe32(p + off, s.cap_next_alloc);
+    return kEncodedSize;
+}
+
+PciDevice::State PciDevice::DecodeState(std::span<const std::uint8_t> bytes) {
+    using namespace tinyvmm::whp::snapshot;
+    if (bytes.size() < kEncodedSize) {
+        throw std::runtime_error("PciDevice::DecodeState: payload too small");
+    }
+    const std::uint8_t* p = bytes.data();
+    State s;
+    std::memcpy(s.cfg, p, kCfgSpaceSize);
+    std::memcpy(s.writable_mask, p + kCfgSpaceSize, kCfgSpaceSize);
+    std::size_t off = kCfgSpaceSize + kCfgSpaceSize;
+    for (int i = 0; i < 6; ++i) {
+        BarState& b = s.bars[static_cast<std::size_t>(i)];
+        b.type         = p[off + 0];
+        b.prefetchable = p[off + 1];
+        if (p[off + 2] != 0 || p[off + 3] != 0) {
+            throw std::runtime_error(
+                "PciDevice::DecodeState: nonzero pad in BAR");
+        }
+        b.size         = ReadLe32(p + off +  4);
+        b.value_lo     = ReadLe32(p + off +  8);
+        b.value_hi     = ReadLe32(p + off + 12);
+        b.mapped       = p[off + 16];
+        for (int j = 17; j < 24; ++j) {
+            if (p[off + j] != 0) {
+                throw std::runtime_error(
+                    "PciDevice::DecodeState: nonzero pad@17 in BAR");
+            }
+        }
+        b.mapped_gpa   = ReadLe64(p + off + 24);
+        off += 32;
+    }
+    s.cap_next_alloc = ReadLe32(p + off);
+    return s;
 }
 
 }  // namespace tinyvmm::pci

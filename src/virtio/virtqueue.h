@@ -66,6 +66,39 @@ public:
                                std::uint16_t new_idx,
                                std::uint16_t old_idx);
 
+    // ----- M33.4 save/restore -------------------------------------------
+    //
+    // CaptureState/ApplyState are the only API exposed for the internal
+    // ring-tracking fields (last_avail_, last_used_idx_, last_used_signaled_).
+    // We deliberately do not provide public setters for those — production
+    // code outside the snapshot path has no business writing them, and
+    // freely exposing setters would invite silent ring-state corruption.
+    struct State {
+        std::uint32_t size                = 0;
+        std::uint8_t  ready               = 0;
+        std::uint8_t  event_idx           = 0;
+        std::uint64_t desc_gpa            = 0;
+        std::uint64_t avail_gpa           = 0;
+        std::uint64_t used_gpa            = 0;
+        std::uint16_t last_avail          = 0;
+        std::uint16_t last_used_idx       = 0;
+        std::uint16_t last_used_signaled  = 0;
+    };
+
+    // Encoded payload size in bytes (constant per ABI).
+    static constexpr std::size_t kEncodedSize = 40;
+
+    State CaptureState() const;
+    void  ApplyState(const State& s);
+
+    // Encode/decode the State to/from the wire format. Appends to `out`;
+    // returns the number of bytes appended (== kEncodedSize). Decode
+    // throws std::runtime_error if bytes is shorter than kEncodedSize or
+    // if a reserved/pad field is non-zero.
+    static std::size_t EncodeState(const State& s,
+                                   std::vector<std::uint8_t>& out);
+    static State       DecodeState(std::span<const std::uint8_t> bytes);
+
 private:
     void* HostFromGpa(std::uint64_t gpa, std::uint32_t bytes) const;
     void* HostFromGpaOff(std::uint64_t base_gpa, std::uint64_t off,

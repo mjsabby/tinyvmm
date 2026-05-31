@@ -39,6 +39,16 @@ void Partition::EnableExtendedExits(const ExtendedExits& bits) {
     SetProperty(WHvPartitionPropertyCodeExtendedVmExits, ext);
 }
 
+void Partition::SetExceptionExitBitmap(std::uint64_t bitmap) {
+    if (setup_done_) {
+        Fatal("SetExceptionExitBitmap called after Setup()");
+    }
+    // The property value is the bitmap itself (UINT64). Cast to the
+    // generic WHV_PARTITION_PROPERTY union via SetProperty's templated
+    // path -- the bitmap is the first 8 bytes of the union.
+    SetProperty(WHvPartitionPropertyCodeExceptionExitBitmap, bitmap);
+}
+
 void Partition::SetLocalApicEmulation(WHV_X64_LOCAL_APIC_EMULATION_MODE mode) {
     if (setup_done_) {
         Fatal("SetLocalApicEmulation called after Setup()");

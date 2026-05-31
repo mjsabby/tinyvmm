@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <functional>
 #include <mutex>
+#include <span>
 #include <string>
 
 namespace tinyvmm::devices {
@@ -69,6 +70,47 @@ public:
     void EnableStringCapture() { capture_ = true; }
     std::string DrainCapture();
 
+    // ---- Phase 33.5 save/restore -----------------------------------------
+    //
+    // Guest-visible state: the seven 8250 registers (IER/LCR/MCR/SCR/FCR
+    // plus the divisor latch DLL/DLM) and our edge-triggered TX-IRQ
+    // pending bit. We also persist `first_byte_fired_` so the boot-time
+    // "first byte seen" callback doesn't re-fire after restore.
+    //
+    // NOT persisted: capture_/captured_/sink_/irq_raise_/first_byte_cb_
+    // (host-side wiring; the caller re-wires these BEFORE Apply) and
+    // tx_bytes_ (diagnostic counter; resets to 0 on restore).
+    //
+    // ResumeRuntime() is the deferred half: if the saved state had a TX
+    // IRQ pending AND the guest had ETBEI=1, we re-raise IRQ4 once so the
+    // guest doesn't deadlock waiting for the THRE interrupt that was in
+    // flight when we snapshotted. ApplyState() itself never touches the
+    // IRQ line, so it's safe to call before the PIC is wired up.
+    struct State {
+        std::uint8_t ier               = 0;
+        std::uint8_t lcr               = 0;
+        std::uint8_t mcr               = 0;
+        std::uint8_t scr               = 0;
+        std::uint8_t fcr               = 0;
+        std::uint8_t dll               = 0;
+        std::uint8_t dlm               = 0;
+        std::uint8_t tx_irq_pending    = 0;
+        std::uint8_t first_byte_fired  = 0;
+    };
+
+    static constexpr std::size_t kEncodedSize = 16u;
+
+    State CaptureState() const;
+    void  ApplyState(const State& s);
+
+    // Called after ApplyState (and after SetIrqCallback) to re-arm the
+    // host-side runtime side-effects. Idempotent.
+    void  ResumeRuntime();
+
+    static std::size_t EncodeState(const State& s,
+                                   std::span<std::uint8_t> out);
+    static State       DecodeState(std::span<const std::uint8_t> bytes);
+
 private:
     void Handle(IoAccess& acc);
     void HandleRead(IoAccess& acc);
@@ -86,7 +128,7 @@ private:
 
     std::uint16_t base_;
     std::FILE* sink_;
-    std::mutex lock_;
+    mutable std::mutex lock_;
     IrqRaiseFn irq_raise_;
 
     // Register state. All bytes; reads return the byte zero-extended into

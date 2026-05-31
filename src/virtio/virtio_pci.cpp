@@ -2,10 +2,12 @@
 
 #include "pci/pci.h"
 #include "virtqueue.h"
+#include "whp/snapshot_file.h"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 
 namespace tinyvmm::virtio {
 
@@ -131,7 +133,16 @@ void PciTransport::OnBarMapped(int idx, std::uint64_t gpa,
     if (idx != 0) return;
     bar_gpa_ = gpa;
     bar_mapped_ = true;
+    InstallBarHandlers_(gpa);
+    if (on_bar_mapped_cb_) on_bar_mapped_cb_();
+}
 
+void PciTransport::InstallBarHandlers_(std::uint64_t gpa) {
+    // Registers the four BAR0 MMIO regions and the MSI-X table+PBA. Used
+    // by both the cold-boot OnBarMapped path and the M33.4 restore path.
+    // Does NOT install partition doorbells (restore-time devices have no
+    // worker thread waiting on them) and does NOT invoke
+    // on_bar_mapped_cb_.
     mmio_bus_.Register(gpa + kOffCommonCfg, kLenCommonCfg,
                        name_ + ":common",
                        [this](devices::MmioAccess& a) { HandleCommonCfg(a); });
@@ -145,7 +156,6 @@ void PciTransport::OnBarMapped(int idx, std::uint64_t gpa,
                        name_ + ":device-cfg",
                        [this](devices::MmioAccess& a) { HandleDeviceCfg(a); });
     msix_.Install(mmio_bus_, gpa);
-    if (on_bar_mapped_cb_) on_bar_mapped_cb_();
 }
 
 void PciTransport::OnBarUnmapped(int idx) {
@@ -557,6 +567,153 @@ void PciTransport::HandleDeviceCfg(devices::MmioAccess& access) {
     std::memset(access.data, 0, sizeof(access.data));
     std::memcpy(access.data, &v,
                 std::min<std::size_t>(access.access_size, 4));
+}
+
+// ----------------------- M33.4 save/restore ---------------------------
+
+PciTransport::State PciTransport::CaptureState() const {
+    State s;
+    std::lock_guard<std::mutex> lk(cfg_mu_);
+    s.device_feature_select = device_feature_select_;
+    s.driver_feature_select = driver_feature_select_;
+    s.driver_features       = driver_features_;
+    s.msix_config           = msix_config_;
+    s.status                = status_;
+    s.config_generation     = config_generation_;
+    s.queue_select          = queue_select_;
+    s.bar_mapped            = bar_mapped_ ? 1u : 0u;
+    s.bar_gpa               = bar_gpa_;
+    s.isr_status            = isr_status_.load(std::memory_order_relaxed);
+    s.queues                = queues_;
+    return s;
+}
+
+void PciTransport::ApplyState(const State& s) {
+    {
+        std::lock_guard<std::mutex> lk(cfg_mu_);
+        if (s.queues.size() != queues_.size()) {
+            throw std::runtime_error(
+                "PciTransport::ApplyState: queue count mismatch");
+        }
+        device_feature_select_ = s.device_feature_select;
+        driver_feature_select_ = s.driver_feature_select;
+        driver_features_       = s.driver_features;
+        msix_config_           = s.msix_config;
+        status_                = s.status;
+        config_generation_     = s.config_generation;
+        queue_select_          = s.queue_select;
+        queues_                = s.queues;
+        bar_mapped_            = s.bar_mapped != 0;
+        bar_gpa_               = s.bar_gpa;
+        isr_status_.store(s.isr_status, std::memory_order_relaxed);
+    }
+    // After unlocking, register MMIO handlers if the BAR was mapped at
+    // capture time. InstallBarHandlers_ doesn't touch any field this
+    // function locked, but it does call into mmio_bus_/msix_ which take
+    // their own locks; we avoid holding cfg_mu_ across those calls.
+    if (s.bar_mapped) {
+        InstallBarHandlers_(s.bar_gpa);
+    }
+}
+
+std::size_t PciTransport::EncodeState(const State& s,
+                                      std::vector<std::uint8_t>& out) {
+    using namespace tinyvmm::whp::snapshot;
+    const std::size_t want = EncodedSize(s.queues.size());
+    const std::size_t start = out.size();
+    out.resize(start + want, 0);
+    std::uint8_t* p = out.data() + start;
+    WriteLe32(p +  0, s.device_feature_select);
+    WriteLe32(p +  4, s.driver_feature_select);
+    WriteLe64(p +  8, s.driver_features);
+    // p[16..17] u16 msix_config
+    p[16] = static_cast<std::uint8_t>(s.msix_config        & 0xFF);
+    p[17] = static_cast<std::uint8_t>((s.msix_config >> 8) & 0xFF);
+    p[18] = s.status;
+    p[19] = s.config_generation;
+    // p[20..21] u16 queue_select
+    p[20] = static_cast<std::uint8_t>(s.queue_select        & 0xFF);
+    p[21] = static_cast<std::uint8_t>((s.queue_select >> 8) & 0xFF);
+    p[22] = s.bar_mapped;
+    // p[23] u8 pad
+    WriteLe64(p + 24, s.bar_gpa);
+    WriteLe32(p + 32, s.isr_status);
+    WriteLe32(p + 36,
+              static_cast<std::uint32_t>(s.queues.size()));   // num_queues
+    std::size_t off = kEncodedHeaderSize;
+    for (const auto& q : s.queues) {
+        // Layout per queue (32 bytes total):
+        //   +0  u16 msix_vector
+        //   +2  u16 enable
+        //   +4  u16 size
+        //   +6  u16 pad
+        //   +8  u64 desc
+        //  +16  u64 driver
+        //  +24  u64 device
+        p[off + 0] = static_cast<std::uint8_t>(q.msix_vector        & 0xFF);
+        p[off + 1] = static_cast<std::uint8_t>((q.msix_vector >> 8) & 0xFF);
+        p[off + 2] = static_cast<std::uint8_t>(q.enable        & 0xFF);
+        p[off + 3] = static_cast<std::uint8_t>((q.enable >> 8) & 0xFF);
+        p[off + 4] = static_cast<std::uint8_t>(q.size        & 0xFF);
+        p[off + 5] = static_cast<std::uint8_t>((q.size >> 8) & 0xFF);
+        // p[off+6..7] u16 pad (already zero from resize)
+        WriteLe64(p + off +  8, q.desc);
+        WriteLe64(p + off + 16, q.driver);
+        WriteLe64(p + off + 24, q.device);
+        off += 32;
+    }
+    return want;
+}
+
+PciTransport::State PciTransport::DecodeState(
+    std::span<const std::uint8_t> bytes) {
+    using namespace tinyvmm::whp::snapshot;
+    if (bytes.size() < kEncodedHeaderSize) {
+        throw std::runtime_error(
+            "PciTransport::DecodeState: payload smaller than header");
+    }
+    const std::uint8_t* p = bytes.data();
+    State s;
+    s.device_feature_select = ReadLe32(p +  0);
+    s.driver_feature_select = ReadLe32(p +  4);
+    s.driver_features       = ReadLe64(p +  8);
+    s.msix_config = static_cast<std::uint16_t>(p[16] | (p[17] << 8));
+    s.status                = p[18];
+    s.config_generation     = p[19];
+    s.queue_select = static_cast<std::uint16_t>(p[20] | (p[21] << 8));
+    s.bar_mapped            = p[22];
+    if (p[23] != 0) {
+        throw std::runtime_error(
+            "PciTransport::DecodeState: nonzero pad@23");
+    }
+    s.bar_gpa               = ReadLe64(p + 24);
+    s.isr_status            = ReadLe32(p + 32);
+    const std::uint32_t nq  = ReadLe32(p + 36);
+    const std::size_t want = EncodedSize(nq);
+    if (bytes.size() < want) {
+        throw std::runtime_error(
+            "PciTransport::DecodeState: payload truncated for num_queues");
+    }
+    s.queues.resize(nq);
+    std::size_t off = kEncodedHeaderSize;
+    for (std::uint32_t i = 0; i < nq; ++i) {
+        QueueState& q = s.queues[i];
+        q.msix_vector = static_cast<std::uint16_t>(
+            p[off + 0] | (p[off + 1] << 8));
+        q.enable      = static_cast<std::uint16_t>(
+            p[off + 2] | (p[off + 3] << 8));
+        q.size        = static_cast<std::uint16_t>(
+            p[off + 4] | (p[off + 5] << 8));
+        if (p[off + 6] != 0 || p[off + 7] != 0) {
+            throw std::runtime_error(
+                "PciTransport::DecodeState: nonzero pad in queue");
+        }
+        q.desc        = ReadLe64(p + off +  8);
+        q.driver      = ReadLe64(p + off + 16);
+        q.device      = ReadLe64(p + off + 24);
+        off += 32;
+    }
+    return s;
 }
 
 }  // namespace tinyvmm::virtio

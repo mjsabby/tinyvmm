@@ -2,10 +2,15 @@
 
 // UsernetBackend (M19h) -- slirp-style user-mode networking for virtio-net.
 //
-// Terminates the guest's L2/L3/L4 inside tinyvmm and translates each
+// Terminates the guest's L2/L3 inside tinyvmm and translates each
 // connection to a Windows kernel socket (Winsock TCP/UDP) or an iphlpapi
 // ICMP echo. The Windows kernel owns the real wire path; no driver and
 // no admin needed beyond the normal user account.
+//
+// TCP uses the `tcp-sans-io` Rust crate (TsiTcpEngine in net_usernet_tsi.*)
+// for full RFC 6675 SACK + RACK-TLP + PRR-Reno + ECN + RFC 7323 TS/WS +
+// SYN cookies + IW=10. M34.8 flipped this from a runtime switch to the
+// only TCP path; the legacy hand-rolled C++ state machine was deleted.
 //
 // Topology presented to the guest:
 //   * gateway IP    = 10.0.0.1   (we answer ARP for this and route from it)
@@ -18,8 +23,7 @@
 //   * IPv4 + ICMP echo (responses synthesized; remote pings proxied via
 //     IcmpSendEcho on iphlpapi).
 //   * IPv4 + UDP datagram NAT (per-4-tuple connected Winsock socket).
-//   * IPv4 + TCP terminate-and-proxy (full state machine on guest side;
-//     blocking Winsock stream on host side).
+//   * IPv4 + TCP terminate-and-proxy via TsiTcpEngine.
 //
 // What we drop:
 //   * IPv6, ARP for any IP other than the gateway, all non-TCP/UDP/ICMP

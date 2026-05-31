@@ -1,5 +1,7 @@
 #include "legacy_isa.h"
 
+#include <stdexcept>
+
 namespace tinyvmm::devices {
 
 namespace {
@@ -93,6 +95,48 @@ void LegacyIsaStubs::HandlePort92(IoAccess& acc) {
         return;
     }
     acc.value = port92_;
+}
+
+// ---- Phase 33.5 save/restore -------------------------------------------
+
+LegacyIsaStubs::State LegacyIsaStubs::CaptureState() const {
+    std::lock_guard<std::mutex> lk(lock_);
+    State s;
+    s.cmos_index = cmos_index_;
+    s.port92     = port92_;
+    return s;
+}
+
+void LegacyIsaStubs::ApplyState(const LegacyIsaStubs::State& s) {
+    std::lock_guard<std::mutex> lk(lock_);
+    cmos_index_ = s.cmos_index;
+    port92_     = s.port92;
+}
+
+std::size_t LegacyIsaStubs::EncodeState(const LegacyIsaStubs::State& s,
+                                        std::span<std::uint8_t> out) {
+    if (out.size() < kEncodedSize) {
+        throw std::runtime_error(
+            "LegacyIsaStubs::EncodeState: output span smaller than "
+            "kEncodedSize");
+    }
+    out[0] = s.cmos_index;
+    out[1] = s.port92;
+    out[2] = 0;
+    out[3] = 0;
+    return kEncodedSize;
+}
+
+LegacyIsaStubs::State LegacyIsaStubs::DecodeState(
+    std::span<const std::uint8_t> bytes) {
+    if (bytes.size() < kEncodedSize) {
+        throw std::runtime_error(
+            "LegacyIsaStubs::DecodeState: payload smaller than kEncodedSize");
+    }
+    State s;
+    s.cmos_index = bytes[0];
+    s.port92     = bytes[1];
+    return s;
 }
 
 }  // namespace tinyvmm::devices

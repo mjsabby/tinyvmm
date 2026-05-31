@@ -4,6 +4,7 @@
 #include "io_bus.h"
 
 #include <mutex>
+#include <span>
 
 namespace tinyvmm::devices {
 
@@ -35,6 +36,25 @@ public:
     // Registers the CMOS index/data, port 0x80, and port 0x92 on the bus.
     void Attach(IoBus& bus);
 
+    // ---- Phase 33.5 save/restore -----------------------------------------
+    //
+    // Two bytes of guest-visible state: the CMOS index latch and the
+    // port 0x92 byte. Persisting these keeps a guest that's mid-CMOS-read
+    // (e.g. wall-clock retrieval) byte-identical across save/restore.
+    struct State {
+        std::uint8_t cmos_index = 0;
+        std::uint8_t port92     = 0x02;
+    };
+
+    static constexpr std::size_t kEncodedSize = 4u;
+
+    State CaptureState() const;
+    void  ApplyState(const State& s);
+
+    static std::size_t EncodeState(const State& s,
+                                   std::span<std::uint8_t> out);
+    static State       DecodeState(std::span<const std::uint8_t> bytes);
+
 private:
     void HandleCmosIndex(IoAccess& acc);   // 0x70
     void HandleCmosData(IoAccess& acc);    // 0x71
@@ -43,7 +63,8 @@ private:
 
     std::uint8_t ReadCmos(std::uint8_t reg);
 
-    std::mutex lock_;
+    // Mutable so CaptureState() can take the lock under const.
+    mutable std::mutex lock_;
 
     std::uint8_t cmos_index_ = 0;
     std::uint8_t port92_ = 0x02;  // bit 1 = A20 gate enabled

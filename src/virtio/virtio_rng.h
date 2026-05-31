@@ -24,6 +24,8 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <span>
+#include <vector>
 
 namespace tinyvmm::virtio {
 
@@ -63,6 +65,28 @@ public:
     std::uint64_t bytes_out() const noexcept { return bytes_out_.load(); }
 
     Virtqueue& request_queue() noexcept { return queue_; }
+
+    // ----- M33.4 save/restore -------------------------------------------
+    struct State {
+        std::uint8_t  driver_ok       = 0;
+        std::uint64_t acked_features  = 0;
+    };
+    static constexpr std::size_t kEncodedSize = 16;
+
+    State CaptureState() const {
+        State s;
+        s.driver_ok       = driver_ok_ ? 1u : 0u;
+        s.acked_features  = acked_features_;
+        return s;
+    }
+    void ApplyState(const State& s) {
+        driver_ok_       = s.driver_ok != 0;
+        acked_features_  = s.acked_features;
+    }
+
+    static std::size_t EncodeState(const State& s,
+                                   std::vector<std::uint8_t>& out);
+    static State       DecodeState(std::span<const std::uint8_t> bytes);
 
 private:
     void DrainRequestQueue();

@@ -47,6 +47,62 @@ if(EXISTS "${XDP_INCLUDE_DIR}/xdp/details/ioctldef.h")
 endif()
 
 # ---------------------------------------------------------------------------
+# tcp-sans-io — Rust user-mode TCP stack (M34)
+#
+# The crate is built as a `--release` staticlib by the local cargo
+# toolchain on every configure/build of tinyvmm. The Rust source tree
+# is referenced in-place (no vendoring) via the TINYVMM_TCP_SANS_IO_DIR
+# cache var. Each build flavor (Release/Debug/ASan/UBSan) gets its own
+# cargo target-dir under ${CMAKE_BINARY_DIR}/cargo/tcp-sans-io to avoid
+# cross-config cargo-lock contention.
+#
+# Library shape: `crate-type = ["cdylib", "staticlib", "rlib"]` in the
+# crate's Cargo.toml; we link the staticlib (tcp_sans_io.lib).
+# ---------------------------------------------------------------------------
+set(TINYVMM_TCP_SANS_IO_DIR "C:/tcp-sans-io" CACHE PATH
+    "Path to the tcp-sans-io Rust source tree (Cargo.toml lives here)")
+
+if(NOT EXISTS "${TINYVMM_TCP_SANS_IO_DIR}/Cargo.toml")
+    message(FATAL_ERROR
+        "TINYVMM_TCP_SANS_IO_DIR='${TINYVMM_TCP_SANS_IO_DIR}' does not "
+        "contain Cargo.toml. Override with "
+        "-DTINYVMM_TCP_SANS_IO_DIR=<path-to-tcp-sans-io>.")
+endif()
+if(NOT EXISTS "${TINYVMM_TCP_SANS_IO_DIR}/include/tcp_sans_io.h")
+    message(FATAL_ERROR
+        "TINYVMM_TCP_SANS_IO_DIR='${TINYVMM_TCP_SANS_IO_DIR}' is missing "
+        "include/tcp_sans_io.h. Pointed at the wrong tree?")
+endif()
+
+find_program(CARGO_EXECUTABLE cargo REQUIRED)
+
+set(TSI_CARGO_TARGET_DIR "${CMAKE_BINARY_DIR}/cargo/tcp-sans-io")
+set(TSI_STATIC_LIB "${TSI_CARGO_TARGET_DIR}/release/tcp_sans_io.lib")
+set(TSI_INCLUDE_DIR "${TINYVMM_TCP_SANS_IO_DIR}/include")
+
+# Re-trigger the cargo build whenever any Rust source (or the manifest /
+# lockfile) changes. CONFIGURE_DEPENDS re-globs on every reconfigure so
+# new files get picked up without needing to re-run CMake by hand.
+file(GLOB_RECURSE TSI_SRC_FILES CONFIGURE_DEPENDS
+    "${TINYVMM_TCP_SANS_IO_DIR}/src/*.rs"
+)
+
+add_custom_command(
+    OUTPUT  "${TSI_STATIC_LIB}"
+    COMMAND "${CARGO_EXECUTABLE}" build --release --lib
+            --manifest-path "${TINYVMM_TCP_SANS_IO_DIR}/Cargo.toml"
+            --target-dir    "${TSI_CARGO_TARGET_DIR}"
+    DEPENDS "${TINYVMM_TCP_SANS_IO_DIR}/Cargo.toml"
+            "${TINYVMM_TCP_SANS_IO_DIR}/Cargo.lock"
+            ${TSI_SRC_FILES}
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "Building tcp_sans_io.lib (release) via cargo"
+    VERBATIM
+)
+
+add_custom_target(tcp_sans_io_build DEPENDS "${TSI_STATIC_LIB}")
+
+# ---------------------------------------------------------------------------
 # Main target
 # ---------------------------------------------------------------------------
 add_executable(tinyvmm
@@ -59,6 +115,9 @@ add_executable(tinyvmm
     src/whp/cpuid.cpp
     src/whp/cpu_affinity.cpp
     src/whp/hv_enlightenment.cpp
+    src/whp/snapshot.cpp
+    src/whp/snapshot_file.cpp
+    src/whp/vcpu_state.cpp
     src/devices/io_bus.cpp
     src/devices/mmio_bus.cpp
     src/devices/serial8250.cpp
@@ -77,6 +136,8 @@ add_executable(tinyvmm
     src/virtio/net_xdp.cpp
     src/virtio/net_wintun.cpp
     src/virtio/net_usernet.cpp
+    src/virtio/net_usernet_tsi.cpp
+    src/net/tsi_sanity.cpp
     src/net/wintun_loader.cpp
     src/net/wintun_adapter_mgr.cpp
     src/net/wintun_device_path.cpp
@@ -94,6 +155,7 @@ add_executable(tinyvmm
     src/boot/pvh_loader.cpp
     src/boot/acpi_tables.cpp
     src/diag/etw.cpp
+    src/debug/gdbstub.cpp
 )
 
 target_include_directories(tinyvmm PRIVATE
@@ -101,6 +163,7 @@ target_include_directories(tinyvmm PRIVATE
     "${XDP_INCLUDE_DIR}"
     third_party/wintunumapi/cpp
     third_party/wintun
+    "${TSI_INCLUDE_DIR}"
 )
 
 target_link_libraries(tinyvmm PRIVATE
@@ -122,7 +185,18 @@ target_link_libraries(tinyvmm PRIVATE
     # and wintunsvc-driven adapter managers (see src/net/wintun_*.cpp).
     SetupAPI.lib
     Cfgmgr32.lib
+    # tcp-sans-io (M34): the Rust crate is built as a staticlib by the
+    # `tcp_sans_io_build` custom target above. We link the resulting
+    # tcp_sans_io.lib directly. The Rust toolchain may also reference
+    # bcrypt (BCryptGenRandom from the `getrandom` crate path) and
+    # userenv (from std startup); MSVC auto-links most CRT/Win32
+    # imports, but bcrypt is the one Rust staticlibs reliably need
+    # explicitly.
+    "${TSI_STATIC_LIB}"
+    Bcrypt.lib
 )
+# Ensure the cargo build runs before the linker tries to consume the .lib.
+add_dependencies(tinyvmm tcp_sans_io_build)
 
 target_compile_definitions(tinyvmm PRIVATE
     _WIN32_WINNT=0x0A00      # Windows 10
@@ -250,6 +324,17 @@ if(MSVC)
         /DYNAMICBASE         # ASLR opt-in (default ON, but be explicit)
         /NXCOMPAT            # DEP / NX opt-in
         /HIGHENTROPYVA       # 64-bit ASLR
+        # M34.2: tcp-sans-io's Tcb is ~2 MiB (two BUF_CAP=1 MiB rings
+        # inline). Even with NRVO, the Rust compiler doesn't reliably
+        # elide every intermediate (Result<Tcb, _> -> TcpStreamHandle
+        # wrap -> ptr::write to caller's heap slot), so `tcp_init` can
+        # transiently consume ~2 MiB of caller stack. Windows' default
+        # main-thread stack is 1 MiB, which is not enough. Bump to
+        # 16 MiB for headroom. Worker threads (M34.3+) must be created
+        # with an explicit stack size of at least 8 MiB via
+        # _beginthreadex(...) -- std::thread's default 1 MiB is not
+        # enough.
+        /STACK:16777216
     )
 
     # ----- MSVC static analysis (Code Analysis, aka PREfast) -----

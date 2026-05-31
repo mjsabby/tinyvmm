@@ -180,6 +180,225 @@ if grep -q 'tinyvmm.test=net' /proc/cmdline 2>/dev/null; then
     exec cat
 fi
 
+# --- optional outbound usernet-TSI HTTP test mode -----------------------
+# Enabled via kernel cmdline marker `tinyvmm.test=usernet-tsi`. Runs a
+# chain of HTTP GETs against the host Python server at
+# <TINYVMM_USERNET_TSI_HOST>:<TINYVMM_USERNET_TSI_PORT> (passed via the
+# kernel cmdline by tools/usernet_tsi_test.py) and asserts byte counts +
+# concurrent connections. See tools/usernet_tsi_test.py for the host-
+# side driver (M34.7).
+#
+# Phases:
+#   A   GET /hello              exact body match (small)
+#   B   GET /echo/1024          byte count check (medium)
+#   C   GET /echo/65536         byte count check (64 KiB, segments + WS)
+#   D   GET /echo/524288        byte count check (512 KiB, many segments)
+#   E   4 parallel GET /echo/16384  concurrent conns
+#   F   GET to a closed port    expect failure (RST / abort path)
+if grep -q 'tinyvmm.test=usernet-tsi' /proc/cmdline 2>/dev/null; then
+    log "--- USERNET-TSI-TEST start ---"
+    host=$(cat /proc/cmdline | tr ' ' '\\n' | grep '^TINYVMM_USERNET_TSI_HOST=' | cut -d= -f2)
+    port=$(cat /proc/cmdline | tr ' ' '\\n' | grep '^TINYVMM_USERNET_TSI_PORT=' | cut -d= -f2)
+    closed_port=$(cat /proc/cmdline | tr ' ' '\\n' | grep '^TINYVMM_USERNET_TSI_CLOSED_PORT=' | cut -d= -f2)
+    log "host=${host} port=${port} closed_port=${closed_port}"
+    if [ -z "${host}" ] || [ -z "${port}" ] || [ -z "${closed_port}" ]; then
+        log "USERNET-TSI SUMMARY: 0/0 phases passed (missing cmdline args)"
+        sync
+        poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
+        exec cat
+    fi
+    base="http://${host}:${port}"
+    pass=0
+    total=0
+
+    # Phase A: tiny GET, exact body match.
+    total=$((total + 1))
+    bodyA=$(wget -q -O - -T 8 -t 1 "${base}/hello" 2>/dev/null)
+    if [ "${bodyA}" = "tinyvmm-tsi-hello" ]; then
+        log "USERNET-TSI A: hello OK"
+        pass=$((pass + 1))
+    else
+        log "USERNET-TSI A: hello FAIL (got '${bodyA}')"
+    fi
+
+    # Phase B: medium GET, byte count.
+    total=$((total + 1))
+    szB=$(wget -q -O - -T 8 -t 1 "${base}/echo/1024" 2>/dev/null | wc -c)
+    if [ "${szB}" = "1024" ]; then
+        log "USERNET-TSI B: echo/1024 OK"
+        pass=$((pass + 1))
+    else
+        log "USERNET-TSI B: echo/1024 FAIL (got ${szB} bytes)"
+    fi
+
+    # Phase C: 64 KiB, exercises segments + window scaling.
+    total=$((total + 1))
+    szC=$(wget -q -O - -T 16 -t 1 "${base}/echo/65536" 2>/dev/null | wc -c)
+    if [ "${szC}" = "65536" ]; then
+        log "USERNET-TSI C: echo/65536 OK"
+        pass=$((pass + 1))
+    else
+        log "USERNET-TSI C: echo/65536 FAIL (got ${szC} bytes)"
+    fi
+
+    # Phase D: 512 KiB, many segments + many ACKs.
+    total=$((total + 1))
+    szD=$(wget -q -O - -T 30 -t 1 "${base}/echo/524288" 2>/dev/null | wc -c)
+    if [ "${szD}" = "524288" ]; then
+        log "USERNET-TSI D: echo/524288 OK"
+        pass=$((pass + 1))
+    else
+        log "USERNET-TSI D: echo/524288 FAIL (got ${szD} bytes)"
+    fi
+
+    # Phase E: 4 parallel GETs to exercise concurrent conns.
+    total=$((total + 1))
+    rm -f /tmp/par_* 2>/dev/null
+    for i in 1 2 3 4; do
+        ( wget -q -O /tmp/par_${i} -T 16 -t 1 "${base}/echo/16384" 2>/dev/null \
+            && echo ok > /tmp/par_${i}.flag ) &
+    done
+    wait
+    par_ok=0
+    for i in 1 2 3 4; do
+        if [ -f /tmp/par_${i}.flag ]; then
+            sz=$(wc -c < /tmp/par_${i})
+            if [ "${sz}" = "16384" ]; then
+                par_ok=$((par_ok + 1))
+            fi
+        fi
+    done
+    if [ "${par_ok}" = "4" ]; then
+        log "USERNET-TSI E: 4-parallel-16K OK"
+        pass=$((pass + 1))
+    else
+        log "USERNET-TSI E: 4-parallel-16K FAIL (${par_ok}/4)"
+    fi
+
+    # Phase F: connect to a port we KNOW is closed -> expect failure.
+    # The host driver binds + closes a port pre-launch and passes it as
+    # TINYVMM_USERNET_TSI_CLOSED_PORT. The engine's Winsock connect()
+    # will get ECONNREFUSED and call AbortConn(), which queues a RST in
+    # the TCB's TX ring and emits it to the guest. wget sees that as a
+    # failed fetch. -t 1 keeps wget from retrying.
+    total=$((total + 1))
+    if wget -q -O /dev/null -T 6 -t 1 "http://${host}:${closed_port}/x" 2>/dev/null; then
+        log "USERNET-TSI F: connect-refused FAIL (wget unexpectedly succeeded)"
+    else
+        log "USERNET-TSI F: connect-refused OK (wget failed as expected)"
+        pass=$((pass + 1))
+    fi
+
+    log "USERNET-TSI SUMMARY: ${pass}/${total} phases passed"
+    sync
+    # Park ~65 s so TSI's 2*MSL TIME_WAIT (60 s) elapses and the engine's
+    # graceful-close reconcile (M34.6) reaps every TCB before tinyvmm
+    # shuts down. Without this the engine summary would show live>0 and
+    # graceful_closes=0 -- the wgets finish way faster than TIME_WAIT.
+    log "USERNET-TSI: parking 65 s for TIME_WAIT drain"
+    sleep 65
+    log "=== tinyvmm shutdown requested ==="
+    sleep 1
+    poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
+    exec cat
+fi
+
+# --- optional usernet networking benchmark ------------------------------
+# Enabled via kernel cmdline marker `tinyvmm.test=usernet-bench`.
+# Driven by tools/usernet_bench.py. Three measurements per run:
+#   1. Ping latency: busybox ping -c N -i 0.01 against the gateway
+#      (10.0.0.1, terminated by the usernet ARP responder). Reports
+#      min/avg/max round-trip; computes p99 from the per-packet lines.
+#   2. TCP single-stream throughput: 3 back-to-back wget downloads of
+#      a synthetic /bytes/SIZE endpoint on the host's Python bench
+#      server. Computed as (size * 8000) / delta_ns Mbps.
+#   3. (Implicit) engine counters via the [usernet-tsi] summary line
+#      that tinyvmm prints on shutdown.
+#
+# Cmdline vars (set by the host driver):
+#   TINYVMM_BENCH_HOST       host LAN IPv4 the bench HTTP server binds to
+#   TINYVMM_BENCH_PORT       bench HTTP server port
+#   TINYVMM_BENCH_SIZE       per-run TCP transfer size in bytes
+#   TINYVMM_BENCH_PINGCOUNT  number of pings (default 100)
+if grep -q 'tinyvmm.test=usernet-bench' /proc/cmdline 2>/dev/null; then
+    log "--- USERNET-BENCH start ---"
+    host=$(cat /proc/cmdline | tr ' ' '\\n' | grep '^TINYVMM_BENCH_HOST=' | cut -d= -f2)
+    port=$(cat /proc/cmdline | tr ' ' '\\n' | grep '^TINYVMM_BENCH_PORT=' | cut -d= -f2)
+    sizebytes=$(cat /proc/cmdline | tr ' ' '\\n' | grep '^TINYVMM_BENCH_SIZE=' | cut -d= -f2)
+    pingcount=$(cat /proc/cmdline | tr ' ' '\\n' | grep '^TINYVMM_BENCH_PINGCOUNT=' | cut -d= -f2)
+    [ -z "${pingcount}" ] && pingcount=100
+    log "host=${host} port=${port} size=${sizebytes} pingcount=${pingcount}"
+    if [ -z "${host}" ] || [ -z "${port}" ] || [ -z "${sizebytes}" ]; then
+        log "BENCH SUMMARY: 0/0 (missing cmdline args)"
+        sync
+        poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
+        exec cat
+    fi
+
+    # ---- Phase 1: ping latency ----------------------------------------
+    # 10 ms inter-packet spacing keeps the test under a second for
+    # pingcount=100. busybox ping emits one "time=X ms" line per reply
+    # plus a final "min/avg/max" summary line.
+    log "BENCH PING start (count=${pingcount})"
+    ping_log=/tmp/bench_ping.log
+    ping -c "${pingcount}" -i 0.01 10.0.0.1 > "${ping_log}" 2>&1
+    # Forward per-packet RTT lines + summary so the host driver can
+    # compute p99 (busybox doesn't).
+    grep 'time=' "${ping_log}" | while IFS= read -r line; do
+        log "BENCH PING RTT $line"
+    done
+    summary=$(grep 'min/avg/max' "${ping_log}")
+    log "BENCH PING SUMMARY ${summary}"
+
+    # ---- Phase 2: TCP single-stream throughput ------------------------
+    # busybox `date +%s%N` does NOT support %N -- returns the literal "N",
+    # giving delta_ns=0. Use /proc/uptime via awk for microsecond
+    # precision instead. We do 1 untimed warm-up run (drops some bytes
+    # consistently due to TCP slow-start / first-TCB cold cache /
+    # Python BaseHTTPServer first-request overhead) before the 3 measured
+    # runs.
+    url="http://${host}:${port}/bytes/${sizebytes}"
+    log "BENCH TCP url=${url}"
+    log "BENCH TCP warmup ..."
+    wget -q -O /tmp/bench_dl -T 60 -t 1 "${url}" >/dev/null 2>&1
+    rm -f /tmp/bench_dl
+    for i in 1 2 3; do
+        rm -f /tmp/bench_dl /tmp/bench_wget.err
+        t0=$(awk '{print int($1 * 1000000)}' /proc/uptime)
+        wget -O /tmp/bench_dl -T 60 -t 1 "${url}" 2>/tmp/bench_wget.err
+        rc=$?
+        t1=$(awk '{print int($1 * 1000000)}' /proc/uptime)
+        delta_us=$((t1 - t0))
+        got=$(wc -c < /tmp/bench_dl 2>/dev/null)
+        [ -z "${got}" ] && got=0
+        if [ "${delta_us}" -gt 0 ] && [ "${rc}" = "0" ] && [ "${got}" = "${sizebytes}" ]; then
+            # bytes * 8 bits/byte / delta_us = Mbps
+            #   (since 1 bit/us == 1 Mbps)
+            mbps=$((sizebytes * 8 / delta_us))
+        else
+            mbps=0
+        fi
+        log "BENCH TCP run=${i} rc=${rc} bytes=${sizebytes} got=${got} delta_us=${delta_us} mbps=${mbps}"
+        if [ "${rc}" != "0" ] || [ "${got}" != "${sizebytes}" ]; then
+            log "BENCH TCP run=${i} wget_err: $(tr '\\n' '|' < /tmp/bench_wget.err | cut -c1-200)"
+        fi
+        rm -f /tmp/bench_dl /tmp/bench_wget.err
+    done
+
+    log "BENCH SUMMARY: done"
+    log "--- USERNET-BENCH end ---"
+    sync
+    # Park 65 s so TSI's 2*MSL TIME_WAIT (60 s) elapses; otherwise the
+    # engine summary shows live>0 / graceful=0 because the wget TCBs
+    # haven't reached CLOSED yet.
+    log "USERNET-BENCH: parking 65 s for TIME_WAIT drain"
+    sleep 65
+    log "=== tinyvmm shutdown requested ==="
+    sleep 1
+    poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
+    exec cat
+fi
+
 # --- optional inbound port-forward test mode ----------------------------
 # Enabled via kernel cmdline marker `tinyvmm.test=portfwd`. Runs a tiny
 # busybox httpd on guest port 8080 serving a known-body sentinel, parks
@@ -198,6 +417,56 @@ EOF
     sleep 25
     log "--- PORTFWD-TEST end ---"
     sync
+    poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
+    exec cat
+fi
+
+# --- optional snapshot save/restore round-trip test ---------------------
+# Enabled via kernel cmdline marker `tinyvmm.test=snapshot`. The host
+# harness drives two distinct tinyvmm invocations against the same
+# initramfs + kernel:
+#
+#   Phase 1 (--save): tinyvmm --pvh-run --save snap.tvm ...
+#     - Guest /init logs "SNAP-TEST: pre-trigger sentinel".
+#     - Guest sleeps briefly to let the console TX queue drain past the
+#       sentinel BEFORE we trigger snapshot capture. The snapshot
+#       captures whatever bytes are still queued in the virtio-console
+#       state, so without the drain the sentinel could re-appear on
+#       restore even though /init does not re-execute that line.
+#     - Guest execs /bin/cpuid_trigger, a 136-byte hand-rolled static
+#       ELF that issues:   mov eax, 0x4000DE57 ; cpuid ; sys_exit(0).
+#     - The host catches the magic-leaf CPUID, drains blk, calls
+#       WriteSnapshotFile() (which captures vCPU regs at post-CPUID
+#       RIP), and exits 0. /init never logs POST-RESTORE-CONTINUE
+#       during the save phase.
+#
+#   Phase 2 (--restore): tinyvmm --restore snap.tvm
+#     - vCPU resumes at post-CPUID RIP inside /bin/cpuid_trigger.
+#     - cpuid_trigger executes sys_exit(0); the parent /init shell's
+#       wait() returns rc=0; /init prints POST-RESTORE-CONTINUE.
+#     - /init prints the shutdown sentinel so the host's serial
+#       watcher (see main.cpp:2585 and 3744) tears down gracefully
+#       even though there is no ACPI poweroff path in tinyvmm.
+if grep -q 'tinyvmm.test=snapshot' /proc/cmdline 2>/dev/null; then
+    log "--- SNAP-TEST start ---"
+    sync
+    log "SNAP-TEST: pre-trigger sentinel"
+    # Drain the virtio-console TX queue past the sentinel before we
+    # snapshot. Without this, the sentinel can survive the round-trip
+    # via the captured console state and re-appear in Phase 2 output,
+    # confusing assertions about "post-restore continue is the only
+    # line".
+    sleep 1
+    /bin/cpuid_trigger
+    rc=$?
+    # Reachable only after restore; the save run captures state at the
+    # CPUID instruction boundary and exits the host process before
+    # this line ever executes in the save invocation.
+    log "SNAP-TEST: POST-RESTORE-CONTINUE rc=$rc"
+    sync
+    sleep 1
+    log "=== tinyvmm shutdown requested ==="
+    sleep 1
     poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
     exec cat
 fi
@@ -972,6 +1241,109 @@ BUSYBOX_APPLETS = [
 ]
 
 
+def build_cpuid_trigger_binary() -> bytes:
+    """Hand-roll a 136-byte x86-64 static ET_EXEC ELF that triggers the
+    tinyvmm magic snapshot CPUID leaf 0x4000DE57 and then exits cleanly.
+
+    Used by the `tinyvmm.test=snapshot` /init block. Placed at
+    /bin/cpuid_trigger inside the initramfs.
+
+    Layout:
+        offset    size  contents
+        0x00      64    Elf64_Ehdr
+        0x40      56    one PT_LOAD Elf64_Phdr (R+X, vaddr=0x400000,
+                                                filesz=memsz=0x88)
+        0x78      16    code (entry point = 0x400078):
+                          B8 57 DE 00 40   mov   eax, 0x4000DE57
+                          0F A2            cpuid
+                          B8 3C 00 00 00   mov   eax, 60     ; sys_exit
+                          31 FF            xor   edi, edi
+                          0F 05            syscall
+
+    Total: 0x88 = 136 bytes. The file contains no .data, no .bss, no
+    dynamic section, no PT_GNU_STACK, no PT_INTERP -- pure code that
+    fits inside a single PT_LOAD.
+
+    The 'cpuid' instruction is unprivileged in x86-64 userspace, so this
+    is reachable from ring 3. tinyvmm's --pvh-run enables CPUID exits
+    via WHvPartitionPropertyCodeExtendedVmExits, and the magic-leaf
+    handler advances RIP past the cpuid before returning
+    StopReason::SnapshotRequested -- so the saved-and-restored RIP
+    points at the 'mov eax, 60' instruction. On restore the syscall
+    runs and the binary exits cleanly.
+    """
+    import struct
+
+    # Elf64_Ehdr
+    e_ident = (
+        b"\x7fELF"          # EI_MAG
+        b"\x02"             # EI_CLASS = ELFCLASS64
+        b"\x01"             # EI_DATA = ELFDATA2LSB
+        b"\x01"             # EI_VERSION = EV_CURRENT
+        b"\x00"             # EI_OSABI = ELFOSABI_NONE (System V)
+        + b"\x00" * 8       # EI_ABIVERSION + EI_PAD
+    )
+    assert len(e_ident) == 16
+
+    e_type    = 2           # ET_EXEC
+    e_machine = 0x3e        # EM_X86_64
+    e_version = 1           # EV_CURRENT
+    e_entry   = 0x400078    # virtual address of code
+    e_phoff   = 0x40        # program-header table offset
+    e_shoff   = 0           # no section headers (not needed for exec)
+    e_flags   = 0
+    e_ehsize    = 64
+    e_phentsize = 56
+    e_phnum     = 1
+    e_shentsize = 0
+    e_shnum     = 0
+    e_shstrndx  = 0
+
+    ehdr = e_ident + struct.pack(
+        "<HHIQQQIHHHHHH",
+        e_type, e_machine, e_version, e_entry, e_phoff, e_shoff, e_flags,
+        e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx,
+    )
+    assert len(ehdr) == 64, len(ehdr)
+
+    # Elf64_Phdr (one PT_LOAD that covers the whole file)
+    p_type   = 1            # PT_LOAD
+    p_flags  = 5            # PF_R | PF_X
+    p_offset = 0
+    p_vaddr  = 0x400000
+    p_paddr  = 0x400000
+    p_filesz = 0x88         # whole file
+    p_memsz  = 0x88
+    p_align  = 0x1000
+
+    phdr = struct.pack(
+        "<IIQQQQQQ",
+        p_type, p_flags, p_offset, p_vaddr, p_paddr,
+        p_filesz, p_memsz, p_align,
+    )
+    assert len(phdr) == 56, len(phdr)
+
+    # Code (16 bytes, entry point = file offset 0x78 = vaddr 0x400078)
+    code = (
+        b"\xB8\x57\xDE\x00\x40"   # mov   eax, 0x4000DE57
+        b"\x0F\xA2"               # cpuid
+        b"\xB8\x3C\x00\x00\x00"   # mov   eax, 60        ; __NR_exit
+        b"\x31\xFF"               # xor   edi, edi       ; status = 0
+        b"\x0F\x05"               # syscall
+    )
+    assert len(code) == 16, len(code)
+
+    blob = ehdr + phdr + code
+    assert len(blob) == 0x88, len(blob)
+    # Self-checks that catch the most common ELF-layout mistakes if
+    # someone tweaks the byte layout above.
+    assert blob[:4] == b"\x7fELF"
+    assert (p_vaddr % p_align) == (p_offset % p_align), \
+        "PT_LOAD vaddr/offset not congruent mod align"
+    assert e_entry == p_vaddr + 0x78, "entry point not in PT_LOAD"
+    return blob
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--busybox", required=True,
@@ -1026,6 +1398,12 @@ def main() -> int:
             continue
         seen.add(app)
         cb.add_symlink(f"bin/{app}", "busybox")
+
+    # M33.7: snapshot save/restore trigger binary. Used by the
+    # `tinyvmm.test=snapshot` /init block to issue the magic CPUID
+    # leaf 0x4000DE57 from ring 3.
+    cb.add_file("bin/cpuid_trigger", build_cpuid_trigger_binary(),
+                mode=0o755)
 
     cb.add_file("init", INIT_SCRIPT, mode=0o755)
 

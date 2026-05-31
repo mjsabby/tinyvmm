@@ -1,9 +1,12 @@
 #include "msix.h"
 
 #include "pci_device.h"
+#include "whp/snapshot_file.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 #include <utility>
 
 namespace tinyvmm::pci {
@@ -276,6 +279,127 @@ bool MsiX::DoInject(std::uint32_t vector) {
     }
     injected_count_.fetch_add(1, std::memory_order_relaxed);
     return inject_(addr, data);
+}
+
+// ----------------------- M33.4 save/restore ---------------------------
+
+MsiX::State MsiX::CaptureState() const {
+    State s;
+    std::lock_guard<std::mutex> lk(mu_);
+    s.num_vectors  = num_vectors_;
+    s.bar_base_gpa = bar_base_gpa_;
+    s.mapped       = mapped_ ? 1u : 0u;
+    s.table.resize(num_vectors_);
+    for (std::uint32_t i = 0; i < num_vectors_; ++i) {
+        s.table[i].addr_lo = table_[i].addr_lo;
+        s.table[i].addr_hi = table_[i].addr_hi;
+        s.table[i].data    = table_[i].data;
+        s.table[i].ctrl    = table_[i].ctrl;
+    }
+    s.pba.assign(pba_.begin(), pba_.end());
+    return s;
+}
+
+void MsiX::ApplyState(const State& s) {
+    if (s.num_vectors != num_vectors_) {
+        throw std::runtime_error(
+            "MsiX::ApplyState: num_vectors mismatch (saved != current)");
+    }
+    if (s.table.size() != num_vectors_) {
+        throw std::runtime_error("MsiX::ApplyState: table length mismatch");
+    }
+    if (s.pba.size() != pba_.size()) {
+        throw std::runtime_error("MsiX::ApplyState: PBA length mismatch");
+    }
+    std::lock_guard<std::mutex> lk(mu_);
+    // Deliberately NOT touching mapped_ / bar_base_gpa_ — those are
+    // re-established by PciTransport::InstallBarHandlers_ calling
+    // Install() during ApplyState.
+    for (std::uint32_t i = 0; i < num_vectors_; ++i) {
+        table_[i].addr_lo = s.table[i].addr_lo;
+        table_[i].addr_hi = s.table[i].addr_hi;
+        table_[i].data    = s.table[i].data;
+        table_[i].ctrl    = s.table[i].ctrl;
+    }
+    std::copy(s.pba.begin(), s.pba.end(), pba_.begin());
+}
+
+std::size_t MsiX::EncodeState(const State& s,
+                              std::vector<std::uint8_t>& out) {
+    using namespace tinyvmm::whp::snapshot;
+    const std::size_t want = EncodedSize(s.num_vectors);
+    if (s.table.size() != s.num_vectors) {
+        throw std::runtime_error(
+            "MsiX::EncodeState: table length != num_vectors");
+    }
+    if (s.pba.size() != (s.num_vectors + 63) / 64) {
+        throw std::runtime_error(
+            "MsiX::EncodeState: pba length wrong for num_vectors");
+    }
+    const std::size_t start = out.size();
+    out.resize(start + want, 0);
+    std::uint8_t* p = out.data() + start;
+    WriteLe32(p +  0, s.num_vectors);
+    // p[4..7] = u32 reserved=0
+    WriteLe64(p +  8, s.bar_base_gpa);
+    p[16] = s.mapped;
+    // p[17..23] = u8 pad[7]
+    std::size_t off = kEncodedHeaderSize;
+    for (std::uint32_t i = 0; i < s.num_vectors; ++i) {
+        WriteLe32(p + off +  0, s.table[i].addr_lo);
+        WriteLe32(p + off +  4, s.table[i].addr_hi);
+        WriteLe32(p + off +  8, s.table[i].data);
+        WriteLe32(p + off + 12, s.table[i].ctrl);
+        off += 16;
+    }
+    for (std::uint64_t w : s.pba) {
+        WriteLe64(p + off, w);
+        off += 8;
+    }
+    return want;
+}
+
+MsiX::State MsiX::DecodeState(std::span<const std::uint8_t> bytes) {
+    using namespace tinyvmm::whp::snapshot;
+    if (bytes.size() < kEncodedHeaderSize) {
+        throw std::runtime_error(
+            "MsiX::DecodeState: payload smaller than header");
+    }
+    const std::uint8_t* p = bytes.data();
+    State s;
+    s.num_vectors  = ReadLe32(p + 0);
+    if (ReadLe32(p + 4) != 0) {
+        throw std::runtime_error("MsiX::DecodeState: nonzero reserved@4");
+    }
+    s.bar_base_gpa = ReadLe64(p + 8);
+    s.mapped       = p[16];
+    for (int i = 17; i < 24; ++i) {
+        if (p[i] != 0) {
+            throw std::runtime_error(
+                "MsiX::DecodeState: nonzero pad in header");
+        }
+    }
+    const std::size_t want = EncodedSize(s.num_vectors);
+    if (bytes.size() < want) {
+        throw std::runtime_error(
+            "MsiX::DecodeState: payload truncated for num_vectors");
+    }
+    s.table.resize(s.num_vectors);
+    std::size_t off = kEncodedHeaderSize;
+    for (std::uint32_t i = 0; i < s.num_vectors; ++i) {
+        s.table[i].addr_lo = ReadLe32(p + off +  0);
+        s.table[i].addr_hi = ReadLe32(p + off +  4);
+        s.table[i].data    = ReadLe32(p + off +  8);
+        s.table[i].ctrl    = ReadLe32(p + off + 12);
+        off += 16;
+    }
+    const std::size_t pba_words = (s.num_vectors + 63) / 64;
+    s.pba.resize(pba_words);
+    for (std::size_t i = 0; i < pba_words; ++i) {
+        s.pba[i] = ReadLe64(p + off);
+        off += 8;
+    }
+    return s;
 }
 
 }  // namespace tinyvmm::pci

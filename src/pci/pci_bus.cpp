@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 #include <utility>
 
 namespace tinyvmm::pci {
@@ -155,6 +156,48 @@ void PciBus::HandleData(devices::IoAccess& access) {
         ++cfg_reads_;
         access.value = dev->ConfigRead(reg_offset, s.size);
     }
+}
+
+// ---- Phase 33.5 host-bridge save/restore --------------------------------
+
+PciBus::State PciBus::CaptureState() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    State s;
+    s.config_address = config_address_;
+    return s;
+}
+
+void PciBus::ApplyState(const PciBus::State& s) {
+    std::lock_guard<std::mutex> lk(mu_);
+    config_address_ = s.config_address;
+}
+
+std::size_t PciBus::EncodeState(const PciBus::State& s,
+                                std::span<std::uint8_t> out) {
+    if (out.size() < kEncodedSize) {
+        throw std::runtime_error(
+            "PciBus::EncodeState: output span smaller than kEncodedSize");
+    }
+    std::uint8_t* p = out.data();
+    p[0] = static_cast<std::uint8_t>(s.config_address & 0xFFu);
+    p[1] = static_cast<std::uint8_t>((s.config_address >> 8)  & 0xFFu);
+    p[2] = static_cast<std::uint8_t>((s.config_address >> 16) & 0xFFu);
+    p[3] = static_cast<std::uint8_t>((s.config_address >> 24) & 0xFFu);
+    return kEncodedSize;
+}
+
+PciBus::State PciBus::DecodeState(std::span<const std::uint8_t> bytes) {
+    if (bytes.size() < kEncodedSize) {
+        throw std::runtime_error(
+            "PciBus::DecodeState: payload smaller than kEncodedSize");
+    }
+    State s;
+    s.config_address =
+        static_cast<std::uint32_t>(bytes[0]) |
+        (static_cast<std::uint32_t>(bytes[1]) << 8)  |
+        (static_cast<std::uint32_t>(bytes[2]) << 16) |
+        (static_cast<std::uint32_t>(bytes[3]) << 24);
+    return s;
 }
 
 }  // namespace tinyvmm::pci

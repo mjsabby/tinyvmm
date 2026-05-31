@@ -9,9 +9,11 @@
 #include "devices/serial8250.h"
 #include "diag/boot_timer.h"
 #include "diag/etw.h"
+#include "debug/gdbstub.h"
 #include "host/block_file.h"
 #include "host/privilege.h"
 #include "host/xdp_probe.h"
+#include "net/tsi_sanity.h"
 #include "net/wintun_loader.h"
 #include "pci/msix.h"
 #include "pci/pci.h"
@@ -32,6 +34,7 @@
 #include "virtio/net_xdp.h"
 #include "virtio/net_wintun.h"
 #include "virtio/net_usernet.h"
+#include "virtio/net_usernet_tsi.h"
 #include "whp/cpu_affinity.h"
 #include "whp/cpuid.h"
 #include "whp/hv_enlightenment.h"
@@ -40,6 +43,9 @@
 #include "whp/notification_port.h"
 #include "whp/partition.h"
 #include "whp/run_loop.h"
+#include "whp/snapshot.h"
+#include "whp/snapshot_file.h"
+#include "whp/vcpu_state.h"
 #include "whp/vcpu.h"
 
 #include <atomic>
@@ -49,8 +55,10 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <span>
+#include <random>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -64,6 +72,7 @@ void PrintUsage() {
         "\n"
         "Usage:\n"
         "  tinyvmm --smoke                   Real-mode HLT smoke test\n"
+        "  tinyvmm --tsi-smoke               tcp-sans-io ABI link/version smoke (M34.0)\n"
         "  tinyvmm --loop-test               Run loop + IO dispatch test\n"
         "  tinyvmm --uart-test               Drive the 8250 from real mode\n"
         "  tinyvmm --virtio-test             Drive virtio-mmio + virtq from host\n"
@@ -73,12 +82,21 @@ void PrintUsage() {
         "  tinyvmm --msix-inject-test        Drive WHvRequestInterrupt into a guest IDT\n"
         "  tinyvmm --virtio-pci-test         Host-side virtio-PCI modern transport\n"
         "  tinyvmm --virtio-blk-test         Host-side virtio-blk via IOCP backend\n"
+        "  tinyvmm --virtio-blk-discard-test Verify DISCARD + WRITE_ZEROES (M34.x) features + ZeroRange\n"
         "  tinyvmm --virtio-blk-ro-test      Backend readonly reject path (OpWrite rejected)\n"
         "  tinyvmm --virtio-net-pci-test     Host-side virtio-net on the PCI transport\n"
         "  tinyvmm --virtio-net-loopback-test Echo a TX packet back as RX via LoopbackNetBackend\n"
+        "  tinyvmm --virtio-net-usernet-tsi-test  Drive TsiTcpEngine end-to-end vs a real Winsock listener (M34.4)\n"
+        "  tinyvmm --tsi-fuzz-test [iters [seed]] Fuzz TsiTcpEngine packet parser + pumps (default 10000 iters)\n"
+        "  tinyvmm --virtio-queue-fuzz-test [iters [seed]] Fuzz Virtqueue::Pop() with random descriptor chains\n"
         "  tinyvmm --virtio-rng-test         Host-side virtio-rng + CNG entropy source\n"
         "  tinyvmm --virtio-console-test     Host-side virtio-console transmitq drain\n"
         "  tinyvmm --cpuid-test              Verify CPUID resolver policy (M18 time hygiene)\n"
+        "  tinyvmm --snapshot-trigger-test   Verify magic CPUID leaf 0x4000DE57 dispatches (M33)\n"
+        "  tinyvmm --save-restore-probe      Validate WHP State API capture/apply round-trip (M33)\n"
+        "  tinyvmm --save-restore-roundtrip-test  Round-trip snapshot file format end-to-end (M33.3)\n"
+        "  tinyvmm --save-restore-pci-test   Round-trip PCI/virtio/MSI-X/Virtqueue state (M33.4)\n"
+        "  tinyvmm --save-restore-legacy-test Round-trip legacy device state (M33.5)\n"
         "  tinyvmm --xdp-probe [<IfIndex>]   Probe XDP capability on every host NIC\n"
         "                                    (or deep-dive on one when IfIndex given)\n"
         "  tinyvmm --wintun-probe [<secs>]   Bring up WinTun adapter 10.0.0.1/24 and dump RX (admin)\n"
@@ -94,9 +112,17 @@ void PrintUsage() {
         "                   [--cpu-affinity all|p|e|p-physical]\n"
         "                   [--portfwd HOST_PORT:GUEST_PORT |\n"
         "                              HOST_IP:HOST_PORT:GUEST_IP:GUEST_PORT]...\n"
+        "                   [--save <path>] [--unsafe-save-mutable-drive]\n"
+        "                   [--gdb-port <port>] (M35 GDB stub on 127.0.0.1:<port>;\n"
+        "                                        halts before first guest insn;\n"
+        "                                        requires --vcpus 1)\n"
         "                   <vmlinux> [-- <kernel cmdline...>]\n"
         "                                    Load and run a PVH kernel\n"
         "                                    --drive may be repeated; drive N appears as /dev/vd<a+N>\n"
+        "  tinyvmm --restore <path>          Restore VM from a TVMMSAVE snapshot file (M33.6)\n"
+        "                   [--drive <path>[,readonly]]... (override saved paths in order)\n"
+        "                   [--watchdog-secs <N>] [--cpu-affinity all|p|e|p-physical]\n"
+        "                   [--unsafe-restore-mutable-drive]\n"
         "  tinyvmm --help                    Show this help\n");
 }
 
@@ -123,6 +149,13 @@ void ReportHostCapabilities() {
                 lock_priv ? "enabled" : "not held (large pages will fall back)");
     std::printf("[host] large-page minimum:    0x%zx bytes\n",
                 host::LargePageSize());
+}
+
+// M34.0 / M34.2 build-time / link-time / runtime sanity for the linked
+// tcp-sans-io Rust staticlib. Defined in src/net/tsi_sanity.cpp so this
+// TU doesn't need to pull tcp_sans_io.h directly.
+int RunTsiSmoke() {
+    return tinyvmm::net::TsiSelfTest();
 }
 
 // M0 smoke test: bring up a partition, map 2 MiB of guest RAM at GPA 0 (so we
@@ -1869,6 +1902,549 @@ struct P9ShareSpec {
     bool                    readonly = false;
 };
 
+// ---------------------------------------------------------------------------
+// M33.6: production --save / --restore plumbing.
+//
+// All the per-class CaptureState/ApplyState/Encode/Decode helpers landed in
+// M33.3 (vCPU+RAM+HV), M33.4 (PCI+virtio), and M33.5 (legacy devices). The
+// machinery below stitches them together into one writer (called from the
+// post-stop hook in RunPvhRun when the magic CPUID has fired) and one
+// reader-applier (called from RunRestore on the parallel cold-restore
+// path). Section ordering on disk: header → vCPU → HV → legacy → per-PCI
+// → RAM last (the rubber-duck-approved layout from M33.6 design review).
+// ---------------------------------------------------------------------------
+
+// Bundle of live VM state references the writer needs at snapshot time.
+// Captured by reference because it lives entirely on RunPvhRun's stack.
+struct SnapshotWriteContext {
+    WHV_PARTITION_HANDLE                                       part_handle;
+    std::uint32_t                                              vcpu_count;
+    std::deque<tinyvmm::whp::Vcpu>&                            vcpus;
+    tinyvmm::whp::GuestMemory&                                 ram;
+    bool                                                       large_pages;
+    tinyvmm::whp::HvEnlightenment&                             hv;
+    tinyvmm::devices::Serial8250&                              com1;
+    tinyvmm::devices::Pic8259&                                 pic;
+    tinyvmm::devices::Pit8254&                                 pit;
+    tinyvmm::devices::LegacyIsaStubs&                          legacy;
+    tinyvmm::pci::PciBus&                                      pbus;
+    const std::vector<std::unique_ptr<tinyvmm::host::BlockFile>>&    blk_backends;
+    const std::vector<std::unique_ptr<tinyvmm::virtio::BlockDevice>>& blk_devices;
+    const std::vector<DriveSpec>&                              drives;
+    bool                                                       hide_tsc_deadline;
+    std::uint64_t                                              tsc_hz;
+};
+
+// Drain helper: poll every BlockDevice's PendingCount() until they all
+// reach zero or the timeout expires. Returns true if all drained.
+//
+// Rationale (rubber-duck M33.6 blocking #1): if we snapshot while
+// virtio-blk has descriptors in flight, the captured virtqueue state
+// shows the head consumed but the used-ring entry not yet posted; on
+// restore the guest waits forever for completion (it won't re-issue).
+// Forcing a quiesce-then-capture sidesteps that whole class of bug.
+bool DrainBlockBackends(
+        const std::vector<std::unique_ptr<tinyvmm::virtio::BlockDevice>>& blk_devices,
+        int timeout_ms = 5000) {
+    if (blk_devices.empty()) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (;;) {
+        bool all_drained = true;
+        for (const auto& d : blk_devices) {
+            if (d->PendingCount() != 0) { all_drained = false; break; }
+        }
+        if (all_drained) return true;
+        const auto el = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        if (el >= timeout_ms) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+}
+
+// Encode a CapturedVcpuState's per-section blocks.
+namespace svcpu_enc {
+    namespace snap = ::tinyvmm::whp::snapshot;
+
+    // Encodes a CapturedVcpuState arch/timing register block.
+    // Layout: u32 vp_idx | u32 reg_count | [u32 name | u32 reserved | 16B value]*.
+    inline std::vector<std::uint8_t> EncodeRegBlock(
+            std::uint32_t vp_idx,
+            const WHV_REGISTER_NAME* names,
+            const std::vector<WHV_REGISTER_VALUE>& values) {
+        const std::uint32_t n = static_cast<std::uint32_t>(values.size());
+        std::vector<std::uint8_t> out(8 + std::size_t{n} * (8 + 16));
+        snap::WriteLe32(&out[0], vp_idx);
+        snap::WriteLe32(&out[4], n);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            std::uint8_t* p = &out[8 + std::size_t{i} * (8 + 16)];
+            snap::WriteLe32(p + 0, static_cast<std::uint32_t>(names[i]));
+            snap::WriteLe32(p + 4, 0u);
+            std::memcpy(p + 8, &values[i], 16);
+        }
+        return out;
+    }
+
+    // Encodes an XSAVE/APIC blob. Layout: u32 vp_idx | u32 size | bytes.
+    inline std::vector<std::uint8_t> EncodeBlobBlock(
+            std::uint32_t vp_idx,
+            const std::vector<std::uint8_t>& blob) {
+        std::vector<std::uint8_t> out(8 + blob.size());
+        snap::WriteLe32(&out[0], vp_idx);
+        snap::WriteLe32(&out[4],
+            tinyvmm::util::checked_int_cast<std::uint32_t>(blob.size()));
+        if (!blob.empty()) std::memcpy(&out[8], blob.data(), blob.size());
+        return out;
+    }
+
+    // Encodes the IntrCtl block.
+    // Layout: u32 vp_idx | u32 reg_count | [u32 name | u8 ok | u8 pad[3] | 16B value]*.
+    inline std::vector<std::uint8_t> EncodeIntrCtlBlock(
+            std::uint32_t vp_idx,
+            const snap::CapturedVcpuState& cap) {
+        const std::uint32_t n = static_cast<std::uint32_t>(cap.intr_ctl.size());
+        std::vector<std::uint8_t> out(8 + std::size_t{n} * (8 + 16));
+        snap::WriteLe32(&out[0], vp_idx);
+        snap::WriteLe32(&out[4], n);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            std::uint8_t* p = &out[8 + std::size_t{i} * (8 + 16)];
+            snap::WriteLe32(p + 0,
+                static_cast<std::uint32_t>(snap::kIntrCtlRegNames[i]));
+            p[4] = cap.intr_ctl_ok[i] ? 1u : 0u;
+            p[5] = 0; p[6] = 0; p[7] = 0;
+            std::memcpy(p + 8, &cap.intr_ctl[i], 16);
+        }
+        return out;
+    }
+
+    // M33.7: Encodes the supervisor-MSR block. Same wire layout as
+    // EncodeIntrCtlBlock; ok-bit indicates whether the register was
+    // successfully readable at capture time.
+    inline std::vector<std::uint8_t> EncodeSupMsrBlock(
+            std::uint32_t vp_idx,
+            const snap::CapturedVcpuState& cap) {
+        const std::uint32_t n = static_cast<std::uint32_t>(cap.sup_msr.size());
+        std::vector<std::uint8_t> out(8 + std::size_t{n} * (8 + 16));
+        snap::WriteLe32(&out[0], vp_idx);
+        snap::WriteLe32(&out[4], n);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            std::uint8_t* p = &out[8 + std::size_t{i} * (8 + 16)];
+            snap::WriteLe32(p + 0,
+                static_cast<std::uint32_t>(snap::kSupervisorMsrNames[i]));
+            p[4] = cap.sup_msr_ok[i] ? 1u : 0u;
+            p[5] = 0; p[6] = 0; p[7] = 0;
+            std::memcpy(p + 8, &cap.sup_msr[i], 16);
+        }
+        return out;
+    }
+
+    // Prepends a 4-byte BDF tag (bus,dev,fn,reserved=0) to `bytes` in place.
+    inline void PrependBdf(const tinyvmm::pci::Bdf& bdf,
+                           std::vector<std::uint8_t>& bytes) {
+        std::vector<std::uint8_t> out;
+        out.reserve(4 + bytes.size());
+        out.push_back(bdf.bus);
+        out.push_back(bdf.device);
+        out.push_back(bdf.function);
+        out.push_back(0);
+        out.insert(out.end(), bytes.begin(), bytes.end());
+        bytes = std::move(out);
+    }
+    // Prepends 4-byte BDF + 4-byte (u16 qidx, u16 pad).
+    inline void PrependBdfQ(const tinyvmm::pci::Bdf& bdf, std::uint16_t qidx,
+                            std::vector<std::uint8_t>& bytes) {
+        std::vector<std::uint8_t> out;
+        out.reserve(8 + bytes.size());
+        out.push_back(bdf.bus);
+        out.push_back(bdf.device);
+        out.push_back(bdf.function);
+        out.push_back(0);
+        out.push_back(static_cast<std::uint8_t>(qidx & 0xFF));
+        out.push_back(static_cast<std::uint8_t>((qidx >> 8) & 0xFF));
+        out.push_back(0);
+        out.push_back(0);
+        out.insert(out.end(), bytes.begin(), bytes.end());
+        bytes = std::move(out);
+    }
+
+    // -------- M33.6 restore-side decoders ----------------------------------
+    // Mirror images of the Encode* helpers above. Each takes a raw section
+    // payload (the BDF prefix, if any, has already been stripped) and
+    // populates the relevant CapturedVcpuState fields. They throw
+    // std::runtime_error on any size mismatch / unexpected register name so
+    // the restore path fails loudly instead of producing a half-applied vCPU.
+
+    // Reads a CapturedVcpuState arch/timing register block. Validates that the
+    // section's `vp_idx` matches `expected_vp_idx`, the register count matches
+    // `expected_count`, and each register name matches `expected_names[i]` in
+    // order. Returns the parsed register values in the same order.
+    inline std::vector<WHV_REGISTER_VALUE> DecodeRegBlock(
+            std::span<const std::uint8_t> bytes,
+            std::uint32_t expected_vp_idx,
+            const WHV_REGISTER_NAME* expected_names,
+            std::size_t expected_count) {
+        if (bytes.size() < 8) {
+            throw std::runtime_error("DecodeRegBlock: payload too small");
+        }
+        const std::uint32_t vp_idx = snap::ReadLe32(&bytes[0]);
+        const std::uint32_t n      = snap::ReadLe32(&bytes[4]);
+        if (vp_idx != expected_vp_idx) {
+            throw std::runtime_error("DecodeRegBlock: vp_idx mismatch");
+        }
+        if (n != expected_count) {
+            throw std::runtime_error("DecodeRegBlock: reg_count mismatch");
+        }
+        const std::size_t need = 8 + std::size_t{n} * (8 + 16);
+        if (bytes.size() < need) {
+            throw std::runtime_error("DecodeRegBlock: payload truncated");
+        }
+        std::vector<WHV_REGISTER_VALUE> values(n);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            const std::uint8_t* p = &bytes[8 + std::size_t{i} * (8 + 16)];
+            const std::uint32_t name = snap::ReadLe32(p + 0);
+            if (name != static_cast<std::uint32_t>(expected_names[i])) {
+                throw std::runtime_error(
+                    "DecodeRegBlock: register name mismatch");
+            }
+            // p + 4 = u32 reserved (ignored on read)
+            std::memcpy(&values[i], p + 8, 16);
+        }
+        return values;
+    }
+
+    // Reads an XSAVE/APIC blob. Validates `vp_idx`. Returns the payload bytes.
+    inline std::vector<std::uint8_t> DecodeBlobBlock(
+            std::span<const std::uint8_t> bytes,
+            std::uint32_t expected_vp_idx) {
+        if (bytes.size() < 8) {
+            throw std::runtime_error("DecodeBlobBlock: payload too small");
+        }
+        const std::uint32_t vp_idx = snap::ReadLe32(&bytes[0]);
+        const std::uint32_t size   = snap::ReadLe32(&bytes[4]);
+        if (vp_idx != expected_vp_idx) {
+            throw std::runtime_error("DecodeBlobBlock: vp_idx mismatch");
+        }
+        if (bytes.size() < 8 + std::size_t{size}) {
+            throw std::runtime_error("DecodeBlobBlock: payload truncated");
+        }
+        return std::vector<std::uint8_t>(bytes.begin() + 8,
+                                         bytes.begin() + 8 + size);
+    }
+
+    // Reads an IntrCtl block into the CapturedVcpuState::intr_ctl + ok arrays.
+    inline void DecodeIntrCtlBlock(std::span<const std::uint8_t> bytes,
+                                   std::uint32_t expected_vp_idx,
+                                   snap::CapturedVcpuState& out) {
+        if (bytes.size() < 8) {
+            throw std::runtime_error("DecodeIntrCtlBlock: payload too small");
+        }
+        const std::uint32_t vp_idx = snap::ReadLe32(&bytes[0]);
+        const std::uint32_t n      = snap::ReadLe32(&bytes[4]);
+        if (vp_idx != expected_vp_idx) {
+            throw std::runtime_error("DecodeIntrCtlBlock: vp_idx mismatch");
+        }
+        if (n != snap::kIntrCtlRegCount()) {
+            throw std::runtime_error("DecodeIntrCtlBlock: reg_count mismatch");
+        }
+        const std::size_t need = 8 + std::size_t{n} * (8 + 16);
+        if (bytes.size() < need) {
+            throw std::runtime_error("DecodeIntrCtlBlock: payload truncated");
+        }
+        out.intr_ctl.assign(n, WHV_REGISTER_VALUE{});
+        out.intr_ctl_ok.assign(n, false);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            const std::uint8_t* p = &bytes[8 + std::size_t{i} * (8 + 16)];
+            const std::uint32_t name = snap::ReadLe32(p + 0);
+            if (name != static_cast<std::uint32_t>(snap::kIntrCtlRegNames[i])) {
+                throw std::runtime_error(
+                    "DecodeIntrCtlBlock: register name mismatch");
+            }
+            out.intr_ctl_ok[i] = (p[4] != 0);
+            std::memcpy(&out.intr_ctl[i], p + 8, 16);
+        }
+    }
+
+    // M33.7: Reads a supervisor-MSR block into out.sup_msr + sup_msr_ok.
+    // Tolerates extra register names appearing on the wire (different
+    // snapshot tooling versions) — only fails if a known name appears in
+    // wrong order. Pads missing tail entries with ok=false so partial
+    // snapshots from older builds still apply (the missing CET MSRs
+    // will be skipped, which is the safe behavior).
+    inline void DecodeSupMsrBlock(std::span<const std::uint8_t> bytes,
+                                  std::uint32_t expected_vp_idx,
+                                  snap::CapturedVcpuState& out) {
+        if (bytes.size() < 8) {
+            throw std::runtime_error("DecodeSupMsrBlock: payload too small");
+        }
+        const std::uint32_t vp_idx = snap::ReadLe32(&bytes[0]);
+        const std::uint32_t n      = snap::ReadLe32(&bytes[4]);
+        if (vp_idx != expected_vp_idx) {
+            throw std::runtime_error("DecodeSupMsrBlock: vp_idx mismatch");
+        }
+        const std::size_t need = 8 + std::size_t{n} * (8 + 16);
+        if (bytes.size() < need) {
+            throw std::runtime_error("DecodeSupMsrBlock: payload truncated");
+        }
+        // Resize to canonical length first (filled with default values +
+        // ok=false). Then overwrite any entries that match the wire's
+        // name in canonical order.
+        out.sup_msr.assign(snap::kSupervisorMsrCount(), WHV_REGISTER_VALUE{});
+        out.sup_msr_ok.assign(snap::kSupervisorMsrCount(), false);
+        const std::size_t common = (std::min)(static_cast<std::size_t>(n),
+                                              snap::kSupervisorMsrCount());
+        for (std::size_t i = 0; i < common; ++i) {
+            const std::uint8_t* p = &bytes[8 + i * (8 + 16)];
+            const std::uint32_t name = snap::ReadLe32(p + 0);
+            if (name != static_cast<std::uint32_t>(
+                            snap::kSupervisorMsrNames[i])) {
+                // Wire order does not match. Skip silently — this entry
+                // (and likely subsequent entries) are from a different
+                // tooling version; safer to leave ok=false.
+                continue;
+            }
+            out.sup_msr_ok[i] = (p[4] != 0);
+            std::memcpy(&out.sup_msr[i], p + 8, 16);
+        }
+    }
+
+    // Encodes a per-(BDF) lookup key for restore-time maps.
+    inline std::uint32_t BdfKey(std::uint8_t bus, std::uint8_t dev,
+                                std::uint8_t fn) noexcept {
+        return (static_cast<std::uint32_t>(bus) << 16) |
+               (static_cast<std::uint32_t>(dev) << 8) |
+               static_cast<std::uint32_t>(fn);
+    }
+    inline std::uint32_t BdfKey(const tinyvmm::pci::Bdf& b) noexcept {
+        return BdfKey(b.bus, b.device, b.function);
+    }
+    // Combined (BDF, qidx) key for VIRTQUEUE map.
+    inline std::uint64_t BdfQKey(std::uint32_t bdfkey,
+                                 std::uint16_t qidx) noexcept {
+        return (static_cast<std::uint64_t>(bdfkey) << 16) |
+               static_cast<std::uint64_t>(qidx);
+    }
+}  // namespace svcpu_enc
+
+// Captures all live state and writes a TVMMSAVE snapshot file at `out_path`.
+// Returns 0 on success, non-zero on failure (with a diagnostic to stderr).
+// The disk in-flight drain is the caller's responsibility (we assume it
+// already ran DrainBlockBackends and returned true).
+int WriteSnapshotFile(const std::string& out_path,
+                      const SnapshotWriteContext& ctx) {
+    namespace snap = ::tinyvmm::whp::snapshot;
+    namespace dev  = ::tinyvmm::devices;
+    namespace p    = ::tinyvmm::pci;
+    namespace v    = ::tinyvmm::virtio;
+
+    try {
+        // ---------------- Capture per-vCPU state ------------------
+        std::vector<snap::CapturedVcpuState> cap_vcpus(ctx.vcpu_count);
+        for (std::uint32_t i = 0; i < ctx.vcpu_count; ++i) {
+            snap::CaptureVcpuState(ctx.vcpus[i], ctx.part_handle, i,
+                                   cap_vcpus[i]);
+        }
+        const auto cap_hv  = ctx.hv.CaptureState();
+        const auto cap_bus = ctx.pbus.CaptureState();
+        const auto cap_isa = ctx.legacy.CaptureState();
+        const auto cap_com = ctx.com1.CaptureState();
+        const auto cap_pic = ctx.pic.CaptureState();
+        const auto cap_pit = ctx.pit.CaptureState();
+
+        // ---------------- Header JSON ----------------
+        snap::JsonObjectWriter jw;
+        jw.Add("phase",             std::string_view("33.6-prod"));
+        jw.Add("vcpu_count",        std::uint64_t{ctx.vcpu_count});
+        jw.Add("ram_size_bytes",    std::uint64_t{ctx.ram.size()});
+        jw.Add("large_pages",       ctx.large_pages);
+        jw.Add("tsc_hz_at_save",    ctx.tsc_hz);
+        jw.Add("hide_tsc_deadline", ctx.hide_tsc_deadline);
+        jw.Add("drive_count",       std::uint64_t{ctx.drives.size()});
+        for (std::size_t i = 0; i < ctx.drives.size(); ++i) {
+            char key[40];
+            std::snprintf(key, sizeof(key), "drive%zu_path", i);
+            jw.Add(key, std::string_view(ctx.drives[i].path));
+            std::snprintf(key, sizeof(key), "drive%zu_size", i);
+            jw.Add(key, std::uint64_t{ctx.blk_backends[i]->size()});
+            std::snprintf(key, sizeof(key), "drive%zu_readonly", i);
+            jw.Add(key, ctx.drives[i].readonly);
+        }
+
+        snap::SnapshotWriter w(out_path);
+        w.WriteHeader(jw.str());
+
+        // ---------------- Per-vCPU sections ----------------
+        for (std::uint32_t i = 0; i < ctx.vcpu_count; ++i) {
+            const auto& c = cap_vcpus[i];
+            auto regs   = svcpu_enc::EncodeRegBlock(i, snap::kArchRegNames,
+                                                    c.arch);
+            auto xsave  = svcpu_enc::EncodeBlobBlock(i, c.xsave);
+            auto apic   = svcpu_enc::EncodeBlobBlock(i, c.apic);
+            auto intr   = svcpu_enc::EncodeIntrCtlBlock(i, c);
+            auto supmsr = svcpu_enc::EncodeSupMsrBlock(i, c);
+            auto timing = svcpu_enc::EncodeRegBlock(i, snap::kTimingRegNames,
+                                                    c.timing);
+            w.WriteSection(snap::SectionType::VcpuRegs,    regs.data(),   regs.size());
+            w.WriteSection(snap::SectionType::VcpuXsave,   xsave.data(),  xsave.size());
+            w.WriteSection(snap::SectionType::VcpuApic,    apic.data(),   apic.size());
+            w.WriteSection(snap::SectionType::VcpuIntrCtl, intr.data(),   intr.size());
+            w.WriteSection(snap::SectionType::VcpuSupMsr,  supmsr.data(), supmsr.size());
+            w.WriteSection(snap::SectionType::VcpuTiming,  timing.data(), timing.size());
+        }
+
+        // ---------------- HV ----------------
+        {
+            std::uint8_t buf[32];
+            snap::WriteLe64(buf +  0, cap_hv.guest_os_id);
+            snap::WriteLe64(buf +  8, cap_hv.hypercall_msr);
+            snap::WriteLe64(buf + 16, cap_hv.reference_tsc_msr);
+            snap::WriteLe64(buf + 24, cap_hv.tsc_invariant_ctl);
+            w.WriteSection(snap::SectionType::HvEnlightenment, buf, sizeof(buf));
+        }
+
+        // ---------------- Legacy singletons ----------------
+        {
+            std::uint8_t buf[p::PciBus::kEncodedSize];
+            p::PciBus::EncodeState(cap_bus, std::span<std::uint8_t>(buf));
+            w.WriteSection(snap::SectionType::LegacyPciBus, buf, sizeof(buf));
+        }
+        {
+            std::uint8_t buf[dev::LegacyIsaStubs::kEncodedSize];
+            dev::LegacyIsaStubs::EncodeState(cap_isa, std::span<std::uint8_t>(buf));
+            w.WriteSection(snap::SectionType::LegacyIsaStubs, buf, sizeof(buf));
+        }
+        {
+            std::uint8_t buf[dev::Serial8250::kEncodedSize];
+            dev::Serial8250::EncodeState(cap_com, std::span<std::uint8_t>(buf));
+            w.WriteSection(snap::SectionType::LegacySerial8250, buf, sizeof(buf));
+        }
+        {
+            std::uint8_t buf[dev::Pic8259::kEncodedSize];
+            dev::Pic8259::EncodeState(cap_pic, std::span<std::uint8_t>(buf));
+            w.WriteSection(snap::SectionType::LegacyPic8259, buf, sizeof(buf));
+        }
+        {
+            std::uint8_t buf[dev::Pit8254::kEncodedSize];
+            dev::Pit8254::EncodeState(cap_pit, std::span<std::uint8_t>(buf));
+            w.WriteSection(snap::SectionType::LegacyPit8254, buf, sizeof(buf));
+        }
+
+        // ---------------- Per PCI device ----------------
+        // Walk in pbus insertion order. Each device is a PciTransport (we
+        // don't have any other PciDevice flavours wired into pbus right
+        // now). Cast down to capture virtio-class state.
+        ctx.pbus.ForEachDevice([&](p::Bdf bdf, p::PciDevice& pd) {
+            auto* xport = dynamic_cast<v::PciTransport*>(&pd);
+            if (!xport) {
+                // Not a virtio transport; just persist generic PciDevice + MsiX.
+                {
+                    std::vector<std::uint8_t> bytes;
+                    p::PciDevice::EncodeState(pd.CaptureState(), bytes);
+                    svcpu_enc::PrependBdf(bdf, bytes);
+                    w.WriteSection(snap::SectionType::PciDevice,
+                                   bytes.data(), bytes.size());
+                }
+                return;
+            }
+
+            // PciDevice base
+            {
+                std::vector<std::uint8_t> bytes;
+                p::PciDevice::EncodeState(
+                    static_cast<const p::PciDevice&>(*xport).CaptureState(),
+                    bytes);
+                svcpu_enc::PrependBdf(bdf, bytes);
+                w.WriteSection(snap::SectionType::PciDevice,
+                               bytes.data(), bytes.size());
+            }
+
+            // Virtio-device-specific State (dispatched on virtio device id)
+            v::Device& vdev = xport->device();
+            switch (vdev.DeviceId()) {
+            case v::kDeviceIdRng: {
+                auto& d = static_cast<v::RngDevice&>(vdev);
+                std::vector<std::uint8_t> bytes;
+                v::RngDevice::EncodeState(d.CaptureState(), bytes);
+                svcpu_enc::PrependBdf(bdf, bytes);
+                w.WriteSection(snap::SectionType::VirtioRngState,
+                               bytes.data(), bytes.size());
+                break;
+            }
+            case v::kDeviceIdConsole: {
+                auto& d = static_cast<v::ConsoleDevice&>(vdev);
+                std::vector<std::uint8_t> bytes;
+                v::ConsoleDevice::EncodeState(d.CaptureState(), bytes);
+                svcpu_enc::PrependBdf(bdf, bytes);
+                w.WriteSection(snap::SectionType::VirtioConsoleState,
+                               bytes.data(), bytes.size());
+                break;
+            }
+            case v::kDeviceIdBlk: {
+                auto& d = static_cast<v::BlockDevice&>(vdev);
+                std::vector<std::uint8_t> bytes;
+                v::BlockDevice::EncodeState(d.CaptureState(), bytes);
+                svcpu_enc::PrependBdf(bdf, bytes);
+                w.WriteSection(snap::SectionType::VirtioBlkState,
+                               bytes.data(), bytes.size());
+                break;
+            }
+            default:
+                // virtio-net (1) and virtio-9p (9) are intentionally
+                // unsupported for save: --save refuses to start if --net
+                // or --virtio-9p-share is present. If we get here, it's a
+                // policy bug.
+                throw std::runtime_error(
+                    "WriteSnapshotFile: unsupported virtio device on save path");
+            }
+
+            // Virtqueue per queue
+            for (std::uint32_t qi = 0; qi < vdev.QueueCount(); ++qi) {
+                v::Virtqueue* q = vdev.GetQueue(qi);
+                if (!q) continue;
+                std::vector<std::uint8_t> bytes;
+                v::Virtqueue::EncodeState(q->CaptureState(), bytes);
+                svcpu_enc::PrependBdfQ(bdf, static_cast<std::uint16_t>(qi),
+                                       bytes);
+                w.WriteSection(snap::SectionType::Virtqueue,
+                               bytes.data(), bytes.size());
+            }
+
+            // MsiX
+            {
+                std::vector<std::uint8_t> bytes;
+                p::MsiX::EncodeState(xport->msix().CaptureState(), bytes);
+                svcpu_enc::PrependBdf(bdf, bytes);
+                w.WriteSection(snap::SectionType::MsixState,
+                               bytes.data(), bytes.size());
+            }
+
+            // PciTransport (LAST -- mirrors apply order, so on restore the
+            // BAR remap stamps over any cfg + queue state we just wrote)
+            {
+                std::vector<std::uint8_t> bytes;
+                v::PciTransport::EncodeState(xport->CaptureState(), bytes);
+                svcpu_enc::PrependBdf(bdf, bytes);
+                w.WriteSection(snap::SectionType::VirtioPciTransport,
+                               bytes.data(), bytes.size());
+            }
+        });
+
+        // ---------------- RAM (LAST per rubber-duck recommendation) -----
+        // Largest section; emit last so a writer crash leaves smaller
+        // metadata uncorrupted (CRC trailer catches any truncation).
+        w.WriteSection(snap::SectionType::RamRaw,
+                       ctx.ram.host_base(), ctx.ram.size());
+
+        w.Finalize();
+        std::printf("[snapshot] wrote %llu bytes to %s\n",
+                    static_cast<unsigned long long>(w.bytes_written()),
+                    out_path.c_str());
+        return 0;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr,
+            "[snapshot] FAIL: %s\n", e.what());
+        return 4;
+    }
+}
+
 int RunPvhRun(const char* path, const std::string& cmdline,
               bool with_net,
               NetBackendKind net_backend,
@@ -1885,7 +2461,8 @@ int RunPvhRun(const char* path, const std::string& cmdline,
               std::uint32_t ram_mb = 256,
               std::uint32_t vcpu_count = 1,
               tinyvmm::whp::AffinityMode affinity_mode =
-                  tinyvmm::whp::AffinityMode::All) {
+                  tinyvmm::whp::AffinityMode::All,
+              std::uint16_t gdb_port = 0) {
     using namespace tinyvmm;
     using namespace tinyvmm::whp;
 
@@ -1902,6 +2479,12 @@ int RunPvhRun(const char* path, const std::string& cmdline,
 
     if (vcpu_count == 0) vcpu_count = 1;
     if (vcpu_count > boot::acpi::kMaxVcpus) vcpu_count = boot::acpi::kMaxVcpus;
+    if (gdb_port != 0 && vcpu_count != 1) {
+        std::fprintf(stderr,
+            "[pvh-run] --gdb-port requires --vcpus 1 (got %u). "
+            "Multi-vCPU debugging is M35 v2.\n", vcpu_count);
+        return 1;
+    }
 
     Partition part(vcpu_count);
     // Enable CPUID + MSR exits. CPUID lets us layer tinyvmm policy
@@ -1910,7 +2493,25 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     // Hyper-V Reference TSC page + TSC-invariant-control MSRs that Linux
     // writes once it detects Hyper-V via the CPUID leaves. See
     // `whp/cpuid.cpp` and `whp/hv_enlightenment.cpp`.
-    part.EnableExtendedExits({.cpuid = true, .msr = true});
+    //
+    // M35 GDB stub also wants exception exits for #DB (single-step) and
+    // #BP (int3 software breakpoint). The exception bitmap is set
+    // *only* when --gdb-port is in effect so non-debug runs stay on
+    // the existing fast path.
+    part.EnableExtendedExits({
+        .cpuid = true, .msr = true,
+        .exception = (gdb_port != 0),
+    });
+    if (gdb_port != 0) {
+        // M35.0 Phase 1: handshake only; the run loop is not yet wired
+        // to handle #DB / #BP. Set the bitmap to 0 (no exceptions
+        // intercepted) so kernel-internal int3 (text_poke) and #DB
+        // (kgdb/ftrace) don't crash the run loop. Phase 4 (M35.3/.5)
+        // will add #BP=bit3 plus a proper handler that either reports
+        // a breakpoint to GDB or re-injects the exception into the
+        // guest.
+        part.SetExceptionExitBitmap(0);
+    }
     // Also publish the same overrides as a static CpuidResultList. WHP's
     // in-hypervisor LAPIC emulation makes architectural feature decisions at
     // SetupPartition time based on this list -- NOT on what our runtime
@@ -2667,6 +3268,30 @@ int RunPvhRun(const char* path, const std::string& cmdline,
     // those one-time host-side bring-up steps run on the whole machine.
     (void)whp::PinCurrentThread(cpu_set_ids);
 
+    // M35: GDB Remote Serial Protocol stub. Constructed lazily based
+    // on --gdb-port. When set, halts the BSP before the first guest
+    // instruction and waits for a real gdb to connect, so the user
+    // can set breakpoints before the kernel runs.
+    std::unique_ptr<tinyvmm::debug::GdbStub> gdb_stub;
+    if (gdb_port != 0) {
+        gdb_stub = std::make_unique<tinyvmm::debug::GdbStub>(
+            part, vcpus[0], ram, gdb_port);
+        gdb_stub->WaitForFirstConnection();
+        // Block until GDB issues continue / step. Pass 0xFF as the
+        // "entry pause" sentinel (the stub reports SIGINT for this).
+        WHV_REGISTER_NAME rn = WHvX64RegisterRip;
+        WHV_REGISTER_VALUE rv{};
+        vcpus[0].GetRegisters(std::span(&rn, 1), std::span(&rv, 1));
+        auto action = gdb_stub->ReportStop(/*vec=*/0xFF, rv.Reg64);
+        if (action == tinyvmm::debug::GdbStub::Action::Shutdown) {
+            std::fprintf(stderr, "[gdbstub] detached at entry; exiting\n");
+            return 0;
+        }
+        // Single-step on entry isn't supported in M35.0 (no exception
+        // exit wiring yet); treat as continue.
+        std::fprintf(stderr, "[gdbstub] resuming guest\n");
+    }
+
     StopReason stop = StopReason::Cancelled;
     try {
         stop = loop.Run();
@@ -2702,6 +3327,31 @@ int RunPvhRun(const char* path, const std::string& cmdline,
         if (auto* b = net->backend()) b->Stop();
     }
 
+    // M33.6: if a snapshot was requested, drain any virtio-blk in-flight
+    // requests BEFORE we Stop() the IOCP workers. With workers still
+    // running, OnComplete callbacks decrement PendingCount() naturally as
+    // OS-level I/Os finish. Refuse the snapshot (return non-zero) if we
+    // can't drain within the timeout -- a partially-completed request
+    // would leave the virtqueue head consumed but the used-ring entry not
+    // posted, and on restore the guest would wait forever for it.
+    // The drain is also a defensive no-op for the non-snapshot path:
+    // PendingCount() should already be zero whenever the guest reached
+    // its own quiesce point (sync; poweroff; etc.).
+    const bool snapshot_requested =
+        ::tinyvmm::whp::snapshot::WasRequested();
+    if (snapshot_requested) {
+        if (!DrainBlockBackends(blk_devices, /*timeout_ms=*/5000)) {
+            std::fprintf(stderr,
+                "[snapshot] FAIL: virtio-blk drain timed out after 5s "
+                "(some device still has in-flight requests); refusing to "
+                "write snapshot.\n");
+            // Still need to Stop() the IOCP workers below to avoid a
+            // dangling-callback UAF in ~BlockDevice, then return non-zero.
+            for (auto& b : blk_backends) b->Stop();
+            return 2;
+        }
+    }
+
     // Quiesce every virtio-blk IOCP worker before the BlockDevice owners
     // (in blk_devices) get destroyed. Otherwise a completion landing
     // after BlockDevice is gone but before BlockFile::~BlockFile runs Stop
@@ -2720,7 +3370,8 @@ int RunPvhRun(const char* path, const std::string& cmdline,
         auto& d = blk_devices[i];
         std::printf("[pvh-run] virtio-blk[%zu] stats: submitted=%llu "
                     "completed=%llu errors=%llu max_inflight=%llu "
-                    "(virtio in=%llu out=%llu flush=%llu err=%llu)\n",
+                    "(virtio in=%llu out=%llu flush=%llu discard=%llu "
+                    "wz=%llu err=%llu)\n",
                     i,
                     static_cast<unsigned long long>(b->submitted()),
                     static_cast<unsigned long long>(b->completed()),
@@ -2729,7 +3380,47 @@ int RunPvhRun(const char* path, const std::string& cmdline,
                     static_cast<unsigned long long>(d->ops_in()),
                     static_cast<unsigned long long>(d->ops_out()),
                     static_cast<unsigned long long>(d->ops_flush()),
+                    static_cast<unsigned long long>(d->ops_discard()),
+                    static_cast<unsigned long long>(d->ops_write_zeroes()),
                     static_cast<unsigned long long>(d->ops_err()));
+    }
+
+    // M33.6 production snapshot writer. By the time we get here all
+    // vCPUs are stopped, the net backend (if any) is Stop()'d, every
+    // virtio-blk IOCP worker is Stop()'d, and PendingCount() drained to
+    // zero (or we would have returned 2 above). Now it's safe to walk
+    // the device tree, capture all per-class state, and write the file.
+    if (snapshot_requested) {
+        const auto& st = ::tinyvmm::whp::snapshot::State();
+        std::printf(
+            "[snapshot] trigger fired from vp=%u; capturing to '%s'\n",
+            st.requesting_vp_index.load(std::memory_order_acquire),
+            st.save_path.c_str());
+
+        SnapshotWriteContext sctx{
+            /*part_handle*/        part.handle(),
+            /*vcpu_count*/         vcpu_count,
+            /*vcpus*/              vcpus,
+            /*ram*/                ram,
+            /*large_pages*/        ram.large_pages(),
+            /*hv*/                 hv,
+            /*com1*/               com1,
+            /*pic*/                pic,
+            /*pit*/                pit,
+            /*legacy*/             legacy,
+            /*pbus*/               *pbus,
+            /*blk_backends*/       blk_backends,
+            /*blk_devices*/        blk_devices,
+            /*drives*/             drives,
+            /*hide_tsc_deadline*/  hide_tsc_deadline,
+            /*tsc_hz*/             ::tinyvmm::whp::GetCachedTscHz(),
+        };
+        const int rc = WriteSnapshotFile(st.save_path, sctx);
+        if (rc != 0) {
+            return rc;
+        }
+        btimer.Mark("snapshot written");
+        return 0;
     }
 
     // Dump the guest's view of itself at the moment we stopped, so we can
@@ -2963,6 +3654,1068 @@ int RunPvhRun(const char* path, const std::string& cmdline,
                          n / (1024 * 1024), dump_path);
         }
     }
+    return 0;
+}
+
+// ===========================================================================
+// M33.6 production --restore main path.
+//
+// Parallel to RunPvhRun but bypasses PVH load + kernel setup. Instead reads
+// a TVMMSAVE snapshot file, reconstructs partition + RAM + devices to match
+// the saved topology, applies all per-class state in the rubber-duck-approved
+// order, then enters the vCPU run loops as if the kernel had just been
+// pre-empted past the CPUID trigger.
+//
+// Snapshot-time restrictions enforced at --save: no --net, no
+// --virtio-9p-share. Drives may be RO (default) or mutable (with explicit
+// --unsafe-save-mutable-drive). --restore mirrors those restrictions and
+// additionally rejects PVH-only flags (--initrd, vmlinux positional,
+// cmdline override, --net, --virtio-9p-share).
+//
+// Apply ordering (must match WriteSnapshotFile section ordering with the
+// crucial inversion that RAM is *read* last but *applied* first, since
+// device state references RAM contents):
+//   1. memcpy RAM into ram.host_base()
+//   2. hv.ApplyState
+//   3. Legacy: PciBus, IsaStubs, Serial, PIC, PIT (Apply only; no Resume)
+//   4. Per-PCI device: PciDevice -> virtio-class State -> per Virtqueue
+//      -> MsiX -> PciTransport (PciTransport last installs BAR handlers)
+//   5. Per-vCPU NonTiming (arch + xsave + apic + intr_ctl)
+//   6. ResumeRuntime: PIC -> Serial -> PIT (now that LAPICs are loaded
+//      with interrupt state, the deferred PIC IRR replay + Serial TX IRQ
+//      re-edge + PIT IRQ thread start can flow through naturally)
+//   7. Per-vCPU Timing back-to-back across all vCPUs (TSC skew min)
+//   8. Start blk_backends (after PCI+virtio state applied so completions
+//      land in fully-restored devices)
+//   9. Construct RunLoops, spawn AP threads, BSP runs loops[0]
+// ===========================================================================
+
+int RunRestore(const std::string& snapshot_path,
+               const std::vector<DriveSpec>& drive_overrides,
+               bool unsafe_restore_mutable_drive,
+               int watchdog_secs,
+               tinyvmm::whp::AffinityMode affinity_mode) {
+    using namespace tinyvmm;
+    using namespace tinyvmm::whp;
+    namespace snap = ::tinyvmm::whp::snapshot;
+    namespace dev  = ::tinyvmm::devices;
+    namespace p    = ::tinyvmm::pci;
+    namespace v    = ::tinyvmm::virtio;
+
+    diag::EtwRegister();
+    diag::BootTimer btimer;
+    btimer.Mark("restore start");
+
+    CheckWhpAvailable();
+    btimer.Mark("WHP probe done");
+    std::puts("[restore] WHP available");
+    ReportHostCapabilities();
+
+    // ---------------- 1. Parse snapshot header --------------------------
+    snap::SnapshotReader rdr(snapshot_path);
+    std::string header_json = rdr.ReadHeader();
+    snap::JsonObjectReader jr(header_json);
+
+    const std::uint32_t vcpu_count_raw =
+        static_cast<std::uint32_t>(jr.GetUint("vcpu_count"));
+    const std::uint64_t ram_size_bytes = jr.GetUint("ram_size_bytes");
+    const bool large_pages       = jr.GetBool("large_pages");
+    const std::uint64_t tsc_hz_saved   = jr.GetUint("tsc_hz_at_save");
+    const bool hide_tsc_deadline       = jr.GetBool("hide_tsc_deadline");
+    const std::uint64_t drive_count    = jr.GetUint("drive_count");
+
+    if (vcpu_count_raw == 0 || vcpu_count_raw > boot::acpi::kMaxVcpus) {
+        std::fprintf(stderr,
+            "[restore] FAIL: header vcpu_count=%u out of range [1,%u]\n",
+            vcpu_count_raw,
+            static_cast<unsigned>(boot::acpi::kMaxVcpus));
+        return 3;
+    }
+    const std::uint32_t vcpu_count = vcpu_count_raw;
+
+    // Validate host TSC matches saved TSC (Reference TSC page math depends
+    // on it; mismatched TSC frequency would skew the guest's wall clock by
+    // the ratio). Rubber-duck blocking finding E.
+    //
+    // Use a 100 ppm tolerance band rather than exact equality. The
+    // host's tsc_hz is calibrated via a one-shot QPC measurement (see
+    // whp::GetCachedTscHz) which has ~1 ppm jitter across process
+    // launches even on the same physical host. Two consecutive
+    // tinyvmm runs that save-then-restore can easily differ by
+    // hundreds of Hz out of ~3 GHz. The guest's notion of time is
+    // anchored to the SAVED tsc_hz (HvEnlightenment is constructed
+    // with tsc_hz_saved below, so the Reference TSC page math uses
+    // saved scale/offset). The check is here purely to catch a
+    // restore on a fundamentally different CPU (e.g., laptop docking
+    // into a different TB box) where tsc_hz could jump by MHz.
+    //
+    // Worst-case 100 ppm = ~8.6 s/day of guest-vs-host time drift,
+    // which is well inside normal NTP correction range for any guest
+    // that runs ntpd/chrony. Tighter than 100 ppm risks spurious
+    // refusal; looser starts to matter for short-lived workloads.
+    const std::uint64_t tsc_hz_host = ::tinyvmm::whp::GetCachedTscHz();
+    {
+        const std::uint64_t lo = std::min(tsc_hz_host, tsc_hz_saved);
+        const std::uint64_t hi = std::max(tsc_hz_host, tsc_hz_saved);
+        const std::uint64_t diff = hi - lo;
+        // diff_ppm = diff * 1e6 / lo (saturating: lo is always
+        // ~10^9-ish so this fits in uint64).
+        const std::uint64_t diff_ppm =
+            (lo == 0) ? UINT64_MAX
+                      : (diff * 1'000'000ULL) / lo;
+        constexpr std::uint64_t kMaxDriftPpm = 100;
+        if (diff_ppm > kMaxDriftPpm) {
+            std::fprintf(stderr,
+                "[restore] FAIL: host tsc_hz=%llu but snapshot was taken at "
+                "tsc_hz=%llu (drift=%llu ppm > %llu ppm tolerance); refuse "
+                "to restore (Reference TSC page math would skew the guest "
+                "clock)\n",
+                static_cast<unsigned long long>(tsc_hz_host),
+                static_cast<unsigned long long>(tsc_hz_saved),
+                static_cast<unsigned long long>(diff_ppm),
+                static_cast<unsigned long long>(kMaxDriftPpm));
+            return 5;
+        }
+        if (diff_ppm > 0) {
+            std::fprintf(stderr,
+                "[restore] note: host tsc_hz=%llu, snapshot tsc_hz=%llu "
+                "(drift=%llu ppm, within %llu ppm tolerance); using saved "
+                "tsc_hz for Reference TSC page math\n",
+                static_cast<unsigned long long>(tsc_hz_host),
+                static_cast<unsigned long long>(tsc_hz_saved),
+                static_cast<unsigned long long>(diff_ppm),
+                static_cast<unsigned long long>(kMaxDriftPpm));
+        }
+    }
+
+    // Build drive specs from header, applying CLI overrides if provided.
+    // For each saved drive: validate file exists, size matches, readonly
+    // matches (or unsafe-restore-mutable-drive opts out).
+    std::vector<DriveSpec> drives;
+    std::vector<std::uint64_t> saved_drive_sizes;
+    drives.reserve(static_cast<std::size_t>(drive_count));
+    saved_drive_sizes.reserve(static_cast<std::size_t>(drive_count));
+    for (std::size_t i = 0; i < drive_count; ++i) {
+        char key[40];
+        DriveSpec ds;
+        std::snprintf(key, sizeof(key), "drive%zu_path", i);
+        ds.path = jr.GetString(key);
+        std::snprintf(key, sizeof(key), "drive%zu_readonly", i);
+        ds.readonly = jr.GetBool(key);
+        std::snprintf(key, sizeof(key), "drive%zu_size", i);
+        saved_drive_sizes.push_back(jr.GetUint(key));
+        if (i < drive_overrides.size() && !drive_overrides[i].path.empty()) {
+            // Override path with operator-supplied one; require readonly to
+            // match unless --unsafe-restore-mutable-drive is in effect.
+            ds.path = drive_overrides[i].path;
+            if (drive_overrides[i].readonly != ds.readonly &&
+                !unsafe_restore_mutable_drive) {
+                std::fprintf(stderr,
+                    "[restore] FAIL: --drive %zu readonly=%d but snapshot has "
+                    "readonly=%d; pass --unsafe-restore-mutable-drive to "
+                    "override\n",
+                    i, drive_overrides[i].readonly ? 1 : 0,
+                    ds.readonly ? 1 : 0);
+                return 6;
+            }
+            ds.readonly = drive_overrides[i].readonly;
+        }
+        drives.push_back(std::move(ds));
+    }
+
+    // ---------------- 2. Construct Partition + RAM + HV ----------------
+    Partition part(vcpu_count);
+    part.EnableExtendedExits({.cpuid = true, .msr = true});
+    SetHideTscDeadline(hide_tsc_deadline);
+    const auto static_cpuid =
+        BuildStaticCpuidResultList(hide_tsc_deadline);
+    part.SetCpuidResultList(static_cpuid.data(), static_cpuid.size());
+    part.SetLocalApicEmulation(WHvX64LocalApicEmulationModeX2Apic);
+    part.Setup();
+
+    GuestMemory ram(part, /*gpa=*/0,
+                    static_cast<std::size_t>(ram_size_bytes),
+                    /*executable=*/true);
+    btimer.Mark("guest RAM mapped");
+    std::printf("[restore] guest RAM: %zu MiB at GPA 0 (%s, header asked %s)\n",
+                ram.size() / (1024 * 1024),
+                ram.large_pages() ? "MEM_LARGE_PAGES" : "4 KiB pages",
+                large_pages ? "MEM_LARGE_PAGES" : "4 KiB pages");
+
+    HvEnlightenment hv(ram, tsc_hz_saved);
+    std::printf("[restore] Hyper-V enlightenment ready (tsc_hz=%llu)\n",
+                static_cast<unsigned long long>(hv.tsc_hz()));
+
+    // ---------------- 3. Construct vCPUs (no PVH setup!) ----------------
+    std::deque<Vcpu> vcpus;
+    for (std::uint32_t i = 0; i < vcpu_count; ++i) {
+        vcpus.emplace_back(part, i);
+    }
+
+    // ---------------- 4. Construct device tree --------------------------
+    devices::IoBus io_bus;
+    devices::MmioBus mmio_bus;
+    devices::Serial8250 com1(0x3F8, stdout);
+    com1.Attach(io_bus);
+    devices::Pit8254 pit;
+    pit.Attach(io_bus);
+    devices::LegacyIsaStubs legacy;
+    legacy.Attach(io_bus);
+
+    WHV_PARTITION_HANDLE ph = part.handle();
+    auto pic_inject = [ph](std::uint8_t vector,
+                           std::uint32_t destination) -> bool {
+        WHV_INTERRUPT_CONTROL ctrl = {};
+        ctrl.Type            = WHvX64InterruptTypeFixed;
+        ctrl.DestinationMode = WHvX64InterruptDestinationModePhysical;
+        ctrl.TriggerMode     = WHvX64InterruptTriggerModeEdge;
+        ctrl.Destination     = destination;
+        ctrl.Vector          = vector;
+        return SUCCEEDED(WHvRequestInterrupt(ph, &ctrl, sizeof(ctrl)));
+    };
+    devices::Pic8259 pic(pic_inject);
+    pic.Attach(io_bus);
+    com1.SetIrqCallback([&pic](int isa_irq) { pic.Raise(isa_irq); });
+    (void)pit;  // pit.SetIrqCallback intentionally not called (matches PVH path).
+
+    auto pbus = std::make_unique<pci::PciBus>();
+    pbus->AttachIoBus(io_bus);
+
+    auto inject_fn = [ph](std::uint64_t addr, std::uint32_t data) {
+        return SUCCEEDED(InjectMsi(ph, addr, data));
+    };
+
+    // Construct virtio devices in EXACTLY the same order RunPvhRun does
+    // so BDF assignments match the saved topology: rng -> console -> blk[i].
+    // M33.6 explicitly rejects --net and --virtio-9p-share both at save
+    // time and at restore time, so we never construct those classes here.
+    std::vector<p::Bdf> all_bdfs;
+
+    auto rng = std::make_unique<v::RngDevice>(ram);
+    p::Bdf rng_bdf{};
+    {
+        v::PciTransport::Options ropts;
+        ropts.subsys_id        = static_cast<std::uint16_t>(v::kDeviceIdRng);
+        ropts.num_msix_vectors = 2;
+        ropts.pci_class        = 0xFF;
+        ropts.pci_subclass     = 0x00;
+        auto rxport = std::make_unique<v::PciTransport>(
+            *rng, ropts, mmio_bus, inject_fn);
+        v::PciTransport* rxp = rxport.get();
+        rng->SetIrqCallback(
+            [rxp](std::uint32_t q) { rxp->RaiseQueueInterrupt(q); });
+        rxport->set_name("virtio-pci-rng");
+        rng_bdf = pbus->AddDevice(std::move(rxport));
+        all_bdfs.push_back(rng_bdf);
+        std::printf("[restore] virtio-rng on PCI %02x:%02x.%u\n",
+                    rng_bdf.bus, rng_bdf.device, rng_bdf.function);
+    }
+
+    auto vcon = std::make_unique<v::ConsoleDevice>(ram, stdout);
+    v::ConsoleDevice* vcon_ptr = vcon.get();
+    p::Bdf vcon_bdf{};
+    // Restore-time shutdown sentinel watcher (mirrors RunPvhRun).
+    auto shutdown_requested =
+        std::make_shared<std::atomic<bool>>(false);
+    {
+        static constexpr const char* kShutdownSentinel =
+            "[init] === tinyvmm shutdown requested ===";
+        auto pending_buf  = std::make_shared<std::string>();
+        auto pending_mu   = std::make_shared<std::mutex>();
+        vcon->SetByteObserver([pending_buf, pending_mu, shutdown_requested]
+                              (const char* d, std::size_t n) {
+            std::lock_guard<std::mutex> lg(*pending_mu);
+            pending_buf->append(d, n);
+            if (pending_buf->size() > 4096) {
+                pending_buf->erase(0, pending_buf->size() - 2048);
+            }
+            if (!shutdown_requested->load(std::memory_order_relaxed) &&
+                pending_buf->find(kShutdownSentinel) != std::string::npos) {
+                shutdown_requested->store(true, std::memory_order_release);
+            }
+        });
+
+        v::PciTransport::Options copts;
+        copts.subsys_id        = static_cast<std::uint16_t>(v::kDeviceIdConsole);
+        copts.num_msix_vectors = 3;
+        copts.pci_class        = 0x07;
+        copts.pci_subclass     = 0x80;
+        auto cxport = std::make_unique<v::PciTransport>(
+            *vcon, copts, mmio_bus, inject_fn);
+        v::PciTransport* cxp = cxport.get();
+        vcon->SetIrqCallback(
+            [cxp](std::uint32_t q) { cxp->RaiseQueueInterrupt(q); });
+        cxport->set_name("virtio-pci-console");
+        vcon_bdf = pbus->AddDevice(std::move(cxport));
+        all_bdfs.push_back(vcon_bdf);
+        std::printf("[restore] virtio-console on PCI %02x:%02x.%u "
+                    "(sink=stdout)\n",
+                    vcon_bdf.bus, vcon_bdf.device, vcon_bdf.function);
+    }
+
+    std::vector<std::unique_ptr<host::BlockFile>>    blk_backends;
+    std::vector<std::unique_ptr<v::BlockDevice>>     blk_devices;
+    std::vector<p::Bdf>                              blk_bdfs;
+    blk_backends.reserve(drives.size());
+    blk_devices.reserve(drives.size());
+    blk_bdfs.reserve(drives.size());
+    for (std::size_t i = 0; i < drives.size(); ++i) {
+        const auto& d = drives[i];
+        std::wstring wpath = std::filesystem::path(d.path).wstring();
+        auto backend = std::make_unique<host::BlockFile>(wpath, d.readonly);
+        if (!backend->open()) {
+            std::fprintf(stderr,
+                "[restore] FAIL: drive %zu '%s' failed to open "
+                "(readonly=%d): hr=0x%08lx\n",
+                i, d.path.c_str(), d.readonly ? 1 : 0,
+                static_cast<unsigned long>(backend->open_hr()));
+            return 4;
+        }
+        if (backend->size() != saved_drive_sizes[i]) {
+            std::fprintf(stderr,
+                "[restore] FAIL: drive %zu '%s' size=%llu but snapshot "
+                "expected size=%llu\n",
+                i, d.path.c_str(),
+                static_cast<unsigned long long>(backend->size()),
+                static_cast<unsigned long long>(saved_drive_sizes[i]));
+            return 6;
+        }
+
+        auto blk = std::make_unique<v::BlockDevice>(
+            ram, *backend, v::BlockDevice::IrqFn{}, /*queue_max=*/256);
+        v::BlockDevice* bp = blk.get();
+        v::PciTransport::Options opts;
+        opts.subsys_id        = static_cast<std::uint16_t>(v::kDeviceIdBlk);
+        opts.num_msix_vectors = 2;
+        opts.pci_class        = 0x01;
+        opts.pci_subclass     = 0x00;
+        auto xport = std::make_unique<v::PciTransport>(
+            *bp, opts, mmio_bus, inject_fn);
+        v::PciTransport* xp = xport.get();
+        bp->SetIrqCallback(
+            [xp](std::uint32_t q) { xp->RaiseQueueInterrupt(q); });
+        char nbuf[32];
+        std::snprintf(nbuf, sizeof(nbuf), "virtio-pci-blk[%zu]", i);
+        xport->set_name(nbuf);
+        // NOTE: Do NOT call backend->Start() here. We hold off until AFTER
+        // device state has been applied below, so an early IOCP completion
+        // can't fire into a half-restored BlockDevice.
+        const p::Bdf bbdf = pbus->AddDevice(std::move(xport));
+        all_bdfs.push_back(bbdf);
+        blk_bdfs.push_back(bbdf);
+        std::printf("[restore] virtio-blk[%zu] on PCI %02x:%02x.%u "
+                    "path=%s%s capacity=%llu sectors\n",
+                    i, bbdf.bus, bbdf.device, bbdf.function,
+                    d.path.c_str(), d.readonly ? " (ro)" : "",
+                    static_cast<unsigned long long>(backend->size() / 512));
+        blk_backends.push_back(std::move(backend));
+        blk_devices .push_back(std::move(blk));
+    }
+
+    btimer.Mark("device tree constructed");
+
+    // ---------------- 5. Read ALL sections into typed maps --------------
+    // We collect first, validate cardinality, then apply. Doing it in one
+    // pass would tangle ordering invariants with parsing diagnostics.
+    struct SectionMaps {
+        std::vector<std::uint8_t> ram;
+        std::vector<std::uint8_t> hv;
+        std::vector<std::uint8_t> legacy_pcibus;
+        std::vector<std::uint8_t> legacy_isa;
+        std::vector<std::uint8_t> serial;
+        std::vector<std::uint8_t> pic;
+        std::vector<std::uint8_t> pit;
+        // Per-vCPU sections (indexed by vp_idx, default empty).
+        std::vector<std::vector<std::uint8_t>> vcpu_regs;
+        std::vector<std::vector<std::uint8_t>> vcpu_xsave;
+        std::vector<std::vector<std::uint8_t>> vcpu_apic;
+        std::vector<std::vector<std::uint8_t>> vcpu_intr;
+        std::vector<std::vector<std::uint8_t>> vcpu_sup_msr;
+        std::vector<std::vector<std::uint8_t>> vcpu_timing;
+        // Per-BDF generic + virtio.
+        std::map<std::uint32_t, std::vector<std::uint8_t>> pci_device;
+        std::map<std::uint32_t, std::vector<std::uint8_t>> msix;
+        std::map<std::uint32_t, std::vector<std::uint8_t>> transport;
+        std::map<std::uint32_t, std::vector<std::uint8_t>> rng_state;
+        std::map<std::uint32_t, std::vector<std::uint8_t>> console_state;
+        std::map<std::uint32_t, std::vector<std::uint8_t>> blk_state;
+        // (BDF, qidx) -> Virtqueue payload bytes.
+        std::map<std::uint64_t, std::vector<std::uint8_t>> virtqueues;
+    };
+    SectionMaps maps;
+    maps.vcpu_regs   .resize(vcpu_count);
+    maps.vcpu_xsave  .resize(vcpu_count);
+    maps.vcpu_apic   .resize(vcpu_count);
+    maps.vcpu_intr   .resize(vcpu_count);
+    maps.vcpu_sup_msr.resize(vcpu_count);
+    maps.vcpu_timing .resize(vcpu_count);
+
+    // Strip the M33.4 BDF / BDF+Q prefix from a section payload. Returns
+    // the BDF key. For VIRTQUEUE: also writes the qidx out.
+    auto strip_bdf = [](std::span<const std::uint8_t> pp,
+                        std::uint32_t& key_out) -> std::span<const std::uint8_t> {
+        if (pp.size() < 4) {
+            throw std::runtime_error("section: BDF prefix truncated");
+        }
+        key_out = svcpu_enc::BdfKey(pp[0], pp[1], pp[2]);
+        // pp[3] is reserved=0.
+        return pp.subspan(4);
+    };
+    auto strip_bdf_q = [](std::span<const std::uint8_t> pp,
+                          std::uint32_t& key_out,
+                          std::uint16_t& qidx_out)
+        -> std::span<const std::uint8_t> {
+        if (pp.size() < 8) {
+            throw std::runtime_error("section: BDF+Q prefix truncated");
+        }
+        key_out  = svcpu_enc::BdfKey(pp[0], pp[1], pp[2]);
+        qidx_out = static_cast<std::uint16_t>(pp[4] |
+                       (static_cast<std::uint16_t>(pp[5]) << 8));
+        return pp.subspan(8);
+    };
+    // Look up a vp_idx from the first 4 bytes of a per-vCPU section.
+    auto peek_vp_idx = [](std::span<const std::uint8_t> pp) -> std::uint32_t {
+        if (pp.size() < 4) {
+            throw std::runtime_error("vCPU section: header too small");
+        }
+        return snap::ReadLe32(&pp[0]);
+    };
+
+    while (auto sec = rdr.NextSection()) {
+        switch (sec->type) {
+        case snap::SectionType::RamRaw:
+            maps.ram.assign(sec->payload.begin(), sec->payload.end());
+            break;
+        case snap::SectionType::HvEnlightenment:
+            maps.hv.assign(sec->payload.begin(), sec->payload.end());
+            break;
+        case snap::SectionType::LegacyPciBus:
+            maps.legacy_pcibus.assign(sec->payload.begin(), sec->payload.end());
+            break;
+        case snap::SectionType::LegacyIsaStubs:
+            maps.legacy_isa.assign(sec->payload.begin(), sec->payload.end());
+            break;
+        case snap::SectionType::LegacySerial8250:
+            maps.serial.assign(sec->payload.begin(), sec->payload.end());
+            break;
+        case snap::SectionType::LegacyPic8259:
+            maps.pic.assign(sec->payload.begin(), sec->payload.end());
+            break;
+        case snap::SectionType::LegacyPit8254:
+            maps.pit.assign(sec->payload.begin(), sec->payload.end());
+            break;
+        case snap::SectionType::VcpuRegs: {
+            std::uint32_t vi = peek_vp_idx(sec->payload);
+            if (vi >= vcpu_count) throw std::runtime_error("VcpuRegs vp_idx OOR");
+            maps.vcpu_regs[vi].assign(sec->payload.begin(), sec->payload.end());
+            break;
+        }
+        case snap::SectionType::VcpuXsave: {
+            std::uint32_t vi = peek_vp_idx(sec->payload);
+            if (vi >= vcpu_count) throw std::runtime_error("VcpuXsave vp_idx OOR");
+            maps.vcpu_xsave[vi].assign(sec->payload.begin(), sec->payload.end());
+            break;
+        }
+        case snap::SectionType::VcpuApic: {
+            std::uint32_t vi = peek_vp_idx(sec->payload);
+            if (vi >= vcpu_count) throw std::runtime_error("VcpuApic vp_idx OOR");
+            maps.vcpu_apic[vi].assign(sec->payload.begin(), sec->payload.end());
+            break;
+        }
+        case snap::SectionType::VcpuIntrCtl: {
+            std::uint32_t vi = peek_vp_idx(sec->payload);
+            if (vi >= vcpu_count) throw std::runtime_error("VcpuIntrCtl vp_idx OOR");
+            maps.vcpu_intr[vi].assign(sec->payload.begin(), sec->payload.end());
+            break;
+        }
+        case snap::SectionType::VcpuSupMsr: {
+            std::uint32_t vi = peek_vp_idx(sec->payload);
+            if (vi >= vcpu_count) throw std::runtime_error("VcpuSupMsr vp_idx OOR");
+            maps.vcpu_sup_msr[vi].assign(sec->payload.begin(), sec->payload.end());
+            break;
+        }
+        case snap::SectionType::VcpuTiming: {
+            std::uint32_t vi = peek_vp_idx(sec->payload);
+            if (vi >= vcpu_count) throw std::runtime_error("VcpuTiming vp_idx OOR");
+            maps.vcpu_timing[vi].assign(sec->payload.begin(), sec->payload.end());
+            break;
+        }
+        case snap::SectionType::PciDevice: {
+            std::uint32_t key = 0;
+            auto rest = strip_bdf(sec->payload, key);
+            maps.pci_device[key].assign(rest.begin(), rest.end());
+            break;
+        }
+        case snap::SectionType::MsixState: {
+            std::uint32_t key = 0;
+            auto rest = strip_bdf(sec->payload, key);
+            maps.msix[key].assign(rest.begin(), rest.end());
+            break;
+        }
+        case snap::SectionType::VirtioPciTransport: {
+            std::uint32_t key = 0;
+            auto rest = strip_bdf(sec->payload, key);
+            maps.transport[key].assign(rest.begin(), rest.end());
+            break;
+        }
+        case snap::SectionType::VirtioRngState: {
+            std::uint32_t key = 0;
+            auto rest = strip_bdf(sec->payload, key);
+            maps.rng_state[key].assign(rest.begin(), rest.end());
+            break;
+        }
+        case snap::SectionType::VirtioConsoleState: {
+            std::uint32_t key = 0;
+            auto rest = strip_bdf(sec->payload, key);
+            maps.console_state[key].assign(rest.begin(), rest.end());
+            break;
+        }
+        case snap::SectionType::VirtioBlkState: {
+            std::uint32_t key = 0;
+            auto rest = strip_bdf(sec->payload, key);
+            maps.blk_state[key].assign(rest.begin(), rest.end());
+            break;
+        }
+        case snap::SectionType::Virtqueue: {
+            std::uint32_t key = 0;
+            std::uint16_t qidx = 0;
+            auto rest = strip_bdf_q(sec->payload, key, qidx);
+            const std::uint64_t kk = svcpu_enc::BdfQKey(key, qidx);
+            maps.virtqueues[kk].assign(rest.begin(), rest.end());
+            break;
+        }
+        default:
+            std::fprintf(stderr,
+                "[restore] WARN: unknown section type 0x%04x (%llu bytes); "
+                "skipping\n",
+                static_cast<unsigned>(sec->type),
+                static_cast<unsigned long long>(sec->payload.size()));
+            break;
+        }
+    }
+    rdr.VerifyTrailer();
+    btimer.Mark("sections read + CRC verified");
+
+    // ---------------- 6. Validate cardinality ---------------------------
+    if (maps.ram.size() != ram.size()) {
+        std::fprintf(stderr,
+            "[restore] FAIL: RAM section size %zu != partition RAM %zu\n",
+            maps.ram.size(), ram.size());
+        return 7;
+    }
+    if (maps.hv.empty() || maps.legacy_pcibus.empty() ||
+        maps.legacy_isa.empty() || maps.serial.empty() ||
+        maps.pic.empty() || maps.pit.empty()) {
+        std::fputs("[restore] FAIL: missing one or more singleton sections\n",
+                   stderr);
+        return 7;
+    }
+    for (std::uint32_t i = 0; i < vcpu_count; ++i) {
+        if (maps.vcpu_regs[i].empty() || maps.vcpu_xsave[i].empty() ||
+            maps.vcpu_intr[i].empty() || maps.vcpu_timing[i].empty()) {
+            std::fprintf(stderr,
+                "[restore] FAIL: vCPU %u missing one or more sections\n", i);
+            return 7;
+        }
+        // APIC section may carry a zero-byte payload for real-mode probes
+        // but must at least have the 8-byte header (vp_idx + size).
+        if (maps.vcpu_apic[i].size() < 8) {
+            std::fprintf(stderr,
+                "[restore] FAIL: vCPU %u APIC section truncated\n", i);
+            return 7;
+        }
+    }
+    for (auto bdf : all_bdfs) {
+        const std::uint32_t k = svcpu_enc::BdfKey(bdf);
+        if (!maps.pci_device.count(k) || !maps.msix.count(k) ||
+            !maps.transport.count(k)) {
+            std::fprintf(stderr,
+                "[restore] FAIL: BDF %02x:%02x.%u missing PciDevice/MsiX/"
+                "Transport section\n",
+                bdf.bus, bdf.device, bdf.function);
+            return 7;
+        }
+    }
+    // Exactly one rng + one console virtio-class section.
+    if (maps.rng_state.size() != 1 || maps.console_state.size() != 1) {
+        std::fprintf(stderr,
+            "[restore] FAIL: expected exactly 1 rng + 1 console state "
+            "section (got %zu + %zu)\n",
+            maps.rng_state.size(), maps.console_state.size());
+        return 7;
+    }
+    if (maps.blk_state.size() != drives.size()) {
+        std::fprintf(stderr,
+            "[restore] FAIL: expected %zu blk state sections but file has %zu\n",
+            drives.size(), maps.blk_state.size());
+        return 7;
+    }
+
+    // ---------------- 7. memcpy RAM -------------------------------------
+    std::memcpy(ram.host_base(), maps.ram.data(), ram.size());
+    btimer.Mark("RAM applied");
+
+    // ---------------- 8. hv ApplyState ----------------------------------
+    {
+        if (maps.hv.size() < 32) {
+            throw std::runtime_error("HV section too small");
+        }
+        HvEnlightenment::State hvs;
+        hvs.guest_os_id        = snap::ReadLe64(&maps.hv[0]);
+        hvs.hypercall_msr      = snap::ReadLe64(&maps.hv[8]);
+        hvs.reference_tsc_msr  = snap::ReadLe64(&maps.hv[16]);
+        hvs.tsc_invariant_ctl  = snap::ReadLe64(&maps.hv[24]);
+        hv.ApplyState(hvs);
+    }
+
+    // ---------------- 9. Legacy singletons ------------------------------
+    pbus->ApplyState(p::PciBus::DecodeState(
+        std::span<const std::uint8_t>(maps.legacy_pcibus)));
+    legacy.ApplyState(dev::LegacyIsaStubs::DecodeState(
+        std::span<const std::uint8_t>(maps.legacy_isa)));
+    com1.ApplyState(dev::Serial8250::DecodeState(
+        std::span<const std::uint8_t>(maps.serial)));
+    pic.ApplyState(dev::Pic8259::DecodeState(
+        std::span<const std::uint8_t>(maps.pic)));
+    pit.ApplyState(dev::Pit8254::DecodeState(
+        std::span<const std::uint8_t>(maps.pit)));
+    btimer.Mark("legacy applied");
+
+    // ---------------- 10. Per-PCI device apply --------------------------
+    pbus->ForEachDevice([&](p::Bdf bdf, p::PciDevice& pd) {
+        const std::uint32_t k = svcpu_enc::BdfKey(bdf);
+
+        // PciDevice base FIRST. (cfg + bars.)
+        pd.ApplyState(p::PciDevice::DecodeState(
+            std::span<const std::uint8_t>(maps.pci_device[k])));
+
+        // virtio-specific State, per Virtqueue, MsiX, then PciTransport
+        // (PciTransport applies BAR-mapped state, which re-installs MMIO
+        // handlers; do this LAST after the queue/msix/dev state is in
+        // place so a guest doorbell hitting the freshly-mapped notify
+        // region sees a fully-configured device).
+        auto* xport = dynamic_cast<v::PciTransport*>(&pd);
+        if (!xport) return;  // generic PciDevice; nothing more to apply.
+
+        v::Device& vdev = xport->device();
+        switch (vdev.DeviceId()) {
+        case v::kDeviceIdRng: {
+            auto& d = static_cast<v::RngDevice&>(vdev);
+            d.ApplyState(v::RngDevice::DecodeState(
+                std::span<const std::uint8_t>(maps.rng_state[k])));
+            break;
+        }
+        case v::kDeviceIdConsole: {
+            auto& d = static_cast<v::ConsoleDevice&>(vdev);
+            d.ApplyState(v::ConsoleDevice::DecodeState(
+                std::span<const std::uint8_t>(maps.console_state[k])));
+            break;
+        }
+        case v::kDeviceIdBlk: {
+            auto& d = static_cast<v::BlockDevice&>(vdev);
+            d.ApplyState(v::BlockDevice::DecodeState(
+                std::span<const std::uint8_t>(maps.blk_state[k])));
+            break;
+        }
+        default:
+            // virtio-net (1) and virtio-9p (9) are forbidden on save+restore;
+            // hitting this branch means the snapshot file is inconsistent
+            // with our construction order.
+            throw std::runtime_error(
+                "RunRestore: unsupported virtio device id during apply");
+        }
+
+        for (std::uint32_t qi = 0; qi < vdev.QueueCount(); ++qi) {
+            v::Virtqueue* q = vdev.GetQueue(qi);
+            if (!q) continue;
+            const std::uint64_t qk = svcpu_enc::BdfQKey(
+                k, static_cast<std::uint16_t>(qi));
+            auto it = maps.virtqueues.find(qk);
+            if (it == maps.virtqueues.end()) {
+                throw std::runtime_error(
+                    "RunRestore: missing Virtqueue section");
+            }
+            q->ApplyState(v::Virtqueue::DecodeState(
+                std::span<const std::uint8_t>(it->second)));
+        }
+
+        xport->msix().ApplyState(p::MsiX::DecodeState(
+            std::span<const std::uint8_t>(maps.msix[k])));
+        xport->ApplyState(v::PciTransport::DecodeState(
+            std::span<const std::uint8_t>(maps.transport[k])));
+    });
+    btimer.Mark("PCI devices applied");
+
+    // ---------------- 11. Per-vCPU NonTiming ----------------------------
+    // Build CapturedVcpuState objects from the maps, run NonTiming apply.
+    std::vector<snap::CapturedVcpuState> cap_vcpus(vcpu_count);
+    for (std::uint32_t i = 0; i < vcpu_count; ++i) {
+        auto& c = cap_vcpus[i];
+        c.arch   = svcpu_enc::DecodeRegBlock(maps.vcpu_regs[i], i,
+                                             snap::kArchRegNames,
+                                             snap::kArchRegCount());
+        c.timing = svcpu_enc::DecodeRegBlock(maps.vcpu_timing[i], i,
+                                             snap::kTimingRegNames,
+                                             snap::kTimingRegCount());
+        svcpu_enc::DecodeIntrCtlBlock(maps.vcpu_intr[i], i, c);
+        // M33.7: VcpuSupMsr section is optional (older snapshots predate
+        // it). When absent, sup_msr_ok stays all-false → CET MSRs simply
+        // are not restored, matching pre-M33.7 behavior. This is fine
+        // for snapshots taken before M33.7 since those guests didn't
+        // exercise CET state across save/restore.
+        if (!maps.vcpu_sup_msr[i].empty()) {
+            svcpu_enc::DecodeSupMsrBlock(maps.vcpu_sup_msr[i], i, c);
+        } else {
+            c.sup_msr.assign(snap::kSupervisorMsrCount(), WHV_REGISTER_VALUE{});
+            c.sup_msr_ok.assign(snap::kSupervisorMsrCount(), false);
+        }
+        c.xsave  = svcpu_enc::DecodeBlobBlock(maps.vcpu_xsave[i], i);
+        c.apic   = svcpu_enc::DecodeBlobBlock(maps.vcpu_apic[i], i);
+        snap::ApplyVcpuStateNonTiming(vcpus[i], part.handle(), i, c);
+    }
+    btimer.Mark("vCPU NonTiming applied");
+
+    // ---------------- 12. ResumeRuntime: PIC -> Serial -> PIT -----------
+    // Order matters: the PIC must be live (mask + IRR populated) before we
+    // re-edge a TX IRQ from the serial, and the PIT IRQ thread must start
+    // after the serial's TX IRQ has been delivered.
+    pic.ResumeRuntime();
+    com1.ResumeRuntime();
+    pit.ResumeRuntime();
+    btimer.Mark("legacy ResumeRuntime");
+
+    // ---------------- 13. Per-vCPU Timing (back-to-back) ----------------
+    // Done as a final tight loop to minimize observable cross-vCPU TSC
+    // skew (vcpu_count writes happen within ~us; Linux's tsc-sync check
+    // tolerates a few hundred cycles).
+    for (std::uint32_t i = 0; i < vcpu_count; ++i) {
+        snap::ApplyVcpuStateTiming(vcpus[i], part.handle(), i, cap_vcpus[i]);
+    }
+    btimer.Mark("vCPU Timing applied");
+
+    // ---------------- 14. Start blk IOCP workers ------------------------
+    // Now that virtqueue + transport + msix state are restored, IOCP
+    // completions for guest-driven submissions can safely land.
+    for (auto& b : blk_backends) {
+        b->Start();
+    }
+    btimer.Mark("blk backends started");
+
+    // ---------------- 15. RunLoops + watchdog + stdin + AP threads ------
+    std::deque<RunLoop> loops;
+    for (std::uint32_t i = 0; i < vcpu_count; ++i) {
+        loops.emplace_back(vcpus[i], io_bus, mmio_bus, vcpu_count);
+        loops.back().set_hv_enlightenment(&hv);
+    }
+    RunLoop& loop = loops.front();
+
+    auto stop_all_loops = [&loops]() {
+        for (auto& l : loops) l.RequestStop();
+    };
+
+    // Shutdown sentinel watcher (poll the shared atomic the byte observer
+    // flips when /init prints the sentinel string).
+    std::atomic<bool> shutdown_watcher_done{false};
+    std::thread shutdown_watcher([&shutdown_watcher_done, shutdown_requested,
+                                   &stop_all_loops]() {
+        while (!shutdown_watcher_done.load(std::memory_order_relaxed)) {
+            if (shutdown_requested->load(std::memory_order_acquire)) {
+                std::fputs("[restore] guest requested shutdown via "
+                           "hvc0 sentinel; stopping vCPU loops\n", stderr);
+                stop_all_loops();
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    });
+
+    // stdin forwarder -- mirrors RunPvhRun's TTY-mode loop verbatim
+    // (Ctrl+A X to quit, Ctrl+A H for help). Skipped if stdin isn't a TTY.
+    HANDLE hstdin = ::GetStdHandle(STD_INPUT_HANDLE);
+    DWORD original_console_mode = 0;
+    bool restore_console_mode = false;
+    std::atomic<bool> stdin_stop{false};
+    std::thread stdin_thread;
+    const bool stdin_is_tty = (hstdin != INVALID_HANDLE_VALUE) &&
+                              (::GetFileType(hstdin) == FILE_TYPE_CHAR);
+    if (stdin_is_tty) {
+        if (::GetConsoleMode(hstdin, &original_console_mode)) {
+            restore_console_mode = true;
+            ::SetConsoleMode(hstdin, ENABLE_WINDOW_INPUT);
+        }
+        if (HANDLE hout = ::GetStdHandle(STD_OUTPUT_HANDLE);
+            hout != INVALID_HANDLE_VALUE) {
+            DWORD om = 0;
+            if (::GetConsoleMode(hout, &om)) {
+                ::SetConsoleMode(hout, om | ENABLE_PROCESSED_OUTPUT |
+                                          ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            }
+        }
+        std::fputs("[restore] interactive console -- press Ctrl+A then X "
+                   "to quit, Ctrl+A H for help\n", stderr);
+        stdin_thread = std::thread(
+            [hstdin, vcon_ptr, &stdin_stop, &stop_all_loops]() {
+            INPUT_RECORD recs[64];
+            bool escape_armed = false;
+            while (!stdin_stop.load(std::memory_order_relaxed)) {
+                DWORD wr = ::WaitForSingleObject(hstdin, 50);
+                if (wr == WAIT_TIMEOUT) continue;
+                if (wr != WAIT_OBJECT_0) break;
+                DWORD num = 0;
+                if (!::GetNumberOfConsoleInputEvents(hstdin, &num)) continue;
+                if (num == 0) continue;
+                DWORD to_read = (num < 64) ? num : 64;
+                DWORD read = 0;
+                if (!::ReadConsoleInputW(hstdin, recs, to_read, &read)) continue;
+                std::string out;
+                out.reserve(read);
+                bool quit_requested = false;
+                for (DWORD i = 0; i < read; ++i) {
+                    if (recs[i].EventType != KEY_EVENT) continue;
+                    const auto& k = recs[i].Event.KeyEvent;
+                    if (!k.bKeyDown) continue;
+                    wchar_t wc = k.uChar.UnicodeChar;
+                    if (wc == 0) {
+                        const char* seq = nullptr;
+                        switch (k.wVirtualKeyCode) {
+                        case VK_UP:     seq = "\x1b[A"; break;
+                        case VK_DOWN:   seq = "\x1b[B"; break;
+                        case VK_RIGHT:  seq = "\x1b[C"; break;
+                        case VK_LEFT:   seq = "\x1b[D"; break;
+                        case VK_HOME:   seq = "\x1b[H"; break;
+                        case VK_END:    seq = "\x1b[F"; break;
+                        case VK_INSERT: seq = "\x1b[2~"; break;
+                        case VK_DELETE: seq = "\x1b[3~"; break;
+                        case VK_PRIOR:  seq = "\x1b[5~"; break;
+                        case VK_NEXT:   seq = "\x1b[6~"; break;
+                        default: break;
+                        }
+                        if (seq) out.append(seq);
+                        continue;
+                    }
+                    if (escape_armed) {
+                        escape_armed = false;
+                        if (wc == L'x' || wc == L'X') {
+                            std::fputs("\r\n[restore] Ctrl+A X -- "
+                                       "quitting\r\n", stderr);
+                            quit_requested = true;
+                            break;
+                        }
+                        if (wc == L'h' || wc == L'H' || wc == L'?') {
+                            std::fputs(
+                                "\r\n[restore] Ctrl+A keys: "
+                                "X=quit, A=literal ^A, H=help\r\n",
+                                stderr);
+                            continue;
+                        }
+                        if (wc == 0x01) { out.push_back('\x01'); continue; }
+                        std::fputs("\r\n[restore] unknown Ctrl+A sequence; "
+                                   "Ctrl+A H for help\r\n", stderr);
+                        continue;
+                    }
+                    if (wc == 0x01) { escape_armed = true; continue; }
+                    if (wc == L'\r') { out.push_back('\n'); continue; }
+                    if (wc < 0x80) {
+                        out.push_back(static_cast<char>(wc));
+                        continue;
+                    }
+                    char mb[8] = {};
+                    int n = ::WideCharToMultiByte(CP_UTF8, 0, &wc, 1, mb,
+                                                  sizeof(mb), nullptr, nullptr);
+                    if (n > 0) out.append(mb, mb + n);
+                }
+                if (!out.empty()) {
+                    vcon_ptr->WriteHostInput(out.data(), out.size());
+                }
+                if (quit_requested) {
+                    stop_all_loops();
+                    break;
+                }
+            }
+        });
+    }
+
+    // Watchdog telemetry (mirrors RunPvhRun).
+    const bool watchdog_enabled = (watchdog_secs > 0);
+    std::atomic<bool> watchdog_done{false};
+    std::thread watchdog;
+    if (watchdog_enabled) {
+        watchdog = std::thread([&] {
+            std::uint64_t prev_io = 0, prev_mmio = 0, prev_halt = 0;
+            std::uint64_t prev_cpuid = 0, prev_msi = 0, prev_uart = 0;
+            int s = 0;
+            auto sum = [&loops](auto getter) -> std::uint64_t {
+                std::uint64_t v = 0;
+                for (auto& l : loops) v += getter(l);
+                return v;
+            };
+            while (!watchdog_done.load()) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (watchdog_done.load()) return;
+                ++s;
+                const std::uint64_t cur_io    =
+                    sum([](RunLoop& l) { return l.io_exits();    });
+                const std::uint64_t cur_mmio  =
+                    sum([](RunLoop& l) { return l.mmio_exits();  });
+                const std::uint64_t cur_halt  =
+                    sum([](RunLoop& l) { return l.halt_exits();  });
+                const std::uint64_t cur_cpuid =
+                    sum([](RunLoop& l) { return l.cpuid_exits(); });
+                const std::uint64_t cur_msi   = whp::MsiInjectCount();
+                const std::uint64_t cur_uart  = com1.tx_bytes();
+                std::fprintf(stderr,
+                    "[restore] @%2ds  io=%llu(+%llu) mmio=%llu(+%llu) "
+                    "cpuid=%llu(+%llu) halt=%llu(+%llu) msi=%llu(+%llu) "
+                    "uart=%llu(+%llu)\n",
+                    s,
+                    static_cast<unsigned long long>(cur_io),
+                    static_cast<unsigned long long>(cur_io - prev_io),
+                    static_cast<unsigned long long>(cur_mmio),
+                    static_cast<unsigned long long>(cur_mmio - prev_mmio),
+                    static_cast<unsigned long long>(cur_cpuid),
+                    static_cast<unsigned long long>(cur_cpuid - prev_cpuid),
+                    static_cast<unsigned long long>(cur_halt),
+                    static_cast<unsigned long long>(cur_halt - prev_halt),
+                    static_cast<unsigned long long>(cur_msi),
+                    static_cast<unsigned long long>(cur_msi - prev_msi),
+                    static_cast<unsigned long long>(cur_uart),
+                    static_cast<unsigned long long>(cur_uart - prev_uart));
+                prev_io    = cur_io;
+                prev_mmio  = cur_mmio;
+                prev_halt  = cur_halt;
+                prev_cpuid = cur_cpuid;
+                prev_msi   = cur_msi;
+                prev_uart  = cur_uart;
+                if (s >= watchdog_secs) {
+                    std::fprintf(stderr,
+                        "[restore] watchdog: %ds elapsed, requesting stop\n",
+                        watchdog_secs);
+                    stop_all_loops();
+                    return;
+                }
+            }
+        });
+    }
+
+    btimer.Mark("entering guest");
+    TINYVMM_ETW_INFO("RestoreGuestEntry",
+        TraceLoggingString(snapshot_path.c_str(), "snapshot"));
+
+    const auto cpu_set_ids = whp::ResolveCpuSetIds(affinity_mode);
+    {
+        const auto& top = whp::GetTopology();
+        if (top.hybrid) {
+            std::printf("[restore] host topology: hybrid, %u logical "
+                        "(P=%u/%uHT, E=%u); cpu-affinity=%s "
+                        "(pinning %zu logicals)\n",
+                        top.total_logical, top.p_physical, top.p_logical,
+                        top.e_logical,
+                        whp::AffinityModeName(affinity_mode),
+                        cpu_set_ids.size());
+        } else {
+            std::printf("[restore] host topology: non-hybrid, %u logical; "
+                        "cpu-affinity=%s (pinning %zu logicals)\n",
+                        top.total_logical,
+                        whp::AffinityModeName(affinity_mode),
+                        cpu_set_ids.size());
+        }
+    }
+
+    std::vector<std::thread> ap_threads;
+    std::vector<std::exception_ptr> ap_excs(vcpu_count, nullptr);
+    ap_threads.reserve(vcpu_count > 0 ? vcpu_count - 1 : 0);
+    for (std::uint32_t i = 1; i < vcpu_count; ++i) {
+        ap_threads.emplace_back([i, &loops, &ap_excs, &stop_all_loops,
+                                 &cpu_set_ids] {
+            (void)whp::PinCurrentThread(cpu_set_ids);
+            try {
+                (void)loops[i].Run();
+            } catch (...) {
+                ap_excs[i] = std::current_exception();
+            }
+            stop_all_loops();
+        });
+    }
+    (void)whp::PinCurrentThread(cpu_set_ids);
+
+    StopReason stop = StopReason::Cancelled;
+    try {
+        stop = loop.Run();
+    } catch (...) {
+        ap_excs[0] = std::current_exception();
+    }
+    (void)stop;
+    btimer.Mark("guest exited");
+    stop_all_loops();
+    watchdog_done.store(true);
+    shutdown_watcher_done.store(true);
+    stdin_stop.store(true);
+    if (watchdog.joinable())        watchdog.join();
+    if (shutdown_watcher.joinable()) shutdown_watcher.join();
+    if (stdin_thread.joinable())    stdin_thread.join();
+    for (auto& t : ap_threads) {
+        if (t.joinable()) t.join();
+    }
+    if (restore_console_mode) {
+        ::SetConsoleMode(hstdin, original_console_mode);
+    }
+
+    // Drain in-flight blk completions before Stop()ping the IOCP workers.
+    // (Same ordering rule as RunPvhRun: completions only fire while workers
+    // are running, so drain BEFORE Stop().) Restore does NOT chain into a
+    // snapshot write afterwards; we just want graceful shutdown.
+    if (!DrainBlockBackends(blk_devices, /*timeout_ms=*/5000)) {
+        std::fputs("[restore] WARN: virtio-blk drain timed out at shutdown\n",
+                   stderr);
+    }
+    for (auto& b : blk_backends) {
+        b->Stop();
+    }
+
+    for (std::size_t i = 0; i < blk_backends.size(); ++i) {
+        auto& b = blk_backends[i];
+        auto& d = blk_devices[i];
+        std::printf("[restore] virtio-blk[%zu] stats: submitted=%llu "
+                    "completed=%llu errors=%llu max_inflight=%llu "
+                    "(virtio in=%llu out=%llu flush=%llu discard=%llu "
+                    "wz=%llu err=%llu)\n",
+                    i,
+                    static_cast<unsigned long long>(b->submitted()),
+                    static_cast<unsigned long long>(b->completed()),
+                    static_cast<unsigned long long>(b->errors()),
+                    static_cast<unsigned long long>(b->max_inflight()),
+                    static_cast<unsigned long long>(d->ops_in()),
+                    static_cast<unsigned long long>(d->ops_out()),
+                    static_cast<unsigned long long>(d->ops_flush()),
+                    static_cast<unsigned long long>(d->ops_discard()),
+                    static_cast<unsigned long long>(d->ops_write_zeroes()),
+                    static_cast<unsigned long long>(d->ops_err()));
+    }
+
+    // Aggregate per-VM run-loop counters across all vCPUs.
+    {
+        std::uint64_t tot_io = 0, tot_mmio = 0, tot_halt = 0, tot_cpuid = 0;
+        for (auto& l : loops) {
+            tot_io    += l.io_exits();
+            tot_mmio  += l.mmio_exits();
+            tot_halt  += l.halt_exits();
+            tot_cpuid += l.cpuid_exits();
+        }
+        std::printf("[restore] vCPU exits: io=%llu mmio=%llu cpuid=%llu "
+                    "halt=%llu msi=%llu uart_tx=%llu\n",
+                    static_cast<unsigned long long>(tot_io),
+                    static_cast<unsigned long long>(tot_mmio),
+                    static_cast<unsigned long long>(tot_cpuid),
+                    static_cast<unsigned long long>(tot_halt),
+                    static_cast<unsigned long long>(whp::MsiInjectCount()),
+                    static_cast<unsigned long long>(com1.tx_bytes()));
+    }
+
+    // Rethrow any AP exception that BSP didn't see directly.
+    for (auto& e : ap_excs) {
+        if (e) std::rethrow_exception(e);
+    }
+
     return 0;
 }
 
@@ -3402,6 +5155,181 @@ int RunVirtioPciTest() {
                 static_cast<unsigned long long>(tx->reads()),
                 static_cast<unsigned long long>(tx->writes()),
                 static_cast<unsigned long long>(tx->notify_count()));
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// --virtio-blk-discard-test
+// Verifies the M34.x DISCARD + WRITE_ZEROES virtio-blk additions:
+//   1. DeviceFeatures() advertises DISCARD + WRITE_ZEROES on a
+//      writable backend; advertises NEITHER on a read-only backend.
+//   2. ReadConfig at the M34.x sub-config offsets returns the values
+//      we PutLe()'d in the constructor (max_discard_sectors,
+//      max_write_zeroes_sectors, write_zeroes_may_unmap=1).
+//   3. BlockFile::ZeroRange on a writable file zeroes the requested
+//      bytes and leaves surrounding bytes untouched.
+//   4. BlockFile::ZeroRange on a readonly file returns false and
+//      leaves the file unchanged.
+int RunVirtioBlkDiscardTest() {
+    using namespace tinyvmm;
+    using namespace tinyvmm::whp;
+    namespace v = tinyvmm::virtio;
+    namespace h = tinyvmm::host;
+    namespace fs = std::filesystem;
+
+    std::puts("[virtio-blk-discard-test] starting (host-side; no WHP)");
+
+    // 1) Build a 1 MiB image filled with 0xAB.
+    fs::path img = fs::temp_directory_path() / "tinyvmm-blk-discard.img";
+    constexpr std::uint64_t kImgSize = 1ull << 20;     // 1 MiB
+    {
+        std::vector<std::uint8_t> seed(kImgSize, 0xAB);
+        std::ofstream ofs(img, std::ios::binary | std::ios::trunc);
+        ofs.write(reinterpret_cast<const char*>(seed.data()),
+                  static_cast<std::streamsize>(seed.size()));
+    }
+    auto cleanup = [&]{ std::error_code ec; fs::remove(img, ec); };
+
+    // 2) Set up a Partition + tiny RAM + BlockFile + BlockDevice.
+    // We don't go through PCI / virtqueue here; we only test
+    // DeviceFeatures / ReadConfig / BlockFile::ZeroRange directly.
+    CheckWhpAvailable();
+    Partition part(/*vcpu_count=*/1);
+    part.Setup();
+    GuestMemory ram(part, /*gpa=*/0, /*size=*/4096, /*executable=*/false);
+
+    {
+        h::BlockFile backend(img.wstring(), /*readonly=*/false);
+        if (!backend.open()) {
+            std::fprintf(stderr,
+                "[virtio-blk-discard-test] FAIL: BlockFile open hr=0x%08lx\n",
+                backend.open_hr());
+            cleanup();
+            return 1;
+        }
+        backend.Start();
+        v::BlockDevice dev(ram, backend, /*irq=*/[](std::uint32_t){});
+
+        // 3) Verify DeviceFeatures advertises both DISCARD + WRITE_ZEROES.
+        const std::uint64_t feats = dev.DeviceFeatures();
+        if (!(feats & v::kBlkFeatureDiscard)) {
+            std::fprintf(stderr,
+                "[virtio-blk-discard-test] FAIL: DISCARD feature bit (13) "
+                "not advertised; features=0x%016llx\n",
+                static_cast<unsigned long long>(feats));
+            backend.Stop();
+            cleanup(); return 2;
+        }
+        if (!(feats & v::kBlkFeatureWriteZeroes)) {
+            std::fprintf(stderr,
+                "[virtio-blk-discard-test] FAIL: WRITE_ZEROES feature bit "
+                "(14) not advertised; features=0x%016llx\n",
+                static_cast<unsigned long long>(feats));
+            backend.Stop();
+            cleanup(); return 3;
+        }
+        std::printf("[virtio-blk-discard-test] feats=0x%016llx OK "
+                    "(DISCARD+WRITE_ZEROES)\n",
+                    static_cast<unsigned long long>(feats));
+
+        // 4) Verify ReadConfig at the M34.x sub-config offsets.
+        auto cfg32 = [&](std::uint32_t off) { return dev.ReadConfig(off, 4); };
+        auto cfg8  = [&](std::uint32_t off) { return dev.ReadConfig(off, 1); };
+        const std::uint32_t max_disc_sec   = cfg32(32);
+        const std::uint32_t max_disc_seg   = cfg32(36);
+        const std::uint32_t disc_align     = cfg32(40);
+        const std::uint32_t max_wz_sec     = cfg32(44);
+        const std::uint32_t max_wz_seg     = cfg32(48);
+        const std::uint32_t wz_may_unmap   = cfg8(52);
+        std::printf("[virtio-blk-discard-test] cfg max_discard_sectors=%u "
+                    "max_discard_seg=%u align=%u | max_wz_sectors=%u "
+                    "max_wz_seg=%u may_unmap=%u\n",
+                    max_disc_sec, max_disc_seg, disc_align,
+                    max_wz_sec, max_wz_seg, wz_may_unmap);
+        if (max_disc_sec == 0 || max_disc_seg == 0 || disc_align == 0 ||
+            max_wz_sec == 0   || max_wz_seg == 0   || wz_may_unmap != 1) {
+            std::fprintf(stderr,
+                "[virtio-blk-discard-test] FAIL: cfg values out of spec\n");
+            backend.Stop();
+            cleanup(); return 4;
+        }
+
+        // 5) ZeroRange: zero 128 KiB at offset 256 KiB.
+        constexpr std::uint64_t kZeroOff = 256ull * 1024;
+        constexpr std::uint64_t kZeroLen = 128ull * 1024;
+        if (!backend.ZeroRange(kZeroOff, kZeroLen)) {
+            std::fprintf(stderr,
+                "[virtio-blk-discard-test] FAIL: ZeroRange returned false\n");
+            backend.Stop();
+            cleanup(); return 5;
+        }
+        backend.Stop();
+    }  // writable BlockFile out of scope; handle closed for ro re-open
+
+    // 6) Re-read the file from disk; expect [256k..384k) = 0x00,
+    //    everything else = 0xAB.
+    constexpr std::uint64_t kZeroOff = 256ull * 1024;
+    constexpr std::uint64_t kZeroLen = 128ull * 1024;
+    std::vector<std::uint8_t> after(kImgSize);
+    {
+        std::ifstream ifs(img, std::ios::binary);
+        ifs.read(reinterpret_cast<char*>(after.data()), kImgSize);
+    }
+    for (std::uint64_t i = 0; i < kImgSize; ++i) {
+        const std::uint8_t want =
+            (i >= kZeroOff && i < kZeroOff + kZeroLen) ? 0x00 : 0xAB;
+        if (after[i] != want) {
+            std::fprintf(stderr,
+                "[virtio-blk-discard-test] FAIL: byte[%llu]=0x%02x "
+                "(want 0x%02x)\n",
+                static_cast<unsigned long long>(i),
+                after[i], want);
+            cleanup(); return 6;
+        }
+    }
+    std::printf("[virtio-blk-discard-test] ZeroRange: 128 KiB @ 256 KiB "
+                "zeroed; surrounding bytes intact\n");
+
+    // 7) Read-only backend: must NOT advertise DISCARD/WRITE_ZEROES and
+    //    ZeroRange must return false (file unchanged).
+    h::BlockFile ro_backend(img.wstring(), /*readonly=*/true);
+    if (!ro_backend.open()) {
+        std::fprintf(stderr,
+            "[virtio-blk-discard-test] FAIL: ro BlockFile open hr=0x%08lx\n",
+            ro_backend.open_hr());
+        cleanup(); return 7;
+    }
+    ro_backend.Start();
+    v::BlockDevice ro_dev(ram, ro_backend, /*irq=*/[](std::uint32_t){});
+    const std::uint64_t ro_feats = ro_dev.DeviceFeatures();
+    if (ro_feats & (v::kBlkFeatureDiscard | v::kBlkFeatureWriteZeroes)) {
+        std::fprintf(stderr,
+            "[virtio-blk-discard-test] FAIL: read-only backend advertised "
+            "DISCARD/WRITE_ZEROES (feats=0x%016llx)\n",
+            static_cast<unsigned long long>(ro_feats));
+        ro_backend.Stop();
+        cleanup(); return 8;
+    }
+    if (!(ro_feats & v::kBlkFeatureRo)) {
+        std::fprintf(stderr,
+            "[virtio-blk-discard-test] FAIL: read-only backend missing "
+            "RO feature bit (feats=0x%016llx)\n",
+            static_cast<unsigned long long>(ro_feats));
+        ro_backend.Stop();
+        cleanup(); return 9;
+    }
+    if (ro_backend.ZeroRange(0, 4096)) {
+        std::fprintf(stderr,
+            "[virtio-blk-discard-test] FAIL: ZeroRange returned true on "
+            "read-only backend\n");
+        ro_backend.Stop();
+        cleanup(); return 10;
+    }
+    ro_backend.Stop();
+
+    std::printf("[virtio-blk-discard-test] PASS (RW: DISCARD+WRITE_ZEROES "
+                "feats + cfg + ZeroRange OK; RO: feats=RO ZeroRange=false)\n");
+    cleanup();
     return 0;
 }
 
@@ -4843,6 +6771,1303 @@ int RunVirtioNetLoopbackTest() {
     return 0;
 }
 
+// --virtio-net-usernet-tsi-test (M34.4)
+// Drive the TsiTcpEngine directly (no PCI, no virtio): construct a
+// real Winsock listener on 127.0.0.1:0, feed the engine synthesized
+// IPv4+TCP packets simulating a guest making an outbound HTTP request,
+// and verify:
+//   * A SYN from the guest produces a SYN-ACK back through the engine.
+//   * A guest-side ACK completes the 3-way handshake.
+//   * Guest payload arrives at the host listener exactly (rubber-duck
+//     blind-spot #3: includes a variant where guest data is sent before
+//     Winsock's connect() completes — staging buffers must hold it).
+//   * Server reply data flows back through the engine as IP+TCP
+//     packets toward the guest.
+//   * Guest FIN translates to a host-side EOF (rubber-duck #3
+//     shutdown(SD_SEND)) and the listener observes recv() == 0.
+int RunVirtioNetUsernetTsiTest() {
+    using namespace tinyvmm;
+    using namespace tinyvmm::virtio;
+
+    std::puts("[virtio-net-usernet-tsi-test] starting (host-side; no WHP, no PCI)");
+
+    WSADATA wsa{};
+    if (::WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
+        std::fputs("[virtio-net-usernet-tsi-test] FAIL: WSAStartup\n", stderr);
+        return 1;
+    }
+
+    // ---- Set up a real Winsock listener at 127.0.0.1:<auto> ----------
+    SOCKET lsn = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (lsn == INVALID_SOCKET) {
+        std::fprintf(stderr, "[virtio-net-usernet-tsi-test] FAIL: socket: %d\n",
+                     ::WSAGetLastError());
+        ::WSACleanup(); return 2;
+    }
+    u_long nb = 1;
+    ::ioctlsocket(lsn, FIONBIO, &nb);
+    sockaddr_in la{}; la.sin_family = AF_INET;
+    la.sin_addr.s_addr = htonl(INADDR_LOOPBACK); la.sin_port = 0;
+    if (::bind(lsn, (sockaddr*)&la, sizeof(la)) != 0) {
+        std::fprintf(stderr, "[virtio-net-usernet-tsi-test] FAIL: bind: %d\n",
+                     ::WSAGetLastError());
+        ::closesocket(lsn); ::WSACleanup(); return 3;
+    }
+    if (::listen(lsn, 4) != 0) {
+        std::fprintf(stderr, "[virtio-net-usernet-tsi-test] FAIL: listen: %d\n",
+                     ::WSAGetLastError());
+        ::closesocket(lsn); ::WSACleanup(); return 4;
+    }
+    sockaddr_in actual{};
+    int alen = sizeof(actual);
+    if (::getsockname(lsn, (sockaddr*)&actual, &alen) != 0) {
+        std::fputs("[virtio-net-usernet-tsi-test] FAIL: getsockname\n", stderr);
+        ::closesocket(lsn); ::WSACleanup(); return 5;
+    }
+    const std::uint16_t dst_port_be = actual.sin_port;
+    std::printf("[virtio-net-usernet-tsi-test] listener at 127.0.0.1:%u\n",
+                static_cast<unsigned>(ntohs(dst_port_be)));
+
+    // ---- Construct TsiTcpEngine with a frame-recorder callback ------
+    struct Captured {
+        std::vector<std::vector<std::uint8_t>> frames;  // each = full IP+TCP
+    } captured;
+
+    TsiTcpEngine::EmitCtx ec{};
+    ec.push_ipv4_to_guest =
+        [&captured](const std::uint8_t* ip, std::size_t n) {
+            captured.frames.emplace_back(ip, ip + n);
+        };
+    std::uint64_t test_clock_ms = 1000;
+    ec.now_ms = [&test_clock_ms]{ return test_clock_ms; };
+    ec.backend_mac = {0x02,0x53,0x54,0x00,0x00,0x01};
+    ec.guest_mac   = {0x52,0x54,0x00,0x12,0x34,0x56};
+    ec.gateway_ip_be = htonl(0x0A000001);  // 10.0.0.1 for M34.5 inbound
+    ec.max_conns   = 4;
+    ec.idle_ms     = 60'000;
+    ec.connect_ms  = 5'000;
+    TsiTcpEngine eng(std::move(ec));
+
+    // ---- Helpers --------------------------------------------------------
+    const std::uint32_t guest_ip_be = htonl(0x0A000002);   // 10.0.0.2
+    const std::uint32_t dst_ip_be   = htonl(0x7F000001);   // 127.0.0.1
+    const std::uint16_t guest_port_be = htons(35472);
+
+    auto wr16be = [](std::uint8_t* p, std::uint16_t v){
+        p[0]=(std::uint8_t)(v>>8); p[1]=(std::uint8_t)v;
+    };
+    auto wr32be = [](std::uint8_t* p, std::uint32_t v){
+        p[0]=(std::uint8_t)(v>>24); p[1]=(std::uint8_t)(v>>16);
+        p[2]=(std::uint8_t)(v>>8);  p[3]=(std::uint8_t)v;
+    };
+    auto be16 = [](const std::uint8_t* p){
+        return (std::uint16_t)((std::uint16_t)p[0]<<8 | (std::uint16_t)p[1]);
+    };
+    auto be32 = [](const std::uint8_t* p){
+        return (std::uint32_t)((std::uint32_t)p[0]<<24 |
+                               (std::uint32_t)p[1]<<16 |
+                               (std::uint32_t)p[2]<<8  |
+                               (std::uint32_t)p[3]);
+    };
+    auto cksum = [](const std::uint8_t* p, std::size_t n, std::uint32_t carry=0){
+        std::uint32_t s = carry;
+        while (n >= 2) { s += (std::uint32_t)p[0]<<8 | p[1]; p+=2; n-=2; }
+        if (n) s += (std::uint32_t)p[0]<<8;
+        while (s>>16) s = (s & 0xFFFF) + (s>>16);
+        return (std::uint16_t)(~s & 0xFFFF);
+    };
+
+    auto build_pkt = [&](std::uint8_t flags, std::uint32_t seq, std::uint32_t ack,
+                         std::uint16_t win,
+                         const std::uint8_t* payload, std::size_t payload_len) {
+        std::vector<std::uint8_t> p(20 + 20 + payload_len);
+        // IP
+        p[0] = 0x45; p[1] = 0x00;
+        wr16be(p.data()+2, (std::uint16_t)p.size());
+        wr16be(p.data()+4, 0); wr16be(p.data()+6, 0x4000);
+        p[8] = 64; p[9] = 6; wr16be(p.data()+10, 0);
+        std::memcpy(p.data()+12, &guest_ip_be, 4);
+        std::memcpy(p.data()+16, &dst_ip_be, 4);
+        wr16be(p.data()+10, cksum(p.data(), 20));
+        // TCP
+        std::uint8_t* t = p.data() + 20;
+        std::memcpy(t+0, &guest_port_be, 2);
+        std::memcpy(t+2, &dst_port_be, 2);
+        wr32be(t+4, seq); wr32be(t+8, ack);
+        t[12] = 0x50; t[13] = flags;
+        wr16be(t+14, win); wr16be(t+16, 0); wr16be(t+18, 0);
+        if (payload_len) std::memcpy(t+20, payload, payload_len);
+        // TCP cksum over pseudo + TCP + payload
+        std::uint32_t ph = 0;
+        ph += (be16((const std::uint8_t*)&guest_ip_be));
+        ph += (be16((const std::uint8_t*)&guest_ip_be + 2));
+        ph += (be16((const std::uint8_t*)&dst_ip_be));
+        ph += (be16((const std::uint8_t*)&dst_ip_be + 2));
+        ph += 6;
+        ph += (std::uint16_t)(20 + payload_len);
+        wr16be(t+16, cksum(t, 20 + payload_len, ph));
+        return p;
+    };
+
+    auto inject = [&](const std::vector<std::uint8_t>& pkt) {
+        eng.OnGuestTcpPacket(test_clock_ms, pkt.data(), pkt.size());
+    };
+
+    // Run engine + advance time + accept/recv on host listener.
+    // Returns when condition() == true, or after `budget_ms` of test time.
+    auto pump_until = [&](auto&& condition, int budget_ms) -> bool {
+        for (int elapsed = 0; elapsed < budget_ms; elapsed += 10) {
+            eng.Tick(test_clock_ms);
+            if (condition()) return true;
+            ::Sleep(10);
+            test_clock_ms += 10;
+        }
+        eng.Tick(test_clock_ms);
+        return condition();
+    };
+
+    // Find last received TCP segment whose flags match `mask` & filter().
+    auto find_last_seg =
+        [&](std::uint8_t flag_must_have, auto&& filter) -> int {
+        for (int i = (int)captured.frames.size() - 1; i >= 0; --i) {
+            const auto& f = captured.frames[i];
+            if (f.size() < 40) continue;
+            if (f[9] != 6) continue;
+            std::uint8_t fl = f[20 + 13];
+            if ((fl & flag_must_have) != flag_must_have) continue;
+            if (filter(f)) return i;
+        }
+        return -1;
+    };
+
+    // ----- 3-way handshake --------------------------------------------
+    const std::uint32_t guest_iss = 0x10000000;
+    auto syn = build_pkt(/*SYN*/0x02, guest_iss, 0, 65535, nullptr, 0);
+    inject(syn);
+
+    // Expect SYN-ACK back.
+    int idx = -1;
+    if (!pump_until([&]{
+        idx = find_last_seg(/*SYN|ACK*/0x12, [&](const std::vector<std::uint8_t>& f){
+            (void)f; return true;
+        });
+        return idx >= 0;
+    }, 500)) {
+        std::fputs("[virtio-net-usernet-tsi-test] FAIL: no SYN-ACK received\n",
+                   stderr);
+        ::closesocket(lsn); ::WSACleanup(); return 6;
+    }
+    const auto& synack = captured.frames[idx];
+    const std::uint32_t srv_iss = be32(synack.data() + 20 + 4);
+    const std::uint32_t srv_ack = be32(synack.data() + 20 + 8);
+    if (srv_ack != guest_iss + 1) {
+        std::fprintf(stderr,
+            "[virtio-net-usernet-tsi-test] FAIL: SYN-ACK ack=%u want=%u\n",
+            srv_ack, guest_iss + 1);
+        ::closesocket(lsn); ::WSACleanup(); return 7;
+    }
+    std::printf("[virtio-net-usernet-tsi-test] 3WHS: guest_iss=0x%x srv_iss=0x%x\n",
+                guest_iss, srv_iss);
+
+    // Guest ACK to complete handshake.
+    auto ack = build_pkt(/*ACK*/0x10, guest_iss + 1, srv_iss + 1,
+                         65535, nullptr, 0);
+    inject(ack);
+
+    // Now wait for host listener to accept (Winsock connect must drain).
+    SOCKET srv = INVALID_SOCKET;
+    if (!pump_until([&]{
+        sockaddr_in ca{}; int clen = sizeof(ca);
+        SOCKET s = ::accept(lsn, (sockaddr*)&ca, &clen);
+        if (s != INVALID_SOCKET) { srv = s; return true; }
+        return false;
+    }, 2000)) {
+        std::fputs("[virtio-net-usernet-tsi-test] FAIL: accept() timed out\n",
+                   stderr);
+        ::closesocket(lsn); ::WSACleanup(); return 8;
+    }
+    u_long nb2 = 1; ::ioctlsocket(srv, FIONBIO, &nb2);
+    std::puts("[virtio-net-usernet-tsi-test] host accept() OK");
+
+    // ----- Rubber-duck blind-spot #3 ----------------------------------
+    // Push a small chunk of guest data RIGHT AFTER the ACK. By design
+    // the host-side connect() races us; the engine must accept these
+    // bytes into staging_to_host and defer WSASend until Established.
+    static const char kReq[] = "GET / HTTP/1.0\r\nHost: x\r\n\r\n";
+    auto data_pkt = build_pkt(/*PSH|ACK*/0x18, guest_iss + 1, srv_iss + 1,
+                              65535, (const std::uint8_t*)kReq,
+                              sizeof(kReq) - 1);
+    inject(data_pkt);
+
+    // Pump until host listener receives the full request.
+    std::vector<char> hbuf(4096, 0);
+    int htotal = 0;
+    if (!pump_until([&]{
+        for (;;) {
+            int r = ::recv(srv, hbuf.data() + htotal,
+                            (int)(hbuf.size() - htotal), 0);
+            if (r > 0) { htotal += r; continue; }
+            if (r == 0) return true;          // EOF (won't happen here)
+            int e = ::WSAGetLastError();
+            if (e == WSAEWOULDBLOCK) break;
+            return false;
+        }
+        return htotal >= (int)(sizeof(kReq) - 1);
+    }, 3000)) {
+        std::fprintf(stderr,
+            "[virtio-net-usernet-tsi-test] FAIL: host recv only got %d/%zu bytes\n",
+            htotal, sizeof(kReq) - 1);
+        ::closesocket(srv); ::closesocket(lsn); ::WSACleanup(); return 9;
+    }
+    if (std::memcmp(hbuf.data(), kReq, sizeof(kReq) - 1) != 0) {
+        std::fputs("[virtio-net-usernet-tsi-test] FAIL: host recv mismatch\n",
+                   stderr);
+        ::closesocket(srv); ::closesocket(lsn); ::WSACleanup(); return 10;
+    }
+    std::printf("[virtio-net-usernet-tsi-test] host received %d bytes from guest\n",
+                htotal);
+
+    // ----- Reply path: host sends data, expect it reach the guest ----
+    static const char kReply[] = "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+    const int reply_len = (int)(sizeof(kReply) - 1);
+    int sent = 0;
+    while (sent < reply_len) {
+        int r = ::send(srv, kReply + sent, reply_len - sent, 0);
+        if (r <= 0) break;
+        sent += r;
+    }
+    if (sent != reply_len) {
+        std::fputs("[virtio-net-usernet-tsi-test] FAIL: host send incomplete\n",
+                   stderr);
+        ::closesocket(srv); ::closesocket(lsn); ::WSACleanup(); return 11;
+    }
+
+    // Snapshot how many frames we already have; new data segments will
+    // be appended.
+    const std::size_t baseline_frames = captured.frames.size();
+
+    if (!pump_until([&]{
+        // Concatenate payloads of all data segments (PSH set, non-empty)
+        // received after the baseline.
+        std::vector<std::uint8_t> assembled;
+        for (std::size_t i = baseline_frames; i < captured.frames.size(); ++i) {
+            const auto& f = captured.frames[i];
+            if (f.size() < 40) continue;
+            if (f[9] != 6) continue;
+            std::uint8_t fl = f[20 + 13];
+            if (!(fl & 0x10)) continue;       // need ACK
+            std::size_t payload_off = 20 + ((f[20 + 12] >> 4) * 4);
+            if (f.size() <= payload_off) continue;
+            assembled.insert(assembled.end(),
+                              f.begin() + payload_off, f.end());
+        }
+        return assembled.size() >= (std::size_t)reply_len &&
+               std::memcmp(assembled.data(), kReply, reply_len) == 0;
+    }, 3000)) {
+        std::fputs("[virtio-net-usernet-tsi-test] FAIL: reply not reassembled\n",
+                   stderr);
+        ::closesocket(srv); ::closesocket(lsn); ::WSACleanup(); return 12;
+    }
+    std::printf("[virtio-net-usernet-tsi-test] guest received %d-byte reply\n",
+                reply_len);
+
+    // ----- Guest FIN -> host should see EOF on recv() -----------------
+    // Advance guest seq past the data we sent.
+    const std::uint32_t guest_next_seq = guest_iss + 1 + (std::uint32_t)(sizeof(kReq) - 1);
+    auto fin = build_pkt(/*FIN|ACK*/0x11, guest_next_seq, srv_iss + 1 + reply_len,
+                         65535, nullptr, 0);
+    inject(fin);
+
+    // Drain any remaining host bytes; verify EOF.
+    bool saw_eof = false;
+    pump_until([&]{
+        char tmp[256];
+        int r = ::recv(srv, tmp, sizeof(tmp), 0);
+        if (r == 0) { saw_eof = true; return true; }
+        if (r < 0 && ::WSAGetLastError() != WSAEWOULDBLOCK) {
+            return true;                       // also accept hard error
+        }
+        return false;
+    }, 2000);
+    if (!saw_eof) {
+        std::fputs("[virtio-net-usernet-tsi-test] FAIL: host did not see EOF "
+                   "after guest FIN (rubber-duck #3 regression)\n", stderr);
+        ::closesocket(srv); ::closesocket(lsn); ::WSACleanup(); return 13;
+    }
+    std::puts("[virtio-net-usernet-tsi-test] host saw EOF after guest FIN");
+
+    // Host closes its side; engine sees EOF, calls tcp_close, and emits
+    // a FIN to the guest (TCB now in LAST_ACK). The full close FSM
+    // requires the guest to ACK our FIN so the TCB can transition to
+    // CLOSED. Without it the TCB sits in LAST_ACK forever — pre-M34.6
+    // that leaked silently; M34.6's half-close watchdog will abort it
+    // after half_close_ms. Inject the closing ACK so this phase ends
+    // cleanly via the graceful path (TIME_WAIT is skipped from
+    // LAST_ACK; CLOSED is the next stop).
+    ::closesocket(srv);
+    pump_until([&]{
+        // Wait for the engine's FIN (the one queued by tcp_close).
+        for (std::size_t i = captured.frames.size(); i-- > 0; ) {
+            const auto& f = captured.frames[i];
+            if (f.size() < 40 || f[9] != 6) continue;
+            // src=engine (srv_iss side) → dst=guest. Filter by src_port
+            // = dst_port_be (engine acted as server on dst_port).
+            std::uint16_t spt = be16(f.data() + 20 + 0);
+            if (spt != ntohs(dst_port_be)) continue;
+            if (f[20 + 13] & 0x01) return true;  // FIN bit set
+        }
+        return false;
+    }, 1500);
+    // Guest ACK of engine's FIN: ack = past engine's SYN + reply data + FIN.
+    auto fin_ack = build_pkt(/*ACK*/0x10,
+                              guest_next_seq + 1,            // past guest FIN
+                              srv_iss + 1 + reply_len + 1,   // past engine FIN
+                              65535, nullptr, 0);
+    inject(fin_ack);
+    pump_until([&]{ return eng.conn_count() == 0; }, 5000);
+
+    // ======================================================================
+    // Phase 2 (M34.5): inbound port-forward TCP via TsiTcpEngine::
+    // StartInboundConn(). Build a socketpair via a local bridge listener;
+    // hand the server side to the engine; drive an SYN→SYN-ACK→ACK→data
+    // round-trip and verify the close path.
+    // ======================================================================
+    std::puts("[virtio-net-usernet-tsi-test] --- M34.5 Phase 2: inbound ---");
+
+    SOCKET bridge_lsn = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (bridge_lsn == INVALID_SOCKET) {
+        std::fputs("[virtio-net-usernet-tsi-test] FAIL: bridge socket\n", stderr);
+        ::closesocket(lsn); ::WSACleanup(); return 14;
+    }
+    u_long nbl = 1; ::ioctlsocket(bridge_lsn, FIONBIO, &nbl);
+    sockaddr_in bla{}; bla.sin_family = AF_INET;
+    bla.sin_addr.s_addr = htonl(INADDR_LOOPBACK); bla.sin_port = 0;
+    if (::bind(bridge_lsn, (sockaddr*)&bla, sizeof(bla)) != 0 ||
+        ::listen(bridge_lsn, 4) != 0) {
+        std::fputs("[virtio-net-usernet-tsi-test] FAIL: bridge bind/listen\n",
+                   stderr);
+        ::closesocket(bridge_lsn); ::closesocket(lsn);
+        ::WSACleanup(); return 15;
+    }
+    sockaddr_in bla_actual{}; int bla_len = sizeof(bla_actual);
+    ::getsockname(bridge_lsn, (sockaddr*)&bla_actual, &bla_len);
+
+    SOCKET host_client = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    u_long nbc = 1; ::ioctlsocket(host_client, FIONBIO, &nbc);
+    ::connect(host_client, (sockaddr*)&bla_actual, sizeof(bla_actual));
+    SOCKET engine_sock = INVALID_SOCKET;
+    for (int spin = 0; spin < 200 && engine_sock == INVALID_SOCKET; ++spin) {
+        sockaddr_in pa{}; int palen = sizeof(pa);
+        engine_sock = ::accept(bridge_lsn, (sockaddr*)&pa, &palen);
+        if (engine_sock == INVALID_SOCKET) ::Sleep(5);
+    }
+    if (engine_sock == INVALID_SOCKET) {
+        std::fputs("[virtio-net-usernet-tsi-test] FAIL: bridge accept\n", stderr);
+        ::closesocket(host_client); ::closesocket(bridge_lsn);
+        ::closesocket(lsn); ::WSACleanup(); return 16;
+    }
+    std::puts("[virtio-net-usernet-tsi-test] bridge socketpair up");
+
+    const std::uint16_t in_guest_port_be = htons(8080);
+    const std::uint32_t in_guest_ip_be   = guest_ip_be;  // 10.0.0.2
+    const std::uint32_t in_gw_ip_be      = htonl(0x0A000001);
+    const std::size_t before_inbound = captured.frames.size();
+    if (!eng.StartInboundConn(engine_sock, in_guest_ip_be, in_guest_port_be)) {
+        std::fputs("[virtio-net-usernet-tsi-test] FAIL: StartInboundConn\n",
+                   stderr);
+        ::closesocket(host_client); ::closesocket(bridge_lsn);
+        ::closesocket(lsn); ::WSACleanup(); return 17;
+    }
+
+    // Find the SYN: src_ip=gw, dst_ip=guest, syn-only flag, dst_port=8080.
+    int syn_idx = -1;
+    for (std::size_t i = before_inbound; i < captured.frames.size(); ++i) {
+        const auto& f = captured.frames[i];
+        if (f.size() < 40 || f[9] != 6) continue;
+        std::uint32_t sip = be32(f.data() + 12);
+        std::uint32_t dip = be32(f.data() + 16);
+        std::uint16_t dpt = be16(f.data() + 20 + 2);
+        std::uint8_t  fl  = f[20 + 13];
+        if (sip != ntohl(in_gw_ip_be))     continue;
+        if (dip != ntohl(in_guest_ip_be))  continue;
+        if (dpt != 8080)                   continue;
+        if ((fl & 0x12) != 0x02)           continue;  // SYN only, no ACK
+        syn_idx = (int)i;
+        break;
+    }
+    if (syn_idx < 0) {
+        std::fputs("[virtio-net-usernet-tsi-test] FAIL: no inbound SYN emitted\n",
+                   stderr);
+        ::closesocket(host_client); ::closesocket(bridge_lsn);
+        ::closesocket(lsn); ::WSACleanup(); return 18;
+    }
+    const auto& syn_frame = captured.frames[syn_idx];
+    const std::uint32_t in_gw_iss   = be32(syn_frame.data() + 20 + 4);
+    const std::uint16_t in_ephem_be = htons(be16(syn_frame.data() + 20 + 0));
+    std::printf("[virtio-net-usernet-tsi-test] inbound SYN: ephem=%u iss=0x%x\n",
+                static_cast<unsigned>(ntohs(in_ephem_be)), in_gw_iss);
+
+    // Build a guest SYN-ACK using a fresh helper that flips src/dst.
+    auto build_pkt_inbound = [&](std::uint8_t flags, std::uint32_t seq,
+                                  std::uint32_t ack, std::uint16_t win,
+                                  const std::uint8_t* payload,
+                                  std::size_t payload_len) {
+        std::vector<std::uint8_t> p(20 + 20 + payload_len);
+        p[0] = 0x45; p[1] = 0;
+        wr16be(p.data()+2, (std::uint16_t)p.size());
+        wr16be(p.data()+4, 0); wr16be(p.data()+6, 0x4000);
+        p[8] = 64; p[9] = 6;
+        std::memcpy(p.data()+12, &in_guest_ip_be, 4);
+        std::memcpy(p.data()+16, &in_gw_ip_be,    4);
+        wr16be(p.data()+10, cksum(p.data(), 20));
+        std::uint8_t* t = p.data() + 20;
+        std::memcpy(t+0, &in_guest_port_be, 2);
+        std::memcpy(t+2, &in_ephem_be,      2);
+        wr32be(t+4, seq); wr32be(t+8, ack);
+        t[12] = 0x50; t[13] = flags;
+        wr16be(t+14, win); wr16be(t+16, 0); wr16be(t+18, 0);
+        if (payload_len) std::memcpy(t+20, payload, payload_len);
+        std::uint32_t ph = 0;
+        ph += be16((const std::uint8_t*)&in_guest_ip_be);
+        ph += be16((const std::uint8_t*)&in_guest_ip_be + 2);
+        ph += be16((const std::uint8_t*)&in_gw_ip_be);
+        ph += be16((const std::uint8_t*)&in_gw_ip_be + 2);
+        ph += 6;
+        ph += (std::uint16_t)(20 + payload_len);
+        wr16be(t+16, cksum(t, 20 + payload_len, ph));
+        return p;
+    };
+
+    const std::uint32_t in_guest_iss = 0x77000000;
+    auto in_synack = build_pkt_inbound(/*SYN|ACK*/0x12, in_guest_iss,
+                                        in_gw_iss + 1, 65535, nullptr, 0);
+    inject(in_synack);
+
+    // Engine should ACK and reach inbound_handshake_done. Test by sending
+    // host data and verifying it appears in captured.
+    static const char kHostReq[] = "GET /probe HTTP/1.0\r\n\r\n";
+    const int kHostReqLen = (int)(sizeof(kHostReq) - 1);
+    int hc_sent = 0;
+    pump_until([&]{
+        if (hc_sent < kHostReqLen) {
+            int r = ::send(host_client, kHostReq + hc_sent,
+                            kHostReqLen - hc_sent, 0);
+            if (r > 0) hc_sent += r;
+        }
+        // Look for a data segment from gw:ephem -> guest:8080 in captured.
+        std::vector<std::uint8_t> asm_;
+        for (std::size_t i = before_inbound; i < captured.frames.size(); ++i) {
+            const auto& f = captured.frames[i];
+            if (f.size() < 40 || f[9] != 6) continue;
+            std::uint16_t spt = be16(f.data() + 20 + 0);
+            std::uint16_t dpt = be16(f.data() + 20 + 2);
+            if (spt != ntohs(in_ephem_be) || dpt != 8080) continue;
+            std::uint8_t fl = f[20 + 13];
+            if (!(fl & 0x10)) continue;
+            std::size_t poff = 20 + ((f[20 + 12] >> 4) * 4);
+            if (f.size() <= poff) continue;
+            asm_.insert(asm_.end(), f.begin() + poff, f.end());
+        }
+        return asm_.size() >= (std::size_t)kHostReqLen &&
+               std::memcmp(asm_.data(), kHostReq, kHostReqLen) == 0;
+    }, 3000);
+    if (hc_sent != kHostReqLen) {
+        std::fprintf(stderr,
+            "[virtio-net-usernet-tsi-test] FAIL: host send incomplete %d/%d\n",
+            hc_sent, kHostReqLen);
+        ::closesocket(host_client); ::closesocket(bridge_lsn);
+        ::closesocket(lsn); ::WSACleanup(); return 19;
+    }
+    std::printf("[virtio-net-usernet-tsi-test] inbound: guest received %d bytes\n",
+                kHostReqLen);
+
+    // Simulate guest reply via PSH+ACK with payload after handshake.
+    static const char kGuestReply[] = "OK\r\n";
+    const std::uint32_t in_guest_next_seq = in_guest_iss + 1;
+    auto in_reply = build_pkt_inbound(/*PSH|ACK*/0x18, in_guest_next_seq,
+                                       in_gw_iss + 1 + kHostReqLen, 65535,
+                                       (const std::uint8_t*)kGuestReply,
+                                       sizeof(kGuestReply) - 1);
+    inject(in_reply);
+
+    // Pump until host_client receives the reply.
+    char hcbuf[64] = {0};
+    int hc_recv = 0;
+    pump_until([&]{
+        int r = ::recv(host_client, hcbuf + hc_recv,
+                        (int)(sizeof(hcbuf) - hc_recv), 0);
+        if (r > 0) hc_recv += r;
+        return hc_recv >= (int)(sizeof(kGuestReply) - 1);
+    }, 3000);
+    if (hc_recv < (int)(sizeof(kGuestReply) - 1) ||
+        std::memcmp(hcbuf, kGuestReply, sizeof(kGuestReply) - 1) != 0) {
+        std::fprintf(stderr,
+            "[virtio-net-usernet-tsi-test] FAIL: host_client recv=%d (want %zu)\n",
+            hc_recv, sizeof(kGuestReply) - 1);
+        ::closesocket(host_client); ::closesocket(bridge_lsn);
+        ::closesocket(lsn); ::WSACleanup(); return 20;
+    }
+    std::printf("[virtio-net-usernet-tsi-test] inbound: host received %d-byte reply\n",
+                hc_recv);
+
+    // Host closes -> engine should emit FIN to guest.
+    ::closesocket(host_client);
+    bool saw_fin = false;
+    pump_until([&]{
+        for (std::size_t i = before_inbound; i < captured.frames.size(); ++i) {
+            const auto& f = captured.frames[i];
+            if (f.size() < 40 || f[9] != 6) continue;
+            std::uint16_t spt = be16(f.data() + 20 + 0);
+            std::uint16_t dpt = be16(f.data() + 20 + 2);
+            if (spt != ntohs(in_ephem_be) || dpt != 8080) continue;
+            if (f[20 + 13] & 0x01) { saw_fin = true; return true; }
+        }
+        return false;
+    }, 3000);
+    if (!saw_fin) {
+        std::fputs("[virtio-net-usernet-tsi-test] FAIL: no inbound FIN emitted\n",
+                   stderr);
+        ::closesocket(bridge_lsn); ::closesocket(lsn);
+        ::WSACleanup(); return 21;
+    }
+    std::puts("[virtio-net-usernet-tsi-test] inbound: FIN emitted toward guest");
+
+    // Complete the close FSM from the guest side.
+    auto in_finack = build_pkt_inbound(/*FIN|ACK*/0x11, in_guest_next_seq +
+                                            (sizeof(kGuestReply) - 1),
+                                        in_gw_iss + 2 + kHostReqLen, 65535,
+                                        nullptr, 0);
+    inject(in_finack);
+    pump_until([&]{ return eng.conn_count() == 0; }, 5000);
+    ::closesocket(bridge_lsn);
+
+    // ======================================================================
+    // Phase 3 (M34.5 rubber-duck #1): handshake timeout. Start a fresh
+    // inbound conn, never inject the guest SYN-ACK, advance time past
+    // the handshake deadline, and verify the engine reaps the conn.
+    // ======================================================================
+    std::puts("[virtio-net-usernet-tsi-test] --- M34.5 Phase 3: handshake timeout ---");
+
+    // Build a fresh engine with a tight connect deadline.
+    Captured cap3;
+    TsiTcpEngine::EmitCtx ec3{};
+    ec3.push_ipv4_to_guest =
+        [&cap3](const std::uint8_t* ip, std::size_t n) {
+            cap3.frames.emplace_back(ip, ip + n);
+        };
+    std::uint64_t test_clock3_ms = 50'000;
+    ec3.now_ms = [&test_clock3_ms]{ return test_clock3_ms; };
+    ec3.backend_mac  = {0x02,0x53,0x54,0x00,0x00,0x01};
+    ec3.guest_mac    = {0x52,0x54,0x00,0x12,0x34,0x56};
+    ec3.gateway_ip_be = htonl(0x0A000001);
+    ec3.max_conns    = 2;
+    ec3.idle_ms      = 60'000;
+    ec3.connect_ms   = 200;
+    TsiTcpEngine eng3(std::move(ec3));
+
+    SOCKET bridge3 = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    u_long nb3 = 1; ::ioctlsocket(bridge3, FIONBIO, &nb3);
+    sockaddr_in b3a{}; b3a.sin_family = AF_INET;
+    b3a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); b3a.sin_port = 0;
+    ::bind(bridge3, (sockaddr*)&b3a, sizeof(b3a));
+    ::listen(bridge3, 4);
+    sockaddr_in b3_actual{}; int b3_alen = sizeof(b3_actual);
+    ::getsockname(bridge3, (sockaddr*)&b3_actual, &b3_alen);
+    SOCKET hc3 = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    u_long nb3c = 1; ::ioctlsocket(hc3, FIONBIO, &nb3c);
+    ::connect(hc3, (sockaddr*)&b3_actual, sizeof(b3_actual));
+    SOCKET es3 = INVALID_SOCKET;
+    for (int s = 0; s < 200 && es3 == INVALID_SOCKET; ++s) {
+        sockaddr_in pa{}; int pal = sizeof(pa);
+        es3 = ::accept(bridge3, (sockaddr*)&pa, &pal);
+        if (es3 == INVALID_SOCKET) ::Sleep(5);
+    }
+    if (es3 == INVALID_SOCKET) {
+        std::fputs("[virtio-net-usernet-tsi-test] FAIL: phase3 bridge\n", stderr);
+        ::closesocket(hc3); ::closesocket(bridge3); ::closesocket(lsn);
+        ::WSACleanup(); return 22;
+    }
+
+    if (!eng3.StartInboundConn(es3, in_guest_ip_be, in_guest_port_be)) {
+        std::fputs("[virtio-net-usernet-tsi-test] FAIL: phase3 StartInboundConn\n",
+                   stderr);
+        ::closesocket(hc3); ::closesocket(bridge3); ::closesocket(lsn);
+        ::WSACleanup(); return 23;
+    }
+    if (eng3.conn_count() != 1) {
+        std::fputs("[virtio-net-usernet-tsi-test] FAIL: phase3 conn_count != 1\n",
+                   stderr);
+        ::closesocket(hc3); ::closesocket(bridge3); ::closesocket(lsn);
+        ::WSACleanup(); return 24;
+    }
+
+    // Advance the clock past the connect_ms (200) deadline; never inject
+    // the SYN-ACK. Engine must abort + reap.
+    bool reaped = false;
+    for (int i = 0; i < 200; ++i) {       // up to ~2s of pumping
+        eng3.Tick(test_clock3_ms);
+        if (eng3.conn_count() == 0) { reaped = true; break; }
+        test_clock3_ms += 50;
+    }
+    if (!reaped) {
+        std::fprintf(stderr,
+            "[virtio-net-usernet-tsi-test] FAIL: phase3 handshake timeout did "
+            "not reap (conn_count=%zu)\n", eng3.conn_count());
+        ::closesocket(hc3); ::closesocket(bridge3); ::closesocket(lsn);
+        ::WSACleanup(); return 25;
+    }
+    std::puts("[virtio-net-usernet-tsi-test] inbound handshake timeout: reaped");
+
+    eng3.Shutdown();
+    ::closesocket(hc3);
+    ::closesocket(bridge3);
+
+    // ======================================================================
+    // Phase 4 (M34.6): half-close watchdog. Stand up a fresh engine with a
+    // tight half_close_ms, drive an inbound flow to ESTABLISHED, close the
+    // bridge host_client to push the TCB into FIN_WAIT_1 (engine sends a
+    // FIN to the guest via tcp_close), then advance time past the
+    // half_close deadline WITHOUT ever injecting the guest's FIN-ACK. The
+    // engine must AbortConn the TCB so aborts++ and the conn reaps. This
+    // is also the regression test for rubber-duck rec #3 (CLOSE_WAIT-like
+    // activity-based timing).
+    // ======================================================================
+    std::puts("[virtio-net-usernet-tsi-test] --- M34.6 Phase 4: half-close watchdog ---");
+
+    Captured cap4;
+    TsiTcpEngine::EmitCtx ec4{};
+    ec4.push_ipv4_to_guest =
+        [&cap4](const std::uint8_t* ip, std::size_t n) {
+            cap4.frames.emplace_back(ip, ip + n);
+        };
+    std::uint64_t test_clock4_ms = 100'000;
+    ec4.now_ms = [&test_clock4_ms]{ return test_clock4_ms; };
+    ec4.backend_mac   = {0x02,0x53,0x54,0x00,0x00,0x01};
+    ec4.guest_mac     = {0x52,0x54,0x00,0x12,0x34,0x56};
+    ec4.gateway_ip_be = htonl(0x0A000001);
+    ec4.max_conns     = 4;
+    ec4.idle_ms       = 600'000;
+    ec4.connect_ms    = 5'000;
+    ec4.half_close_ms = 200;
+    TsiTcpEngine eng4(std::move(ec4));
+
+    SOCKET bridge4 = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    u_long nb4 = 1; ::ioctlsocket(bridge4, FIONBIO, &nb4);
+    sockaddr_in b4a{}; b4a.sin_family = AF_INET;
+    b4a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); b4a.sin_port = 0;
+    ::bind(bridge4, (sockaddr*)&b4a, sizeof(b4a));
+    ::listen(bridge4, 4);
+    sockaddr_in b4_actual{}; int b4_alen = sizeof(b4_actual);
+    ::getsockname(bridge4, (sockaddr*)&b4_actual, &b4_alen);
+    SOCKET hc4 = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    u_long nb4c = 1; ::ioctlsocket(hc4, FIONBIO, &nb4c);
+    ::connect(hc4, (sockaddr*)&b4_actual, sizeof(b4_actual));
+    SOCKET es4 = INVALID_SOCKET;
+    for (int s = 0; s < 200 && es4 == INVALID_SOCKET; ++s) {
+        sockaddr_in pa{}; int pal = sizeof(pa);
+        es4 = ::accept(bridge4, (sockaddr*)&pa, &pal);
+        if (es4 == INVALID_SOCKET) ::Sleep(5);
+    }
+    if (es4 == INVALID_SOCKET) {
+        std::fputs("[virtio-net-usernet-tsi-test] FAIL: phase4 bridge\n", stderr);
+        ::closesocket(hc4); ::closesocket(bridge4); ::closesocket(lsn);
+        ::WSACleanup(); return 26;
+    }
+
+    if (!eng4.StartInboundConn(es4, in_guest_ip_be, in_guest_port_be)) {
+        std::fputs("[virtio-net-usernet-tsi-test] FAIL: phase4 StartInboundConn\n",
+                   stderr);
+        ::closesocket(hc4); ::closesocket(bridge4); ::closesocket(lsn);
+        ::WSACleanup(); return 27;
+    }
+
+    // Find the SYN, extract iss + ephem.
+    int syn4_idx = -1;
+    for (std::size_t i = 0; i < cap4.frames.size(); ++i) {
+        const auto& f = cap4.frames[i];
+        if (f.size() < 40 || f[9] != 6) continue;
+        std::uint16_t dpt = be16(f.data() + 20 + 2);
+        std::uint8_t  fl  = f[20 + 13];
+        if (dpt != 8080)         continue;
+        if ((fl & 0x12) != 0x02) continue;
+        syn4_idx = (int)i; break;
+    }
+    if (syn4_idx < 0) {
+        std::fputs("[virtio-net-usernet-tsi-test] FAIL: phase4 no SYN\n", stderr);
+        ::closesocket(hc4); ::closesocket(bridge4); ::closesocket(lsn);
+        ::WSACleanup(); return 28;
+    }
+    const std::uint32_t in_gw_iss4   = be32(cap4.frames[syn4_idx].data() + 20 + 4);
+    const std::uint16_t in_ephem4_be = htons(be16(cap4.frames[syn4_idx].data() + 20));
+
+    // Build & inject guest SYN-ACK targeted at eng4 (different ephem).
+    auto build_synack4 = [&](std::uint32_t guest_iss, std::uint32_t ack) {
+        std::vector<std::uint8_t> p(40);
+        p[0]=0x45; p[1]=0; wr16be(p.data()+2,40);
+        wr16be(p.data()+4,0); wr16be(p.data()+6,0x4000);
+        p[8]=64; p[9]=6; wr16be(p.data()+10,0);
+        std::memcpy(p.data()+12, &in_guest_ip_be, 4);
+        std::memcpy(p.data()+16, &in_gw_ip_be,    4);
+        wr16be(p.data()+10, cksum(p.data(),20));
+        std::uint8_t* t = p.data()+20;
+        std::memcpy(t+0, &in_guest_port_be, 2);
+        std::memcpy(t+2, &in_ephem4_be,     2);
+        wr32be(t+4, guest_iss); wr32be(t+8, ack);
+        t[12]=0x50; t[13]=0x12; wr16be(t+14,65535);
+        wr16be(t+16,0); wr16be(t+18,0);
+        std::uint32_t ph = 0;
+        ph += be16((const std::uint8_t*)&in_guest_ip_be);
+        ph += be16((const std::uint8_t*)&in_guest_ip_be + 2);
+        ph += be16((const std::uint8_t*)&in_gw_ip_be);
+        ph += be16((const std::uint8_t*)&in_gw_ip_be + 2);
+        ph += 6; ph += 20;
+        wr16be(t+16, cksum(t,20,ph));
+        return p;
+    };
+    const std::uint32_t guest_iss4 = 0x99000000;
+    auto sa4 = build_synack4(guest_iss4, in_gw_iss4 + 1);
+    eng4.OnGuestTcpPacket(test_clock4_ms, sa4.data(), sa4.size());
+
+    // One Tick: should latch inbound_handshake_done.
+    eng4.Tick(test_clock4_ms);
+    if (eng4.conn_count() != 1) {
+        std::fprintf(stderr,
+            "[virtio-net-usernet-tsi-test] FAIL: phase4 conn_count=%zu\n",
+            eng4.conn_count());
+        ::closesocket(hc4); ::closesocket(bridge4); ::closesocket(lsn);
+        ::WSACleanup(); return 29;
+    }
+    const std::uint64_t aborts4_before = eng4.aborts();
+
+    // Close the bridge -> engine sees EOF on es4 -> tcp_close -> FIN sent
+    // to guest -> FIN_WAIT_1. We do NOT inject any guest reply.
+    ::closesocket(hc4);
+
+    // Give the loopback FIN a moment to propagate, then pump once so
+    // WSARecv on es4 sees the EOF.
+    ::Sleep(50);
+    eng4.Tick(test_clock4_ms);
+
+    // Fast-forward well past half_close_ms (200) WITHOUT real Sleeps. The
+    // half-close watchdog uses last_activity_ms; with no further injects
+    // it will fire on the next Tick after the deadline.
+    bool reaped4 = false;
+    for (int i = 0; i < 200; ++i) {
+        test_clock4_ms += 50;
+        eng4.Tick(test_clock4_ms);
+        if (eng4.aborts() > aborts4_before && eng4.conn_count() == 0) {
+            reaped4 = true; break;
+        }
+    }
+    if (!reaped4) {
+        std::fprintf(stderr,
+            "[virtio-net-usernet-tsi-test] FAIL: phase4 half-close watchdog "
+            "did not fire (conn_count=%zu aborts_delta=%llu)\n",
+            eng4.conn_count(),
+            (unsigned long long)(eng4.aborts() - aborts4_before));
+        ::closesocket(bridge4); ::closesocket(lsn);
+        ::WSACleanup(); return 30;
+    }
+    std::printf("[virtio-net-usernet-tsi-test] half-close watchdog fired "
+                "(aborts=%llu graceful=%llu)\n",
+                (unsigned long long)eng4.aborts(),
+                (unsigned long long)eng4.graceful_closes());
+
+    eng4.Shutdown();
+    ::closesocket(bridge4);
+
+    // ======================================================================
+    // Phase 5 (M34.6): graceful-close reap + counter sanity. The Phase 1
+    // outbound and Phase 2 inbound flows both ended with a normal FIN
+    // exchange, so their TCBs are sitting in TIME_WAIT inside `eng`.
+    // Without the M34.6 shim-Closed reconcile they would leak the map
+    // forever (latent bug also present in M34.5). Fast-forward `eng`'s
+    // clock past TIME_WAIT (TSI uses 2*MSL; 200s is comfortably past)
+    // and verify both conns are reaped and counted as graceful.
+    // ======================================================================
+    std::puts("[virtio-net-usernet-tsi-test] --- M34.6 Phase 5: graceful-close reap ---");
+    const std::size_t live_before = eng.conn_count();
+    const std::uint64_t graceful_before = eng.graceful_closes();
+    bool eng_drained = false;
+    for (int i = 0; i < 4000; ++i) {       // ~200s of test time
+        test_clock_ms += 50;
+        eng.Tick(test_clock_ms);
+        if (eng.conn_count() == 0) { eng_drained = true; break; }
+    }
+    if (!eng_drained) {
+        std::fprintf(stderr,
+            "[virtio-net-usernet-tsi-test] FAIL: phase5 eng not drained "
+            "(live=%zu after fast-forward, aborts=%llu, graceful=%llu)\n",
+            eng.conn_count(),
+            (unsigned long long)eng.aborts(),
+            (unsigned long long)eng.graceful_closes());
+        ::closesocket(lsn); ::WSACleanup(); return 31;
+    }
+    const std::uint64_t graceful_delta = eng.graceful_closes() - graceful_before;
+    std::printf("[virtio-net-usernet-tsi-test] eng drained: was live=%zu, "
+                "graceful_delta=%llu, aborts=%llu\n",
+                live_before, (unsigned long long)graceful_delta,
+                (unsigned long long)eng.aborts());
+
+    // Counter sanity across all three engines (eng, eng3, eng4).
+    // Expectations:
+    //   eng:  outbound + inbound, both graceful close -> total=2, aborts=0,
+    //         graceful_closes>=2, segments_rx>0, segments_tx>0.
+    //   eng3: inbound that timed out -> total=1, aborts=1.
+    //   eng4: inbound that hit half-close watchdog -> total=1, aborts=1.
+    bool ok = true;
+    auto report = [&](const char* name, std::uint64_t got, std::uint64_t want,
+                      bool require_eq) {
+        const bool pass = require_eq ? (got == want) : (got >= want);
+        if (!pass) {
+            std::fprintf(stderr,
+                "[virtio-net-usernet-tsi-test] FAIL counter: %s got=%llu want%s=%llu\n",
+                name, (unsigned long long)got, require_eq ? "==" : ">=",
+                (unsigned long long)want);
+            ok = false;
+        }
+    };
+    report("eng.total_conns",     eng.total_conns(),     2, true);
+    report("eng.aborts",          eng.aborts(),          0, true);
+    report("eng.graceful_closes", eng.graceful_closes(), 2, false);
+    report("eng.segments_rx",     eng.segments_rx(),     1, false);
+    report("eng.segments_tx",     eng.segments_tx(),     1, false);
+    report("eng3.total_conns",    eng3.total_conns(),    1, true);
+    report("eng3.aborts",         eng3.aborts(),         1, true);
+    report("eng4.total_conns",    eng4.total_conns(),    1, true);
+    report("eng4.aborts",         eng4.aborts(),         1, true);
+    if (!ok) { ::closesocket(lsn); ::WSACleanup(); return 32; }
+    std::printf("[virtio-net-usernet-tsi-test] counters OK: eng{total=%llu "
+                "graceful=%llu rsts=%llu seg_rx=%llu seg_tx=%llu} "
+                "eng3{aborts=%llu} eng4{aborts=%llu}\n",
+                (unsigned long long)eng.total_conns(),
+                (unsigned long long)eng.graceful_closes(),
+                (unsigned long long)eng.rsts_sent(),
+                (unsigned long long)eng.segments_rx(),
+                (unsigned long long)eng.segments_tx(),
+                (unsigned long long)eng3.aborts(),
+                (unsigned long long)eng4.aborts());
+
+    std::printf("[virtio-net-usernet-tsi-test] PASS (conn_total=%llu "
+                "rsts=%llu live=%zu)\n",
+                static_cast<unsigned long long>(eng.total_conns()),
+                static_cast<unsigned long long>(eng.rsts_sent()),
+                eng.conn_count());
+
+    eng.Shutdown();
+    ::closesocket(lsn);
+    ::WSACleanup();
+    return 0;
+}
+
+// --tsi-fuzz-test
+// Feed N random IPv4+TCP packets to TsiTcpEngine::OnGuestTcpPacket plus
+// periodic Tick(). Catches: crashes, asserts, AVs, infinite loops
+// (one Tick per iter == built-in budget), conn_count over the
+// configured cap, and resource leaks (engine.Shutdown reports any
+// live TCBs at exit). Deterministic via --seed N; reproducible.
+//
+// The fuzzer keeps the packet shape *just valid enough* to reach the
+// parser past header validation (correct IPv4 vihl + total_len + TCP
+// proto + valid data_offset). Everything else is random:
+//   - flags (SYN/ACK/RST/FIN/PSH/URG/ECE/CWR combinations)
+//   - seq / ack
+//   - window size
+//   - 5-tuple ports
+//   - payload bytes
+//   - random truncation occasionally past validation
+//
+// dst_ip is forced to 127.0.0.1 with random dst_port. On Windows
+// loopback, Winsock connect() to a closed port returns ECONNREFUSED
+// instantly, so the engine's BeginConnect failure path runs at full
+// fuzz speed without piling up real outbound sockets.
+//
+// Cap: max_conns=8, idle_ms=500ms, connect_ms=100ms, half_close_ms=200ms
+// keeps the engine bounded and fast-recycling.
+int RunTsiFuzzTest(int iters, std::uint64_t seed) {
+    using namespace tinyvmm;
+    using namespace tinyvmm::virtio;
+
+    std::printf("[tsi-fuzz-test] starting (iters=%d, seed=%llu)\n",
+                iters, static_cast<unsigned long long>(seed));
+
+    WSADATA wsa{};
+    if (::WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        std::fputs("[tsi-fuzz-test] FAIL: WSAStartup\n", stderr);
+        return 1;
+    }
+
+    constexpr std::size_t kCap = 8;
+    TsiTcpEngine::EmitCtx ec{};
+    ec.push_ipv4_to_guest =
+        [](const std::uint8_t* /*ip*/, std::size_t /*n*/) {
+            // Discard. Fuzz cares about reaching the parser, not what
+            // the engine emits back.
+        };
+    std::uint64_t test_clock_ms = 1000;
+    ec.now_ms        = [&test_clock_ms]{ return test_clock_ms; };
+    ec.backend_mac   = {0x02, 0x53, 0x54, 0x00, 0x00, 0x01};
+    ec.guest_mac     = {0x52, 0x54, 0x00, 0x12, 0x34, 0x56};
+    ec.gateway_ip_be = ::htonl(0x0A000001);
+    ec.max_conns     = kCap;
+    ec.idle_ms       = 500;
+    ec.connect_ms    = 100;
+    ec.half_close_ms = 200;
+    TsiTcpEngine eng(std::move(ec));
+
+    std::mt19937_64 rng(seed);
+    std::vector<std::uint8_t> pkt;
+    pkt.reserve(1500);
+
+    std::size_t conn_max = 0;
+    int first_fail = -1;
+
+    auto wr16be = [](std::uint8_t* p, std::uint16_t v) {
+        p[0] = static_cast<std::uint8_t>(v >> 8);
+        p[1] = static_cast<std::uint8_t>(v);
+    };
+
+    const std::uint32_t src_ip_be = ::htonl(0x0A000002);   // 10.0.0.2
+    const std::uint32_t dst_ip_be = ::htonl(0x7F000001);   // 127.0.0.1
+
+    for (int i = 0; i < iters; ++i) {
+        // Pick size: mostly 40..120 (header + small payload), sometimes
+        // larger or right at boundary. Min IPv4+TCP = 40 bytes.
+        const std::uint32_t r = static_cast<std::uint32_t>(rng());
+        std::size_t sz;
+        if ((r & 0xF) == 0) {
+            sz = 40 + (rng() % 1460);            // up to MTU
+        } else if ((r & 0xF) == 1) {
+            sz = 40 + (rng() % 8);               // header + 0..7 payload
+        } else if ((r & 0xF) == 2) {
+            sz = 35 + (rng() % 5);               // truncated (35..39)
+        } else {
+            sz = 40 + (rng() % 64);              // common case
+        }
+        pkt.resize(sz);
+        for (auto& b : pkt) b = static_cast<std::uint8_t>(rng());
+
+        // Fix IPv4 header to be parser-valid in the common case:
+        //   vihl = 0x45 (IPv4 + IHL=5).
+        //   total_len = sz.
+        //   protocol = 6 (TCP).
+        // The parser rejects on bad vihl / proto / total_len; we want
+        // most iters to reach the TCP layer.
+        if (sz >= 20) {
+            pkt[0] = 0x45;
+            pkt[1] = 0x00;
+            wr16be(pkt.data() + 2, static_cast<std::uint16_t>(sz));
+            pkt[6] = pkt[6] & 0x1F;              // no DF/MF, frag offset 0
+            pkt[7] = 0;
+            pkt[9] = 6;                          // proto = TCP
+            std::memcpy(pkt.data() + 12, &src_ip_be, 4);
+            std::memcpy(pkt.data() + 16, &dst_ip_be, 4);
+            // src_port: random; dst_port: 127.0.0.1:random (mostly
+            // closed) => instant ECONNREFUSED in BeginConnect.
+            std::uint16_t src_port = ::htons(
+                static_cast<std::uint16_t>(40000 + (rng() % 1024)));
+            std::uint16_t dst_port = ::htons(
+                static_cast<std::uint16_t>(50000 + (rng() % 5000)));
+            std::memcpy(pkt.data() + 20 + 0, &src_port, 2);
+            std::memcpy(pkt.data() + 20 + 2, &dst_port, 2);
+            // TCP data offset: 5..15 but capped to (sz-20)/4 so it's
+            // in-bounds. The parser rejects if data_offset_bytes > tcp_len.
+            const std::size_t tcp_len = sz - 20;
+            const std::uint8_t max_doff = static_cast<std::uint8_t>(
+                std::min<std::size_t>(15, tcp_len / 4));
+            std::uint8_t doff = static_cast<std::uint8_t>(5 + (rng() % 4));
+            if (doff > max_doff) doff = max_doff;
+            if (doff < 5) doff = 5;
+            pkt[20 + 12] = static_cast<std::uint8_t>(doff << 4);
+            // Flags: random (low 6 bits = FIN|SYN|RST|PSH|ACK|URG).
+            pkt[20 + 13] = static_cast<std::uint8_t>(rng()) & 0x3F;
+        }
+
+        // 1 in 8 iters: occasionally truncate sub-IPv4 header to
+        // exercise early-bail paths.
+        if ((rng() & 0x7) == 0 && sz >= 20) {
+            pkt.resize(15 + (rng() % 5));
+        }
+
+        try {
+            eng.OnGuestTcpPacket(test_clock_ms, pkt.data(), pkt.size());
+            eng.Tick(test_clock_ms);
+        } catch (...) {
+            std::fprintf(stderr,
+                "[tsi-fuzz-test] FAIL: exception at iter=%d (size=%zu, "
+                "seed=%llu)\n",
+                i, pkt.size(),
+                static_cast<unsigned long long>(seed));
+            if (first_fail < 0) first_fail = i;
+        }
+        test_clock_ms += 10;
+
+        // Cap check.
+        const std::size_t n = eng.conn_count();
+        if (n > conn_max) conn_max = n;
+        if (n > kCap) {
+            std::fprintf(stderr,
+                "[tsi-fuzz-test] FAIL: conn_count=%zu > cap=%zu at "
+                "iter=%d seed=%llu\n",
+                n, kCap, i, static_cast<unsigned long long>(seed));
+            eng.Shutdown();
+            ::WSACleanup();
+            return 1;
+        }
+    }
+
+    // Drain remaining conns: advance the clock past any half_close /
+    // idle deadlines, run Tick repeatedly.
+    test_clock_ms += 60'000;
+    for (int i = 0; i < 200 && eng.conn_count() > 0; ++i) {
+        eng.Tick(test_clock_ms);
+        test_clock_ms += 100;
+    }
+
+    const std::size_t live_at_end = eng.conn_count();
+    const std::uint64_t total     = eng.total_conns();
+    const std::uint64_t aborts    = eng.aborts();
+    const std::uint64_t graceful  = eng.graceful_closes();
+    const std::uint64_t rsts      = eng.rsts_sent();
+    const std::uint64_t seg_rx    = eng.segments_rx();
+    const std::uint64_t seg_tx    = eng.segments_tx();
+
+    eng.Shutdown();
+    ::WSACleanup();
+
+    if (first_fail >= 0) {
+        std::fprintf(stderr, "[tsi-fuzz-test] FAIL: %d iters, first "
+                             "exception at iter=%d\n", iters, first_fail);
+        return 1;
+    }
+
+    std::printf("[tsi-fuzz-test] PASS (%d iters, seed=%llu, conn_max=%zu, "
+                "live_at_end=%zu, total=%llu, seg_rx=%llu, seg_tx=%llu, "
+                "aborts=%llu, graceful=%llu, rsts=%llu)\n",
+                iters, static_cast<unsigned long long>(seed),
+                conn_max, live_at_end,
+                static_cast<unsigned long long>(total),
+                static_cast<unsigned long long>(seg_rx),
+                static_cast<unsigned long long>(seg_tx),
+                static_cast<unsigned long long>(aborts),
+                static_cast<unsigned long long>(graceful),
+                static_cast<unsigned long long>(rsts));
+    return 0;
+}
+
+// --virtio-queue-fuzz-test
+// Direct Virtqueue::Pop() fuzz: build a guest RAM region + virtqueue,
+// push random descriptor chains to the avail ring, and verify Pop()
+// never crashes / loops infinitely / lets a buffer escape RAM. This
+// targets the virtqueue PARSER, which is the input surface for
+// every virtio device (blk, net, rng, console, 9p).
+//
+// Bugs this catches:
+//   * Descriptor cycles (chain->next forms a loop).
+//   * desc.addr or desc.addr+desc.len escaping guest RAM bounds.
+//   * Zero-length / oversize / misaligned descriptors.
+//   * Indirect descriptor tables with bad inner GPAs.
+//   * Avail-ring index wrap-around / desync.
+//   * Buffer span outliving the RAM mapping.
+//
+// Pop() is the only API surface; the device-side validation that runs
+// after Pop() (virtio-blk header, virtio-net header, 9p T-message
+// dispatcher) is exercised separately by each device's own fuzz.
+//
+// Reproducible via --seed; default seed = 0xFADE0FF.
+int RunVirtioQueueFuzzTest(int iters, std::uint64_t seed) {
+    using namespace tinyvmm;
+    using namespace tinyvmm::whp;
+    namespace v = tinyvmm::virtio;
+
+    std::printf("[virtio-queue-fuzz-test] starting (iters=%d, seed=%llu)\n",
+                iters, static_cast<unsigned long long>(seed));
+
+    CheckWhpAvailable();
+    Partition part(/*vcpu_count=*/1);
+    part.Setup();
+
+    // 1 MiB guest RAM, host-accessible. Note: large-page allocator
+    // rounds the actual region up to 2 MiB (the large-page minimum),
+    // even when the 4 KiB fallback is taken -- the alloc_size in
+    // GuestMemory is computed before the page-policy fallback. So
+    // use mem.size() instead of kRamBytes when computing the host
+    // RAM bound.
+    constexpr std::size_t kRamBytes = 1 << 20;
+    GuestMemory ram(part, /*gpa=*/0, kRamBytes, /*executable=*/false);
+    const std::size_t kRamActual = ram.size();
+    auto* host_ram = static_cast<std::uint8_t*>(ram.host_base());
+    std::memset(host_ram, 0, kRamActual);
+    const std::uint8_t* ram_lo = host_ram;
+    const std::uint8_t* ram_hi = host_ram + kRamActual;
+
+    // Lay out the rings in guest RAM:
+    //   desc  ring: 256 * 16 = 4096 bytes @ 0x10000
+    //   avail ring: 6 + 256*2 + 2 = 520 bytes @ 0x11000
+    //   used  ring: 6 + 256*8 + 2 = 2056 bytes @ 0x12000
+    // Leaves [0..0x10000) free for descriptor buffer targets.
+    constexpr std::uint32_t kQSize    = 256;
+    constexpr std::uint64_t kDescGpa  = 0x10000;
+    constexpr std::uint64_t kAvailGpa = 0x11000;
+    constexpr std::uint64_t kUsedGpa  = 0x12000;
+    constexpr std::uint64_t kBufLo    = 0x00100;
+    constexpr std::uint64_t kBufHi    = 0x10000;
+
+    v::Virtqueue vq(ram, /*max_size=*/kQSize);
+    vq.SetSize(kQSize);
+    vq.SetDescGpa(kDescGpa);
+    vq.SetAvailGpa(kAvailGpa);
+    vq.SetUsedGpa(kUsedGpa);
+    vq.SetReady(true);
+
+    // Convenience writers for desc/avail entries.
+    auto wr_desc = [&](std::uint16_t idx, std::uint64_t addr,
+                        std::uint32_t len, std::uint16_t flags,
+                        std::uint16_t next) {
+        std::uint8_t* p = host_ram + kDescGpa + idx * 16ULL;
+        std::memcpy(p + 0, &addr, 8);
+        std::memcpy(p + 8, &len, 4);
+        std::memcpy(p + 12, &flags, 2);
+        std::memcpy(p + 14, &next, 2);
+    };
+    auto wr_avail_idx = [&](std::uint16_t idx) {
+        std::memcpy(host_ram + kAvailGpa + 2, &idx, 2);
+    };
+    auto wr_avail_ring = [&](std::uint16_t slot, std::uint16_t head) {
+        std::memcpy(host_ram + kAvailGpa + 4 + slot * 2ULL, &head, 2);
+    };
+
+    constexpr std::uint16_t kVringDescFNext     = 0x1;
+    constexpr std::uint16_t kVringDescFWrite    = 0x2;
+    constexpr std::uint16_t kVringDescFIndirect = 0x4;
+
+    std::mt19937_64 rng(seed);
+    auto rnd = [&rng](std::uint64_t hi) -> std::uint64_t {
+        return hi == 0 ? 0 : (rng() % hi);
+    };
+
+    std::uint16_t next_head = 0;
+    std::uint16_t avail_idx = 0;
+    int pops = 0, nulls = 0, escapes = 0, oversize = 0;
+
+    for (int i = 0; i < iters; ++i) {
+        // Pick chain length L in [1..16], occasionally bigger (up to 32).
+        const std::size_t L = 1 + (rnd(16) + ((rng() & 0xF) == 0 ? rnd(16) : 0));
+
+        // Build the chain via L descriptors at sequential indices
+        // [next_head .. next_head + L - 1] (mod kQSize).
+        const std::uint16_t head = next_head;
+        for (std::size_t k = 0; k < L; ++k) {
+            const std::uint16_t idx =
+                static_cast<std::uint16_t>((head + k) % kQSize);
+            // Random addr: 70% inside the buffer region, 20% inside
+            // RAM but possibly clipping, 10% outside RAM.
+            std::uint64_t addr;
+            const std::uint32_t bucket = static_cast<std::uint32_t>(rng()) % 10;
+            if (bucket < 7) {
+                addr = kBufLo + (rnd(kBufHi - kBufLo) & ~7ULL);
+            } else if (bucket < 9) {
+                addr = rnd(kRamBytes);
+            } else {
+                addr = kRamBytes + rnd(kRamBytes);   // out of RAM
+            }
+            // Random len: usually small (0..4096), sometimes huge.
+            std::uint32_t len;
+            const std::uint32_t lb = static_cast<std::uint32_t>(rng()) % 8;
+            if (lb < 6) {
+                len = static_cast<std::uint32_t>(rnd(4097));
+            } else if (lb < 7) {
+                len = static_cast<std::uint32_t>(rnd(static_cast<std::uint64_t>(kRamBytes)) * 2);
+            } else {
+                len = static_cast<std::uint32_t>(rng());  // very large
+            }
+            // Flags: NEXT for non-last, occasionally INDIRECT, random WRITE.
+            std::uint16_t flags = 0;
+            if (k + 1 < L) flags |= kVringDescFNext;
+            if ((rng() & 1) == 0) flags |= kVringDescFWrite;
+            // INDIRECT: only on the very first descriptor of a single-entry
+            // chain (or rarely standalone). We don't actually write a
+            // valid inner table -- the parser MUST detect that the inner
+            // GPA + len cover unmapped/oversized memory and fail.
+            if (L == 1 && (rng() & 0x1F) == 0) flags |= kVringDescFIndirect;
+            // next: usually +1, but 1/16 of the time pick a random
+            // index (could form a cycle or wrap).
+            std::uint16_t nxt = static_cast<std::uint16_t>(
+                (idx + 1) % kQSize);
+            if ((rng() & 0xF) == 0) {
+                nxt = static_cast<std::uint16_t>(rng() % kQSize);
+            }
+            wr_desc(idx, addr, len, flags, nxt);
+        }
+
+        // Publish to avail.
+        wr_avail_ring(avail_idx % kQSize, head);
+        ++avail_idx;
+        wr_avail_idx(avail_idx);
+
+        // Wrap next_head so we keep cycling through the 256 desc slots.
+        next_head = static_cast<std::uint16_t>(
+            (next_head + L) % kQSize);
+
+        // Pop and validate.
+        try {
+            auto chain = vq.Pop();
+            ++pops;
+            if (!chain) {
+                ++nulls;
+                continue;
+            }
+            // Every buffer span must lie within the host RAM range.
+            for (const auto& b : chain->bufs) {
+                if (b.bytes.empty()) continue;
+                if (b.bytes.data() < ram_lo || b.bytes.data() > ram_hi) {
+                    ++escapes;
+                    std::fprintf(stderr,
+                        "[virtio-queue-fuzz-test] FAIL: buffer ptr %p "
+                        "escapes RAM [%p..%p) at iter=%d seed=%llu\n",
+                        (const void*)b.bytes.data(),
+                        (const void*)ram_lo, (const void*)ram_hi,
+                        i, static_cast<unsigned long long>(seed));
+                    return 1;
+                }
+                if (b.bytes.data() + b.bytes.size() > ram_hi) {
+                    ++escapes;
+                    std::fprintf(stderr,
+                        "[virtio-queue-fuzz-test] FAIL: buffer end %p+%zu "
+                        "escapes RAM [%p..%p) at iter=%d seed=%llu\n",
+                        (const void*)b.bytes.data(), b.bytes.size(),
+                        (const void*)ram_lo, (const void*)ram_hi,
+                        i, static_cast<unsigned long long>(seed));
+                    return 1;
+                }
+                if (b.bytes.size() > kRamActual) {
+                    ++oversize;
+                    std::fprintf(stderr,
+                        "[virtio-queue-fuzz-test] FAIL: oversize buffer "
+                        "%zu > %zu at iter=%d seed=%llu\n",
+                        b.bytes.size(), kRamActual,
+                        i, static_cast<unsigned long long>(seed));
+                    return 1;
+                }
+            }
+            // Release the chain back to the device-write side via Push;
+            // exercises used-ring layout under random conditions too.
+            vq.Push(chain->head_index, /*used_len=*/0);
+        } catch (...) {
+            std::fprintf(stderr,
+                "[virtio-queue-fuzz-test] FAIL: exception at iter=%d "
+                "seed=%llu\n", i, static_cast<unsigned long long>(seed));
+            return 1;
+        }
+    }
+
+    std::printf("[virtio-queue-fuzz-test] PASS (%d iters, seed=%llu, "
+                "pops=%d, nulls=%d, escapes=%d, oversize=%d)\n",
+                iters, static_cast<unsigned long long>(seed),
+                pops, nulls, escapes, oversize);
+    return 0;
+}
+
 // --virtio-rng-test (M17)
 // Drive a virtio-rng device end-to-end via the PCI transport. Push a
 // single writable 256-byte descriptor and verify:
@@ -5532,6 +8757,2538 @@ int RunVirtioConsoleTest() {
     return 0;
 }
 
+// --snapshot-trigger-test (M33 Phase 33.1)
+// Drives the magic CPUID leaf 0x4000DE57 from a real-mode stub and verifies:
+//
+//   1. With snapshot::State().armed == false (disarmed): the leaf returns
+//      the signature (EAX=0, EBX='TINY', ECX='SAVE', EDX=1), RIP is
+//      advanced past the CPUID, and the run loop continues to the
+//      subsequent HLT (stop reason GuestHalted because IF=0 in real
+//      mode).
+//
+//   2. With snapshot::State().armed == true (armed): the leaf returns
+//      the signature AND the run loop stops with
+//      StopReason::SnapshotRequested, snapshot::WasRequested() flips
+//      to true, and snapshot::State().requesting_vp_index records this
+//      vCPU's index.
+//
+// Real-mode hand-assembled stub at GPA 0x1000 (CS.Base=0x1000, IP=0):
+//
+//      66 B8 57 DE 00 40   mov eax, 0x4000DE57
+//      0F A2               cpuid
+//      F4                  hlt
+//
+// The CPUID instruction stores its result in EAX/EBX/ECX/EDX. WHP's CPUID
+// exit triggers our handler before any of those registers are written by
+// hardware, so we set all 5 via WHvSetVirtualProcessorRegisters in the
+// magic-leaf branch (the 5th being the next-RIP).
+int RunSnapshotTriggerTest() {
+    using namespace tinyvmm;
+    using namespace tinyvmm::whp;
+    namespace snap = ::tinyvmm::whp::snapshot;
+
+    auto fail = [](const char* msg) {
+        std::fprintf(stderr, "[snapshot-trigger-test] FAIL: %s\n", msg);
+        return 2;
+    };
+
+    CheckWhpAvailable();
+    std::puts("[snapshot-trigger-test] WHP available");
+
+    // The 5-byte mov-imm32 + 2-byte cpuid + 1-byte hlt = 8 bytes total.
+    constexpr std::uint64_t kCodeGpa = 0x1000;
+    const std::uint8_t code[] = {
+        0x66, 0xB8, 0x57, 0xDE, 0x00, 0x40,  // mov eax, 0x4000DE57
+        0x0F, 0xA2,                          // cpuid
+        0xF4,                                // hlt
+    };
+
+    // ---- Subtest 1: disarmed path -------------------------------------
+    // Construct partition + memory + vCPU fresh per subtest so register
+    // state doesn't bleed across.
+    {
+        // Reset global state explicitly (this test is the only writer; the
+        // global persists across subtests within one process).
+        snap::State().armed.store(false, std::memory_order_release);
+        snap::State().requested.store(false, std::memory_order_release);
+        snap::State().requesting_vp_index.store(0, std::memory_order_release);
+        snap::State().save_path.clear();
+
+        Partition part(/*vcpu_count=*/1);
+        // The magic CPUID leaf only intercepts when CPUID exits are routed
+        // to user-mode. This mirrors the production --pvh-run path which
+        // enables cpuid+msr exits for the hypervisor enlightenment surface.
+        part.EnableExtendedExits({.cpuid = true});
+        part.Setup();
+
+        const std::size_t kRamSize = host::LargePageSize();
+        GuestMemory ram(part, /*gpa=*/0, kRamSize, /*executable=*/true);
+        ram.WriteAt(kCodeGpa, code, sizeof(code));
+
+        Vcpu vp(part, 0);
+        vp.SetupRealMode(/*cs_base=*/kCodeGpa);
+        WHV_REGISTER_VALUE rip = {}; rip.Reg64 = 0;
+        vp.SetRegister(WHvX64RegisterRip, rip);
+
+        devices::IoBus io_bus;
+        devices::MmioBus mmio_bus;
+        RunLoop loop(vp, io_bus, mmio_bus);
+        std::puts("[snapshot-trigger-test] disarmed: running...");
+        StopReason stop = loop.Run();
+
+        if (stop != StopReason::GuestHalted) {
+            std::fprintf(stderr,
+                "[snapshot-trigger-test] disarmed: expected "
+                "GuestHalted, got stop=%d\n", static_cast<int>(stop));
+            return 2;
+        }
+        if (snap::WasRequested()) {
+            return fail("disarmed: snapshot::WasRequested() must be false");
+        }
+        // Verify the signature landed in EAX/EBX/ECX/EDX.
+        static const WHV_REGISTER_NAME kNames[] = {
+            WHvX64RegisterRax, WHvX64RegisterRbx,
+            WHvX64RegisterRcx, WHvX64RegisterRdx,
+            WHvX64RegisterRip,
+        };
+        WHV_REGISTER_VALUE vals[5] = {};
+        vp.GetRegisters(kNames, vals);
+        // Real-mode EAX writes only update the low 32. CPUID upper-zeros
+        // are architectural; checking the low 32 is sufficient.
+        const std::uint32_t eax = static_cast<std::uint32_t>(vals[0].Reg64);
+        const std::uint32_t ebx = static_cast<std::uint32_t>(vals[1].Reg64);
+        const std::uint32_t ecx = static_cast<std::uint32_t>(vals[2].Reg64);
+        const std::uint32_t edx = static_cast<std::uint32_t>(vals[3].Reg64);
+        if (eax != snap::kSignatureEax || ebx != snap::kSignatureEbx ||
+            ecx != snap::kSignatureEcx || edx != snap::kSignatureEdx) {
+            std::fprintf(stderr,
+                "[snapshot-trigger-test] disarmed: signature mismatch: "
+                "eax=0x%08X ebx=0x%08X ecx=0x%08X edx=0x%08X "
+                "(want %08X %08X %08X %08X)\n",
+                eax, ebx, ecx, edx,
+                snap::kSignatureEax, snap::kSignatureEbx,
+                snap::kSignatureEcx, snap::kSignatureEdx);
+            return 2;
+        }
+        // Verify RIP is at the HLT (offset 8, since code is 9 bytes total
+        // and RIP points at the byte AFTER the HLT was executed). Real
+        // mode RIP is reported in 16-bit form by WHP but stored as Reg64;
+        // the value should be 9.
+        if (vals[4].Reg64 != 9) {
+            std::fprintf(stderr,
+                "[snapshot-trigger-test] disarmed: RIP=0x%llx (expected 9)\n",
+                static_cast<unsigned long long>(vals[4].Reg64));
+            return 2;
+        }
+        std::printf("[snapshot-trigger-test] disarmed: PASS "
+                    "(cpuid=%llu halt=%llu)\n",
+                    static_cast<unsigned long long>(loop.cpuid_exits()),
+                    static_cast<unsigned long long>(loop.halt_exits()));
+    }
+
+    // ---- Subtest 2: armed path ----------------------------------------
+    {
+        snap::State().armed.store(true, std::memory_order_release);
+        snap::State().requested.store(false, std::memory_order_release);
+        snap::State().requesting_vp_index.store(0xDEADBEEFu,
+            std::memory_order_release);
+        snap::State().save_path = "test://armed-path";
+
+        Partition part(/*vcpu_count=*/1);
+        part.EnableExtendedExits({.cpuid = true});
+        part.Setup();
+
+        const std::size_t kRamSize = host::LargePageSize();
+        GuestMemory ram(part, /*gpa=*/0, kRamSize, /*executable=*/true);
+        ram.WriteAt(kCodeGpa, code, sizeof(code));
+
+        Vcpu vp(part, 0);
+        vp.SetupRealMode(/*cs_base=*/kCodeGpa);
+        WHV_REGISTER_VALUE rip = {}; rip.Reg64 = 0;
+        vp.SetRegister(WHvX64RegisterRip, rip);
+
+        devices::IoBus io_bus;
+        devices::MmioBus mmio_bus;
+        RunLoop loop(vp, io_bus, mmio_bus);
+        std::puts("[snapshot-trigger-test] armed: running...");
+        StopReason stop = loop.Run();
+
+        if (stop != StopReason::SnapshotRequested) {
+            std::fprintf(stderr,
+                "[snapshot-trigger-test] armed: expected "
+                "SnapshotRequested, got stop=%d\n", static_cast<int>(stop));
+            return 2;
+        }
+        if (!snap::WasRequested()) {
+            return fail("armed: snapshot::WasRequested() must be true");
+        }
+        if (snap::State().requesting_vp_index.load(
+                std::memory_order_acquire) != 0u) {
+            return fail("armed: requesting_vp_index must be 0 (this is vp 0)");
+        }
+        // Signature should still be present in EAX/EBX/ECX/EDX (the magic
+        // CPUID branch writes them BEFORE deciding to stop).
+        static const WHV_REGISTER_NAME kNames[] = {
+            WHvX64RegisterRax, WHvX64RegisterRbx,
+            WHvX64RegisterRcx, WHvX64RegisterRdx,
+            WHvX64RegisterRip,
+        };
+        WHV_REGISTER_VALUE vals[5] = {};
+        vp.GetRegisters(kNames, vals);
+        const std::uint32_t eax = static_cast<std::uint32_t>(vals[0].Reg64);
+        const std::uint32_t ebx = static_cast<std::uint32_t>(vals[1].Reg64);
+        const std::uint32_t ecx = static_cast<std::uint32_t>(vals[2].Reg64);
+        const std::uint32_t edx = static_cast<std::uint32_t>(vals[3].Reg64);
+        if (eax != snap::kSignatureEax || ebx != snap::kSignatureEbx ||
+            ecx != snap::kSignatureEcx || edx != snap::kSignatureEdx) {
+            std::fprintf(stderr,
+                "[snapshot-trigger-test] armed: signature mismatch: "
+                "eax=0x%08X ebx=0x%08X ecx=0x%08X edx=0x%08X\n",
+                eax, ebx, ecx, edx);
+            return 2;
+        }
+        // RIP should be at offset 8 (just past CPUID), NOT at 9 (past HLT)
+        // because we stop before reaching the HLT.
+        if (vals[4].Reg64 != 8) {
+            std::fprintf(stderr,
+                "[snapshot-trigger-test] armed: RIP=0x%llx (expected 8)\n",
+                static_cast<unsigned long long>(vals[4].Reg64));
+            return 2;
+        }
+        if (loop.halt_exits() != 0) {
+            return fail("armed: HLT must NOT have been reached");
+        }
+        std::printf("[snapshot-trigger-test] armed: PASS "
+                    "(cpuid=%llu halt=%llu vp=%u path='%s')\n",
+                    static_cast<unsigned long long>(loop.cpuid_exits()),
+                    static_cast<unsigned long long>(loop.halt_exits()),
+                    snap::State().requesting_vp_index.load(
+                        std::memory_order_acquire),
+                    snap::State().save_path.c_str());
+
+        // Clean up: disarm so this global state doesn't poison anything
+        // else if subsequent tests are added.
+        snap::State().armed.store(false, std::memory_order_release);
+        snap::State().requested.store(false, std::memory_order_release);
+        snap::State().save_path.clear();
+    }
+
+    std::puts("[snapshot-trigger-test] PASS");
+    return 0;
+}
+
+// --save-restore-probe (M33 Phase 33.2)
+// Validate the WHP State API contract that Phase 33.3+ will depend on:
+// (1) capture full vCPU + RAM state from a running partition,
+// (2) destroy the partition,
+// (3) recreate a fresh partition + vCPU,
+// (4) apply saved state BEFORE the new vCPU's first Run,
+// (5) verify the guest continues from exactly where it left off.
+//
+// Two subtests cover different save-point boundaries:
+//   * Subtest 1: capture at HLT (clean architectural boundary).
+//   * Subtest 2: capture at the magic CPUID SnapshotRequested exit
+//     (the actual production save point — RIP advanced past CPUID by
+//     the snapshot::HandleCpuidExit branch).
+//
+// Restore order (rubber-duck Phase 33.2 finding): set architectural and
+// control registers (Cr0/Cr4/Efer/XCr0/segments/ApicBase) BEFORE applying
+// XSAVE blob, because XSAVE interpretation depends on XCR0. Set TSC and
+// timing registers LAST to minimize observable skew across vCPUs.
+//
+// The register-name arrays, CapturedVcpuState, CaptureVcpuState, and
+// ApplyVcpuState now live in `whp/vcpu_state.{h,cpp}` so the production
+// `--save` / `--restore` paths (Phase 33.6) can share them with the
+// host-side probes/tests.
+
+int RunSaveRestoreProbe() {
+    using namespace tinyvmm;
+    using namespace tinyvmm::whp;
+    namespace snap = ::tinyvmm::whp::snapshot;
+
+    CheckWhpAvailable();
+    std::puts("[save-restore-probe] WHP available");
+
+    auto fail = [](const char* msg) {
+        std::fprintf(stderr, "[save-restore-probe] FAIL: %s\n", msg);
+        return 2;
+    };
+
+    // ---------------- Subtest 1: capture at HLT boundary ----------------
+    //   B8 00 00     mov ax, 0     (3 bytes, offset 0..2)
+    //   40           inc ax         (1 byte, offset 3)
+    //   F4           hlt #1         (1 byte, offset 4) -> RIP=5 after exit
+    //   40           inc ax         (1 byte, offset 5)
+    //   40           inc ax         (1 byte, offset 6)
+    //   F4           hlt #2         (1 byte, offset 7) -> RIP=8 after exit
+    {
+        constexpr std::uint64_t kCodeGpa = 0x1000;
+        const std::uint8_t code[] = {
+            0xB8, 0x00, 0x00,
+            0x40,
+            0xF4,
+            0x40,
+            0x40,
+            0xF4,
+        };
+
+        snap::CapturedVcpuState state;
+        std::vector<std::uint8_t> ram_bytes;
+        std::size_t ram_size = 0;
+
+        // Phase A: cold boot, halt at HLT #1, capture
+        {
+            Partition part(/*vcpu_count=*/1);
+            part.EnableExtendedExits({.cpuid = true});
+            // Deliberately NOT enabling LAPIC emulation: this is a real-mode
+            // probe that doesn't program the LAPIC, and enabling x2APIC
+            // makes WHP wedge on HLT (the run loop sees pending virtual
+            // interrupt state and re-enters indefinitely).
+            part.Setup();
+
+            ram_size = host::LargePageSize();
+            GuestMemory ram(part, /*gpa=*/0, ram_size, /*executable=*/true);
+            ram.WriteAt(kCodeGpa, code, sizeof(code));
+
+            Vcpu vp(part, 0);
+            vp.SetupRealMode(/*cs_base=*/kCodeGpa);
+            WHV_REGISTER_VALUE rip = {}; rip.Reg64 = 0;
+            vp.SetRegister(WHvX64RegisterRip, rip);
+
+            devices::IoBus io_bus;
+            devices::MmioBus mmio_bus;
+            RunLoop loop(vp, io_bus, mmio_bus);
+            std::puts("[save-restore-probe] subtest1 phaseA: running...");
+            StopReason stop = loop.Run();
+            if (stop != StopReason::GuestHalted) {
+                std::fprintf(stderr, "[save-restore-probe] subtest1 phaseA:"
+                             " expected GuestHalted, got %d\n",
+                             static_cast<int>(stop));
+                return 2;
+            }
+            const auto ax = vp.GetRegister(WHvX64RegisterRax).Reg64 & 0xFFFFu;
+            const auto rip_v = vp.GetRegister(WHvX64RegisterRip).Reg64;
+            if (ax != 1 || rip_v != 5) {
+                std::fprintf(stderr, "[save-restore-probe] subtest1 phaseA:"
+                             " AX=%llu RIP=0x%llx (want AX=1 RIP=5)\n",
+                             static_cast<unsigned long long>(ax),
+                             static_cast<unsigned long long>(rip_v));
+                return 2;
+            }
+
+            snap::CaptureVcpuState(vp, part.handle(), 0, state);
+            ram_bytes.resize(ram.size());
+            std::memcpy(ram_bytes.data(), ram.host_base(), ram.size());
+            std::printf("[save-restore-probe] subtest1 phaseA captured: "
+                        "arch=%zu timing=%zu intr=%zu xsave=%zu apic=%zu "
+                        "ram=%zu bytes\n",
+                        snap::kArchRegCount(), snap::kTimingRegCount(),
+                        snap::kIntrCtlRegCount(),
+                        state.xsave.size(), state.apic.size(),
+                        ram_bytes.size());
+        }
+
+        // Phase B: recreate, apply, continue
+        const auto t0 = std::chrono::steady_clock::now();
+        {
+            Partition part(/*vcpu_count=*/1);
+            part.EnableExtendedExits({.cpuid = true});
+            // No LAPIC emulation — see Phase A comment.
+            part.Setup();
+
+            GuestMemory ram(part, /*gpa=*/0, ram_size, /*executable=*/true);
+            std::memcpy(ram.host_base(), ram_bytes.data(), ram_size);
+
+            // Brand-new vCPU — never called Run.
+            Vcpu vp(part, 0);
+
+            snap::ApplyVcpuState(vp, part.handle(), 0, state);
+
+            // Read back key registers to verify state was accepted before Run.
+            const auto cs_seg  = vp.GetRegister(WHvX64RegisterCs).Segment;
+            const auto cr0     = vp.GetRegister(WHvX64RegisterCr0).Reg64;
+            const auto efer    = vp.GetRegister(WHvX64RegisterEfer).Reg64;
+            const auto xcr0    = vp.GetRegister(WHvX64RegisterXCr0).Reg64;
+            const auto apic_b  = vp.GetRegister(WHvX64RegisterApicBase).Reg64;
+            const auto rip_pre = vp.GetRegister(WHvX64RegisterRip).Reg64;
+            std::printf("[save-restore-probe] subtest1 phaseB applied: "
+                        "rip=0x%llx cs.base=0x%llx cr0=0x%llx efer=0x%llx "
+                        "xcr0=0x%llx apic_base=0x%llx\n",
+                        static_cast<unsigned long long>(rip_pre),
+                        static_cast<unsigned long long>(cs_seg.Base),
+                        static_cast<unsigned long long>(cr0),
+                        static_cast<unsigned long long>(efer),
+                        static_cast<unsigned long long>(xcr0),
+                        static_cast<unsigned long long>(apic_b));
+            if (rip_pre != 5) {
+                return fail("subtest1 phaseB: RIP didn't take");
+            }
+            if (cs_seg.Base != kCodeGpa) {
+                return fail("subtest1 phaseB: CS.base didn't take");
+            }
+
+            devices::IoBus io_bus;
+            devices::MmioBus mmio_bus;
+            RunLoop loop(vp, io_bus, mmio_bus);
+            std::puts("[save-restore-probe] subtest1 phaseB: continuing...");
+            StopReason stop = loop.Run();
+            if (stop != StopReason::GuestHalted) {
+                std::fprintf(stderr, "[save-restore-probe] subtest1 phaseB:"
+                             " expected GuestHalted, got %d\n",
+                             static_cast<int>(stop));
+                return 2;
+            }
+            const auto ax = vp.GetRegister(WHvX64RegisterRax).Reg64 & 0xFFFFu;
+            const auto rip_v = vp.GetRegister(WHvX64RegisterRip).Reg64;
+            if (ax != 3 || rip_v != 8) {
+                std::fprintf(stderr, "[save-restore-probe] subtest1 phaseB:"
+                             " AX=%llu RIP=0x%llx (want AX=3 RIP=8)\n",
+                             static_cast<unsigned long long>(ax),
+                             static_cast<unsigned long long>(rip_v));
+                return 2;
+            }
+        }
+        const auto restore_ms = std::chrono::duration_cast<
+            std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+        std::printf("[save-restore-probe] subtest1 PASS"
+                    " (restore wall-time %lld ms)\n",
+                    static_cast<long long>(restore_ms));
+    }
+
+    // ---------------- Subtest 2: capture at CPUID magic-leaf boundary ---
+    //   66 B8 57 DE 00 40   mov eax, 0x4000DE57   (6 bytes, offset 0..5)
+    //   0F A2               cpuid                 (2 bytes, offset 6..7)
+    //                       -> magic-leaf handler advances RIP to 8 +
+    //                          returns SnapshotRequested
+    //   40                  inc ax                (1 byte, offset 8)
+    //   40                  inc ax                (1 byte, offset 9)
+    //   F4                  hlt                   (1 byte, offset 10)
+    //                       -> RIP=11 after exit
+    //
+    // After the magic CPUID, EAX=kSignatureEax=0 so AX low-16=0. After
+    // the two inc ax's: AX=2.
+    {
+        constexpr std::uint64_t kCodeGpa = 0x1000;
+        const std::uint8_t code[] = {
+            0x66, 0xB8, 0x57, 0xDE, 0x00, 0x40,
+            0x0F, 0xA2,
+            0x40,
+            0x40,
+            0xF4,
+        };
+
+        snap::CapturedVcpuState state;
+        std::vector<std::uint8_t> ram_bytes;
+        std::size_t ram_size = 0;
+
+        // Phase A: cold boot, trigger snapshot via CPUID
+        {
+            snap::State().armed.store(true, std::memory_order_release);
+            snap::State().requested.store(false, std::memory_order_release);
+            snap::State().requesting_vp_index.store(0xDEADBEEFu,
+                std::memory_order_release);
+            snap::State().save_path = "test://probe-armed";
+
+            Partition part(/*vcpu_count=*/1);
+            part.EnableExtendedExits({.cpuid = true});
+            // No LAPIC emulation in this real-mode probe (see subtest1).
+            part.Setup();
+
+            ram_size = host::LargePageSize();
+            GuestMemory ram(part, /*gpa=*/0, ram_size, /*executable=*/true);
+            ram.WriteAt(kCodeGpa, code, sizeof(code));
+
+            Vcpu vp(part, 0);
+            vp.SetupRealMode(/*cs_base=*/kCodeGpa);
+            WHV_REGISTER_VALUE rip = {}; rip.Reg64 = 0;
+            vp.SetRegister(WHvX64RegisterRip, rip);
+
+            devices::IoBus io_bus;
+            devices::MmioBus mmio_bus;
+            RunLoop loop(vp, io_bus, mmio_bus);
+            std::puts("[save-restore-probe] subtest2 phaseA: running...");
+            StopReason stop = loop.Run();
+
+            // Disarm before any potential re-entry. We capture state next,
+            // which doesn't itself execute CPUID, but be defensive in case
+            // future revisions add state-touching code that does.
+            snap::State().armed.store(false, std::memory_order_release);
+            snap::State().requested.store(false, std::memory_order_release);
+            snap::State().save_path.clear();
+
+            if (stop != StopReason::SnapshotRequested) {
+                std::fprintf(stderr, "[save-restore-probe] subtest2 phaseA:"
+                             " expected SnapshotRequested, got %d\n",
+                             static_cast<int>(stop));
+                return 2;
+            }
+            const auto rip_v = vp.GetRegister(WHvX64RegisterRip).Reg64;
+            if (rip_v != 8) {
+                std::fprintf(stderr, "[save-restore-probe] subtest2 phaseA:"
+                             " RIP=0x%llx (want 8 post-CPUID)\n",
+                             static_cast<unsigned long long>(rip_v));
+                return 2;
+            }
+            const auto ax = vp.GetRegister(WHvX64RegisterRax).Reg64 & 0xFFFFu;
+            // Magic-leaf handler writes EAX = kSignatureEax = 0.
+            if (ax != 0) {
+                std::fprintf(stderr, "[save-restore-probe] subtest2 phaseA:"
+                             " AX=%llu (want 0, magic signature)\n",
+                             static_cast<unsigned long long>(ax));
+                return 2;
+            }
+
+            snap::CaptureVcpuState(vp, part.handle(), 0, state);
+            ram_bytes.resize(ram.size());
+            std::memcpy(ram_bytes.data(), ram.host_base(), ram.size());
+            std::puts("[save-restore-probe] subtest2 phaseA captured at"
+                      " post-CPUID RIP=8");
+        }
+
+        // Phase B: recreate, apply, continue past CPUID through to HLT
+        const auto t0 = std::chrono::steady_clock::now();
+        {
+            // Snapshot state must be disarmed for the restored partition.
+            // RIP=8 means we never re-execute CPUID, but if armed and
+            // something accidentally re-entered it would fire again.
+            snap::State().armed.store(false, std::memory_order_release);
+            snap::State().requested.store(false, std::memory_order_release);
+            snap::State().save_path.clear();
+
+            Partition part(/*vcpu_count=*/1);
+            part.EnableExtendedExits({.cpuid = true});
+            // No LAPIC emulation in this real-mode probe (see subtest1).
+            part.Setup();
+
+            GuestMemory ram(part, /*gpa=*/0, ram_size, /*executable=*/true);
+            std::memcpy(ram.host_base(), ram_bytes.data(), ram_size);
+
+            Vcpu vp(part, 0);
+            snap::ApplyVcpuState(vp, part.handle(), 0, state);
+
+            devices::IoBus io_bus;
+            devices::MmioBus mmio_bus;
+            RunLoop loop(vp, io_bus, mmio_bus);
+            std::puts("[save-restore-probe] subtest2 phaseB: continuing...");
+            StopReason stop = loop.Run();
+            if (stop != StopReason::GuestHalted) {
+                std::fprintf(stderr, "[save-restore-probe] subtest2 phaseB:"
+                             " expected GuestHalted, got %d\n",
+                             static_cast<int>(stop));
+                return 2;
+            }
+            const auto ax = vp.GetRegister(WHvX64RegisterRax).Reg64 & 0xFFFFu;
+            const auto rip_v = vp.GetRegister(WHvX64RegisterRip).Reg64;
+            if (ax != 2 || rip_v != 11) {
+                std::fprintf(stderr, "[save-restore-probe] subtest2 phaseB:"
+                             " AX=%llu RIP=0x%llx (want AX=2 RIP=11)\n",
+                             static_cast<unsigned long long>(ax),
+                             static_cast<unsigned long long>(rip_v));
+                return 2;
+            }
+        }
+        const auto restore_ms = std::chrono::duration_cast<
+            std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+        std::printf("[save-restore-probe] subtest2 PASS"
+                    " (restore wall-time %lld ms)\n",
+                    static_cast<long long>(restore_ms));
+    }
+
+    std::puts("[save-restore-probe] PASS");
+    return 0;
+}
+
+// --save-restore-roundtrip-test (M33.3)
+//
+// End-to-end exercise of the Phase 33.3 file format:
+//
+//   Phase A: Cold-boot a real-mode partition (same shape as
+//            --save-restore-probe subtest 2: arm snapshot, run until
+//            SnapshotRequested fires at post-CPUID RIP=8). Capture live
+//            vCPU state + RAM + HvEnlightenment state.
+//
+//   Phase B: Write everything to a temp file using SnapshotWriter.
+//
+//   Phase C: Read it back using SnapshotReader. Verify trailer CRC.
+//            Materialize a side-by-side copy of the captured state and
+//            assert byte-for-byte equality with the in-memory original
+//            (RAM, xsave, apic, arch values, timing values, intr_ctl
+//            entries pairwise with ok-bit check, HvEnlightenment state).
+//
+//   Phase D: Construct a fresh Partition + GuestMemory, memcpy restored
+//            RAM into the new GuestMemory's host_base() (rubber-duck
+//            blocking #1), apply restored vCPU state via the shared
+//            snap module, apply restored HvEnlightenment state. Run.
+//            Expect GuestHalted at RIP=11 (post-cpuid: inc; inc; hlt).
+//
+// File is deleted on success. On failure the path is logged so the
+// caller can inspect it.
+int RunSaveRestoreRoundtripTest() {
+    using namespace tinyvmm;
+    using namespace tinyvmm::whp;
+    namespace snap = ::tinyvmm::whp::snapshot;
+
+    CheckWhpAvailable();
+    std::puts("[save-restore-roundtrip] WHP available");
+
+    // Acquire a unique temp path via Win32. This deletes any previously
+    // existing file at the path; we recreate via SnapshotWriter
+    // (CREATE_ALWAYS). The 0-prefix arg to GetTempFileNameA creates a
+    // unique name and the file (which SnapshotWriter then overwrites).
+    std::string tmp_path;
+    {
+        char dir[MAX_PATH + 1] = {};
+        DWORD n = ::GetTempPathA(MAX_PATH, dir);
+        if (n == 0 || n > MAX_PATH) {
+            std::fprintf(stderr,
+                "[save-restore-roundtrip] FAIL: GetTempPathA err=%lu\n",
+                ::GetLastError());
+            return 2;
+        }
+        char path[MAX_PATH + 1] = {};
+        if (::GetTempFileNameA(dir, "tvm", 0, path) == 0) {
+            std::fprintf(stderr,
+                "[save-restore-roundtrip] FAIL: GetTempFileNameA err=%lu\n",
+                ::GetLastError());
+            return 2;
+        }
+        tmp_path = path;
+    }
+    std::printf("[save-restore-roundtrip] temp file: %s\n", tmp_path.c_str());
+
+    auto cleanup = [&]() noexcept {
+        ::DeleteFileA(tmp_path.c_str());
+    };
+
+    // Reproducing the probe subtest2's exact bytes (11 bytes total):
+    //   66 B8 57 DE 00 40  mov eax, 0x4000DE57   (6 bytes, offset 0..5)
+    //                                            (66 = operand-size prefix
+    //                                             needed for 32-bit imm in
+    //                                             real mode)
+    //   0F A2              cpuid                 (2 bytes, offset 6..7)
+    //                                            magic-leaf handler advances
+    //                                            RIP to 8 + returns
+    //                                            SnapshotRequested
+    //   40                 inc ax                (1 byte, offset 8)
+    //   40                 inc ax                (1 byte, offset 9)
+    //   F4                 hlt                   (1 byte, offset 10)
+    //                                            -> RIP=11 after exit
+    //
+    // After magic CPUID, EAX=kSignatureEax=0 so AX low-16=0. After the
+    // two inc ax's: AX=2. (Mirrors --save-restore-probe subtest 2.)
+    constexpr std::uint64_t kCodeGpa = 0x1000;
+    const std::uint8_t code[] = {
+        0x66, 0xB8, 0x57, 0xDE, 0x00, 0x40,
+        0x0F, 0xA2,
+        0x40,
+        0x40,
+        0xF4,
+    };
+
+    snap::CapturedVcpuState captured_state;
+    std::vector<std::uint8_t> captured_ram;
+    HvEnlightenment::State captured_hv{};
+    std::size_t ram_size = 0;
+    std::uint64_t tsc_hz = whp::GetCachedTscHz();
+
+    // ----------------- Phase A: cold-boot and capture -----------------
+    {
+        snap::State().armed.store(true, std::memory_order_release);
+        snap::State().requested.store(false, std::memory_order_release);
+        snap::State().requesting_vp_index.store(0xDEADBEEFu,
+            std::memory_order_release);
+        snap::State().save_path = "test://roundtrip-armed";
+
+        Partition part(/*vcpu_count=*/1);
+        part.EnableExtendedExits({.cpuid = true});
+        // No LAPIC emulation in this real-mode probe (mirrors
+        // --save-restore-probe subtest 2).
+        part.Setup();
+
+        ram_size = host::LargePageSize();
+        GuestMemory ram(part, /*gpa=*/0, ram_size, /*executable=*/true);
+        ram.WriteAt(kCodeGpa, code, sizeof(code));
+
+        Vcpu vp(part, 0);
+        vp.SetupRealMode(/*cs_base=*/kCodeGpa);
+        WHV_REGISTER_VALUE rip = {}; rip.Reg64 = 0;
+        vp.SetRegister(WHvX64RegisterRip, rip);
+
+        // HvEnlightenment isn't actually exercised by this real-mode
+        // guest (no MSR exits enabled), but we still capture and
+        // restore it to exercise the on-disk format. The state values
+        // are simply the (zero) defaults set by ctor.
+        HvEnlightenment hv(ram, tsc_hz);
+
+        devices::IoBus io_bus;
+        devices::MmioBus mmio_bus;
+        RunLoop loop(vp, io_bus, mmio_bus);
+        std::puts("[save-restore-roundtrip] phaseA: running...");
+        StopReason stop = loop.Run();
+
+        snap::State().armed.store(false, std::memory_order_release);
+        snap::State().requested.store(false, std::memory_order_release);
+        snap::State().save_path.clear();
+
+        if (stop != StopReason::SnapshotRequested) {
+            std::fprintf(stderr,
+                "[save-restore-roundtrip] phaseA: expected"
+                " SnapshotRequested, got %d\n",
+                static_cast<int>(stop));
+            cleanup();
+            return 2;
+        }
+        const auto rip_v = vp.GetRegister(WHvX64RegisterRip).Reg64;
+        if (rip_v != 8) {
+            std::fprintf(stderr,
+                "[save-restore-roundtrip] phaseA: RIP=0x%llx (want 8)\n",
+                static_cast<unsigned long long>(rip_v));
+            cleanup();
+            return 2;
+        }
+
+        snap::CaptureVcpuState(vp, part.handle(), 0, captured_state);
+        captured_ram.resize(ram.size());
+        std::memcpy(captured_ram.data(), ram.host_base(), ram.size());
+        captured_hv = hv.CaptureState();
+        std::printf("[save-restore-roundtrip] phaseA captured:"
+                    " arch=%zu timing=%zu intr=%zu xsave=%zu"
+                    " apic=%zu ram=%zu tsc_hz=%llu\n",
+                    captured_state.arch.size(),
+                    captured_state.timing.size(),
+                    captured_state.intr_ctl.size(),
+                    captured_state.xsave.size(),
+                    captured_state.apic.size(),
+                    captured_ram.size(),
+                    static_cast<unsigned long long>(tsc_hz));
+    }
+
+    // ---------------------- Phase B: write file ----------------------
+    {
+        snap::JsonObjectWriter jw;
+        jw.Add("vcpu_count",     std::uint64_t{1});
+        jw.Add("ram_size_bytes", static_cast<std::uint64_t>(ram_size));
+        jw.Add("large_pages",    false);
+        jw.Add("tsc_hz_at_save", tsc_hz);
+        jw.Add("test_marker",    std::string_view("roundtrip"));
+
+        snap::SnapshotWriter w(tmp_path);
+        w.WriteHeader(jw.str());
+
+        // RAM first (largest section).
+        w.WriteSection(snap::SectionType::RamRaw,
+                       captured_ram.data(), captured_ram.size());
+
+        // VCPU_REGS: u32 vp_idx | u32 reg_count |
+        //            [u32 name | u32 reserved | 16 bytes value]*
+        auto encode_reg_block =
+            [](std::uint32_t vp_idx,
+               const WHV_REGISTER_NAME* names,
+               const std::vector<WHV_REGISTER_VALUE>& values)
+            -> std::vector<std::uint8_t>
+        {
+            const std::uint32_t n = static_cast<std::uint32_t>(values.size());
+            std::vector<std::uint8_t> out(8 + n * (8 + 16));
+            snap::WriteLe32(&out[0], vp_idx);
+            snap::WriteLe32(&out[4], n);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                std::uint8_t* p = &out[8 + i * (8 + 16)];
+                snap::WriteLe32(p + 0, static_cast<std::uint32_t>(names[i]));
+                snap::WriteLe32(p + 4, 0u);  // reserved
+                std::memcpy(p + 8, &values[i], 16);
+            }
+            return out;
+        };
+
+        auto regs_block = encode_reg_block(0, snap::kArchRegNames,
+                                           captured_state.arch);
+        w.WriteSection(snap::SectionType::VcpuRegs,
+                       regs_block.data(), regs_block.size());
+
+        // VCPU_XSAVE: u32 vp_idx | u32 size | bytes
+        {
+            std::vector<std::uint8_t> blob(8 + captured_state.xsave.size());
+            snap::WriteLe32(&blob[0], 0u);  // vp_idx
+            snap::WriteLe32(&blob[4],
+                tinyvmm::util::checked_int_cast<std::uint32_t>(
+                    captured_state.xsave.size()));
+            if (!captured_state.xsave.empty()) {
+                std::memcpy(&blob[8], captured_state.xsave.data(),
+                            captured_state.xsave.size());
+            }
+            w.WriteSection(snap::SectionType::VcpuXsave,
+                           blob.data(), blob.size());
+        }
+
+        // VCPU_APIC: same encoding as XSAVE. May be 0-length.
+        {
+            std::vector<std::uint8_t> blob(8 + captured_state.apic.size());
+            snap::WriteLe32(&blob[0], 0u);
+            snap::WriteLe32(&blob[4],
+                tinyvmm::util::checked_int_cast<std::uint32_t>(
+                    captured_state.apic.size()));
+            if (!captured_state.apic.empty()) {
+                std::memcpy(&blob[8], captured_state.apic.data(),
+                            captured_state.apic.size());
+            }
+            w.WriteSection(snap::SectionType::VcpuApic,
+                           blob.data(), blob.size());
+        }
+
+        // VCPU_INTR_CTL: u32 vp_idx | u32 reg_count |
+        //                [u32 name | u8 ok | u8 pad[3] | 16 bytes value]*
+        {
+            const std::uint32_t n = static_cast<std::uint32_t>(
+                captured_state.intr_ctl.size());
+            std::vector<std::uint8_t> blob(8 + n * (8 + 16));
+            snap::WriteLe32(&blob[0], 0u);
+            snap::WriteLe32(&blob[4], n);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                std::uint8_t* p = &blob[8 + i * (8 + 16)];
+                snap::WriteLe32(p + 0,
+                    static_cast<std::uint32_t>(snap::kIntrCtlRegNames[i]));
+                p[4] = captured_state.intr_ctl_ok[i] ? 1u : 0u;
+                p[5] = 0; p[6] = 0; p[7] = 0;
+                std::memcpy(p + 8, &captured_state.intr_ctl[i], 16);
+            }
+            w.WriteSection(snap::SectionType::VcpuIntrCtl,
+                           blob.data(), blob.size());
+        }
+
+        // VCPU_TIMING: same encoding as VCPU_REGS.
+        auto timing_block = encode_reg_block(0, snap::kTimingRegNames,
+                                             captured_state.timing);
+        w.WriteSection(snap::SectionType::VcpuTiming,
+                       timing_block.data(), timing_block.size());
+
+        // HV_ENLIGHTENMENT: 32 bytes (4 LE u64s).
+        {
+            std::uint8_t hv[32];
+            snap::WriteLe64(hv +  0, captured_hv.guest_os_id);
+            snap::WriteLe64(hv +  8, captured_hv.hypercall_msr);
+            snap::WriteLe64(hv + 16, captured_hv.reference_tsc_msr);
+            snap::WriteLe64(hv + 24, captured_hv.tsc_invariant_ctl);
+            w.WriteSection(snap::SectionType::HvEnlightenment, hv, sizeof(hv));
+        }
+
+        w.Finalize();
+        std::printf("[save-restore-roundtrip] phaseB wrote %llu bytes\n",
+                    static_cast<unsigned long long>(w.bytes_written()));
+    }
+
+    // ---------------- Phase C: read back + byte equality ----------------
+    snap::CapturedVcpuState restored_state;
+    std::vector<std::uint8_t> restored_ram;
+    HvEnlightenment::State restored_hv{};
+    {
+        snap::SnapshotReader r(tmp_path);
+        const std::string hdr = r.ReadHeader();
+        snap::JsonObjectReader jr(hdr);
+        if (jr.GetUint("vcpu_count") != 1) {
+            std::fprintf(stderr,
+                "[save-restore-roundtrip] phaseC: vcpu_count mismatch\n");
+            cleanup(); return 2;
+        }
+        if (jr.GetUint("ram_size_bytes") != ram_size) {
+            std::fprintf(stderr,
+                "[save-restore-roundtrip] phaseC: ram_size mismatch\n");
+            cleanup(); return 2;
+        }
+        if (jr.GetUint("tsc_hz_at_save") != tsc_hz) {
+            std::fprintf(stderr,
+                "[save-restore-roundtrip] phaseC: tsc_hz mismatch\n");
+            cleanup(); return 2;
+        }
+        if (jr.GetBool("large_pages") != false) {
+            std::fprintf(stderr,
+                "[save-restore-roundtrip] phaseC: large_pages mismatch\n");
+            cleanup(); return 2;
+        }
+        if (jr.GetString("test_marker") != "roundtrip") {
+            std::fprintf(stderr,
+                "[save-restore-roundtrip] phaseC: test_marker mismatch\n");
+            cleanup(); return 2;
+        }
+
+        auto decode_reg_block = [&](std::span<const std::uint8_t> payload,
+                                    std::vector<WHV_REGISTER_VALUE>& out,
+                                    const WHV_REGISTER_NAME* expected_names,
+                                    std::size_t expected_count,
+                                    const char* tag) -> bool
+        {
+            if (payload.size() < 8) {
+                std::fprintf(stderr,
+                    "[save-restore-roundtrip] phaseC: %s short header\n",
+                    tag);
+                return false;
+            }
+            const std::uint32_t vp_idx = snap::ReadLe32(payload.data() + 0);
+            const std::uint32_t n      = snap::ReadLe32(payload.data() + 4);
+            if (vp_idx != 0) {
+                std::fprintf(stderr,
+                    "[save-restore-roundtrip] phaseC: %s vp_idx=%u\n",
+                    tag, vp_idx);
+                return false;
+            }
+            if (n != expected_count) {
+                std::fprintf(stderr,
+                    "[save-restore-roundtrip] phaseC: %s count=%u want=%zu\n",
+                    tag, n, expected_count);
+                return false;
+            }
+            const std::size_t need = 8 + n * (8 + 16);
+            if (payload.size() < need) {
+                std::fprintf(stderr,
+                    "[save-restore-roundtrip] phaseC: %s truncated payload\n",
+                    tag);
+                return false;
+            }
+            out.resize(n);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                const std::uint8_t* p = payload.data() + 8 + i * (8 + 16);
+                const std::uint32_t name = snap::ReadLe32(p + 0);
+                const std::uint32_t rsv  = snap::ReadLe32(p + 4);
+                if (rsv != 0) {
+                    std::fprintf(stderr,
+                        "[save-restore-roundtrip] phaseC: %s[%u] rsv=%u\n",
+                        tag, i, rsv);
+                    return false;
+                }
+                if (name != static_cast<std::uint32_t>(expected_names[i])) {
+                    std::fprintf(stderr,
+                        "[save-restore-roundtrip] phaseC: %s[%u]"
+                        " name=0x%08x want=0x%08x\n", tag, i, name,
+                        static_cast<unsigned>(expected_names[i]));
+                    return false;
+                }
+                std::memcpy(&out[i], p + 8, 16);
+            }
+            return true;
+        };
+
+        bool saw_ram = false, saw_regs = false, saw_xsave = false;
+        bool saw_apic = false, saw_intr = false, saw_timing = false;
+        bool saw_hv = false;
+
+        while (auto sec = r.NextSection()) {
+            switch (sec->type) {
+            case snap::SectionType::RamRaw: {
+                if (sec->payload.size() != ram_size) {
+                    std::fprintf(stderr,
+                        "[save-restore-roundtrip] phaseC: RAM size %zu"
+                        " want %zu\n", sec->payload.size(), ram_size);
+                    cleanup(); return 2;
+                }
+                restored_ram.assign(sec->payload.begin(), sec->payload.end());
+                saw_ram = true;
+                break;
+            }
+            case snap::SectionType::VcpuRegs: {
+                if (!decode_reg_block(sec->payload, restored_state.arch,
+                                      snap::kArchRegNames,
+                                      snap::kArchRegCount(), "arch")) {
+                    cleanup(); return 2;
+                }
+                saw_regs = true;
+                break;
+            }
+            case snap::SectionType::VcpuXsave: {
+                if (sec->payload.size() < 8) {
+                    std::fprintf(stderr,
+                        "[save-restore-roundtrip] phaseC: xsave hdr short\n");
+                    cleanup(); return 2;
+                }
+                const std::uint32_t vp_idx = snap::ReadLe32(sec->payload.data());
+                const std::uint32_t sz     = snap::ReadLe32(sec->payload.data() + 4);
+                if (vp_idx != 0 || sec->payload.size() != 8u + sz) {
+                    std::fprintf(stderr,
+                        "[save-restore-roundtrip] phaseC: xsave bad\n");
+                    cleanup(); return 2;
+                }
+                restored_state.xsave.assign(
+                    sec->payload.begin() + 8, sec->payload.end());
+                saw_xsave = true;
+                break;
+            }
+            case snap::SectionType::VcpuApic: {
+                if (sec->payload.size() < 8) {
+                    std::fprintf(stderr,
+                        "[save-restore-roundtrip] phaseC: apic hdr short\n");
+                    cleanup(); return 2;
+                }
+                const std::uint32_t vp_idx = snap::ReadLe32(sec->payload.data());
+                const std::uint32_t sz     = snap::ReadLe32(sec->payload.data() + 4);
+                if (vp_idx != 0 || sec->payload.size() != 8u + sz) {
+                    std::fprintf(stderr,
+                        "[save-restore-roundtrip] phaseC: apic bad\n");
+                    cleanup(); return 2;
+                }
+                restored_state.apic.assign(
+                    sec->payload.begin() + 8, sec->payload.end());
+                saw_apic = true;
+                break;
+            }
+            case snap::SectionType::VcpuIntrCtl: {
+                if (sec->payload.size() < 8) {
+                    std::fprintf(stderr,
+                        "[save-restore-roundtrip] phaseC: intr hdr short\n");
+                    cleanup(); return 2;
+                }
+                const std::uint32_t vp_idx = snap::ReadLe32(sec->payload.data());
+                const std::uint32_t n      = snap::ReadLe32(sec->payload.data() + 4);
+                if (vp_idx != 0 || n != snap::kIntrCtlRegCount() ||
+                    sec->payload.size() != 8u + n * (8u + 16u)) {
+                    std::fprintf(stderr,
+                        "[save-restore-roundtrip] phaseC: intr bad\n");
+                    cleanup(); return 2;
+                }
+                restored_state.intr_ctl.resize(n);
+                restored_state.intr_ctl_ok.assign(n, false);
+                for (std::uint32_t i = 0; i < n; ++i) {
+                    const std::uint8_t* p =
+                        sec->payload.data() + 8 + i * (8 + 16);
+                    const std::uint32_t name = snap::ReadLe32(p + 0);
+                    if (name != static_cast<std::uint32_t>(
+                                    snap::kIntrCtlRegNames[i])) {
+                        std::fprintf(stderr,
+                            "[save-restore-roundtrip] phaseC: intr[%u]"
+                            " name=0x%08x want=0x%08x\n", i, name,
+                            static_cast<unsigned>(snap::kIntrCtlRegNames[i]));
+                        cleanup(); return 2;
+                    }
+                    restored_state.intr_ctl_ok[i] = (p[4] != 0);
+                    if (p[5] != 0 || p[6] != 0 || p[7] != 0) {
+                        std::fprintf(stderr,
+                            "[save-restore-roundtrip] phaseC: intr[%u]"
+                            " nonzero pad\n", i);
+                        cleanup(); return 2;
+                    }
+                    std::memcpy(&restored_state.intr_ctl[i], p + 8, 16);
+                }
+                saw_intr = true;
+                break;
+            }
+            case snap::SectionType::VcpuTiming: {
+                if (!decode_reg_block(sec->payload, restored_state.timing,
+                                      snap::kTimingRegNames,
+                                      snap::kTimingRegCount(), "timing")) {
+                    cleanup(); return 2;
+                }
+                saw_timing = true;
+                break;
+            }
+            case snap::SectionType::HvEnlightenment: {
+                if (sec->payload.size() != 32) {
+                    std::fprintf(stderr,
+                        "[save-restore-roundtrip] phaseC: hv size %zu\n",
+                        sec->payload.size());
+                    cleanup(); return 2;
+                }
+                restored_hv.guest_os_id =
+                    snap::ReadLe64(sec->payload.data() +  0);
+                restored_hv.hypercall_msr =
+                    snap::ReadLe64(sec->payload.data() +  8);
+                restored_hv.reference_tsc_msr =
+                    snap::ReadLe64(sec->payload.data() + 16);
+                restored_hv.tsc_invariant_ctl =
+                    snap::ReadLe64(sec->payload.data() + 24);
+                saw_hv = true;
+                break;
+            }
+            default:
+                std::fprintf(stderr,
+                    "[save-restore-roundtrip] phaseC: unexpected section"
+                    " type=0x%08x\n",
+                    static_cast<unsigned>(sec->type));
+                cleanup(); return 2;
+            }
+        }
+        r.VerifyTrailer();
+
+        if (!(saw_ram && saw_regs && saw_xsave && saw_apic && saw_intr
+              && saw_timing && saw_hv)) {
+            std::fprintf(stderr,
+                "[save-restore-roundtrip] phaseC: missing section(s):"
+                " ram=%d regs=%d xsave=%d apic=%d intr=%d timing=%d hv=%d\n",
+                saw_ram, saw_regs, saw_xsave, saw_apic, saw_intr,
+                saw_timing, saw_hv);
+            cleanup(); return 2;
+        }
+
+        // Byte-equality checks.
+        if (restored_ram != captured_ram) {
+            std::fprintf(stderr,
+                "[save-restore-roundtrip] phaseC: RAM bytes differ\n");
+            cleanup(); return 2;
+        }
+        if (restored_state.xsave != captured_state.xsave) {
+            std::fprintf(stderr,
+                "[save-restore-roundtrip] phaseC: xsave bytes differ\n");
+            cleanup(); return 2;
+        }
+        if (restored_state.apic != captured_state.apic) {
+            std::fprintf(stderr,
+                "[save-restore-roundtrip] phaseC: apic bytes differ\n");
+            cleanup(); return 2;
+        }
+        if (restored_state.arch.size() != captured_state.arch.size() ||
+            std::memcmp(restored_state.arch.data(),
+                        captured_state.arch.data(),
+                        restored_state.arch.size() *
+                            sizeof(WHV_REGISTER_VALUE)) != 0) {
+            std::fprintf(stderr,
+                "[save-restore-roundtrip] phaseC: arch values differ\n");
+            cleanup(); return 2;
+        }
+        if (restored_state.timing.size() != captured_state.timing.size() ||
+            std::memcmp(restored_state.timing.data(),
+                        captured_state.timing.data(),
+                        restored_state.timing.size() *
+                            sizeof(WHV_REGISTER_VALUE)) != 0) {
+            std::fprintf(stderr,
+                "[save-restore-roundtrip] phaseC: timing values differ\n");
+            cleanup(); return 2;
+        }
+        for (std::size_t i = 0; i < captured_state.intr_ctl.size(); ++i) {
+            if (restored_state.intr_ctl_ok[i] != captured_state.intr_ctl_ok[i]) {
+                std::fprintf(stderr,
+                    "[save-restore-roundtrip] phaseC: intr_ctl[%zu] ok"
+                    " differs (%d vs %d)\n",
+                    i,
+                    static_cast<int>(restored_state.intr_ctl_ok[i]),
+                    static_cast<int>(captured_state.intr_ctl_ok[i]));
+                cleanup(); return 2;
+            }
+            if (std::memcmp(&restored_state.intr_ctl[i],
+                            &captured_state.intr_ctl[i], 16) != 0) {
+                std::fprintf(stderr,
+                    "[save-restore-roundtrip] phaseC: intr_ctl[%zu] value"
+                    " differs\n", i);
+                cleanup(); return 2;
+            }
+        }
+        if (std::memcmp(&restored_hv, &captured_hv,
+                        sizeof(HvEnlightenment::State)) != 0) {
+            std::fprintf(stderr,
+                "[save-restore-roundtrip] phaseC: HV state differs\n");
+            cleanup(); return 2;
+        }
+        std::puts("[save-restore-roundtrip] phaseC: bytewise equality OK");
+    }
+
+    // -------- Phase D: fresh partition + apply restored state ---------
+    const auto t0 = std::chrono::steady_clock::now();
+    {
+        // Snapshot trigger must be disarmed: we never re-execute CPUID
+        // post-restore (RIP=8 is past it), but defensive disarm protects
+        // against future revisions.
+        snap::State().armed.store(false, std::memory_order_release);
+        snap::State().requested.store(false, std::memory_order_release);
+        snap::State().save_path.clear();
+
+        Partition part(/*vcpu_count=*/1);
+        part.EnableExtendedExits({.cpuid = true});
+        part.Setup();
+
+        // Allocate fresh GuestMemory, then memcpy restored RAM into it
+        // (rubber-duck blocking #1: restore MUST repopulate guest RAM).
+        GuestMemory ram(part, /*gpa=*/0, ram_size, /*executable=*/true);
+        std::memcpy(ram.host_base(), restored_ram.data(), ram_size);
+
+        // HvEnlightenment ApplyState — the test partition has no MSR
+        // exits enabled, so this is exercised mostly to validate the
+        // helper compiles and round-trips state via the saved values.
+        HvEnlightenment hv(ram, tsc_hz);
+        hv.ApplyState(restored_hv);
+
+        Vcpu vp(part, 0);
+        snap::ApplyVcpuState(vp, part.handle(), 0, restored_state);
+
+        devices::IoBus io_bus;
+        devices::MmioBus mmio_bus;
+        RunLoop loop(vp, io_bus, mmio_bus);
+        std::puts("[save-restore-roundtrip] phaseD: continuing...");
+        StopReason stop = loop.Run();
+        if (stop != StopReason::GuestHalted) {
+            std::fprintf(stderr,
+                "[save-restore-roundtrip] phaseD: expected GuestHalted,"
+                " got %d\n", static_cast<int>(stop));
+            cleanup(); return 2;
+        }
+        const auto ax = vp.GetRegister(WHvX64RegisterRax).Reg64 & 0xFFFFu;
+        const auto rip_v = vp.GetRegister(WHvX64RegisterRip).Reg64;
+        if (ax != 2 || rip_v != 11) {
+            std::fprintf(stderr,
+                "[save-restore-roundtrip] phaseD: AX=%llu RIP=0x%llx"
+                " (want AX=2 RIP=11)\n",
+                static_cast<unsigned long long>(ax),
+                static_cast<unsigned long long>(rip_v));
+            cleanup(); return 2;
+        }
+    }
+    const auto restore_ms = std::chrono::duration_cast<
+        std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+    std::printf("[save-restore-roundtrip] phaseD PASS"
+                " (restore+run wall-time %lld ms)\n",
+                static_cast<long long>(restore_ms));
+
+    cleanup();
+    std::puts("[save-restore-roundtrip] PASS");
+    return 0;
+}
+
+// --save-restore-pci-test (M33.4)
+//
+// End-to-end round-trip of every PCI / virtio-pci / MSI-X / Virtqueue /
+// per-virtio-device State struct introduced in M33.4. Validates:
+//
+//   1. Each Capture/Encode/Decode/Apply path is byte-stable across the
+//      on-disk format (Encode-Decode-Encode produces identical bytes).
+//   2. ApplyState on a fresh device produces a State whose Encode bytes
+//      match the original Capture bytes (so the apply path is lossless).
+//   3. PciTransport::ApplyState correctly re-installs BAR0 MMIO handlers
+//      via InstallBarHandlers_ when bar_mapped was true (the new
+//      restore-time hook that replaces the cold-boot OnBarMapped path).
+//
+// Topology: two devices on the same bus.
+//   00:00.0   virtio-rng     1 virtqueue,  2 MSI-X vectors
+//   00:01.0   virtio-console 2 virtqueues, 3 MSI-X vectors
+//
+// The two-virtqueue device (console) is essential — it guarantees the
+// per-queue layout in PciTransport's encoded section is exercised at
+// num_queues > 1, and that VIRTQUEUE sections at different qidx round
+// trip independently.
+//
+// Driving the devices: we use the same MMIO/CFG path as the existing
+// --virtio-{rng,console}-test functions (write COMMAND.MEM_SPACE to
+// trigger OnBarMapped, program MSI-X table + cap, program every queue,
+// flip status to ACK | DRIVER | FEATURES_OK | DRIVER_OK). No vCPU is
+// ever created; this is pure host-side state plumbing.
+int RunSaveRestorePciTest() {
+    using namespace tinyvmm;
+    using namespace tinyvmm::whp;
+    namespace p    = tinyvmm::pci;
+    namespace v    = tinyvmm::virtio;
+    namespace snap = tinyvmm::whp::snapshot;
+
+    std::puts("[save-restore-pci-test] starting (host-side; no WHP)");
+
+    CheckWhpAvailable();
+    std::puts("[save-restore-pci-test] WHP available");
+
+    // ----------------- Acquire temp file path -----------------
+    std::string tmp_path;
+    {
+        char dir[MAX_PATH + 1] = {};
+        DWORD n = ::GetTempPathA(MAX_PATH, dir);
+        if (n == 0 || n > MAX_PATH) {
+            std::fprintf(stderr,
+                "[save-restore-pci-test] FAIL: GetTempPathA err=%lu\n",
+                ::GetLastError());
+            return 2;
+        }
+        char path[MAX_PATH + 1] = {};
+        if (::GetTempFileNameA(dir, "tvp", 0, path) == 0) {
+            std::fprintf(stderr,
+                "[save-restore-pci-test] FAIL: GetTempFileNameA err=%lu\n",
+                ::GetLastError());
+            return 2;
+        }
+        tmp_path = path;
+    }
+    std::printf("[save-restore-pci-test] temp file: %s\n", tmp_path.c_str());
+    auto cleanup = [&]() noexcept { ::DeleteFileA(tmp_path.c_str()); };
+
+    // ----------------- Shared helpers / fixtures -----------------
+    // Drives an entire VM bring-up of (rng, console) and returns the
+    // populated captures. Used twice: once for the original capture,
+    // once for the post-Apply re-capture.
+    struct CaptureSet {
+        // RNG-side captures
+        p::Bdf                rng_bdf;
+        p::PciDevice::State   rng_pci;
+        p::MsiX::State        rng_msix;
+        v::PciTransport::State rng_xport;
+        v::RngDevice::State   rng_dev;
+        v::Virtqueue::State   rng_q0;
+
+        // Console-side captures
+        p::Bdf                con_bdf;
+        p::PciDevice::State   con_pci;
+        p::MsiX::State        con_msix;
+        v::PciTransport::State con_xport;
+        v::ConsoleDevice::State con_dev;
+        v::Virtqueue::State   con_q0_rx;
+        v::Virtqueue::State   con_q1_tx;
+    };
+
+    // Brings up a fresh bus + devices, returns a CaptureSet after
+    // driving them through MMIO/CFG to a richly-populated state.
+    // `apply_first` (optional) is invoked between bringup-of-fresh-
+    // devices and the final Capture; this is how we test ApplyState.
+    auto drive_and_capture =
+        [&](const std::function<void(v::RngDevice*,
+                                     v::PciTransport*,
+                                     v::ConsoleDevice*,
+                                     v::PciTransport*)>& apply_first,
+            CaptureSet& out) -> bool {
+        Partition part(/*vcpu_count=*/1);
+        part.Setup();
+        constexpr std::size_t kRamBytes = 0x200000;
+        GuestMemory ram(part, /*gpa=*/0, kRamBytes, /*executable=*/false);
+        std::memset(ram.host_base(), 0, kRamBytes);
+
+        devices::IoBus   io_bus;
+        devices::MmioBus mmio_bus;
+        p::PciBus        pbus;
+        pbus.AttachIoBus(io_bus);
+
+        auto inject_fn = [](std::uint64_t, std::uint32_t) { return true; };
+
+        // ----- construct rng device + transport
+        auto rng = std::make_unique<v::RngDevice>(ram);
+        v::RngDevice* rng_ptr = rng.get();
+        v::PciTransport::Options ro;
+        ro.subsys_id        = static_cast<std::uint16_t>(v::kDeviceIdRng);
+        ro.num_msix_vectors = 2;
+        ro.pci_class        = 0xFF;
+        ro.pci_subclass     = 0x00;
+        auto rxport = std::make_unique<v::PciTransport>(
+            *rng_ptr, ro, mmio_bus, inject_fn);
+        v::PciTransport* rxp = rxport.get();
+        rxport->set_name("virtio-pci-rng");
+        rng_ptr->SetIrqCallback(
+            [rxp](std::uint32_t q) { rxp->RaiseQueueInterrupt(q); });
+
+        // ----- construct console device + transport
+        auto con = std::make_unique<v::ConsoleDevice>(ram, nullptr);
+        v::ConsoleDevice* con_ptr = con.get();
+        v::PciTransport::Options co;
+        co.subsys_id        = static_cast<std::uint16_t>(v::kDeviceIdConsole);
+        co.num_msix_vectors = 3;
+        co.pci_class        = 0x07;
+        co.pci_subclass     = 0x80;
+        auto cxport = std::make_unique<v::PciTransport>(
+            *con_ptr, co, mmio_bus, inject_fn);
+        v::PciTransport* cxp = cxport.get();
+        cxport->set_name("virtio-pci-console");
+        con_ptr->SetIrqCallback(
+            [cxp](std::uint32_t q) { cxp->RaiseQueueInterrupt(q); });
+
+        // ----- attach to bus
+        const p::Bdf rng_bdf = pbus.AddDevice(std::move(rxport));
+        const p::Bdf con_bdf = pbus.AddDevice(std::move(cxport));
+        out.rng_bdf = rng_bdf;
+        out.con_bdf = con_bdf;
+
+        // ----- optional apply step BEFORE driving via MMIO. This is
+        //       how Phase E exercises ApplyState: applies all the
+        //       captured state on fresh constructed devices, then we
+        //       re-capture to verify equality.
+        if (apply_first) {
+            apply_first(rng_ptr, rxp, con_ptr, cxp);
+        }
+
+        // ----- MMIO/CFG helpers (shared with --virtio-*-test pattern)
+        auto io_w = [&](std::uint16_t port, std::uint16_t size,
+                        std::uint32_t val) {
+            devices::IoAccess a{port, size, /*write=*/true, val};
+            if (!io_bus.Dispatch(a))
+                Fatal("save-restore-pci-test: unmatched IO write");
+        };
+        auto io_r = [&](std::uint16_t port,
+                        std::uint16_t size) -> std::uint32_t {
+            devices::IoAccess a{port, size, /*write=*/false, 0};
+            if (!io_bus.Dispatch(a))
+                Fatal("save-restore-pci-test: unmatched IO read");
+            return a.value;
+        };
+        auto encode_addr = [](const p::Bdf& bdf,
+                              std::uint8_t reg) -> std::uint32_t {
+            return p::kConfigAddressEnable |
+                (std::uint32_t{bdf.bus}      << 16) |
+                (std::uint32_t{bdf.device}   << 11) |
+                (std::uint32_t{bdf.function} <<  8) |
+                (reg & 0xFCu);
+        };
+        auto cfg_r = [&](const p::Bdf& bdf,
+                         std::uint8_t reg,
+                         std::uint16_t size) -> std::uint32_t {
+            io_w(p::kConfigAddressPort, 4, encode_addr(bdf, reg));
+            return io_r(static_cast<std::uint16_t>(
+                            p::kConfigDataPort + (reg & 3)),
+                        size);
+        };
+        auto cfg_w = [&](const p::Bdf& bdf,
+                         std::uint8_t reg,
+                         std::uint16_t size,
+                         std::uint32_t val) {
+            io_w(p::kConfigAddressPort, 4, encode_addr(bdf, reg));
+            io_w(static_cast<std::uint16_t>(
+                     p::kConfigDataPort + (reg & 3)),
+                 size, val);
+        };
+        auto mmio_w = [&](std::uint64_t gpa, std::uint32_t val,
+                          std::uint8_t sz) {
+            devices::MmioAccess a{};
+            a.gpa = gpa; a.access_size = sz; a.is_write = true;
+            std::memcpy(a.data, &val, std::min<std::size_t>(sz, 4));
+            if (!mmio_bus.Dispatch(a))
+                Fatal("save-restore-pci-test: unmatched MMIO write");
+        };
+
+        // ----- bring up one device (rng or console)
+        // num_msix_vectors must match what the ctor declared.
+        auto bring_up = [&](const p::Bdf& bdf,
+                            std::uint16_t num_msix,
+                            std::uint64_t acked_features,
+                            std::span<const std::pair<
+                                std::uint32_t, std::uint16_t>>
+                                queue_msix_vectors,
+                            std::uint16_t cfg_msix_vector,
+                            std::span<const std::pair<
+                                std::uint64_t, std::uint32_t>>
+                                queue_ring_gpas)
+            -> std::uint64_t /* bar_gpa */ {
+            // BAR0 read + MEM_SPACE map.
+            const std::uint32_t bar0_lo = cfg_r(bdf, p::kCfgBar0, 4);
+            const std::uint32_t bar0_hi = cfg_r(bdf, p::kCfgBar0 + 4, 4);
+            cfg_w(bdf, p::kCfgCommand, 2,
+                  p::kCmdMemorySpace | p::kCmdBusMaster);
+            const std::uint64_t bar_gpa =
+                (static_cast<std::uint64_t>(bar0_hi) << 32) |
+                (bar0_lo & ~0xFu);
+
+            // Walk caps to find MSI-X cap offset.
+            std::uint8_t cap =
+                static_cast<std::uint8_t>(cfg_r(bdf, p::kCfgCapPtr, 1));
+            std::uint8_t msix_cap_off = 0;
+            for (std::size_t i = 0; cap != 0 && i < 16; ++i) {
+                const std::uint8_t id =
+                    static_cast<std::uint8_t>(cfg_r(bdf, cap, 1));
+                if (id == p::kCapIdMsiX) msix_cap_off = cap;
+                cap = static_cast<std::uint8_t>(
+                    cfg_r(bdf,
+                          static_cast<std::uint8_t>(cap + 1), 1));
+            }
+            if (!msix_cap_off)
+                Fatal("save-restore-pci-test: MSI-X cap not found");
+
+            // Program MSI-X table entries with distinct (addr,data) so
+            // bit-equality on round-trip is informative.
+            constexpr std::uint64_t kMsiAddrBase = 0xFEE00000ull;
+            for (std::uint32_t v = 0; v < num_msix; ++v) {
+                const std::uint64_t tbl =
+                    bar_gpa + v::PciTransport::kOffMsixTable + 16ull * v;
+                const std::uint64_t addr =
+                    kMsiAddrBase | (static_cast<std::uint64_t>(v) << 12);
+                mmio_w(tbl + 0,
+                       static_cast<std::uint32_t>(addr & 0xFFFFFFFFu), 4);
+                mmio_w(tbl + 4,
+                       static_cast<std::uint32_t>(addr >> 32), 4);
+                mmio_w(tbl + 8,
+                       0x40u + (static_cast<std::uint32_t>(v) << 4), 4);
+                // Leave vector-control bit 0 set (masked) on some
+                // vectors and clear on others so the saved ctrl[] array
+                // carries non-uniform data.
+                mmio_w(tbl + 12, (v & 1u) ? 0u : 1u, 4);
+            }
+            // Enable MSI-X (cap MC bit 15 = enable).
+            cfg_w(bdf, static_cast<std::uint8_t>(msix_cap_off + 2), 2,
+                  0x8000u);
+
+            // Negotiate features (just VERSION_1 from the device — keep
+            // ShouldInterruptDriver simple; tests aren't running guests).
+            mmio_w(bar_gpa + 0x00, 0, 4);  // device_feature_select=0
+            mmio_w(bar_gpa + 0x00, 1, 4);  // device_feature_select=1
+            mmio_w(bar_gpa + 0x14, v::kStatusAcknowledge, 1);
+            mmio_w(bar_gpa + 0x14,
+                   v::kStatusAcknowledge | v::kStatusDriver, 1);
+            mmio_w(bar_gpa + 0x08, 0, 4);  // driver_feature_select=0
+            mmio_w(bar_gpa + 0x0C,
+                   static_cast<std::uint32_t>(acked_features & 0xFFFFFFFFu),
+                   4);
+            mmio_w(bar_gpa + 0x08, 1, 4);
+            mmio_w(bar_gpa + 0x0C,
+                   static_cast<std::uint32_t>(acked_features >> 32), 4);
+            mmio_w(bar_gpa + 0x14,
+                   v::kStatusAcknowledge | v::kStatusDriver |
+                       v::kStatusFeaturesOk, 1);
+
+            // Set msix_config vector.
+            mmio_w(bar_gpa + 0x10, cfg_msix_vector, 2);
+
+            // Program every queue. queue_ring_gpas is parallel to
+            // queue_msix_vectors and gives a distinct desc_gpa per queue.
+            for (std::size_t qi = 0; qi < queue_msix_vectors.size(); ++qi) {
+                const std::uint32_t qidx = queue_msix_vectors[qi].first;
+                const std::uint16_t vec  = queue_msix_vectors[qi].second;
+                const std::uint64_t desc = queue_ring_gpas[qi].first;
+                const std::uint32_t qsz  = queue_ring_gpas[qi].second;
+                const std::uint64_t avail = desc + 0x100;
+                const std::uint64_t used  = desc + 0x200;
+
+                mmio_w(bar_gpa + 0x16,
+                       static_cast<std::uint32_t>(qidx), 2);
+                mmio_w(bar_gpa + 0x18, qsz, 2);
+                mmio_w(bar_gpa + 0x1A, vec, 2);
+                mmio_w(bar_gpa + 0x20,
+                       static_cast<std::uint32_t>(desc), 4);
+                mmio_w(bar_gpa + 0x24,
+                       static_cast<std::uint32_t>(desc >> 32), 4);
+                mmio_w(bar_gpa + 0x28,
+                       static_cast<std::uint32_t>(avail), 4);
+                mmio_w(bar_gpa + 0x2C,
+                       static_cast<std::uint32_t>(avail >> 32), 4);
+                mmio_w(bar_gpa + 0x30,
+                       static_cast<std::uint32_t>(used), 4);
+                mmio_w(bar_gpa + 0x34,
+                       static_cast<std::uint32_t>(used >> 32), 4);
+                mmio_w(bar_gpa + 0x1C, 1, 2);  // enable
+            }
+
+            // DRIVER_OK fan-out.
+            mmio_w(bar_gpa + 0x14,
+                   v::kStatusAcknowledge | v::kStatusDriver |
+                       v::kStatusFeaturesOk | v::kStatusDriverOk, 1);
+            return bar_gpa;
+        };
+
+        // ----- The apply path already populated state directly into
+        //       devices; in that case we MUST NOT redrive via MMIO
+        //       (that would mutate the queues back to defaults).
+        if (!apply_first) {
+            // rng: queue 0 (requestq) -> vector 0; cfg-change -> vector 1.
+            std::array<std::pair<std::uint32_t, std::uint16_t>, 1>
+                rng_q = {{ {0u, std::uint16_t{0}} }};
+            std::array<std::pair<std::uint64_t, std::uint32_t>, 1>
+                rng_g = {{ {0x30000ull, 8u} }};
+            bring_up(rng_bdf, /*num_msix=*/2,
+                     /*acked_features=*/v::kFeatureVersion1,
+                     rng_q, /*cfg_msix_vector=*/std::uint16_t{1}, rng_g);
+
+            // console: queue 0 (rxq) -> vector 0; queue 1 (txq) -> vector 1;
+            // cfg-change -> vector 2.
+            std::array<std::pair<std::uint32_t, std::uint16_t>, 2>
+                con_q = {{ {0u, std::uint16_t{0}}, {1u, std::uint16_t{1}} }};
+            std::array<std::pair<std::uint64_t, std::uint32_t>, 2>
+                con_g = {{ {0x50000ull, 16u}, {0x60000ull, 32u} }};
+            bring_up(con_bdf, /*num_msix=*/3,
+                     /*acked_features=*/v::kFeatureVersion1,
+                     con_q, /*cfg_msix_vector=*/std::uint16_t{2}, con_g);
+        }
+
+        // ----- Capture all state (works equally well in both branches).
+        // Reach into PciBus to grab the PciDevice* by BDF.
+        auto pci_dev_at = [&](const p::Bdf& b) -> p::PciDevice* {
+            return pbus.Find(b);
+        };
+
+        p::PciDevice* rng_dev_p = pci_dev_at(rng_bdf);
+        p::PciDevice* con_dev_p = pci_dev_at(con_bdf);
+        if (!rng_dev_p || !con_dev_p)
+            Fatal("save-restore-pci-test: device lookup failed");
+
+        out.rng_pci   = rng_dev_p->CaptureState();
+        out.rng_msix  = rxp->msix().CaptureState();
+        out.rng_xport = rxp->CaptureState();
+        out.rng_dev   = rng_ptr->CaptureState();
+        out.rng_q0    = rng_ptr->request_queue().CaptureState();
+
+        out.con_pci    = con_dev_p->CaptureState();
+        out.con_msix   = cxp->msix().CaptureState();
+        out.con_xport  = cxp->CaptureState();
+        out.con_dev    = con_ptr->CaptureState();
+        out.con_q0_rx  = con_ptr->receive_queue().CaptureState();
+        out.con_q1_tx  = con_ptr->transmit_queue().CaptureState();
+        return true;
+    };
+
+    // ----------------------------- Phase A -----------------------------
+    std::puts("[save-restore-pci-test] phaseA: drive + capture original");
+    CaptureSet orig;
+    if (!drive_and_capture({}, orig)) {
+        cleanup(); return 2;
+    }
+    std::printf("[save-restore-pci-test] rng bdf=%02x:%02x.%u  "
+                "console bdf=%02x:%02x.%u\n",
+                orig.rng_bdf.bus, orig.rng_bdf.device, orig.rng_bdf.function,
+                orig.con_bdf.bus, orig.con_bdf.device, orig.con_bdf.function);
+
+    // Sanity: capture must show bar_mapped + DRIVER_OK on both.
+    if (!orig.rng_xport.bar_mapped) {
+        std::fprintf(stderr,
+            "[save-restore-pci-test] FAIL: rng bar_mapped=0 after bringup\n");
+        cleanup(); return 2;
+    }
+    if (!orig.con_xport.bar_mapped) {
+        std::fprintf(stderr,
+            "[save-restore-pci-test] FAIL: con bar_mapped=0 after bringup\n");
+        cleanup(); return 2;
+    }
+    if (orig.rng_dev.driver_ok == 0 || orig.con_dev.driver_ok == 0) {
+        std::fprintf(stderr,
+            "[save-restore-pci-test] FAIL: driver_ok=0 after bringup\n");
+        cleanup(); return 2;
+    }
+
+    // ----------------------------- Phase B/C ----------------------------
+    // Helper: prepend a 4-byte BDF prefix to an encoded section payload.
+    auto prepend_bdf = [&](const p::Bdf& bdf,
+                           std::vector<std::uint8_t>& buf) {
+        std::vector<std::uint8_t> out;
+        out.reserve(4 + buf.size());
+        out.push_back(bdf.bus);
+        out.push_back(bdf.device);
+        out.push_back(bdf.function);
+        out.push_back(0);  // reserved
+        out.insert(out.end(), buf.begin(), buf.end());
+        buf = std::move(out);
+    };
+    auto prepend_bdf_q = [&](const p::Bdf& bdf, std::uint16_t qidx,
+                             std::vector<std::uint8_t>& buf) {
+        std::vector<std::uint8_t> out;
+        out.reserve(8 + buf.size());
+        out.push_back(bdf.bus);
+        out.push_back(bdf.device);
+        out.push_back(bdf.function);
+        out.push_back(0);
+        out.push_back(static_cast<std::uint8_t>(qidx & 0xFF));
+        out.push_back(static_cast<std::uint8_t>((qidx >> 8) & 0xFF));
+        out.push_back(0);
+        out.push_back(0);
+        out.insert(out.end(), buf.begin(), buf.end());
+        buf = std::move(out);
+    };
+
+    // Encode every State to its bytes; remember each pre-prefix encoding
+    // for later byte-equality after re-Capture.
+    std::vector<std::uint8_t> rng_pci_enc, rng_msix_enc, rng_xport_enc,
+                              rng_dev_enc, rng_q0_enc;
+    std::vector<std::uint8_t> con_pci_enc, con_msix_enc, con_xport_enc,
+                              con_dev_enc, con_q0_enc, con_q1_enc;
+
+    p::PciDevice::EncodeState   (orig.rng_pci,   rng_pci_enc);
+    p::MsiX::EncodeState        (orig.rng_msix,  rng_msix_enc);
+    v::PciTransport::EncodeState(orig.rng_xport, rng_xport_enc);
+    v::RngDevice::EncodeState   (orig.rng_dev,   rng_dev_enc);
+    v::Virtqueue::EncodeState   (orig.rng_q0,    rng_q0_enc);
+
+    p::PciDevice::EncodeState     (orig.con_pci,    con_pci_enc);
+    p::MsiX::EncodeState          (orig.con_msix,   con_msix_enc);
+    v::PciTransport::EncodeState  (orig.con_xport,  con_xport_enc);
+    v::ConsoleDevice::EncodeState (orig.con_dev,    con_dev_enc);
+    v::Virtqueue::EncodeState     (orig.con_q0_rx,  con_q0_enc);
+    v::Virtqueue::EncodeState     (orig.con_q1_tx,  con_q1_enc);
+
+    // ------------- Write file -------------
+    {
+        snap::JsonObjectWriter jw;
+        jw.Add("test_marker", std::string_view("pci_roundtrip"));
+        jw.Add("device_count", std::uint64_t{2});
+
+        snap::SnapshotWriter w(tmp_path);
+        w.WriteHeader(jw.str());
+
+        auto write_with_bdf = [&](snap::SectionType st,
+                                  const p::Bdf& bdf,
+                                  std::vector<std::uint8_t> bytes) {
+            prepend_bdf(bdf, bytes);
+            w.WriteSection(st, bytes.data(), bytes.size());
+        };
+        auto write_with_bdf_q = [&](snap::SectionType st,
+                                    const p::Bdf& bdf, std::uint16_t qidx,
+                                    std::vector<std::uint8_t> bytes) {
+            prepend_bdf_q(bdf, qidx, bytes);
+            w.WriteSection(st, bytes.data(), bytes.size());
+        };
+
+        // Per-device sections in topologically-sensible order (PCI dev
+        // first; phase-D ApplyState ordering follows this for clarity).
+        write_with_bdf(snap::SectionType::PciDevice,
+                       orig.rng_bdf, rng_pci_enc);
+        write_with_bdf(snap::SectionType::VirtioRngState,
+                       orig.rng_bdf, rng_dev_enc);
+        write_with_bdf_q(snap::SectionType::Virtqueue,
+                         orig.rng_bdf, 0, rng_q0_enc);
+        write_with_bdf(snap::SectionType::MsixState,
+                       orig.rng_bdf, rng_msix_enc);
+        write_with_bdf(snap::SectionType::VirtioPciTransport,
+                       orig.rng_bdf, rng_xport_enc);
+
+        write_with_bdf(snap::SectionType::PciDevice,
+                       orig.con_bdf, con_pci_enc);
+        write_with_bdf(snap::SectionType::VirtioConsoleState,
+                       orig.con_bdf, con_dev_enc);
+        write_with_bdf_q(snap::SectionType::Virtqueue,
+                         orig.con_bdf, 0, con_q0_enc);
+        write_with_bdf_q(snap::SectionType::Virtqueue,
+                         orig.con_bdf, 1, con_q1_enc);
+        write_with_bdf(snap::SectionType::MsixState,
+                       orig.con_bdf, con_msix_enc);
+        write_with_bdf(snap::SectionType::VirtioPciTransport,
+                       orig.con_bdf, con_xport_enc);
+
+        w.Finalize();
+        std::printf("[save-restore-pci-test] phaseB wrote %llu bytes\n",
+                    static_cast<unsigned long long>(w.bytes_written()));
+    }
+
+    // ----------------------------- Phase D: read back + decode ---------
+    std::puts("[save-restore-pci-test] phaseC: read back + decode");
+    auto strip_bdf = [&](const snap::SnapshotReader::Section& sec)
+        -> std::pair<p::Bdf, std::span<const std::uint8_t>> {
+        if (sec.payload.size() < 4)
+            Fatal("save-restore-pci-test: section payload < 4 (BDF prefix)");
+        p::Bdf b{ sec.payload[0], sec.payload[1], sec.payload[2] };
+        if (sec.payload[3] != 0)
+            Fatal("save-restore-pci-test: BDF prefix reserved byte != 0");
+        return { b,
+                 std::span<const std::uint8_t>(
+                     sec.payload.data() + 4, sec.payload.size() - 4) };
+    };
+    auto strip_bdf_q = [&](const snap::SnapshotReader::Section& sec)
+        -> std::tuple<p::Bdf, std::uint16_t,
+                      std::span<const std::uint8_t>> {
+        if (sec.payload.size() < 8)
+            Fatal("save-restore-pci-test: VIRTQUEUE section payload < 8");
+        p::Bdf b{ sec.payload[0], sec.payload[1], sec.payload[2] };
+        if (sec.payload[3] != 0)
+            Fatal("save-restore-pci-test: VQ BDF prefix reserved byte != 0");
+        const std::uint16_t qidx = static_cast<std::uint16_t>(
+            sec.payload[4] | (sec.payload[5] << 8));
+        if (sec.payload[6] != 0 || sec.payload[7] != 0)
+            Fatal("save-restore-pci-test: VIRTQUEUE qidx pad != 0");
+        return { b, qidx,
+                 std::span<const std::uint8_t>(
+                     sec.payload.data() + 8, sec.payload.size() - 8) };
+    };
+
+    snap::SnapshotReader r(tmp_path);
+    const std::string hdr = r.ReadHeader();
+    snap::JsonObjectReader jr(hdr);
+    if (jr.GetString("test_marker") != "pci_roundtrip") {
+        std::fprintf(stderr,
+            "[save-restore-pci-test] phaseC: test_marker mismatch\n");
+        cleanup(); return 2;
+    }
+
+    auto bdf_eq = [](const p::Bdf& a, const p::Bdf& b) {
+        return a.bus == b.bus && a.device == b.device &&
+               a.function == b.function;
+    };
+
+    int saw_rng_pci = 0, saw_rng_msix = 0, saw_rng_xport = 0;
+    int saw_rng_dev = 0, saw_rng_q0   = 0;
+    int saw_con_pci = 0, saw_con_msix = 0, saw_con_xport = 0;
+    int saw_con_dev = 0, saw_con_q0   = 0, saw_con_q1   = 0;
+
+    auto check_bytes_eq = [&](const char* what,
+                              std::span<const std::uint8_t> got_payload,
+                              const std::vector<std::uint8_t>& want) -> bool {
+        if (got_payload.size() != want.size() ||
+            !std::equal(got_payload.begin(), got_payload.end(),
+                        want.begin())) {
+            std::fprintf(stderr,
+                "[save-restore-pci-test] phaseC: %s payload bytes differ"
+                " (got=%zu want=%zu)\n",
+                what, got_payload.size(), want.size());
+            return false;
+        }
+        return true;
+    };
+
+    while (auto sec = r.NextSection()) {
+        switch (sec->type) {
+        case snap::SectionType::PciDevice: {
+            auto [b, body] = strip_bdf(*sec);
+            const std::vector<std::uint8_t>& want =
+                bdf_eq(b, orig.rng_bdf) ? rng_pci_enc :
+                bdf_eq(b, orig.con_bdf) ? con_pci_enc :
+                std::vector<std::uint8_t>{};
+            if (want.empty()) {
+                std::fprintf(stderr,
+                    "[save-restore-pci-test] phaseC: unknown PCI BDF\n");
+                cleanup(); return 2;
+            }
+            if (!check_bytes_eq("PciDevice", body, want)) {
+                cleanup(); return 2;
+            }
+            // Also round-trip: Decode then Re-Encode -> identical.
+            auto st = p::PciDevice::DecodeState(body);
+            std::vector<std::uint8_t> re;
+            p::PciDevice::EncodeState(st, re);
+            if (!check_bytes_eq("PciDevice re-encode", re, want)) {
+                cleanup(); return 2;
+            }
+            if (bdf_eq(b, orig.rng_bdf)) saw_rng_pci++;
+            else                          saw_con_pci++;
+            break;
+        }
+        case snap::SectionType::MsixState: {
+            auto [b, body] = strip_bdf(*sec);
+            const std::vector<std::uint8_t>& want =
+                bdf_eq(b, orig.rng_bdf) ? rng_msix_enc : con_msix_enc;
+            if (!check_bytes_eq("MsixState", body, want)) {
+                cleanup(); return 2;
+            }
+            auto st = p::MsiX::DecodeState(body);
+            std::vector<std::uint8_t> re;
+            p::MsiX::EncodeState(st, re);
+            if (!check_bytes_eq("MsixState re-encode", re, want)) {
+                cleanup(); return 2;
+            }
+            if (bdf_eq(b, orig.rng_bdf)) saw_rng_msix++;
+            else                          saw_con_msix++;
+            break;
+        }
+        case snap::SectionType::VirtioPciTransport: {
+            auto [b, body] = strip_bdf(*sec);
+            const std::vector<std::uint8_t>& want =
+                bdf_eq(b, orig.rng_bdf) ? rng_xport_enc : con_xport_enc;
+            if (!check_bytes_eq("VirtioPciTransport", body, want)) {
+                cleanup(); return 2;
+            }
+            auto st = v::PciTransport::DecodeState(body);
+            std::vector<std::uint8_t> re;
+            v::PciTransport::EncodeState(st, re);
+            if (!check_bytes_eq("VirtioPciTransport re-encode", re, want)) {
+                cleanup(); return 2;
+            }
+            if (bdf_eq(b, orig.rng_bdf)) saw_rng_xport++;
+            else                          saw_con_xport++;
+            break;
+        }
+        case snap::SectionType::Virtqueue: {
+            auto [b, qi, body] = strip_bdf_q(*sec);
+            const std::vector<std::uint8_t>* want = nullptr;
+            if (bdf_eq(b, orig.rng_bdf) && qi == 0)      want = &rng_q0_enc;
+            else if (bdf_eq(b, orig.con_bdf) && qi == 0) want = &con_q0_enc;
+            else if (bdf_eq(b, orig.con_bdf) && qi == 1) want = &con_q1_enc;
+            if (!want) {
+                std::fprintf(stderr,
+                    "[save-restore-pci-test] phaseC: unknown VQ BDF/qi\n");
+                cleanup(); return 2;
+            }
+            if (!check_bytes_eq("Virtqueue", body, *want)) {
+                cleanup(); return 2;
+            }
+            auto st = v::Virtqueue::DecodeState(body);
+            std::vector<std::uint8_t> re;
+            v::Virtqueue::EncodeState(st, re);
+            if (!check_bytes_eq("Virtqueue re-encode", re, *want)) {
+                cleanup(); return 2;
+            }
+            if (bdf_eq(b, orig.rng_bdf))           saw_rng_q0++;
+            else if (qi == 0)                       saw_con_q0++;
+            else                                    saw_con_q1++;
+            break;
+        }
+        case snap::SectionType::VirtioRngState: {
+            auto [b, body] = strip_bdf(*sec);
+            if (!bdf_eq(b, orig.rng_bdf)) {
+                std::fprintf(stderr,
+                    "[save-restore-pci-test] phaseC: RNG_STATE wrong BDF\n");
+                cleanup(); return 2;
+            }
+            if (!check_bytes_eq("VirtioRngState", body, rng_dev_enc)) {
+                cleanup(); return 2;
+            }
+            auto st = v::RngDevice::DecodeState(body);
+            std::vector<std::uint8_t> re;
+            v::RngDevice::EncodeState(st, re);
+            if (!check_bytes_eq("VirtioRngState re-encode", re,
+                                rng_dev_enc)) {
+                cleanup(); return 2;
+            }
+            saw_rng_dev++;
+            break;
+        }
+        case snap::SectionType::VirtioConsoleState: {
+            auto [b, body] = strip_bdf(*sec);
+            if (!bdf_eq(b, orig.con_bdf)) {
+                std::fprintf(stderr,
+                    "[save-restore-pci-test] phaseC: CONSOLE_STATE wrong BDF\n");
+                cleanup(); return 2;
+            }
+            if (!check_bytes_eq("VirtioConsoleState", body, con_dev_enc)) {
+                cleanup(); return 2;
+            }
+            auto st = v::ConsoleDevice::DecodeState(body);
+            std::vector<std::uint8_t> re;
+            v::ConsoleDevice::EncodeState(st, re);
+            if (!check_bytes_eq("VirtioConsoleState re-encode", re,
+                                con_dev_enc)) {
+                cleanup(); return 2;
+            }
+            saw_con_dev++;
+            break;
+        }
+        default:
+            std::fprintf(stderr,
+                "[save-restore-pci-test] phaseC: unexpected section type"
+                " 0x%04x\n", static_cast<unsigned>(sec->type));
+            cleanup(); return 2;
+        }
+    }
+    try {
+        r.VerifyTrailer();
+    } catch (const std::exception& e) {
+        std::fprintf(stderr,
+            "[save-restore-pci-test] phaseC: CRC trailer: %s\n", e.what());
+        cleanup(); return 2;
+    }
+
+    // Section presence check.
+    if (saw_rng_pci != 1 || saw_rng_msix != 1 || saw_rng_xport != 1 ||
+        saw_rng_dev != 1 || saw_rng_q0 != 1 ||
+        saw_con_pci != 1 || saw_con_msix != 1 || saw_con_xport != 1 ||
+        saw_con_dev != 1 || saw_con_q0 != 1 || saw_con_q1 != 1) {
+        std::fprintf(stderr,
+            "[save-restore-pci-test] phaseC: missing sections rng_pci=%d"
+            " rng_msix=%d rng_xport=%d rng_dev=%d rng_q0=%d"
+            " con_pci=%d con_msix=%d con_xport=%d con_dev=%d con_q0=%d"
+            " con_q1=%d\n",
+            saw_rng_pci, saw_rng_msix, saw_rng_xport, saw_rng_dev,
+            saw_rng_q0, saw_con_pci, saw_con_msix, saw_con_xport,
+            saw_con_dev, saw_con_q0, saw_con_q1);
+        cleanup(); return 2;
+    }
+    std::puts("[save-restore-pci-test] phaseC PASS"
+              " (all 11 sections byte-identical; re-encode stable)");
+
+    // ----------------------------- Phase E: ApplyState round-trip ------
+    // Construct fresh devices identically, then in the apply_first hook
+    // (called from drive_and_capture) apply state in the order Phase
+    // 33.6 production code will follow:
+    //   1. PciDevice::ApplyState (cfg + BARs)
+    //   2. Per-virtio-device ApplyState (driver_ok, acked_features)
+    //   3. Per-Virtqueue ApplyState (size, ready, ring GPAs, indices)
+    //   4. MsiX::ApplyState (table entries + PBA)
+    //   5. PciTransport::ApplyState (common_cfg + queue stubs + bar_mapped;
+    //      re-installs BAR0 MMIO handlers via InstallBarHandlers_)
+    std::puts("[save-restore-pci-test] phaseE: apply on fresh devices");
+    CaptureSet recap;
+    {
+        auto apply_fn =
+            [&](v::RngDevice* rng_p, v::PciTransport* rxp,
+                v::ConsoleDevice* con_p, v::PciTransport* cxp) {
+            // RNG side
+            // PciDevice::ApplyState requires the underlying object; the
+            // PciTransport IS the PciDevice (multiple inheritance not used;
+            // PciTransport derives from PciDevice). So apply on the
+            // transport pointer cast to PciDevice.
+            static_cast<p::PciDevice*>(rxp)->ApplyState(orig.rng_pci);
+            rng_p->ApplyState(orig.rng_dev);
+            rng_p->request_queue().ApplyState(orig.rng_q0);
+            rxp->msix().ApplyState(orig.rng_msix);
+            rxp->ApplyState(orig.rng_xport);
+
+            // Console side
+            static_cast<p::PciDevice*>(cxp)->ApplyState(orig.con_pci);
+            con_p->ApplyState(orig.con_dev);
+            con_p->receive_queue().ApplyState(orig.con_q0_rx);
+            con_p->transmit_queue().ApplyState(orig.con_q1_tx);
+            cxp->msix().ApplyState(orig.con_msix);
+            cxp->ApplyState(orig.con_xport);
+        };
+        if (!drive_and_capture(apply_fn, recap)) {
+            cleanup(); return 2;
+        }
+    }
+
+    // Re-encode the recaptured states and verify byte-equality vs the
+    // originals. This is the strongest possible test that ApplyState is
+    // lossless across the full set of field types we persist.
+    auto enc_pcid = [](const p::PciDevice::State& s) {
+        std::vector<std::uint8_t> v;
+        p::PciDevice::EncodeState(s, v);
+        return v;
+    };
+    auto enc_msix = [](const p::MsiX::State& s) {
+        std::vector<std::uint8_t> v;
+        p::MsiX::EncodeState(s, v);
+        return v;
+    };
+    auto enc_xport = [](const v::PciTransport::State& s) {
+        std::vector<std::uint8_t> v;
+        v::PciTransport::EncodeState(s, v);
+        return v;
+    };
+    auto enc_vq = [](const v::Virtqueue::State& s) {
+        std::vector<std::uint8_t> v;
+        v::Virtqueue::EncodeState(s, v);
+        return v;
+    };
+    auto enc_rng = [](const v::RngDevice::State& s) {
+        std::vector<std::uint8_t> v;
+        v::RngDevice::EncodeState(s, v);
+        return v;
+    };
+    auto enc_con = [](const v::ConsoleDevice::State& s) {
+        std::vector<std::uint8_t> v;
+        v::ConsoleDevice::EncodeState(s, v);
+        return v;
+    };
+
+    auto cmp = [&](const char* what,
+                   const std::vector<std::uint8_t>& a,
+                   const std::vector<std::uint8_t>& b) -> bool {
+        if (a.size() != b.size() || !std::equal(a.begin(), a.end(),
+                                                 b.begin())) {
+            std::fprintf(stderr,
+                "[save-restore-pci-test] phaseE: %s post-Apply bytes differ"
+                " (orig=%zu recap=%zu)\n", what, a.size(), b.size());
+            return false;
+        }
+        return true;
+    };
+
+    bool ok = true;
+    ok = cmp("rng PciDevice",   rng_pci_enc,   enc_pcid (recap.rng_pci))   && ok;
+    ok = cmp("rng MsiX",        rng_msix_enc,  enc_msix (recap.rng_msix))  && ok;
+    ok = cmp("rng PciTransport",rng_xport_enc, enc_xport(recap.rng_xport)) && ok;
+    ok = cmp("rng Device",      rng_dev_enc,   enc_rng  (recap.rng_dev))   && ok;
+    ok = cmp("rng Virtqueue 0", rng_q0_enc,    enc_vq   (recap.rng_q0))    && ok;
+    ok = cmp("con PciDevice",   con_pci_enc,   enc_pcid (recap.con_pci))   && ok;
+    ok = cmp("con MsiX",        con_msix_enc,  enc_msix (recap.con_msix))  && ok;
+    ok = cmp("con PciTransport",con_xport_enc, enc_xport(recap.con_xport)) && ok;
+    ok = cmp("con Device",      con_dev_enc,   enc_con  (recap.con_dev))   && ok;
+    ok = cmp("con Virtqueue 0", con_q0_enc,    enc_vq   (recap.con_q0_rx)) && ok;
+    ok = cmp("con Virtqueue 1", con_q1_enc,    enc_vq   (recap.con_q1_tx)) && ok;
+
+    if (!ok) {
+        cleanup();
+        return 2;
+    }
+
+    // Sanity: BDFs assigned by the fresh PciBus must match the original
+    // BDFs (otherwise an unrelated ordering bug would invalidate the
+    // entire scheme, since Phase 33.6 production code assumes
+    // AddDevice ordering is deterministic).
+    if (!bdf_eq(orig.rng_bdf, recap.rng_bdf) ||
+        !bdf_eq(orig.con_bdf, recap.con_bdf)) {
+        std::fprintf(stderr,
+            "[save-restore-pci-test] phaseE: BDF reassignment differs"
+            " (orig rng=%02x:%02x.%u recap rng=%02x:%02x.%u)\n",
+            orig.rng_bdf.bus, orig.rng_bdf.device, orig.rng_bdf.function,
+            recap.rng_bdf.bus, recap.rng_bdf.device, recap.rng_bdf.function);
+        cleanup(); return 2;
+    }
+
+    std::puts("[save-restore-pci-test] phaseE PASS"
+              " (Apply round-trip byte-stable across all 11 states)");
+
+    cleanup();
+    std::puts("[save-restore-pci-test] PASS");
+    return 0;
+}
+
+// --save-restore-legacy-test (M33.5)
+// Round-trips Serial8250 / Pic8259 / Pit8254 / PciBus / LegacyIsaStubs
+// state through the snapshot file format. No vCPU and no WHP. Each
+// device is driven via IO writes to populate state, captured, encoded,
+// written to a temp file, read back + decoded, byte-compared, then
+// re-applied on fresh devices and re-captured + byte-compared. Counting
+// callbacks verify that ResumeRuntime() invokes the expected runtime
+// side-effects (Serial TX-IRQ edge, PIC IRR replay, PIT IRQ thread arm).
+int RunSaveRestoreLegacyTest() {
+    using namespace tinyvmm;
+    namespace dev  = tinyvmm::devices;
+    namespace snap = tinyvmm::whp::snapshot;
+
+    std::puts("[save-restore-legacy-test] starting (host-side; no WHP)");
+
+    auto Fatal = [](const char* msg) -> int {
+        std::fprintf(stderr, "[save-restore-legacy-test] FATAL: %s\n", msg);
+        return 2;
+    };
+
+    // ---- Temp file -------------------------------------------------------
+    char tmp_dir[MAX_PATH];
+    if (GetTempPathA(MAX_PATH, tmp_dir) == 0) {
+        return Fatal("GetTempPathA failed");
+    }
+    char tmp_file[MAX_PATH];
+    if (GetTempFileNameA(tmp_dir, "tvl", 0, tmp_file) == 0) {
+        return Fatal("GetTempFileNameA failed");
+    }
+    std::string tmp_path = tmp_file;
+    auto cleanup_file = [&] { DeleteFileA(tmp_path.c_str()); };
+    std::printf("[save-restore-legacy-test] temp file: %s\n",
+                tmp_path.c_str());
+
+    // ---- Shared captured-state struct -----------------------------------
+    struct Captured {
+        dev::Serial8250::State    serial;
+        dev::Pic8259::State       pic;
+        dev::Pit8254::State       pit;
+        pci::PciBus::State        pcibus;
+        dev::LegacyIsaStubs::State isa;
+    };
+
+    // ---- IO drive helper -------------------------------------------------
+    auto do_write = [](devices::IoBus& b, std::uint16_t port,
+                       std::uint16_t size, std::uint32_t value) {
+        devices::IoAccess acc{};
+        acc.port        = port;
+        acc.access_size = size;
+        acc.is_write    = true;
+        acc.value       = value;
+        b.Dispatch(acc);
+    };
+
+    // ---- Phase A: drive + capture ORIG -----------------------------------
+    std::puts("[save-restore-legacy-test] phaseA: drive + capture original");
+
+    int phaseA_tx_irq = 0, phaseA_pic_inject = 0, phaseA_pit_irq = 0;
+    Captured orig;
+    {
+        dev::Pic8259 pic(
+            [&](std::uint8_t, std::uint32_t) {
+                ++phaseA_pic_inject;
+                return true;
+            });
+        dev::Serial8250 serial(0x3F8, /*sink=*/nullptr);
+        serial.SetIrqCallback([&](int) { ++phaseA_tx_irq; });
+        dev::Pit8254 pit;
+        pit.SetIrqCallback([&](int) { ++phaseA_pit_irq; });
+        pci::PciBus pcibus;
+        dev::LegacyIsaStubs isa;
+
+        devices::IoBus io_bus;
+        serial.Attach(io_bus);
+        pic.Attach(io_bus);
+        pit.Attach(io_bus);
+        pcibus.AttachIoBus(io_bus);
+        isa.Attach(io_bus);
+
+        // ---- PIC: full init sequence (master + slave) -------------------
+        // ICW1=0x11 (init+icw4 will follow), command port.
+        do_write(io_bus, 0x20, 1, 0x11);
+        do_write(io_bus, 0xA0, 1, 0x11);
+        // ICW2: vector base 0x30 master, 0x38 slave.
+        do_write(io_bus, 0x21, 1, 0x30);
+        do_write(io_bus, 0xA1, 1, 0x38);
+        // ICW3: cascade. Master tells which input has slave (bit 2 = IRQ2).
+        // Slave tells its cascade identity (0x02).
+        do_write(io_bus, 0x21, 1, 0x04);
+        do_write(io_bus, 0xA1, 1, 0x02);
+        // ICW4: 8086 mode.
+        do_write(io_bus, 0x21, 1, 0x01);
+        do_write(io_bus, 0xA1, 1, 0x01);
+        // OCW1: mask. Master: 0xFB unmasks IRQ2 (cascade). Slave: 0xFF
+        // mask everything initially. Then unmask slave IRQ2 (local) for
+        // a moment to demonstrate replay.
+        do_write(io_bus, 0x21, 1, 0xFB);   // master: cascade unmasked
+        do_write(io_bus, 0xA1, 1, 0xFF);   // slave: all masked
+        // Raise IRQ 10 (slave bit 2). Since slave mask has bit 2 set,
+        // this latches in slave IRR.
+        pic.Raise(10);
+        // Also raise master IRQ 1 directly. Master mask 0xFB has bit 1
+        // set, so this latches in master IRR.
+        pic.Raise(1);
+
+        // ---- Serial: program registers + write THR to trigger IRQ -------
+        // LCR set DLAB=1.
+        do_write(io_bus, 0x3FB, 1, 0x83);  // 8N1 + DLAB
+        // Divisor 0x000C (96 = 1200 baud? doesn't matter, just bookkeeping)
+        do_write(io_bus, 0x3F8, 1, 0x0C);
+        do_write(io_bus, 0x3F9, 1, 0x00);
+        // Clear DLAB, 8N1 stays.
+        do_write(io_bus, 0x3FB, 1, 0x03);
+        // IER: ETBEI (bit 1) only.
+        do_write(io_bus, 0x3F9, 1, 0x02);
+        // MCR: OUT2 set (bit 3) so IRQ would actually route.
+        do_write(io_bus, 0x3FC, 1, 0x08);
+        // SCR: arbitrary byte.
+        do_write(io_bus, 0x3FF, 1, 0x5A);
+        // FCR: enable FIFO, clear both, 14-byte threshold (write-only).
+        do_write(io_bus, 0x3FA, 1, 0xC7);
+        // Now write THR -- because ETBEI is set and tx is "always
+        // ready", this triggers MaybeRaiseTxIrqLocked which sets
+        // tx_irq_pending_ and raises IRQ4.
+        do_write(io_bus, 0x3F8, 1, 0x41);  // 'A'
+
+        // ---- PIT: program ch0 mode 2 (rate gen) periodic ----------------
+        // Control word for ch0: select counter 0, LSB-then-MSB access,
+        // mode 2, binary = 0x34.
+        do_write(io_bus, 0x43, 1, 0x34);
+        do_write(io_bus, 0x40, 1, 0x00);   // LSB
+        do_write(io_bus, 0x40, 1, 0x10);   // MSB -> reload 0x1000
+        // ch2 mode 0 (one-shot), LSB-then-MSB, binary = 0xB0.
+        do_write(io_bus, 0x43, 1, 0xB0);
+        do_write(io_bus, 0x42, 1, 0xFF);
+        do_write(io_bus, 0x42, 1, 0xFF);   // reload 0xFFFF
+        // Port 0x61: enable gate2 + speaker data.
+        do_write(io_bus, 0x61, 1, 0x03);
+
+        // ---- PciBus: latch a CONFIG_ADDRESS value -----------------------
+        do_write(io_bus, 0xCF8, 4, 0x80001234);
+
+        // ---- LegacyIsaStubs: CMOS index + port 0x92 ---------------------
+        do_write(io_bus, 0x70, 1, 0x09);   // CMOS year
+        do_write(io_bus, 0x92, 1, 0x03);   // A20 + reset bit cleared
+
+        // ---- Capture ----------------------------------------------------
+        orig.serial = serial.CaptureState();
+        orig.pic    = pic.CaptureState();
+        orig.pit    = pit.CaptureState();
+        orig.pcibus = pcibus.CaptureState();
+        orig.isa    = isa.CaptureState();
+    }
+
+    // Sanity check: at this point we should have seen exactly 1 TX IRQ
+    // (from the THR write) and 1 PIC inject (also from the THR write,
+    // since serial.irq_raise -> pic.Raise(4) -> InjectLocked).
+    if (phaseA_tx_irq != 1) {
+        std::fprintf(stderr,
+            "[save-restore-legacy-test] phaseA: TX IRQ count = %d (want 1)\n",
+            phaseA_tx_irq);
+        cleanup_file(); return 2;
+    }
+
+    std::printf("[save-restore-legacy-test] phaseA: original captured "
+                "(tx_irq=%d, pic_inject=%d, pit_irq=%d)\n",
+                phaseA_tx_irq, phaseA_pic_inject, phaseA_pit_irq);
+
+    // ---- Phase B: encode + write file ------------------------------------
+    std::puts("[save-restore-legacy-test] phaseB: encode + write");
+
+    auto encode_to_vec = [](auto encode_fn, const auto& state,
+                            std::size_t size) {
+        std::vector<std::uint8_t> v(size);
+        encode_fn(state, std::span<std::uint8_t>(v));
+        return v;
+    };
+
+    std::vector<std::uint8_t> bytes_serial =
+        encode_to_vec(dev::Serial8250::EncodeState, orig.serial,
+                      dev::Serial8250::kEncodedSize);
+    std::vector<std::uint8_t> bytes_pic =
+        encode_to_vec(dev::Pic8259::EncodeState, orig.pic,
+                      dev::Pic8259::kEncodedSize);
+    std::vector<std::uint8_t> bytes_pit =
+        encode_to_vec(dev::Pit8254::EncodeState, orig.pit,
+                      dev::Pit8254::kEncodedSize);
+    std::vector<std::uint8_t> bytes_pcibus =
+        encode_to_vec(pci::PciBus::EncodeState, orig.pcibus,
+                      pci::PciBus::kEncodedSize);
+    std::vector<std::uint8_t> bytes_isa =
+        encode_to_vec(dev::LegacyIsaStubs::EncodeState, orig.isa,
+                      dev::LegacyIsaStubs::kEncodedSize);
+
+    try {
+        snap::SnapshotWriter w(tmp_path);
+        snap::JsonObjectWriter hdr;
+        hdr.Add("version", std::uint64_t{1});
+        hdr.Add("phase", std::string_view{"33.5-legacy-test"});
+        w.WriteHeader(hdr.str());
+        w.WriteSection(snap::SectionType::LegacySerial8250,
+                       bytes_serial.data(), bytes_serial.size());
+        w.WriteSection(snap::SectionType::LegacyPic8259,
+                       bytes_pic.data(), bytes_pic.size());
+        w.WriteSection(snap::SectionType::LegacyPit8254,
+                       bytes_pit.data(), bytes_pit.size());
+        w.WriteSection(snap::SectionType::LegacyPciBus,
+                       bytes_pcibus.data(), bytes_pcibus.size());
+        w.WriteSection(snap::SectionType::LegacyIsaStubs,
+                       bytes_isa.data(), bytes_isa.size());
+        w.Finalize();
+        std::printf("[save-restore-legacy-test] phaseB wrote %llu bytes\n",
+            static_cast<unsigned long long>(w.bytes_written()));
+    } catch (const std::exception& e) {
+        std::fprintf(stderr,
+            "[save-restore-legacy-test] phaseB: %s\n", e.what());
+        cleanup_file(); return 2;
+    }
+
+    // ---- Phase C: read back + decode + byte-equal + re-encode stable ----
+    std::puts("[save-restore-legacy-test] phaseC: read back + decode");
+    auto cmp = [&](const char* name,
+                   std::span<const std::uint8_t> a,
+                   std::span<const std::uint8_t> b) -> bool {
+        if (a.size() != b.size()) {
+            std::fprintf(stderr,
+                "[save-restore-legacy-test] phaseC %s: size %zu != %zu\n",
+                name, a.size(), b.size());
+            return false;
+        }
+        if (std::memcmp(a.data(), b.data(), a.size()) != 0) {
+            std::fprintf(stderr,
+                "[save-restore-legacy-test] phaseC %s: byte mismatch\n",
+                name);
+            return false;
+        }
+        return true;
+    };
+    try {
+        snap::SnapshotReader r(tmp_path);
+        (void)r.ReadHeader();
+        int n = 0;
+        Captured decoded{};
+        std::vector<std::uint8_t> re_serial, re_pic, re_pit, re_pcibus, re_isa;
+        while (auto sec = r.NextSection()) {
+            ++n;
+            switch (sec->type) {
+                case snap::SectionType::LegacySerial8250: {
+                    if (!cmp("SERIAL", sec->payload, bytes_serial)) {
+                        cleanup_file(); return 2;
+                    }
+                    decoded.serial = dev::Serial8250::DecodeState(sec->payload);
+                    re_serial = encode_to_vec(dev::Serial8250::EncodeState,
+                        decoded.serial, dev::Serial8250::kEncodedSize);
+                    if (!cmp("SERIAL re-enc", re_serial, bytes_serial)) {
+                        cleanup_file(); return 2;
+                    }
+                    break;
+                }
+                case snap::SectionType::LegacyPic8259: {
+                    if (!cmp("PIC", sec->payload, bytes_pic)) {
+                        cleanup_file(); return 2;
+                    }
+                    decoded.pic = dev::Pic8259::DecodeState(sec->payload);
+                    re_pic = encode_to_vec(dev::Pic8259::EncodeState,
+                        decoded.pic, dev::Pic8259::kEncodedSize);
+                    if (!cmp("PIC re-enc", re_pic, bytes_pic)) {
+                        cleanup_file(); return 2;
+                    }
+                    break;
+                }
+                case snap::SectionType::LegacyPit8254: {
+                    if (!cmp("PIT", sec->payload, bytes_pit)) {
+                        cleanup_file(); return 2;
+                    }
+                    decoded.pit = dev::Pit8254::DecodeState(sec->payload);
+                    re_pit = encode_to_vec(dev::Pit8254::EncodeState,
+                        decoded.pit, dev::Pit8254::kEncodedSize);
+                    if (!cmp("PIT re-enc", re_pit, bytes_pit)) {
+                        cleanup_file(); return 2;
+                    }
+                    break;
+                }
+                case snap::SectionType::LegacyPciBus: {
+                    if (!cmp("PCIBUS", sec->payload, bytes_pcibus)) {
+                        cleanup_file(); return 2;
+                    }
+                    decoded.pcibus = pci::PciBus::DecodeState(sec->payload);
+                    re_pcibus = encode_to_vec(pci::PciBus::EncodeState,
+                        decoded.pcibus, pci::PciBus::kEncodedSize);
+                    if (!cmp("PCIBUS re-enc", re_pcibus, bytes_pcibus)) {
+                        cleanup_file(); return 2;
+                    }
+                    break;
+                }
+                case snap::SectionType::LegacyIsaStubs: {
+                    if (!cmp("ISA", sec->payload, bytes_isa)) {
+                        cleanup_file(); return 2;
+                    }
+                    decoded.isa = dev::LegacyIsaStubs::DecodeState(
+                        sec->payload);
+                    re_isa = encode_to_vec(dev::LegacyIsaStubs::EncodeState,
+                        decoded.isa, dev::LegacyIsaStubs::kEncodedSize);
+                    if (!cmp("ISA re-enc", re_isa, bytes_isa)) {
+                        cleanup_file(); return 2;
+                    }
+                    break;
+                }
+                default:
+                    std::fprintf(stderr,
+                        "[save-restore-legacy-test] phaseC: unexpected "
+                        "section 0x%04x\n",
+                        static_cast<unsigned>(sec->type));
+                    cleanup_file(); return 2;
+            }
+        }
+        r.VerifyTrailer();
+        if (n != 5) {
+            std::fprintf(stderr,
+                "[save-restore-legacy-test] phaseC: got %d sections, want 5\n",
+                n);
+            cleanup_file(); return 2;
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr,
+            "[save-restore-legacy-test] phaseC: %s\n", e.what());
+        cleanup_file(); return 2;
+    }
+    std::puts("[save-restore-legacy-test] phaseC PASS "
+              "(5/5 byte-identical; re-encode stable)");
+
+    // ---- Phase D: ApplyState on fresh devices + verify side-effects -----
+    std::puts("[save-restore-legacy-test] phaseD: apply on fresh devices");
+
+    int apply_tx_irq      = 0;
+    int apply_pic_inject  = 0;
+    int apply_pit_irq     = 0;
+    Captured re_captured;
+    {
+        dev::Pic8259 pic(
+            [&](std::uint8_t, std::uint32_t) {
+                ++apply_pic_inject;
+                return true;
+            });
+        dev::Serial8250 serial(0x3F8, /*sink=*/nullptr);
+        serial.SetIrqCallback([&](int) { ++apply_tx_irq; });
+        dev::Pit8254 pit;
+        pit.SetIrqCallback([&](int) { ++apply_pit_irq; });
+        pci::PciBus pcibus;
+        dev::LegacyIsaStubs isa;
+
+        // Apply order: PIC first (so Serial/PIT ResumeRuntime can flow
+        // IRQs through it), then everyone else. Order within Apply isn't
+        // load-bearing because Apply is pure state restore -- only the
+        // subsequent ResumeRuntime calls have side effects.
+        pic.ApplyState(orig.pic);
+        serial.ApplyState(orig.serial);
+        pit.ApplyState(orig.pit);
+        pcibus.ApplyState(orig.pcibus);
+        isa.ApplyState(orig.isa);
+
+        // Resume runtime in production order: PIC (replays IRR), then
+        // Serial (re-edges TX IRQ through PIC), then PIT (starts IRQ
+        // thread which may immediately fire ch0 -> PIC IRQ0).
+        pic.ResumeRuntime();
+        serial.ResumeRuntime();
+        pit.ResumeRuntime();
+
+        // Re-capture before letting the PIT IRQ thread fire (which
+        // happens asynchronously). Re-capture immediately.
+        re_captured.serial = serial.CaptureState();
+        re_captured.pic    = pic.CaptureState();
+        re_captured.pit    = pit.CaptureState();
+        re_captured.pcibus = pcibus.CaptureState();
+        re_captured.isa    = isa.CaptureState();
+    }
+
+    // Encode re-captured states and byte-compare against ORIG. For PIT,
+    // a "running" channel's elapsed_pit_ticks naturally drifts forward
+    // between original Capture and post-Apply re-Capture (real wall-clock
+    // time passes), so for that one section we compare a normalized view
+    // that masks out the per-channel elapsed_pit_ticks fields. Everything
+    // else must be byte-identical.
+    {
+        std::vector<std::uint8_t> re2_serial = encode_to_vec(
+            dev::Serial8250::EncodeState, re_captured.serial,
+            dev::Serial8250::kEncodedSize);
+        std::vector<std::uint8_t> re2_pic = encode_to_vec(
+            dev::Pic8259::EncodeState, re_captured.pic,
+            dev::Pic8259::kEncodedSize);
+        std::vector<std::uint8_t> re2_pit = encode_to_vec(
+            dev::Pit8254::EncodeState, re_captured.pit,
+            dev::Pit8254::kEncodedSize);
+        std::vector<std::uint8_t> re2_pcibus = encode_to_vec(
+            pci::PciBus::EncodeState, re_captured.pcibus,
+            pci::PciBus::kEncodedSize);
+        std::vector<std::uint8_t> re2_isa = encode_to_vec(
+            dev::LegacyIsaStubs::EncodeState, re_captured.isa,
+            dev::LegacyIsaStubs::kEncodedSize);
+        if (!cmp("PIC apply",    re2_pic,    bytes_pic))    {
+            cleanup_file(); return 2;
+        }
+        if (!cmp("SERIAL apply", re2_serial, bytes_serial)) {
+            cleanup_file(); return 2;
+        }
+        // Normalize PIT: zero the elapsed_pit_ticks bytes in both copies.
+        // Per channel: 8 bytes at offsets ch_base + 16. Channel bases
+        // are 8 (ch0), 32 (ch1), 56 (ch2) within the 88-byte payload.
+        auto normalize_pit = [](std::vector<std::uint8_t>& v) {
+            for (std::size_t ch_base : {8u, 32u, 56u}) {
+                for (std::size_t i = 0; i < 8; ++i) {
+                    v[ch_base + 16 + i] = 0;
+                }
+            }
+        };
+        std::vector<std::uint8_t> norm_orig = bytes_pit;
+        std::vector<std::uint8_t> norm_re2  = re2_pit;
+        normalize_pit(norm_orig);
+        normalize_pit(norm_re2);
+        if (!cmp("PIT apply (normalized)", norm_re2, norm_orig)) {
+            cleanup_file(); return 2;
+        }
+        // Verify elapsed_pit_ticks monotonically advanced (or stayed
+        // zero for non-running channels) for the running channels.
+        // This proves the time rebase actually preserved phase rather
+        // than zeroing start_qpc.
+        for (int ch = 0; ch < 3; ++ch) {
+            const std::uint64_t orig_e =
+                orig.pit.ch[ch].elapsed_pit_ticks;
+            const std::uint64_t new_e  =
+                re_captured.pit.ch[ch].elapsed_pit_ticks;
+            if (orig.pit.ch[ch].running && new_e < orig_e) {
+                std::fprintf(stderr,
+                    "[save-restore-legacy-test] phaseD PIT ch%d: "
+                    "elapsed regressed (%llu -> %llu)\n",
+                    ch,
+                    static_cast<unsigned long long>(orig_e),
+                    static_cast<unsigned long long>(new_e));
+                cleanup_file(); return 2;
+            }
+        }
+        if (!cmp("PCIBUS apply", re2_pcibus, bytes_pcibus)) {
+            cleanup_file(); return 2;
+        }
+        if (!cmp("ISA apply",    re2_isa,    bytes_isa))    {
+            cleanup_file(); return 2;
+        }
+    }
+
+    // ResumeRuntime side-effect counts:
+    //   - Serial: 1 TX IRQ edge (the in-flight pending one).
+    //   - PIC: ResumeRuntime injects MASTER IRR bits whose mask is clear.
+    //     Master has IRR=0x02 (IRQ 1, from Raise(1) earlier) AND IRR
+    //     bit 4 from the TX IRQ (IRQ 4 from earlier THR write, latched
+    //     after Apply because we didn't clear master_.irr at save -- in
+    //     fact the original Raise(4) would have injected immediately
+    //     since IRQ 4 was unmasked; so master.irr bit 4 should be
+    //     CLEAR in the original state).
+    //
+    //   Actually, original captured state:
+    //     master_.mask = 0xFB (bit 2 clear; everything else set EXCEPT
+    //                          bit 2... wait, mask=0xFB means bits 0,1,
+    //                          3,4,5,6,7 are masked, bit 2 unmasked).
+    //     So Raise(4) -> chip.mask bit 4 set -> latched in IRR
+    //     (InjectLocked NOT called because masked).
+    //     But Serial's IRQ-raise goes through pic.Raise(4)... if mask
+    //     has bit 4 set then it latches.
+    //   So master_.irr should have bits 1 and 4 set after phase A.
+    //   ResumeRuntime: master mask 0xFB has bit 2 clear; deliverable =
+    //     irr (0x12) & ~mask (~0xFB=0x04) = 0x00. None deliverable!
+    //   So PIC ResumeRuntime injects 0 times.
+    //
+    //   Serial ResumeRuntime: tx_irq_pending=1 AND ETBEI=1 AND
+    //     irq_raise_ set -> clears pending, calls
+    //     MaybeRaiseTxIrqLocked -> sets pending, calls
+    //     irq_raise_(4) -> tx_irq_count++.
+    //
+    //   PIT ResumeRuntime: ch0_irq_armed=1 -> starts IRQ thread, may
+    //     deliver IRQ 0 asynchronously. We can't assert exact count
+    //     since it's racy; just confirm >=0.
+    //
+    //   Expected: apply_tx_irq=1, apply_pic_inject in [0, N] (could
+    //     receive ch0 IRQs via PIT through pic.Raise(0) -> InjectLocked
+    //     if IRQ0 mask is clear in master (0xFB has bit 0 set, so IRQ0
+    //     would be latched, not injected). So apply_pic_inject=0.
+    if (apply_tx_irq != 1) {
+        std::fprintf(stderr,
+            "[save-restore-legacy-test] phaseD: serial TX IRQ count = %d "
+            "(want 1)\n", apply_tx_irq);
+        cleanup_file(); return 2;
+    }
+    std::printf("[save-restore-legacy-test] phaseD: side-effects "
+                "(tx_irq=%d, pic_inject=%d, pit_irq=%d)\n",
+                apply_tx_irq, apply_pic_inject, apply_pit_irq);
+    std::puts("[save-restore-legacy-test] phaseD PASS "
+              "(Apply round-trip byte-stable across all 5 states)");
+
+    cleanup_file();
+    std::puts("[save-restore-legacy-test] PASS");
+    return 0;
+}
+
 // --cpuid-test (M18)
 // Drive the CPUID resolver directly (no WHP) and assert that the policy
 // produces the bits Linux needs to (a) trust TSC as a clocksource, (b) skip
@@ -6144,6 +11901,9 @@ int main(int argc, char** argv) {
         if (cmd == "--smoke") {
             return RunSmoke();
         }
+        if (cmd == "--tsi-smoke") {
+            return RunTsiSmoke();
+        }
         if (cmd == "--loop-test") {
             return RunLoopTest();
         }
@@ -6174,11 +11934,33 @@ int main(int argc, char** argv) {
         if (cmd == "--virtio-blk-ro-test") {
             return RunVirtioBlkRoTest();
         }
+        if (cmd == "--virtio-blk-discard-test") {
+            return RunVirtioBlkDiscardTest();
+        }
         if (cmd == "--virtio-net-pci-test") {
             return RunVirtioNetPciTest();
         }
         if (cmd == "--virtio-net-loopback-test") {
             return RunVirtioNetLoopbackTest();
+        }
+        if (cmd == "--virtio-net-usernet-tsi-test") {
+            return RunVirtioNetUsernetTsiTest();
+        }
+        if (cmd == "--tsi-fuzz-test") {
+            int iters = 10000;
+            std::uint64_t seed = 0xC0FFEE12345678ULL;
+            if (argc >= 3) iters = std::atoi(argv[2]);
+            if (argc >= 4) seed  = std::strtoull(argv[3], nullptr, 0);
+            if (iters <= 0) iters = 10000;
+            return RunTsiFuzzTest(iters, seed);
+        }
+        if (cmd == "--virtio-queue-fuzz-test") {
+            int iters = 50000;
+            std::uint64_t seed = 0xFADE0FFULL;
+            if (argc >= 3) iters = std::atoi(argv[2]);
+            if (argc >= 4) seed  = std::strtoull(argv[3], nullptr, 0);
+            if (iters <= 0) iters = 50000;
+            return RunVirtioQueueFuzzTest(iters, seed);
         }
         if (cmd == "--virtio-rng-test") {
             return RunVirtioRngTest();
@@ -6188,6 +11970,21 @@ int main(int argc, char** argv) {
         }
         if (cmd == "--cpuid-test") {
             return RunCpuidTest();
+        }
+        if (cmd == "--snapshot-trigger-test") {
+            return RunSnapshotTriggerTest();
+        }
+        if (cmd == "--save-restore-probe") {
+            return RunSaveRestoreProbe();
+        }
+        if (cmd == "--save-restore-roundtrip-test") {
+            return RunSaveRestoreRoundtripTest();
+        }
+        if (cmd == "--save-restore-pci-test") {
+            return RunSaveRestorePciTest();
+        }
+        if (cmd == "--save-restore-legacy-test") {
+            return RunSaveRestoreLegacyTest();
         }
         if (cmd == "--cpu-affinity-test") {
             return RunCpuAffinityTest();
@@ -6256,6 +12053,19 @@ int main(int argc, char** argv) {
                 tinyvmm::whp::AffinityMode::All;
             std::vector<tinyvmm::virtio::UsernetBackend::PortForward>
                 port_forwards;
+            // M35: GDB Remote Serial Protocol stub TCP port on
+            // 127.0.0.1. 0 disables (default). When non-zero, tinyvmm
+            // halts before the first guest instruction and waits for
+            // `target remote :<port>` from gdb.
+            std::uint16_t gdb_port = 0;
+            // M33 Phase 33.1: snapshot trigger settings. When `--save
+            // <path>` is parsed, `save_path` is populated and the global
+            // snapshot::State() is armed before the run loop starts.
+            // `unsafe_save_mutable_drive` opts out of the v1 RO-default
+            // policy on `--drive`s (consistency caveat documented in
+            // plan §"drive consistency").
+            std::string save_path;
+            bool unsafe_save_mutable_drive = false;
             // Hide TSC-deadline by default: WHP's LAPIC emulation rejects
             // WRMSR 0x6E0 even when the bit is set in CpuidResultList, so
             // advertising it just causes Linux to log a 30-line `unchecked
@@ -6693,6 +12503,54 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                     port_forwards.push_back(pf);
+                } else if (f == "--save") {
+                    // M33 Phase 33.1: arms the magic snapshot CPUID. The
+                    // actual file write is implemented in later phases
+                    // (33.3+); for now, the flag is parsed end-to-end and
+                    // triggers the StopReason::SnapshotRequested branch in
+                    // the run loop, but the post-stop handler in
+                    // RunPvhRun only logs a [snapshot] line and exits.
+                    if (vmlinux_arg + 1 >= argc) {
+                        std::fputs("--pvh-run: --save wants <path>\n",
+                                   stderr);
+                        return 1;
+                    }
+                    ++vmlinux_arg;
+                    save_path = argv[vmlinux_arg];
+                    if (save_path.empty()) {
+                        std::fputs("--pvh-run: --save: empty path\n",
+                                   stderr);
+                        return 1;
+                    }
+                } else if (f == "--unsafe-save-mutable-drive") {
+                    // Opt-out of the v1 read-only-drive policy for --save.
+                    // Without this, --save refuses to start if any --drive
+                    // is mutable (not ,readonly). See plan §"drive
+                    // consistency" for the rationale: a mutated disk +
+                    // stale RAM snapshot = corrupt guest filesystem.
+                    unsafe_save_mutable_drive = true;
+                } else if (f == "--gdb-port") {
+                    // M35: bind a GDB Remote Serial Protocol stub on
+                    // 127.0.0.1:<port>. tinyvmm halts before the first
+                    // guest instruction and waits for `target remote
+                    // :<port>` from gdb. Requires --vcpus 1 (validated
+                    // in RunPvhRun). Auto-appends `nokaslr` to the
+                    // kernel cmdline if not already present, so
+                    // GDB-known symbols match runtime addresses.
+                    if (vmlinux_arg + 1 >= argc) {
+                        std::fputs("--pvh-run: --gdb-port wants <port>\n",
+                                   stderr);
+                        return 1;
+                    }
+                    ++vmlinux_arg;
+                    int port = std::atoi(argv[vmlinux_arg]);
+                    if (port <= 0 || port > 65535) {
+                        std::fprintf(stderr,
+                            "--pvh-run: --gdb-port: invalid port '%s' "
+                            "(want 1..65535)\n", argv[vmlinux_arg]);
+                        return 1;
+                    }
+                    gdb_port = static_cast<std::uint16_t>(port);
                 } else {
                     std::fprintf(stderr,
                                  "--pvh-run: unknown flag '%.*s'\n",
@@ -6732,6 +12590,64 @@ int main(int argc, char** argv) {
                            "--net-backend usernet\n", stderr);
                 return 1;
             }
+            // M33 Phase 33.1: cross-flag validation for --save.
+            //
+            // Phase-1 scope is vCPU + RAM + virtio-{rng,console,blk}. We
+            // explicitly refuse --save with --net (the network backends
+            // can't capture/restore in-flight host sockets) or with
+            // --virtio-9p-share (Win32 HANDLEs don't survive a process
+            // exit). These can be lifted in later phases by widening the
+            // device-state capture.
+            if (!save_path.empty() && with_net) {
+                std::fputs(
+                    "--pvh-run: --save is incompatible with --net "
+                    "(net backends cannot survive snapshot in v1)\n",
+                    stderr);
+                return 1;
+            }
+            if (!save_path.empty() && !p9_shares.empty()) {
+                std::fputs(
+                    "--pvh-run: --save is incompatible with "
+                    "--virtio-9p-share (Win32 HANDLEs cannot survive "
+                    "snapshot)\n",
+                    stderr);
+                return 1;
+            }
+            if (!save_path.empty() && !unsafe_save_mutable_drive) {
+                for (const auto& d : drives) {
+                    if (!d.readonly) {
+                        std::fprintf(stderr,
+                            "--pvh-run: --save: drive '%s' is mutable. "
+                            "Either add ',readonly' to every --drive, or "
+                            "pass --unsafe-save-mutable-drive to accept "
+                            "the risk that a mutated disk plus a stale "
+                            "RAM snapshot corrupts the guest filesystem.\n",
+                            d.path.c_str());
+                        return 1;
+                    }
+                }
+            }
+            if (unsafe_save_mutable_drive && save_path.empty()) {
+                std::fputs(
+                    "--pvh-run: --unsafe-save-mutable-drive requires "
+                    "--save\n",
+                    stderr);
+                return 1;
+            }
+            // Arm the global snapshot trigger if --save was provided. Done
+            // here (not inside RunPvhRun) so the arming happens before the
+            // global state is observable by any RunLoop.
+            if (!save_path.empty()) {
+                auto& st = ::tinyvmm::whp::snapshot::State();
+                st.save_path = save_path;
+                st.armed.store(true, std::memory_order_release);
+                std::printf(
+                    "[pvh-run] snapshot armed: will write to '%s' on "
+                    "guest-side magic CPUID 0x%08X\n",
+                    save_path.c_str(),
+                    static_cast<unsigned>(
+                        ::tinyvmm::whp::snapshot::kMagicLeaf));
+            }
             std::string cmdline;
             int sep = -1;
             for (int i = vmlinux_arg + 1; i < argc; ++i) {
@@ -6762,11 +12678,128 @@ int main(int argc, char** argv) {
                               "nofb nomodeset";
                 }
             }
+            // M35: when --gdb-port is set, auto-append `nokaslr` so
+            // the runtime kernel addresses match the symbols in the
+            // user's vmlinux file (rubber-duck #3). Idempotent: only
+            // appends if not already present in the cmdline.
+            if (gdb_port != 0 &&
+                cmdline.find("nokaslr") == std::string::npos) {
+                if (!cmdline.empty()) cmdline.push_back(' ');
+                cmdline.append("nokaslr");
+                std::fprintf(stderr,
+                    "[pvh-run] --gdb-port: auto-appended 'nokaslr' to "
+                    "kernel cmdline so gdb symbols match runtime "
+                    "addresses\n");
+            }
             return RunPvhRun(argv[vmlinux_arg], cmdline, with_net,
                              net_backend, xdp_if, xdp_queue, xdp_debug,
                              initrd_path, drives, p9_shares, watchdog_secs,
-                             hide_tsc_deadline, port_forwards, ram_mb,
-                             vcpu_count, affinity_mode);
+                             hide_tsc_deadline, port_forwards,
+                             ram_mb,
+                             vcpu_count, affinity_mode, gdb_port);
+        }
+        if (cmd == "--restore") {
+            if (argc < 3) {
+                std::fputs("--restore: expected path to snapshot file\n",
+                           stderr);
+                return 1;
+            }
+            const std::string snapshot_path = argv[2];
+            std::vector<DriveSpec> drive_overrides;
+            bool unsafe_restore_mutable_drive = false;
+            int watchdog_secs = 0;
+            tinyvmm::whp::AffinityMode affinity_mode =
+                tinyvmm::whp::AffinityMode::All;
+            // Parser: walk argv[3..] in order. Each option is independent;
+            // unknown options and PVH-only flags are rejected loudly so a
+            // typo (`--rseotre`-style) doesn't silently fall through to a
+            // restore with default settings.
+            for (int i = 3; i < argc; ++i) {
+                const std::string_view a = argv[i];
+                if (a == "--drive") {
+                    if (i + 1 >= argc) {
+                        std::fputs("--restore --drive: expected path\n",
+                                   stderr);
+                        return 1;
+                    }
+                    DriveSpec spec;
+                    std::string token = argv[++i];
+                    auto comma = token.find(',');
+                    if (comma == std::string::npos) {
+                        spec.path = token;
+                    } else {
+                        spec.path = token.substr(0, comma);
+                        if (token.substr(comma + 1) == "readonly") {
+                            spec.readonly = true;
+                        } else {
+                            std::fprintf(stderr,
+                                "--restore --drive: unknown attribute '%s' "
+                                "(only 'readonly' is supported)\n",
+                                token.substr(comma + 1).c_str());
+                            return 1;
+                        }
+                    }
+                    drive_overrides.push_back(std::move(spec));
+                } else if (a == "--watchdog-secs") {
+                    if (i + 1 >= argc) {
+                        std::fputs("--restore --watchdog-secs: expected N\n",
+                                   stderr);
+                        return 1;
+                    }
+                    watchdog_secs = std::atoi(argv[++i]);
+                    if (watchdog_secs < 0) {
+                        std::fputs("--restore --watchdog-secs: must be >= 0\n",
+                                   stderr);
+                        return 1;
+                    }
+                } else if (a == "--cpu-affinity") {
+                    if (i + 1 >= argc) {
+                        std::fputs(
+                            "--restore --cpu-affinity: expected mode\n",
+                            stderr);
+                        return 1;
+                    }
+                    std::string_view as = argv[++i];
+                    if (!tinyvmm::whp::ParseAffinityMode(as, affinity_mode)) {
+                        std::fprintf(stderr,
+                            "--restore --cpu-affinity: unknown mode '%.*s' "
+                            "(expected all|p|e|p-physical)\n",
+                            static_cast<int>(as.size()), as.data());
+                        return 1;
+                    }
+                    if (affinity_mode == tinyvmm::whp::AffinityMode::ECore
+                        && !tinyvmm::whp::GetTopology().hybrid) {
+                        std::fputs(
+                            "--restore --cpu-affinity e: not a hybrid host\n",
+                            stderr);
+                        return 1;
+                    }
+                } else if (a == "--unsafe-restore-mutable-drive") {
+                    unsafe_restore_mutable_drive = true;
+                } else if (a == "--net" || a == "--net-backend" ||
+                           a == "--xdp-if" || a == "--xdp-queue" ||
+                           a == "--xdp-debug" || a == "--initrd" ||
+                           a == "--virtio-9p-share" || a == "--debug-boot" ||
+                           a == "--expose-tsc-deadline" ||
+                           a == "--ram-mb" || a == "--vcpus" ||
+                           a == "--portfwd" ||
+                           a == "--save" || a == "--gdb-port" ||
+                           a == "--unsafe-save-mutable-drive") {
+                    std::fprintf(stderr,
+                        "--restore: option '%.*s' is not valid in restore "
+                        "mode (the snapshot encodes the full VM topology)\n",
+                        static_cast<int>(a.size()), a.data());
+                    return 1;
+                } else {
+                    std::fprintf(stderr,
+                        "--restore: unknown option '%.*s'\n",
+                        static_cast<int>(a.size()), a.data());
+                    return 1;
+                }
+            }
+            return RunRestore(snapshot_path, drive_overrides,
+                              unsafe_restore_mutable_drive,
+                              watchdog_secs, affinity_mode);
         }
         if (cmd == "--help" || cmd == "-h") {
             PrintUsage();

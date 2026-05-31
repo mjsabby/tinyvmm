@@ -1,6 +1,9 @@
 #include "virtio_rng.h"
 
 #include "host/rng.h"
+#include "whp/snapshot_file.h"
+
+#include <stdexcept>
 
 namespace tinyvmm::virtio {
 
@@ -61,6 +64,38 @@ void RngDevice::DrainRequestQueue() {
     if (any && irq_ && queue_.ShouldInterruptDriver()) {
         irq_(kRngRequestQueueIdx);
     }
+}
+
+// ----------------------- M33.4 save/restore ---------------------------
+
+std::size_t RngDevice::EncodeState(const State& s,
+                                   std::vector<std::uint8_t>& out) {
+    using namespace tinyvmm::whp::snapshot;
+    const std::size_t start = out.size();
+    out.resize(start + kEncodedSize, 0);
+    std::uint8_t* p = out.data() + start;
+    p[0] = s.driver_ok;
+    // p[1..7] u8 pad[7]
+    WriteLe64(p + 8, s.acked_features);
+    return kEncodedSize;
+}
+
+RngDevice::State RngDevice::DecodeState(std::span<const std::uint8_t> bytes) {
+    using namespace tinyvmm::whp::snapshot;
+    if (bytes.size() < kEncodedSize) {
+        throw std::runtime_error("RngDevice::DecodeState: payload too small");
+    }
+    const std::uint8_t* p = bytes.data();
+    State s;
+    s.driver_ok = p[0];
+    for (int i = 1; i < 8; ++i) {
+        if (p[i] != 0) {
+            throw std::runtime_error(
+                "RngDevice::DecodeState: nonzero pad");
+        }
+    }
+    s.acked_features = ReadLe64(p + 8);
+    return s;
 }
 
 }  // namespace tinyvmm::virtio

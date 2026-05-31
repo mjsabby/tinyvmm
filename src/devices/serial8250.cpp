@@ -1,7 +1,9 @@
 #include "serial8250.h"
+#include "../whp/snapshot_file.h"
 
 #include <cstdio>
 #include <mutex>
+#include <stdexcept>
 
 namespace tinyvmm::devices {
 
@@ -219,6 +221,95 @@ void Serial8250::HandleRead(IoAccess& acc) {
             break;
     }
     acc.value = v;
+}
+
+// ---- Phase 33.5 save/restore ----------------------------------------------
+
+Serial8250::State Serial8250::CaptureState() const {
+    std::lock_guard<std::mutex> lk(lock_);
+    State s;
+    s.ier              = ier_;
+    s.lcr              = lcr_;
+    s.mcr              = mcr_;
+    s.scr              = scr_;
+    s.fcr              = fcr_;
+    s.dll              = dll_;
+    s.dlm              = dlm_;
+    s.tx_irq_pending   = tx_irq_pending_ ? 1u : 0u;
+    s.first_byte_fired = first_byte_fired_ ? 1u : 0u;
+    return s;
+}
+
+void Serial8250::ApplyState(const Serial8250::State& s) {
+    std::lock_guard<std::mutex> lk(lock_);
+    ier_              = s.ier;
+    lcr_              = s.lcr;
+    mcr_              = s.mcr;
+    scr_              = s.scr;
+    fcr_              = s.fcr;
+    dll_              = s.dll;
+    dlm_              = s.dlm;
+    tx_irq_pending_   = (s.tx_irq_pending != 0);
+    first_byte_fired_ = (s.first_byte_fired != 0);
+    // Do NOT raise the IRQ here; defer to ResumeRuntime() so the PIC is
+    // guaranteed to be applied + wired before we re-edge it.
+}
+
+void Serial8250::ResumeRuntime() {
+    std::lock_guard<std::mutex> lk(lock_);
+    // If the snapshot was taken with an in-flight TX IRQ, edge it again.
+    // MaybeRaiseTxIrqLocked() bails out early when tx_irq_pending_ is true,
+    // so we clear it first and let the helper re-set + fire.
+    if (tx_irq_pending_ && (ier_ & kIerEtbei) != 0 && irq_raise_) {
+        tx_irq_pending_ = false;
+        MaybeRaiseTxIrqLocked();
+    }
+}
+
+std::size_t Serial8250::EncodeState(const Serial8250::State& s,
+                                    std::span<std::uint8_t> out) {
+    if (out.size() < kEncodedSize) {
+        throw std::runtime_error(
+            "Serial8250::EncodeState: output span smaller than kEncodedSize");
+    }
+    std::uint8_t* p = out.data();
+    p[0] = s.ier;
+    p[1] = s.lcr;
+    p[2] = s.mcr;
+    p[3] = s.scr;
+    p[4] = s.fcr;
+    p[5] = s.dll;
+    p[6] = s.dlm;
+    p[7] = s.tx_irq_pending ? 1u : 0u;
+    p[8] = s.first_byte_fired ? 1u : 0u;
+    // Reserved bytes [9..15] are written as 0; reader rejects non-zero.
+    for (std::size_t i = 9; i < kEncodedSize; ++i) p[i] = 0;
+    return kEncodedSize;
+}
+
+Serial8250::State Serial8250::DecodeState(
+    std::span<const std::uint8_t> bytes) {
+    if (bytes.size() < kEncodedSize) {
+        throw std::runtime_error(
+            "Serial8250::DecodeState: payload smaller than kEncodedSize");
+    }
+    State s;
+    s.ier              = bytes[0];
+    s.lcr              = bytes[1];
+    s.mcr              = bytes[2];
+    s.scr              = bytes[3];
+    s.fcr              = bytes[4];
+    s.dll              = bytes[5];
+    s.dlm              = bytes[6];
+    s.tx_irq_pending   = (bytes[7] != 0) ? 1u : 0u;
+    s.first_byte_fired = (bytes[8] != 0) ? 1u : 0u;
+    for (std::size_t i = 9; i < kEncodedSize; ++i) {
+        if (bytes[i] != 0) {
+            throw std::runtime_error(
+                "Serial8250::DecodeState: reserved byte non-zero");
+        }
+    }
+    return s;
 }
 
 }  // namespace tinyvmm::devices

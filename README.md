@@ -6,7 +6,14 @@ as the network back-end.
 
 ## Status
 
-M0 (in progress): partition bring-up, vCPU lifecycle, real-mode HLT smoke test.
+A working tiny VMM on Windows Hypervisor Platform, with milestones
+M0-M34 done. Boots an unmodified Linux PVH kernel, runs SMP, exposes
+virtio-rng / virtio-console / virtio-blk / virtio-net / virtio-9p over
+a PCI bridge with MSI-X, has working save/restore (instant resume
+from checkpoint via a magic CPUID leaf), and a user-mode networking
+backend whose TCP terminates inside the `tcp-sans-io` Rust crate
+(RFC 6675 SACK + RACK-TLP + PRR-Reno + ECN + RFC 7323 TS/WS + SYN
+cookies + IW=10).
 
 See [docs design notes / VM-exit hot-path analysis] in the session plan.
 
@@ -421,16 +428,14 @@ still need admin.
 
 For day-to-day use, `--net-backend usernet` is the
 recommended path. It needs no kernel driver, no admin token,
-and no host network configuration — outbound UDP/TCP/ICMP
-flow through the host's normal Winsock + `IcmpSendEcho2`
-APIs, identical to any other user-mode application's
-traffic. Guest sees `10.0.0.2/24` with gateway `10.0.0.1`;
-the gateway is a synthetic L3 endpoint inside tinyvmm that
-terminates the guest's IP stack at L4 and proxies each
-flow as a per-tuple host socket. TCP options advertise
-`MSS=1460` plus `WScale=7` (when the guest negotiates it),
-clamp the guest's effective MSS to 1460 on inbound SYN, and
-honour wrap-safe RFC 793 §3.7 window updates.
+and no host network configuration — outbound UDP/ICMP flow
+through the host's normal Winsock + `IcmpSendEcho2` APIs and
+outbound TCP terminates inside the [`tcp-sans-io`](https://github.com/mjsabby/tcp-sans-io)
+Rust crate (RFC 6675 SACK + RACK-TLP + PRR-Reno + ECN +
+RFC 7323 TS/WS + SYN cookies + IW=10; linked as a staticlib).
+Guest sees `10.0.0.2/24` with gateway `10.0.0.1`; the gateway is a
+synthetic L3 endpoint inside tinyvmm that terminates the guest's IP
+stack at L4 and proxies each flow as a per-tuple host socket.
 
 ### Inbound TCP port-forward (`--portfwd`)
 
