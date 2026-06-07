@@ -1,0 +1,15 @@
+[package]
+name = "whpsys"
+version = "0.1.0"
+edition = "2021"
+description = "Safe wrappers over the Windows Hypervisor Platform (WHP): partition, guest memory, virtual processors, MSI injection. Concentrates the hypervisor-FFI unsafe in one auditable crate."
+license = "MIT"
+
+[dependencies]
+winsys = { path = "../winsys" }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Hypervisor",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }
