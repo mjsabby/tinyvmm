@@ -53,3 +53,6 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+# Emit full debug info so the MSVC linker produces target/release/tinyvmm.pdb
+# alongside the optimized binary (useful for crash dumps / debugging release builds).
+debug = true

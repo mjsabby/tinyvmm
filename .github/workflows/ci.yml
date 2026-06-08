@@ -48,11 +48,13 @@ jobs:
       - name: Run tests
         run: cargo test --release
 
-      - name: Upload tinyvmm.exe artifact
+      - name: Upload tinyvmm artifacts
         uses: actions/upload-artifact@v4
         with:
           name: tinyvmm-windows-x86_64
-          path: target/release/tinyvmm.exe
+          path: |
+            target/release/tinyvmm.exe
+            target/release/tinyvmm.pdb
           if-no-files-found: error
 
       # Publish a GitHub Release using the gh CLI (preinstalled on runners)
@@ -73,7 +75,7 @@ jobs:
           $notes = "Automated build from commit $env:GITHUB_SHA on $env:GITHUB_REF_NAME."
           # Make re-runs idempotent: drop any existing release+tag with this name.
           gh release delete $tag --yes --cleanup-tag 2>$null
-          gh release create $tag "target/release/tinyvmm.exe" `
+          gh release create $tag "target/release/tinyvmm.exe" "target/release/tinyvmm.pdb" `
             --title $title `
             --notes $notes `
             --target $env:GITHUB_SHA
