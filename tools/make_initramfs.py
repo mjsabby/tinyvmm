@@ -877,6 +877,58 @@ if grep -q 'tinyvmm.test=9p' /proc/cmdline 2>/dev/null; then
     exec cat
 fi
 
+# --- concurrent virtio-9p throughput benchmark -------------------------
+# Enabled via kernel cmdline marker `tinyvmm.test=bench-9p` (name chosen so it
+# is NOT a substring of the `tinyvmm.test=9p` / `tinyvmm.test=p9` markers, whose
+# greps would otherwise also fire on it). The host driver (tools/p9_bench.py)
+# stages /mnt/p9/bench/big000.. with N large files of a fixed size, then this
+# block mounts the share and reads every big* file IN PARALLEL (one dd per
+# file) to /dev/null, reporting raw /proc/uptime start/end so the host computes
+# aggregate MB/s. A serial p9 engine (one request at a time on the doorbell
+# pump thread) caps the aggregate near single-stream; a concurrent (worker-pool)
+# engine should scale it with the reader count. Prints
+# `9P-BENCH readers=N start=.. end=..`.
+if grep -q 'tinyvmm.test=bench-9p' /proc/cmdline 2>/dev/null; then
+    log "--- 9P-BENCH start ---"
+    mkdir -p /mnt/p9
+    # Optional `p9cache=MODE` cmdline token (default none). cache=none does NO
+    # guest readahead -> one Tread at a time -> latency-bound single stream;
+    # cache=loose enables the guest page cache + readahead, which pipelines a
+    # single stream. Comparing the two attributes single-stream throughput to
+    # the guest cache policy rather than the device.
+    P9CACHE=none
+    for tok in $(cat /proc/cmdline); do
+        case "$tok" in p9cache=*) P9CACHE="${tok#p9cache=}" ;; esac
+    done
+    log "9P-BENCH cache=$P9CACHE"
+    if mount -t 9p -o "trans=virtio,version=9p2000.L,msize=1048576,cache=$P9CACHE" \
+              host /mnt/p9 2>/dev/kmsg; then
+        N=0
+        for f in /mnt/p9/bench/big*; do
+            [ -f "$f" ] && N=$((N + 1))
+        done
+        # Drop the guest page cache so every read goes out as a Tread.
+        sync
+        echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+        start=$(cut -d' ' -f1 /proc/uptime)
+        for f in /mnt/p9/bench/big*; do
+            [ -f "$f" ] && dd if="$f" of=/dev/null bs=1M 2>/dev/null &
+        done
+        wait
+        end=$(cut -d' ' -f1 /proc/uptime)
+        log "9P-BENCH readers=$N start=$start end=$end"
+    else
+        log "9P-BENCH: mount FAILED"
+    fi
+    log "--- 9P-BENCH end ---"
+    sync
+    sleep 1
+    log "=== tinyvmm shutdown requested ==="
+    sleep 1
+    poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
+    exec cat
+fi
+
 # --- optional virtio-blk real-workload test mode ------------------------
 # Enabled via kernel cmdline marker `tinyvmm.test=blk`. The host harness
 # attaches:

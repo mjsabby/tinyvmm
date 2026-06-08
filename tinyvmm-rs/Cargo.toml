@@ -1,0 +1,48 @@
+[package]
+name = "tinyvmm"
+version = "0.1.0"
+edition = "2021"
+description = "A tiny user-mode VMM on the Windows Hypervisor Platform (Rust rewrite)"
+license = "MIT"
+
+[workspace]
+members = ["crates/winsys", "crates/whpsys"]
+
+[[bin]]
+name = "tinyvmm"
+path = "src/main.rs"
+
+[dependencies]
+winsys = { path = "crates/winsys" }
+whpsys = { path = "crates/whpsys" }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Hypervisor",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_SystemInformation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_Security_Cryptography",
+    "Win32_System_Ioctl",
+    "Win32_System_Performance",
+    "Win32_System_LibraryLoader",
+    "Win32_NetworkManagement_Ndis",
+] }
+# User-directed dependency: client-only sans-I/O TCP stack (local path; the
+# crate is publish=false/private). `std` disables its no_std panic handler so
+# it links into our std binary. Rings are the crate default 1 MiB/direction
+# (~2.1 MiB per Tcb) — per user, kept as-is; the nat-worker thread is given a
+# large stack so each Tcb can be constructed.
+tcp-sans-io = { path = "C:/tcp-sans-io", features = ["std"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

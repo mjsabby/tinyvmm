@@ -1,0 +1,25 @@
+[package]
+name = "winsys"
+version = "0.1.0"
+edition = "2021"
+description = "Safe wrappers over the Win32 host APIs tinyvmm uses (file I/O, memory-mapping, privileges, CNG random). All host-FFI unsafe is concentrated + audited here."
+license = "MIT"
+
+[dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Performance",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
