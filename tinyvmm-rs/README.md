@@ -113,7 +113,8 @@ the privilege is absent, tinyvmm prints the warning above and falls back to
 | `--ram-mb <N>` | `256` | Clamped to **128–3584**. Upper bound is hard: the PCI MMIO window opens at `0xE000_0000` (3584 MiB); a bigger contiguous region would collide with device BARs. |
 | `--vcpus <N>` | `1` | Clamped to **1–32**. BSP on the main thread; each AP on its own host thread. |
 | `--rng` | off | Add a virtio-rng device (`/dev/hwrng`). |
-| `--input` | off | Add two virtio-input devices — a keyboard and an absolute tablet (pointer + scroll + buttons). The host source is the interactive console: with a real TTY, stdin switches to `ReadConsoleInputW` with mouse input, so keystrokes drive both hvc0 and the keyboard, and mouse motion/buttons/wheel drive the tablet. Pairs with virtio-gpu (planned); requires a guest kernel built with `CONFIG_INPUT`/`CONFIG_INPUT_EVDEV`/`CONFIG_VIRTIO_INPUT`. |
+| `--gpu [WxH]` | off | Add a virtio-gpu 2D device and open a Win32 window showing its scanout (CPU blit). Optional `WxH` sets the preferred display size (default `1280x800`). Drops `nofb nomodeset` from the default cmdline so the guest's DRM driver mode-sets. With `--input`, the window is also the host input source (keyboard/pointer/wheel). |
+| `--input` | off | Add two virtio-input devices — a keyboard and an absolute tablet (pointer + scroll + buttons). With `--gpu`, the host source is the GPU window (1:1 pixel coordinates); otherwise it falls back to the interactive console (`ReadConsoleInputW`). Requires a guest kernel built with `CONFIG_INPUT`/`CONFIG_INPUT_EVDEV`/`CONFIG_VIRTIO_INPUT`. |
 | `--net` | off | Add a virtio-net NIC. **Repeatable** — each `--net` starts a new NIC; the NIC-scoped flags below modify the most recent NIC. |
 | `--net-backend loopback\|nat\|wintun` | `nat` | Backend for the current NIC (see [§3](#3-devices-in-detail)). |
 | `--portfwd HOSTPORT:GUESTPORT` | — | Forward `127.0.0.1:HOSTPORT` (host) → `10.0.0.2:GUESTPORT` (guest). NAT only. Repeatable per NIC. |
@@ -165,7 +166,8 @@ PCI slot in the order it is created.
 | virtio-rng | `--rng` | `/dev/hwrng` | Filled from Windows CNG `BCryptGenRandom`. 2 vectors. |
 | virtio-blk | `--drive` (×8) | `/dev/vd{a…}` | Async IOCP backend. 2 vectors. |
 | virtio-9p | `--virtio-9p-share` (×8) | `mount -t 9p` | 9P2000.L, Win32 backend. 2 vectors. |
-| virtio-input | `--input` | `/dev/input/event*` | Keyboard + absolute tablet (pointer/scroll/buttons), sourced from the host console. 3 vectors each. |
+| virtio-gpu | `--gpu [WxH]` | `/dev/dri/card0`, `/dev/fb0` | Basic 2D scanout to a Win32 GDI window (CPU blit). controlq + cursorq, single scanout, 32bpp resources. Snapshot-aware (resources + framebuffer + scanout saved/restored). 3 vectors. |
+| virtio-input | `--input` | `/dev/input/event*` | Keyboard + absolute tablet (pointer/scroll/buttons). Host source: the GPU window with `--gpu`, else the console. 3 vectors each. |
 
 **Legacy/emulated devices** (always present, for boot correctness):
 
@@ -794,7 +796,9 @@ Sections cover per-vCPU register state (GPRs, control/segment/descriptor regs,
 EFER, XSAVE, APIC, interrupt-controller state, TSC last), the Hyper‑V
 enlightenment, the legacy devices, every PCI device, and **guest RAM last**. Each
 PCI device section is tagged with its `device_index` (PCI-add order: console=0,
-then NICs, rng, blk*, `--input` keyboard+tablet, 9p*). **Save and restore must
+PCI device section is tagged with its `device_index` (PCI-add order: console=0,
+then NICs, rng, blk*, `--input` keyboard+tablet, gpu; 9p* is never in a snapshot
+since `--save` is refused with `--virtio-9p-share`). **Save and restore must
 construct devices in the same order** or indices misalign — `run_restore`
 rebuilds them from the header in that exact sequence. A virtio device snapshots
 through just four `VirtioDevice` hooks (`capture_queue`/`apply_queue`/
@@ -808,6 +812,11 @@ captured, and the pointer position also lives in restored guest RAM, so the
 cursor resumes where it was left. Host input in flight at save time is not
 guaranteed to be captured — saves are taken at a quiescent point, so this is by
 design (a stray keystroke/click at the exact save instant may be dropped).
+
+virtio-gpu is snapshot-aware: `capture_device_state` serializes every resource's
+geometry, backing scatter-gather list, and host pixel shadow plus the scanout
+binding, so `--restore` re-presents the saved framebuffer into a fresh window —
+the UI comes back exactly as saved, before the guest issues any new commands.
 
 `--save` is refused with an attached *writable* `--drive` (the disk isn't in the
 snapshot, so a mutated disk would diverge from restored RAM) unless you pass

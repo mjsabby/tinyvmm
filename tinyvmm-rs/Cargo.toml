@@ -33,6 +33,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Performance",
     "Win32_System_LibraryLoader",
     "Win32_NetworkManagement_Ndis",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
 ] }
 # User-directed dependency: client-only sans-I/O TCP stack (local path; the
 # crate is publish=false/private). `std` disables its no_std panic handler so it

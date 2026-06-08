@@ -12,6 +12,7 @@
 mod boot;
 mod devices;
 mod diag;
+mod display;
 mod error;
 mod host;
 mod net;
@@ -25,6 +26,7 @@ use crate::devices::mmio_bus::MmioBus;
 use crate::devices::pic::Pic8259;
 use crate::devices::pit::Pit8254;
 use crate::devices::serial::Serial8250;
+use crate::display::Display;
 use crate::error::{check_hr, Error, Result};
 use crate::host::block_file::BlockFile;
 use crate::net::nat::{NatBackend, NatOptions, PortForward};
@@ -32,6 +34,7 @@ use crate::pci::{PciBus, PciFunction};
 use crate::virtio::blk::BlockDevice;
 use crate::virtio::console::ConsoleDevice;
 use crate::virtio::device::VirtioDevice;
+use crate::virtio::gpu::GpuDevice;
 use crate::virtio::input::{InputDevice, InputEvent};
 use crate::virtio::net::{LoopbackBackend, NetDevice};
 use crate::virtio::p9::P9Device;
@@ -136,6 +139,7 @@ fn print_usage() {
          \x20              [--net [--net-backend loopback|nat] [--portfwd H:G]...]...  (repeat --net per NIC)\n\
          \x20              [--drive <path>[,readonly]]... [--cpu-affinity all|p|e|p-physical]\n\
          \x20              [--virtio-9p-share <tag>=<host_path>[,ro]]...\n\
+         \x20              [--gpu [WxH]]  (virtio-gpu 2D scanout to a window; default 1280x800)\n\
          \x20              [--save <path> [--unsafe-save-mutable-drive]]\n\
          \x20              [--watchdog-secs N] [--debug-boot] <vmlinux> [-- <cmdline>]\n\
          \x20 tinyvmm --restore <path> [--drive <path>[,ro|rw]]... [--cpu-affinity all|p|e|p-physical]\n\
@@ -516,6 +520,9 @@ struct PvhArgs {
     watchdog_secs: u32,
     nics: Vec<NicSpec>,
     with_rng: bool,
+    with_gpu: bool,
+    gpu_width: u32,
+    gpu_height: u32,
     drives: Vec<DriveSpec>,
     affinity_mode: AffinityMode,
     p9_shares: Vec<P9ShareSpec>,
@@ -545,6 +552,18 @@ fn parse_portfwd(s: &str) -> Result<PortForward> {
     })
 }
 
+/// Parse a `WIDTHxHEIGHT` display size (e.g. "1280x800"). Returns `None` if the
+/// string isn't two positive integers joined by 'x'/'X'.
+fn parse_wxh(s: &str) -> Option<(u32, u32)> {
+    let (w, h) = s.split_once(['x', 'X'])?;
+    let w: u32 = w.parse().ok()?;
+    let h: u32 = h.parse().ok()?;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some((w, h))
+}
+
 fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
     let mut initrd = None;
     let mut ram_mb = 256u32;
@@ -553,6 +572,9 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
     let mut debug_boot = false;
     let mut nics: Vec<NicSpec> = Vec::new();
     let mut with_rng = false;
+    let mut with_gpu = false;
+    let mut gpu_width = 1280u32;
+    let mut gpu_height = 800u32;
     let mut drives: Vec<DriveSpec> = Vec::new();
     let mut affinity_mode = AffinityMode::All;
     let mut p9_shares: Vec<P9ShareSpec> = Vec::new();
@@ -657,6 +679,16 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
                 nics.last_mut().unwrap().port_forwards.push(pf);
             }
             "--rng" => with_rng = true,
+            "--gpu" => {
+                with_gpu = true;
+                // Optional immediate WxH size (e.g. `--gpu 1024x768`). If the
+                // next token isn't a size it's left for the kernel-path arg.
+                if let Some((w, h)) = args.get(i + 1).and_then(|s| parse_wxh(s)) {
+                    gpu_width = w;
+                    gpu_height = h;
+                    i += 1;
+                }
+            }
             "--input" => with_input = true,
             "--cpu-affinity" => {
                 i += 1;
@@ -780,12 +812,14 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
         // Phase 2 default: route the kernel console to the virtio-console
         // (hvc0) so the initramfs /init drops to an interactive shell. With
         // --debug-boot, also stream early boot to ttyS0 (the 8250) before
-        // hvc0 comes up. pci=conf1 forces our 0xCF8/0xCFC mechanism.
+        // hvc0 comes up. pci=conf1 forces our 0xCF8/0xCFC mechanism. Without a
+        // GPU we also disable the kernel framebuffer/KMS (`nofb nomodeset`);
+        // with --gpu we drop those so the virtio-gpu DRM driver can mode-set.
+        let fb = if with_gpu { "" } else { " nofb nomodeset" };
         cmdline = if debug_boot {
-            "earlyprintk=ttyS0,115200 console=hvc0 pci=conf1,nocrs,lastbus=0 nofb nomodeset"
-                .to_string()
+            format!("earlyprintk=ttyS0,115200 console=hvc0 pci=conf1,nocrs,lastbus=0{fb}")
         } else {
-            "console=hvc0 pci=conf1,nocrs,lastbus=0 nofb nomodeset".to_string()
+            format!("console=hvc0 pci=conf1,nocrs,lastbus=0{fb}")
         };
     }
 
@@ -798,6 +832,9 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
         watchdog_secs,
         nics,
         with_rng,
+        with_gpu,
+        gpu_width,
+        gpu_height,
         drives,
         affinity_mode,
         p9_shares,
@@ -870,6 +907,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         .u32("nics", cfg.nics.len() as u32)
         .u32("rng", cfg.with_rng as u32)
         .u32("drives", cfg.drives.len() as u32)
+        .u32("gpu", cfg.with_gpu as u32)
         .write();
 
     if host::enable_lock_memory_privilege() {
@@ -1157,12 +1195,15 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     }
 
     // --- virtio-input keyboard + absolute tablet (optional, --input) ---
-    // Added after blk and before 9p so the snapshot device order is
-    // console, [net...], [rng], [blk...], [keyboard, tablet] (9p is never
-    // snapshotted). The host source is the interactive console (see below).
+    // Added after blk and before 9p so the device order matches run_restore.
+    // Host source: the GPU window when --gpu is set (wired below), else the
+    // interactive console.
     let input_devices = if cfg.with_input {
         let devs = add_input_devices(&ram, &mmio_bus, part_handle, &pci_bus, &mut transports);
-        println!("[pvh-run] virtio-input keyboard + tablet on PCI (host source: console)");
+        println!(
+            "[pvh-run] virtio-input keyboard + tablet on PCI (host source: {})",
+            if cfg.with_gpu { "gpu window" } else { "console" }
+        );
         Some(devs)
     } else {
         None
@@ -1209,6 +1250,63 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
             s.tag,
             s.host_root.display(),
             if s.readonly { " (ro)" } else { "" }
+        );
+    }
+
+    // --- virtio-gpu (optional, --gpu): basic 2D scanout to a Win32 window ---
+    // Added last so its snapshot device-index doesn't perturb the others (and
+    // --save + --gpu is refused above anyway). The Display owns a Win32 window
+    // on its own message-pump thread; RESOURCE_FLUSH presents the bound scanout
+    // resource to it via a CPU blit.
+    let mut display: Option<Arc<Display>> = None;
+    let mut gpu_keepalive: Option<Arc<GpuDevice>> = None;
+    if cfg.with_gpu {
+        let gpu = GpuDevice::new(ram.clone(), cfg.gpu_width, cfg.gpu_height);
+        let gpu_dev: Arc<dyn VirtioDevice> = gpu.clone();
+
+        // Spawn the display window. If it can't be created we still expose the
+        // device (so the guest's GPU probe succeeds); present then no-ops.
+        match Display::new(
+            &format!("tinyvmm - virtio-gpu {}x{}", cfg.gpu_width, cfg.gpu_height),
+            cfg.gpu_width,
+            cfg.gpu_height,
+        ) {
+            Some(d) => {
+                let dd = d.clone();
+                gpu.set_present_callback(Box::new(move |bgra, w, h| dd.present(bgra, w, h)));
+                display = Some(d);
+            }
+            None => {
+                eprintln!("[pvh-run] WARN: virtio-gpu window creation failed; running headless");
+            }
+        }
+
+        let gopts = transport::Options {
+            vendor_id: 0x1AF4,
+            sub_vendor_id: 0x1AF4,
+            sub_id: virtio::device::DEVICE_ID_GPU as u16,
+            num_msix_vectors: 3, // controlq + cursorq + config-change
+            pci_class: 0x03,     // display controller
+            pci_subclass: 0x80,  // other
+            doorbells: false,    // low-rate; serviced inline on the vCPU thread
+        };
+        let gt = PciTransport::new("virtio-pci-gpu", gpu_dev, gopts, mmio_bus.clone(), part_handle);
+        let wt = Arc::downgrade(&gt);
+        gpu.set_irq_callback(Box::new(move |q| {
+            if let Some(t) = wt.upgrade() {
+                t.raise_queue_interrupt(q);
+            }
+        }));
+        let gfunc: Arc<dyn PciFunction> = gt.clone();
+        let gbdf = pci_bus.add_device(gfunc);
+        transports.push(gt.clone());
+        gpu_keepalive = Some(gpu.clone());
+        println!(
+            "[pvh-run] virtio-gpu on PCI 00:{:02x}.0 ({}x{}{})",
+            gbdf.device,
+            cfg.gpu_width,
+            cfg.gpu_height,
+            if display.is_some() { "" } else { ", headless" }
         );
     }
 
@@ -1263,9 +1361,21 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     };
 
     // Interactive console: raw stdin -> virtio-console RX. Ctrl+A X quits.
-    // With --input the reader also forwards mouse/keyboard to virtio-input.
+    // When both --gpu and --input are active, the GPU window is the host input
+    // source (1:1 pixel coords for the tablet); the console reader then just
+    // forwards hvc0 bytes. Otherwise --input falls back to the console source.
+    let window_owns_input = display.is_some() && input_devices.is_some();
+    if window_owns_input {
+        wire_window_input(
+            display.as_ref().unwrap(),
+            input_devices.as_ref().unwrap(),
+            cfg.gpu_width,
+            cfg.gpu_height,
+        );
+    }
+    let console_input = if window_owns_input { None } else { input_devices };
     let console_restore =
-        setup_interactive_console(console.clone(), input_devices, stop_all.clone());
+        setup_interactive_console(console.clone(), console_input, stop_all.clone());
 
     // Shutdown sentinel watcher: the guest prints this marker on hvc0 to
     // request a clean stop. Harnesses rely on it because an ACPI-less
@@ -1384,6 +1494,18 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         let _ = w.join();
     }
     console_restore.restore();
+
+    // Close the virtio-gpu window and join its message-pump thread.
+    if let Some(d) = &display {
+        d.shutdown();
+    }
+    if let Some(g) = &gpu_keepalive {
+        println!(
+            "[pvh-run] virtio-gpu stats: ctrl_cmds={} frames_presented={}",
+            g.ctrl_cmds(),
+            g.frames()
+        );
+    }
 
     // Quiesce every virtio-blk IOCP worker before its BlockDevice owner is
     // dropped, so no completion lands on freed memory. Then print the per-disk
@@ -1671,6 +1793,9 @@ fn write_snapshot(
         .u64("tsc_hz_at_save", cached_tsc_hz())
         .bool("hide_tsc_deadline", true)
         .bool("with_rng", cfg.with_rng)
+        .bool("with_gpu", cfg.with_gpu)
+        .u64("gpu_width", cfg.gpu_width as u64)
+        .u64("gpu_height", cfg.gpu_height as u64)
         .bool("with_input", cfg.with_input)
         .u64("nic_count", cfg.nics.len() as u64)
         .u64("drive_count", cfg.drives.len() as u64)
@@ -1861,6 +1986,9 @@ fn run_restore(args: &[String]) -> Result<i32> {
     let large_pages = jr.get_bool("large_pages").unwrap_or(true);
     let tsc_hz_at_save = jr.get_u64("tsc_hz_at_save").unwrap_or(0);
     let with_rng = jr.get_bool("with_rng").unwrap_or(false);
+    let with_gpu = jr.get_bool("with_gpu").unwrap_or(false);
+    let gpu_width = jr.get_u64("gpu_width").unwrap_or(1280) as u32;
+    let gpu_height = jr.get_u64("gpu_height").unwrap_or(800) as u32;
     let with_input = jr.get_bool("with_input").unwrap_or(false);
     let drive_count = jr.get_u64("drive_count").unwrap_or(0) as usize;
     let p9_count = jr.get_u64("p9_count").unwrap_or(0) as usize;
@@ -1882,7 +2010,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
     }
     println!(
         "[restore] header: vcpus={vcpu_count} ram={} MiB large_pages={large_pages} rng={with_rng} \
-         nics={} drives={drive_count}",
+         gpu={with_gpu} nics={} drives={drive_count}",
         ram_size / (1024 * 1024),
         restore_nics.len()
     );
@@ -2098,10 +2226,19 @@ fn run_restore(args: &[String]) -> Result<i32> {
         blk_backends.push(backend);
     }
 
+    // virtio-input (if present in the snapshot): recreate in the same order as
+    // run_pvh_run (after blk, before 9p) so PciDevice indices align. The host
+    // input source is wired further below (the GPU window if --gpu, else console).
+    let input_devices = if with_input {
+        Some(add_input_devices(&ram, &mmio_bus, part_handle, &pci_bus, &mut transports))
+    } else {
+        None
+    };
+
     // virtio-9p devices (reconstructed from the header; each device's fid table
     // is restored from its PciDevice section's device-state, which reopens the
     // host handles). Same creation ORDER as run_pvh_run so PCI/device indices
-    // line up: console, nets, rng, blk, 9p.
+    // line up: console, nets, rng, blk, input, 9p.
     for i in 0..p9_count {
         let tag = jr.get_str(&format!("p9{i}_tag"))?;
         let root = jr.get_str(&format!("p9{i}_root"))?;
@@ -2138,13 +2275,49 @@ fn run_restore(args: &[String]) -> Result<i32> {
         );
     }
 
-    // virtio-input (if present in the snapshot): recreate in the same order as
-    // the save run (keyboard then tablet, after blk) so PciDevice indices align.
-    let input_devices = if with_input {
-        Some(add_input_devices(&ram, &mmio_bus, part_handle, &pci_bus, &mut transports))
-    } else {
-        None
-    };
+    // virtio-gpu (if present in the snapshot): rebuilt LAST so its PciDevice
+    // index matches the save run. The Display + present callback are wired now,
+    // BEFORE the device snapshot is applied, so apply_device_state can re-present
+    // the restored scanout image into the freshly-created window.
+    let mut display: Option<Arc<Display>> = None;
+    let mut gpu_keepalive: Option<Arc<GpuDevice>> = None;
+    if with_gpu {
+        let gpu = GpuDevice::new(ram.clone(), gpu_width, gpu_height);
+        let gpu_dev: Arc<dyn VirtioDevice> = gpu.clone();
+        match Display::new(
+            &format!("tinyvmm - virtio-gpu {gpu_width}x{gpu_height}"),
+            gpu_width,
+            gpu_height,
+        ) {
+            Some(d) => {
+                let dd = d.clone();
+                gpu.set_present_callback(Box::new(move |bgra, w, h| dd.present(bgra, w, h)));
+                display = Some(d);
+            }
+            None => {
+                eprintln!("[restore] WARN: virtio-gpu window creation failed; running headless");
+            }
+        }
+        let gopts = transport::Options {
+            vendor_id: 0x1AF4,
+            sub_vendor_id: 0x1AF4,
+            sub_id: virtio::device::DEVICE_ID_GPU as u16,
+            num_msix_vectors: 3,
+            pci_class: 0x03,
+            pci_subclass: 0x80,
+            doorbells: false,
+        };
+        let gt = PciTransport::new("virtio-pci-gpu", gpu_dev, gopts, mmio_bus.clone(), part_handle);
+        let wt = Arc::downgrade(&gt);
+        gpu.set_irq_callback(Box::new(move |q| {
+            if let Some(t) = wt.upgrade() {
+                t.raise_queue_interrupt(q);
+            }
+        }));
+        pci_bus.add_device(gt.clone() as Arc<dyn PciFunction>);
+        transports.push(gt.clone());
+        gpu_keepalive = Some(gpu.clone());
+    }
 
     pci_bus.attach_io_bus(&mut io_bus);
     let io_bus = Arc::new(io_bus);
@@ -2347,8 +2520,18 @@ fn run_restore(args: &[String]) -> Result<i32> {
         }
     };
 
+    let window_owns_input = display.is_some() && input_devices.is_some();
+    if window_owns_input {
+        wire_window_input(
+            display.as_ref().unwrap(),
+            input_devices.as_ref().unwrap(),
+            gpu_width,
+            gpu_height,
+        );
+    }
+    let console_input = if window_owns_input { None } else { input_devices };
     let console_restore =
-        setup_interactive_console(console.clone(), input_devices, stop_all.clone());
+        setup_interactive_console(console.clone(), console_input, stop_all.clone());
     {
         const SENTINEL: &[u8] = b"=== tinyvmm shutdown requested ===";
         let stop_all = stop_all.clone();
@@ -2468,6 +2651,16 @@ fn run_restore(args: &[String]) -> Result<i32> {
     for b in &blk_backends {
         b.stop();
     }
+    if let Some(d) = &display {
+        d.shutdown();
+    }
+    if let Some(g) = &gpu_keepalive {
+        println!(
+            "[restore] virtio-gpu stats: ctrl_cmds={} frames_presented={}",
+            g.ctrl_cmds(),
+            g.frames()
+        );
+    }
 
     println!("[restore] stopped: reason={:?} uart_tx={}", reason, com1.tx_bytes());
     Ok(match reason {
@@ -2570,6 +2763,119 @@ fn add_input_devices(
     transports.push(tt);
 
     InputDevices { keyboard, tablet }
+}
+
+/// Route the GPU window's input events into the virtio-input devices: keyboard
+/// keys to the keyboard, pointer motion/buttons/wheel to the absolute tablet.
+/// The window client area equals the scanout, so pointer pixels map straight
+/// onto the tablet's absolute axes (0..=ABS_AXIS_MAX). Used when both `--gpu`
+/// and `--input` are present — the window then replaces the console as the host
+/// input source (the console reader falls back to plain hvc0 byte forwarding).
+/// The sink runs on the window's message-pump thread and reuses its event
+/// buffers, so a steady input stream allocates nothing after warmup.
+fn wire_window_input(display: &Arc<Display>, devs: &InputDevices, width: u32, height: u32) {
+    use crate::display::{MouseButton, WindowEvent};
+    use crate::virtio::input::{
+        ABS_X, ABS_Y, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, REL_HWHEEL, REL_WHEEL,
+    };
+
+    let keyboard = devs.keyboard.clone();
+    let tablet = devs.tablet.clone();
+    let mut pressed = [false; 256];
+    let mut cw = width.max(1);
+    let mut ch = height.max(1);
+    let mut kbd: Vec<InputEvent> = Vec::new();
+    let mut tab: Vec<InputEvent> = Vec::new();
+
+    display.set_input_sink(Box::new(move |ev| match ev {
+        WindowEvent::Key { vkey, pressed: down, repeat, .. } => {
+            let Some(code) = vk_to_linux_keycode(vkey) else {
+                return;
+            };
+            let kc = code as usize;
+            kbd.clear();
+            if down {
+                // evdev value 2 == autorepeat.
+                let val = if repeat || pressed[kc] { 2 } else { 1 };
+                pressed[kc] = true;
+                kbd.push(InputEvent::key_value(code, val));
+            } else if pressed[kc] {
+                pressed[kc] = false;
+                kbd.push(InputEvent::key(code, false));
+            }
+            if !kbd.is_empty() {
+                keyboard.submit_frame(&kbd);
+            }
+        }
+        WindowEvent::PointerMotion { x, y } => {
+            tab.clear();
+            push_abs(&mut tab, x, y, cw, ch, ABS_X, ABS_Y);
+            tablet.submit_frame(&tab);
+        }
+        WindowEvent::Button { button, pressed: down, x, y } => {
+            let code = match button {
+                MouseButton::Left => BTN_LEFT,
+                MouseButton::Right => BTN_RIGHT,
+                MouseButton::Middle => BTN_MIDDLE,
+                MouseButton::X1 | MouseButton::X2 => return, // tablet has no side btns
+            };
+            tab.clear();
+            push_abs(&mut tab, x, y, cw, ch, ABS_X, ABS_Y);
+            tab.push(InputEvent::key(code, down));
+            tablet.submit_frame(&tab);
+        }
+        WindowEvent::Wheel { dx, dy } => {
+            tab.clear();
+            if dy != 0 {
+                tab.push(InputEvent::rel(REL_WHEEL, wheel_notches(dy)));
+            }
+            if dx != 0 {
+                tab.push(InputEvent::rel(REL_HWHEEL, wheel_notches(dx)));
+            }
+            if !tab.is_empty() {
+                tablet.submit_frame(&tab);
+            }
+        }
+        WindowEvent::Resized { width, height } if width > 0 && height > 0 => {
+            cw = width;
+            ch = height;
+        }
+        WindowEvent::Focus { gained: false } => {
+            // Release any held keys so focus loss can't leave a key stuck down.
+            kbd.clear();
+            for (kc, down) in pressed.iter_mut().enumerate() {
+                if *down {
+                    *down = false;
+                    kbd.push(InputEvent::key(kc as u16, false));
+                }
+            }
+            if !kbd.is_empty() {
+                keyboard.submit_frame(&kbd);
+            }
+        }
+        _ => {}
+    }));
+}
+
+/// Push ABS_X/ABS_Y for a client pixel, scaled to the tablet's absolute range.
+fn push_abs(tab: &mut Vec<InputEvent>, x: i32, y: i32, cw: u32, ch: u32, abs_x: u16, abs_y: u16) {
+    let cx = x.clamp(0, cw as i32 - 1) as i64;
+    let cy = y.clamp(0, ch as i32 - 1) as i64;
+    let max = crate::virtio::input::ABS_AXIS_MAX as i64;
+    let ax = if cw > 1 { (cx * max / (cw as i64 - 1)) as u32 } else { 0 };
+    let ay = if ch > 1 { (cy * max / (ch as i64 - 1)) as u32 } else { 0 };
+    tab.push(InputEvent::abs(abs_x, ax));
+    tab.push(InputEvent::abs(abs_y, ay));
+}
+
+/// WHEEL_DELTA (120) units -> evdev notch count (at least ±1 for any motion).
+fn wheel_notches(delta: i32) -> i32 {
+    let c = delta / 120;
+    if c != 0 {
+        c
+    } else {
+        delta.signum()
+    }
 }
 
 /// Put the console into raw VT mode and spawn a detached reader thread that
