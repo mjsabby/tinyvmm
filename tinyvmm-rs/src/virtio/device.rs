@@ -9,6 +9,7 @@ pub const DEVICE_ID_BLOCK: u32 = 2;
 pub const DEVICE_ID_CONSOLE: u32 = 3;
 pub const DEVICE_ID_RNG: u32 = 4;
 pub const DEVICE_ID_P9: u32 = 9;
+pub const DEVICE_ID_INPUT: u32 = 18;
 
 pub const FEATURE_RING_EVENT_IDX: u64 = 1 << 29;
 pub const FEATURE_VERSION_1: u64 = 1 << 32;

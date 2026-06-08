@@ -32,6 +32,7 @@ use crate::pci::{PciBus, PciFunction};
 use crate::virtio::blk::BlockDevice;
 use crate::virtio::console::ConsoleDevice;
 use crate::virtio::device::VirtioDevice;
+use crate::virtio::input::{InputDevice, InputEvent};
 use crate::virtio::net::{LoopbackBackend, NetDevice};
 use crate::virtio::p9::P9Device;
 use crate::virtio::rng::RngDevice;
@@ -48,13 +49,17 @@ use std::sync::Arc;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Storage::FileSystem::{GetFileType, ReadFile, FILE_TYPE_CHAR};
 use windows_sys::Win32::System::Console::{
-    GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
-    ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT, ENABLE_VIRTUAL_TERMINAL_INPUT,
-    ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, ReadConsoleInputW, SetConsoleMode,
+    CONSOLE_SCREEN_BUFFER_INFO, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT,
+    ENABLE_MOUSE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE,
+    ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT,
+    FROM_LEFT_1ST_BUTTON_PRESSED, FROM_LEFT_2ND_BUTTON_PRESSED, INPUT_RECORD, KEY_EVENT,
+    MOUSE_EVENT, MOUSE_EVENT_RECORD, MOUSE_HWHEELED, MOUSE_WHEELED, RIGHTMOST_BUTTON_PRESSED,
+    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::Hypervisor::{
     WHvGetCapability, WHvRequestInterrupt, WHvCapabilityCodeHypervisorPresent,
-    WHvX64LocalApicEmulationModeX2Apic, WHV_INTERRUPT_CONTROL,
+    WHvX64LocalApicEmulationModeX2Apic, WHV_INTERRUPT_CONTROL, WHV_PARTITION_HANDLE,
 };
 
 const MAX_VCPUS: u32 = boot::acpi::MAX_VCPUS;
@@ -127,7 +132,7 @@ fn print_usage() {
          \x20 tinyvmm --blk-selftest        host-side virtio-blk DISCARD/WRITE_ZEROES test\n\
          \x20 tinyvmm --pci-selftest        host-side PCI host-bridge + BAR + sizing test\n\
          \x20 tinyvmm --pvh-info <vmlinux>\n\
-         \x20 tinyvmm --pvh-run [--initrd <cpio>] [--ram-mb N] [--vcpus N] [--rng]\n\
+         \x20 tinyvmm --pvh-run [--initrd <cpio>] [--ram-mb N] [--vcpus N] [--rng] [--input]\n\
          \x20              [--net [--net-backend loopback|nat] [--portfwd H:G]...]...  (repeat --net per NIC)\n\
          \x20              [--drive <path>[,readonly]]... [--cpu-affinity all|p|e|p-physical]\n\
          \x20              [--virtio-9p-share <tag>=<host_path>[,ro]]...\n\
@@ -516,6 +521,7 @@ struct PvhArgs {
     p9_shares: Vec<P9ShareSpec>,
     save_path: Option<String>,
     unsafe_save_mutable_drive: bool,
+    with_input: bool,
 }
 
 /// Parse a `--portfwd HOSTPORT:GUESTPORT` rule. The host side binds 127.0.0.1
@@ -552,6 +558,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
     let mut p9_shares: Vec<P9ShareSpec> = Vec::new();
     let mut save_path: Option<String> = None;
     let mut unsafe_save_mutable_drive = false;
+    let mut with_input = false;
 
     let mut i = 2;
     while i < args.len() && args[i].starts_with("--") && args[i] != "--" {
@@ -650,6 +657,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
                 nics.last_mut().unwrap().port_forwards.push(pf);
             }
             "--rng" => with_rng = true,
+            "--input" => with_input = true,
             "--cpu-affinity" => {
                 i += 1;
                 let m = args
@@ -795,6 +803,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
         p9_shares,
         save_path,
         unsafe_save_mutable_drive,
+        with_input,
     })
 }
 
@@ -1147,6 +1156,18 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         blk_devices.push(blk);
     }
 
+    // --- virtio-input keyboard + absolute tablet (optional, --input) ---
+    // Added after blk and before 9p so the snapshot device order is
+    // console, [net...], [rng], [blk...], [keyboard, tablet] (9p is never
+    // snapshotted). The host source is the interactive console (see below).
+    let input_devices = if cfg.with_input {
+        let devs = add_input_devices(&ram, &mmio_bus, part_handle, &pci_bus, &mut transports);
+        println!("[pvh-run] virtio-input keyboard + tablet on PCI (host source: console)");
+        Some(devs)
+    } else {
+        None
+    };
+
     // --- virtio-9p (optional, repeatable via --virtio-9p-share) ---
     // Each share becomes one virtio-9p PCI device exposing one host directory.
     // The guest mounts via:
@@ -1242,7 +1263,9 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     };
 
     // Interactive console: raw stdin -> virtio-console RX. Ctrl+A X quits.
-    let console_restore = setup_interactive_console(console.clone(), stop_all.clone());
+    // With --input the reader also forwards mouse/keyboard to virtio-input.
+    let console_restore =
+        setup_interactive_console(console.clone(), input_devices, stop_all.clone());
 
     // Shutdown sentinel watcher: the guest prints this marker on hvc0 to
     // request a clean stop. Harnesses rely on it because an ACPI-less
@@ -1648,6 +1671,7 @@ fn write_snapshot(
         .u64("tsc_hz_at_save", cached_tsc_hz())
         .bool("hide_tsc_deadline", true)
         .bool("with_rng", cfg.with_rng)
+        .bool("with_input", cfg.with_input)
         .u64("nic_count", cfg.nics.len() as u64)
         .u64("drive_count", cfg.drives.len() as u64)
         .u64("p9_count", cfg.p9_shares.len() as u64);
@@ -1837,6 +1861,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
     let large_pages = jr.get_bool("large_pages").unwrap_or(true);
     let tsc_hz_at_save = jr.get_u64("tsc_hz_at_save").unwrap_or(0);
     let with_rng = jr.get_bool("with_rng").unwrap_or(false);
+    let with_input = jr.get_bool("with_input").unwrap_or(false);
     let drive_count = jr.get_u64("drive_count").unwrap_or(0) as usize;
     let p9_count = jr.get_u64("p9_count").unwrap_or(0) as usize;
     // Reconstruct the per-NIC specs (backend + port-forwards) and MACs from the
@@ -2113,6 +2138,14 @@ fn run_restore(args: &[String]) -> Result<i32> {
         );
     }
 
+    // virtio-input (if present in the snapshot): recreate in the same order as
+    // the save run (keyboard then tablet, after blk) so PciDevice indices align.
+    let input_devices = if with_input {
+        Some(add_input_devices(&ram, &mmio_bus, part_handle, &pci_bus, &mut transports))
+    } else {
+        None
+    };
+
     pci_bus.attach_io_bus(&mut io_bus);
     let io_bus = Arc::new(io_bus);
 
@@ -2314,7 +2347,8 @@ fn run_restore(args: &[String]) -> Result<i32> {
         }
     };
 
-    let console_restore = setup_interactive_console(console.clone(), stop_all.clone());
+    let console_restore =
+        setup_interactive_console(console.clone(), input_devices, stop_all.clone());
     {
         const SENTINEL: &[u8] = b"=== tinyvmm shutdown requested ===";
         let stop_all = stop_all.clone();
@@ -2461,78 +2495,149 @@ impl ConsoleModeRestore {
     }
 }
 
+/// The pair of virtio-input devices (keyboard + absolute tablet) created by
+/// `--input`. Kept so the host input source (the console reader) can inject
+/// events; the devices themselves are also held alive by the transport list.
+struct InputDevices {
+    keyboard: Arc<InputDevice>,
+    tablet: Arc<InputDevice>,
+}
+
+/// Build one virtio-input PCI function: wire the device's queue-interrupt back
+/// to the transport and register it on the bus. Returns the transport so the
+/// caller can record it for snapshotting.
+fn attach_input_transport(
+    name: &str,
+    dev: Arc<InputDevice>,
+    pci_subclass: u8,
+    mmio_bus: &Arc<MmioBus>,
+    part_handle: WHV_PARTITION_HANDLE,
+    pci_bus: &Arc<PciBus>,
+) -> Arc<PciTransport> {
+    let vdev: Arc<dyn VirtioDevice> = dev.clone();
+    let opts = transport::Options {
+        vendor_id: 0x1AF4,
+        sub_vendor_id: 0x1AF4,
+        sub_id: virtio::device::DEVICE_ID_INPUT as u16,
+        num_msix_vectors: 3, // eventq + statusq + config-change
+        pci_class: 0x09,     // input device controller
+        pci_subclass,
+        // Low rate, host-driven: the guest only kicks to replenish eventq
+        // buffers (a no-op for us) or post statusq LED updates. Service inline.
+        doorbells: false,
+    };
+    let t = PciTransport::new(name, vdev, opts, mmio_bus.clone(), part_handle);
+    let wt = Arc::downgrade(&t);
+    dev.set_irq_callback(Box::new(move |q| {
+        if let Some(tt) = wt.upgrade() {
+            tt.raise_queue_interrupt(q);
+        }
+    }));
+    pci_bus.add_device(t.clone() as Arc<dyn PciFunction>);
+    t
+}
+
+/// Create the keyboard + tablet virtio-input devices, register them on the PCI
+/// bus, and append their transports (in keyboard-then-tablet order, which both
+/// the run and restore paths must match for snapshot device indices to line up).
+fn add_input_devices(
+    ram: &Arc<GuestMemory>,
+    mmio_bus: &Arc<MmioBus>,
+    part_handle: WHV_PARTITION_HANDLE,
+    pci_bus: &Arc<PciBus>,
+    transports: &mut Vec<Arc<PciTransport>>,
+) -> InputDevices {
+    let keyboard = InputDevice::new_keyboard(ram.clone());
+    let kt = attach_input_transport(
+        "virtio-pci-input-keyboard",
+        keyboard.clone(),
+        0x00, // keyboard
+        mmio_bus,
+        part_handle,
+        pci_bus,
+    );
+    transports.push(kt);
+
+    let tablet = InputDevice::new_tablet(ram.clone());
+    let tt = attach_input_transport(
+        "virtio-pci-input-tablet",
+        tablet.clone(),
+        0x02, // mouse / pointing device
+        mmio_bus,
+        part_handle,
+        pci_bus,
+    );
+    transports.push(tt);
+
+    InputDevices { keyboard, tablet }
+}
+
 /// Put the console into raw VT mode and spawn a detached reader thread that
 /// forwards keystrokes into the guest's virtio-console RX. Ctrl+A X quits.
 /// When stdin is redirected (not a console), input forwarding is skipped.
+///
+/// When `input` is supplied and stdin is a real console, the reader switches to
+/// `ReadConsoleInputW` with mouse input enabled: keystrokes still drive hvc0
+/// (translated to VT sequences) *and* the virtio-input keyboard, while mouse
+/// motion/buttons/wheel drive the virtio-input absolute tablet.
 fn setup_interactive_console(
     console: Arc<ConsoleDevice>,
+    input: Option<InputDevices>,
     stop_all: impl Fn() + Send + 'static,
 ) -> ConsoleModeRestore {
     unsafe {
         let hin = GetStdHandle(STD_INPUT_HANDLE);
         let hout = GetStdHandle(STD_OUTPUT_HANDLE);
         let is_console = GetFileType(hin) == FILE_TYPE_CHAR;
+        let want_mouse = is_console && input.is_some();
         let mut in_mode: u32 = 0;
         let mut out_mode: u32 = 0;
         if is_console {
             GetConsoleMode(hin, &mut in_mode);
             GetConsoleMode(hout, &mut out_mode);
-            let raw_in = (in_mode
-                & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT))
-                | ENABLE_VIRTUAL_TERMINAL_INPUT;
+            let raw_in = if want_mouse {
+                // ReadConsoleInputW path: enable window + mouse records and set
+                // EXTENDED_FLAGS to clear QuickEdit (which would otherwise eat
+                // mouse events for text selection). We translate keys to VT
+                // ourselves, so VT *input* mode is left off.
+                (in_mode
+                    & !(ENABLE_LINE_INPUT
+                        | ENABLE_ECHO_INPUT
+                        | ENABLE_PROCESSED_INPUT
+                        | ENABLE_QUICK_EDIT_MODE))
+                    | ENABLE_EXTENDED_FLAGS
+                    | ENABLE_WINDOW_INPUT
+                    | ENABLE_MOUSE_INPUT
+            } else {
+                (in_mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT))
+                    | ENABLE_VIRTUAL_TERMINAL_INPUT
+            };
             SetConsoleMode(hin, raw_in);
             SetConsoleMode(
                 hout,
                 out_mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
             );
-            eprintln!("[pvh-run] interactive console -- press Ctrl+A then X to quit");
+            if want_mouse {
+                eprintln!(
+                    "[pvh-run] interactive console + virtio-input -- mouse & keyboard forwarded; \
+                     Ctrl+A then X to quit"
+                );
+            } else {
+                eprintln!("[pvh-run] interactive console -- press Ctrl+A then X to quit");
+            }
         }
 
         // HANDLE isn't Send; smuggle it across the thread boundary as usize.
-        // We forward bytes from both a real console (raw VT mode, above) and a
-        // redirected pipe/file (so `echo cmd | tinyvmm ...` drives the shell).
         let hin_addr = hin as usize;
-        std::thread::spawn(move || {
-            let hin = hin_addr as HANDLE;
-            let mut escape = false;
-            let mut buf = [0u8; 256];
-            loop {
-                let mut read: u32 = 0;
-                let ok = ReadFile(
-                    hin,
-                    buf.as_mut_ptr() as *mut _,
-                    buf.len() as u32,
-                    &mut read,
-                    std::ptr::null_mut(),
-                );
-                if ok == 0 || read == 0 {
-                    return;
-                }
-                let mut out = Vec::with_capacity(read as usize);
-                for &b in &buf[..read as usize] {
-                    if escape {
-                        escape = false;
-                        if b == b'x' || b == b'X' {
-                            eprintln!("\r\n[pvh-run] Ctrl+A X -- quitting");
-                            stop_all();
-                            return;
-                        }
-                        if b == 0x01 {
-                            out.push(0x01);
-                        }
-                        continue;
-                    }
-                    if b == 0x01 {
-                        escape = true;
-                        continue;
-                    }
-                    out.push(b);
-                }
-                if !out.is_empty() {
-                    console.write_host_input(&out);
-                }
+        let hout_addr = hout as usize;
+        match input {
+            Some(devs) if want_mouse => {
+                spawn_input_reader(hin_addr, hout_addr, console, devs, stop_all);
             }
-        });
+            // No input devices, or stdin is redirected (no console records):
+            // forward raw bytes from a real console (VT mode) or a pipe/file.
+            _ => spawn_byte_reader(hin_addr, console, stop_all),
+        }
 
         ConsoleModeRestore {
             valid: is_console,
@@ -2542,6 +2647,345 @@ fn setup_interactive_console(
             out_mode,
         }
     }
+}
+
+/// Byte-stream reader: forwards stdin bytes to hvc0. Used when there are no
+/// virtio-input devices, or when stdin is a redirected pipe/file (so
+/// `echo cmd | tinyvmm ...` drives the shell). Ctrl+A X quits.
+fn spawn_byte_reader(
+    hin_addr: usize,
+    console: Arc<ConsoleDevice>,
+    stop_all: impl Fn() + Send + 'static,
+) {
+    std::thread::spawn(move || {
+        let hin = hin_addr as HANDLE;
+        let mut escape = false;
+        let mut buf = [0u8; 256];
+        loop {
+            let mut read: u32 = 0;
+            let ok = unsafe {
+                ReadFile(
+                    hin,
+                    buf.as_mut_ptr() as *mut _,
+                    buf.len() as u32,
+                    &mut read,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 || read == 0 {
+                return;
+            }
+            let mut out = Vec::with_capacity(read as usize);
+            for &b in &buf[..read as usize] {
+                if escape {
+                    escape = false;
+                    if b == b'x' || b == b'X' {
+                        eprintln!("\r\n[pvh-run] Ctrl+A X -- quitting");
+                        stop_all();
+                        return;
+                    }
+                    if b == 0x01 {
+                        out.push(0x01);
+                    }
+                    continue;
+                }
+                if b == 0x01 {
+                    escape = true;
+                    continue;
+                }
+                out.push(b);
+            }
+            if !out.is_empty() {
+                console.write_host_input(&out);
+            }
+        }
+    });
+}
+
+/// Console-record reader (mouse + keyboard). Drives hvc0 (VT-translated keys),
+/// the virtio-input keyboard (key down/up), and the virtio-input tablet
+/// (absolute motion, buttons, wheel). Ctrl+A X quits.
+fn spawn_input_reader(
+    hin_addr: usize,
+    hout_addr: usize,
+    console: Arc<ConsoleDevice>,
+    devs: InputDevices,
+    stop_all: impl Fn() + Send + 'static,
+) {
+    std::thread::spawn(move || {
+        let hin = hin_addr as HANDLE;
+        let hout = hout_addr as HANDLE;
+        let keyboard = devs.keyboard;
+        let tablet = devs.tablet;
+        let mut escape = false; // Ctrl+A escape state for the hvc0 quit shortcut
+        let mut pressed = [false; 256]; // per-keycode state for the kbd device
+        let mut prev_buttons: u32 = 0; // last LEFT|RIGHT|MIDDLE button mask
+        let mut recs: [INPUT_RECORD; 64] = unsafe { std::mem::zeroed() };
+        // Reused across iterations so a steady stream of input allocates
+        // nothing after warmup (mirrors the device-side ChainScratch reuse).
+        let mut hvc0: Vec<u8> = Vec::new();
+        let mut kbd: Vec<InputEvent> = Vec::new();
+        let mut tab: Vec<InputEvent> = Vec::new();
+        loop {
+            let mut read: u32 = 0;
+            let ok = unsafe {
+                ReadConsoleInputW(hin, recs.as_mut_ptr(), recs.len() as u32, &mut read)
+            };
+            if ok == 0 || read == 0 {
+                return;
+            }
+            hvc0.clear();
+            kbd.clear();
+            tab.clear();
+            let mut quit = false;
+            for r in &recs[..read as usize] {
+                match r.EventType as u32 {
+                    KEY_EVENT => {
+                        let k = unsafe { r.Event.KeyEvent };
+                        let down = k.bKeyDown != 0;
+                        let wc = unsafe { k.uChar.UnicodeChar };
+                        let reps = k.wRepeatCount.max(1);
+                        // virtio-input keyboard: emit for both press and release.
+                        if let Some(code) = vk_to_linux_keycode(k.wVirtualKeyCode) {
+                            let kc = code as usize;
+                            if down {
+                                for _ in 0..reps {
+                                    let val = if pressed[kc] { 2 } else { 1 };
+                                    pressed[kc] = true;
+                                    kbd.push(InputEvent::key_value(code, val));
+                                }
+                            } else if pressed[kc] {
+                                pressed[kc] = false;
+                                kbd.push(InputEvent::key(code, false));
+                            }
+                        }
+                        // hvc0 text console: key-down only, VT-translated.
+                        if down && append_hvc0_bytes(&mut hvc0, &mut escape, wc, k.wVirtualKeyCode, reps)
+                        {
+                            quit = true;
+                            break;
+                        }
+                    }
+                    MOUSE_EVENT => {
+                        let m = unsafe { r.Event.MouseEvent };
+                        append_mouse_events(&mut tab, &mut prev_buttons, hout, &m);
+                    }
+                    _ => {}
+                }
+            }
+            if !hvc0.is_empty() {
+                console.write_host_input(&hvc0);
+            }
+            if !kbd.is_empty() {
+                keyboard.submit_frame(&kbd);
+            }
+            if !tab.is_empty() {
+                tablet.submit_frame(&tab);
+            }
+            if quit {
+                eprintln!("\r\n[pvh-run] Ctrl+A X -- quitting");
+                stop_all();
+                return;
+            }
+        }
+    });
+}
+
+/// Append `bytes` to `out` `reps` times (key-repeat expansion for hvc0).
+fn push_repeated(out: &mut Vec<u8>, bytes: &[u8], reps: u16) {
+    for _ in 0..reps {
+        out.extend_from_slice(bytes);
+    }
+}
+
+/// Translate one key-down record into hvc0 bytes (VT sequences for navigation
+/// keys, UTF-8 for printable characters), honoring the Ctrl+A escape. Returns
+/// true if the user asked to quit (Ctrl+A then X).
+fn append_hvc0_bytes(out: &mut Vec<u8>, escape: &mut bool, wc: u16, vk: u16, reps: u16) -> bool {
+    if *escape {
+        *escape = false;
+        if wc == u16::from(b'x') || wc == u16::from(b'X') {
+            return true;
+        }
+        if wc == 0x01 {
+            out.push(0x01); // literal Ctrl+A
+        }
+        return false;
+    }
+    if wc == 0x01 {
+        *escape = true; // arm escape, swallow
+        return false;
+    }
+    // Navigation / function keys arrive with UnicodeChar == 0; emit xterm/VT.
+    if wc == 0 {
+        if let Some(seq) = vk_to_vt_sequence(vk) {
+            push_repeated(out, seq, reps);
+        }
+        return false;
+    }
+    if wc == u16::from(b'\r') {
+        push_repeated(out, b"\n", reps);
+    } else if wc < 0x80 {
+        push_repeated(out, &[wc as u8], reps);
+    } else if let Some(c) = char::from_u32(wc as u32) {
+        let mut tmp = [0u8; 4];
+        push_repeated(out, c.encode_utf8(&mut tmp).as_bytes(), reps);
+    }
+    false
+}
+
+/// Convert a Windows mouse record into tablet events: absolute position
+/// (scaled to the eventq axis range), button transitions, and wheel scroll.
+fn append_mouse_events(
+    tab: &mut Vec<InputEvent>,
+    prev_buttons: &mut u32,
+    hout: HANDLE,
+    m: &MOUSE_EVENT_RECORD,
+) {
+    use crate::virtio::input::{ABS_AXIS_MAX, ABS_X, ABS_Y, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT,
+        REL_HWHEEL, REL_WHEEL};
+
+    // Absolute position: scale visible-window cell coords into 0..=ABS_AXIS_MAX.
+    let mut info: CONSOLE_SCREEN_BUFFER_INFO = unsafe { std::mem::zeroed() };
+    if unsafe { GetConsoleScreenBufferInfo(hout, &mut info) } != 0 {
+        let w = &info.srWindow;
+        let cols = (w.Right - w.Left + 1).max(1) as i32;
+        let rows = (w.Bottom - w.Top + 1).max(1) as i32;
+        let rx = (m.dwMousePosition.X as i32 - w.Left as i32).clamp(0, cols - 1);
+        let ry = (m.dwMousePosition.Y as i32 - w.Top as i32).clamp(0, rows - 1);
+        let ax = if cols > 1 { rx * ABS_AXIS_MAX as i32 / (cols - 1) } else { 0 };
+        let ay = if rows > 1 { ry * ABS_AXIS_MAX as i32 / (rows - 1) } else { 0 };
+        tab.push(InputEvent::abs(ABS_X, ax as u32));
+        tab.push(InputEvent::abs(ABS_Y, ay as u32));
+    }
+
+    // Button transitions (low word holds the pressed-button mask).
+    let cur = m.dwButtonState
+        & (FROM_LEFT_1ST_BUTTON_PRESSED | RIGHTMOST_BUTTON_PRESSED | FROM_LEFT_2ND_BUTTON_PRESSED);
+    for (mask, code) in [
+        (FROM_LEFT_1ST_BUTTON_PRESSED, BTN_LEFT),
+        (RIGHTMOST_BUTTON_PRESSED, BTN_RIGHT),
+        (FROM_LEFT_2ND_BUTTON_PRESSED, BTN_MIDDLE),
+    ] {
+        let was = *prev_buttons & mask != 0;
+        let is = cur & mask != 0;
+        if was != is {
+            tab.push(InputEvent::key(code, is));
+        }
+    }
+    *prev_buttons = cur;
+
+    // Wheel: the high word of dwButtonState is a signed delta (WHEEL_DELTA=120).
+    if m.dwEventFlags & MOUSE_WHEELED != 0 {
+        let delta = (m.dwButtonState >> 16) as i16 as i32;
+        if delta != 0 {
+            let clicks = delta / 120;
+            tab.push(InputEvent::rel(REL_WHEEL, if clicks != 0 { clicks } else { delta.signum() }));
+        }
+    }
+    if m.dwEventFlags & MOUSE_HWHEELED != 0 {
+        let delta = (m.dwButtonState >> 16) as i16 as i32;
+        if delta != 0 {
+            let clicks = delta / 120;
+            tab.push(InputEvent::rel(REL_HWHEEL, if clicks != 0 { clicks } else { delta.signum() }));
+        }
+    }
+}
+
+/// xterm/VT escape for a navigation or function key (matches the C++ reference).
+fn vk_to_vt_sequence(vk: u16) -> Option<&'static [u8]> {
+    let seq: &'static [u8] = match vk {
+        0x26 => b"\x1b[A",   // VK_UP
+        0x28 => b"\x1b[B",   // VK_DOWN
+        0x27 => b"\x1b[C",   // VK_RIGHT
+        0x25 => b"\x1b[D",   // VK_LEFT
+        0x24 => b"\x1b[H",   // VK_HOME
+        0x23 => b"\x1b[F",   // VK_END
+        0x2D => b"\x1b[2~",  // VK_INSERT
+        0x2E => b"\x1b[3~",  // VK_DELETE
+        0x21 => b"\x1b[5~",  // VK_PRIOR (PgUp)
+        0x22 => b"\x1b[6~",  // VK_NEXT (PgDn)
+        0x70 => b"\x1bOP",   // VK_F1
+        0x71 => b"\x1bOQ",   // VK_F2
+        0x72 => b"\x1bOR",   // VK_F3
+        0x73 => b"\x1bOS",   // VK_F4
+        0x74 => b"\x1b[15~", // VK_F5
+        0x75 => b"\x1b[17~", // VK_F6
+        0x76 => b"\x1b[18~", // VK_F7
+        0x77 => b"\x1b[19~", // VK_F8
+        0x78 => b"\x1b[20~", // VK_F9
+        0x79 => b"\x1b[21~", // VK_F10
+        0x7A => b"\x1b[23~", // VK_F11
+        0x7B => b"\x1b[24~", // VK_F12
+        _ => return None,
+    };
+    Some(seq)
+}
+
+/// Map a Windows virtual-key code to a Linux evdev keycode (KEY_*). Returns
+/// None for keys the keyboard device does not advertise.
+fn vk_to_linux_keycode(vk: u16) -> Option<u16> {
+    // QWERTY letter row order for VK_A..VK_Z (0x41..0x5A).
+    const LETTERS: [u16; 26] = [
+        30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47, 17,
+        45, 21, 44,
+    ];
+    // VK_0..VK_9 (0x30..0x39) -> KEY_0..KEY_9.
+    const DIGITS: [u16; 10] = [11, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    // VK_NUMPAD0..9 (0x60..0x69) -> KEY_KP0..KEY_KP9.
+    const NUMPAD: [u16; 10] = [82, 79, 80, 81, 75, 76, 77, 71, 72, 73];
+
+    Some(match vk {
+        0x41..=0x5A => LETTERS[(vk - 0x41) as usize],
+        0x30..=0x39 => DIGITS[(vk - 0x30) as usize],
+        0x60..=0x69 => NUMPAD[(vk - 0x60) as usize],
+        0x70..=0x79 => 59 + (vk - 0x70),      // VK_F1..F10 -> KEY_F1..F10
+        0x7A => 87,                            // VK_F11
+        0x7B => 88,                            // VK_F12
+        0x0D => 28,                            // VK_RETURN -> KEY_ENTER
+        0x1B => 1,                             // VK_ESCAPE -> KEY_ESC
+        0x08 => 14,                            // VK_BACK -> KEY_BACKSPACE
+        0x09 => 15,                            // VK_TAB
+        0x20 => 57,                            // VK_SPACE
+        0x10 | 0xA0 => 42,                     // VK_SHIFT / VK_LSHIFT -> KEY_LEFTSHIFT
+        0xA1 => 54,                            // VK_RSHIFT
+        0x11 | 0xA2 => 29,                     // VK_CONTROL / VK_LCONTROL -> KEY_LEFTCTRL
+        0xA3 => 97,                            // VK_RCONTROL
+        0x12 | 0xA4 => 56,                     // VK_MENU / VK_LMENU -> KEY_LEFTALT
+        0xA5 => 100,                           // VK_RMENU -> KEY_RIGHTALT
+        0x5B => 125,                           // VK_LWIN -> KEY_LEFTMETA
+        0x5C => 126,                           // VK_RWIN -> KEY_RIGHTMETA
+        0x14 => 58,                            // VK_CAPITAL -> KEY_CAPSLOCK
+        0x90 => 69,                            // VK_NUMLOCK
+        0x91 => 70,                            // VK_SCROLL -> KEY_SCROLLLOCK
+        0x26 => 103,                           // VK_UP
+        0x28 => 108,                           // VK_DOWN
+        0x25 => 105,                           // VK_LEFT
+        0x27 => 106,                           // VK_RIGHT
+        0x24 => 102,                           // VK_HOME
+        0x23 => 107,                           // VK_END
+        0x21 => 104,                           // VK_PRIOR -> KEY_PAGEUP
+        0x22 => 109,                           // VK_NEXT -> KEY_PAGEDOWN
+        0x2D => 110,                           // VK_INSERT
+        0x2E => 111,                           // VK_DELETE
+        0x6A => 55,                            // VK_MULTIPLY -> KEY_KPASTERISK
+        0x6B => 78,                            // VK_ADD -> KEY_KPPLUS
+        0x6D => 74,                            // VK_SUBTRACT -> KEY_KPMINUS
+        0x6E => 83,                            // VK_DECIMAL -> KEY_KPDOT
+        0x6F => 98,                            // VK_DIVIDE -> KEY_KPSLASH
+        0xBA => 39,                            // VK_OEM_1 ;:
+        0xBB => 13,                            // VK_OEM_PLUS =+
+        0xBC => 51,                            // VK_OEM_COMMA ,<
+        0xBD => 12,                            // VK_OEM_MINUS -_
+        0xBE => 52,                            // VK_OEM_PERIOD .>
+        0xBF => 53,                            // VK_OEM_2 /?
+        0xC0 => 41,                            // VK_OEM_3 `~
+        0xDB => 26,                            // VK_OEM_4 [{
+        0xDC => 43,                            // VK_OEM_5 \|
+        0xDD => 27,                            // VK_OEM_6 ]}
+        0xDE => 40,                            // VK_OEM_7 '"
+        _ => return None,
+    })
 }
 
 fn main() {
