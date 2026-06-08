@@ -287,6 +287,9 @@ def main() -> int:
     ap.add_argument("--vmlinux", type=Path, default=DEFAULT_VMLINUX)
     ap.add_argument("--initrd",  type=Path, default=DEFAULT_INITRD)
     ap.add_argument("--timeout-sec", type=int, default=180)
+    ap.add_argument("--backend", type=str, default="usernet",
+                    help="--net-backend value. C++ uses 'usernet'; the Rust "
+                         "build uses 'nat' (same tcp-sans-io engine).")
     ap.add_argument("--host-ip", type=str, default=None,
                     help="Override host IPv4 (default: auto-discover via "
                          "UDP-connect-to-8.8.8.8 trick)")
@@ -313,7 +316,7 @@ def main() -> int:
             "--pvh-run",
             "--ram-mb", "256",
             "--net",
-            "--net-backend", "usernet",
+            "--net-backend", args.backend,
             "--initrd", str(args.initrd),
             "--watchdog-secs", str(max(30, args.timeout_sec - 10)),
             str(args.vmlinux),

@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::Instant;
-use tcp_sans_io::{Endpoint, State, Tcb, TcbConfig};
+use tcp_sans_io::{Endpoint, State, Tcb, TcbConfig, TcpError};
 use windows_sys::Win32::Networking::WinSock::{INVALID_SOCKET, SOCKET, WSABUF};
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
@@ -77,6 +77,16 @@ pub struct NatOptions {
     pub gateway_ip: [u8; 4],
     pub gateway_mac: [u8; 6],
     pub port_forwards: Vec<PortForward>,
+    /// Per-tier count of Tcbs to preallocate at startup (warm pool). Pools
+    /// still grow on demand up to the flow cap and recycle thereafter, so this
+    /// only governs cold-start latency, not the hard ceiling.
+    pub tcb_warm: [usize; N_TCB_TIERS],
+    /// Tier index assigned to a flow when no port override matches.
+    pub default_tier: usize,
+    /// Optional service-port → tier overrides (e.g. route known-bulk ports to
+    /// the big-ring tier). Keyed by the destination port (outbound) / guest
+    /// service port (inbound).
+    pub tcb_port_tier: Vec<(u16, usize)>,
 }
 
 impl Default for NatOptions {
@@ -85,8 +95,204 @@ impl Default for NatOptions {
             gateway_ip: [10, 0, 0, 1],
             gateway_mac: [0x02, 0x53, 0x54, 0x00, 0x00, 0x01],
             port_forwards: Vec::new(),
+            tcb_warm: DEFAULT_TCB_WARM,
+            default_tier: DEFAULT_TIER,
+            tcb_port_tier: Vec::new(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tcb buffer tiers + preallocated control-plane object pools
+// ---------------------------------------------------------------------------
+//
+// Per-flow / per-event objects (the Tcb, the overlapped op buffers, and the
+// cross-thread accept/ICMP messages) are drawn from preallocated free-lists
+// rather than `Box::new`-d per connection, so steady state is allocation-free
+// (ArrayPool<T> semantics). The data plane was already alloc-free (FramePool +
+// reused scratch buffers); this extends the same discipline to flow setup.
+//
+// Tcb ring sizes are COMPILE-TIME tiers (const-generic `Tcb<BUF>`); the WAN
+// bandwidth-delay product is absorbed by the host kernel socket, so for the
+// NAT these rings only bridge the sub-millisecond in-VMM guest leg — the
+// default tier is ample. Counts are RUNTIME pool config (see `NatOptions`).
+// Sizes MUST be powers of two.
+
+/// Number of compile-time Tcb ring-size tiers.
+pub const N_TCB_TIERS: usize = 3;
+/// The tier ring sizes, smallest first. Each is a power of two. Single source
+/// of truth — `TIER_MAKE` builds one `Tcb<{TIER_BUF[i]}>` constructor per entry.
+const TIER_BUF: [usize; N_TCB_TIERS] = [64 * 1024, 256 * 1024, 1024 * 1024];
+/// Per-tier constructors (one monomorphization of `make_tcb` per size).
+const TIER_MAKE: [fn() -> Box<dyn TcbDyn>; N_TCB_TIERS] = [
+    make_tcb::<{ TIER_BUF[0] }>,
+    make_tcb::<{ TIER_BUF[1] }>,
+    make_tcb::<{ TIER_BUF[2] }>,
+];
+/// Default warm counts: most flows ride the mid tier; the small/big tiers are
+/// lightly warmed (big is opt-in via `tcb_port_tier`).
+const DEFAULT_TCB_WARM: [usize; N_TCB_TIERS] = [192, 56, 8];
+/// Default tier index (256 KiB) when no port override matches.
+const DEFAULT_TIER: usize = 1;
+
+/// Placeholder config a pooled Tcb is built with; `reinit` on acquire fully
+/// overwrites it, so these values never reach the wire.
+const TCB_PLACEHOLDER: TcbConfig = TcbConfig {
+    local: Endpoint { ip: [0; 4], port: 0 },
+    remote: Endpoint { ip: [0; 4], port: 0 },
+    iss: 0,
+    initial_rto_ms: 1000,
+};
+
+fn make_tcb<const BUF: usize>() -> Box<dyn TcbDyn> {
+    Box::new(Tcb::<BUF>::new(TCB_PLACEHOLDER).expect("nat: Tcb pool allocation"))
+}
+
+/// The subset of `Tcb`'s API the NAT drives, made object-safe so a flow can
+/// hold any compile-time ring size behind a single `Box<dyn TcbDyn>`. This is
+/// a worker-local trait; the vtable indirection is irrelevant here (profiling
+/// shows ~all CPU is the hypervisor + kernel I/O, not our code). The forwarding
+/// bodies call the inherent `Tcb` methods — inherent methods win over trait
+/// methods in resolution, so `self.method(..)` forwards rather than recurses.
+trait TcbDyn {
+    fn set_now(&mut self, now: u64);
+    fn listen(&mut self) -> Result<(), TcpError>;
+    fn connect(&mut self) -> Result<(), TcpError>;
+    fn inject_packet(&mut self, pkt: &[u8]) -> Result<(), TcpError>;
+    fn extract_packet(&mut self, out: &mut [u8]) -> Result<usize, TcpError>;
+    fn poll(&self) -> u32;
+    fn recv(&mut self, dst: &mut [u8]) -> Result<usize, TcpError>;
+    fn send(&mut self, data: &[u8]) -> Result<usize, TcpError>;
+    fn state(&self) -> State;
+    fn tick(&mut self) -> Result<(), TcpError>;
+    fn abort(&mut self) -> Result<(), TcpError>;
+    fn close(&mut self) -> Result<(), TcpError>;
+    /// Recycle this Tcb onto a new connection in place (reuses its rings).
+    fn reinit(&mut self, cfg: TcbConfig);
+}
+
+impl<const BUF: usize> TcbDyn for Tcb<BUF> {
+    fn set_now(&mut self, now: u64) {
+        self.set_now(now)
+    }
+    fn listen(&mut self) -> Result<(), TcpError> {
+        self.listen()
+    }
+    fn connect(&mut self) -> Result<(), TcpError> {
+        self.connect()
+    }
+    fn inject_packet(&mut self, pkt: &[u8]) -> Result<(), TcpError> {
+        self.inject_packet(pkt)
+    }
+    fn extract_packet(&mut self, out: &mut [u8]) -> Result<usize, TcpError> {
+        self.extract_packet(out)
+    }
+    fn poll(&self) -> u32 {
+        self.poll()
+    }
+    fn recv(&mut self, dst: &mut [u8]) -> Result<usize, TcpError> {
+        self.recv(dst)
+    }
+    fn send(&mut self, data: &[u8]) -> Result<usize, TcpError> {
+        self.send(data)
+    }
+    fn state(&self) -> State {
+        self.state()
+    }
+    fn tick(&mut self) -> Result<(), TcpError> {
+        self.tick()
+    }
+    fn abort(&mut self) -> Result<(), TcpError> {
+        self.abort()
+    }
+    fn close(&mut self) -> Result<(), TcpError> {
+        self.close()
+    }
+    fn reinit(&mut self, cfg: TcbConfig) {
+        self.reinit(cfg)
+    }
+}
+
+/// Worker-thread-only free-list of preallocated boxed objects (ArrayPool<T>).
+/// `acquire` pops a recycled box or, on a cold miss, makes one (bounded by the
+/// flow caps); `release` returns it. Single-threaded → no locking, and no
+/// steady-state allocation once the high-water mark is warmed. `T: ?Sized` so
+/// the same type serves both concrete ops and `dyn TcbDyn`.
+struct BoxPool<T: ?Sized> {
+    free: Vec<Box<T>>,
+    make: fn() -> Box<T>,
+}
+
+impl<T: ?Sized> BoxPool<T> {
+    fn new(warm: usize, make: fn() -> Box<T>) -> Self {
+        let mut free = Vec::with_capacity(warm);
+        for _ in 0..warm {
+            free.push(make());
+        }
+        BoxPool { free, make }
+    }
+    fn acquire(&mut self) -> Box<T> {
+        match self.free.pop() {
+            Some(b) => b,
+            None => (self.make)(),
+        }
+    }
+    fn release(&mut self, b: Box<T>) {
+        self.free.push(b);
+    }
+}
+
+/// Cross-thread variant for the rare producer→worker handoffs (port-forward
+/// accepts, ICMP replies): producer threads acquire+fill, the worker releases.
+/// Cold path, so the mutex is uncontended.
+struct SyncBoxPool<T> {
+    free: Mutex<Vec<Box<T>>>,
+    make: fn() -> Box<T>,
+}
+
+impl<T> SyncBoxPool<T> {
+    fn new(warm: usize, make: fn() -> Box<T>) -> Self {
+        let mut v = Vec::with_capacity(warm);
+        for _ in 0..warm {
+            v.push(make());
+        }
+        SyncBoxPool {
+            free: Mutex::new(v),
+            make,
+        }
+    }
+    fn acquire(&self) -> Box<T> {
+        match self.free.lock().unwrap().pop() {
+            Some(b) => b,
+            None => (self.make)(),
+        }
+    }
+    fn release(&self, b: Box<T>) {
+        self.free.lock().unwrap().push(b);
+    }
+}
+
+fn make_tcp_op() -> Box<TcpOp> {
+    // All fields are POD (integers, byte arrays, OVERLAPPED/WSABUF), so a fully
+    // zeroed value is valid; the acquire site sets key/kind and arms the op.
+    Box::new(unsafe { core::mem::zeroed() })
+}
+fn make_tcp_send_op() -> Box<TcpSendOp> {
+    Box::new(unsafe { core::mem::zeroed() })
+}
+fn make_udp_op() -> Box<UdpOp> {
+    Box::new(unsafe { core::mem::zeroed() })
+}
+fn make_accept_msg() -> Box<AcceptMsg> {
+    Box::new(unsafe { core::mem::zeroed() })
+}
+fn make_icmp_reply() -> Box<IcmpReplyMsg> {
+    // IcmpReplyMsg holds a Vec, which is not safe to `zeroed()`; build it empty.
+    Box::new(IcmpReplyMsg {
+        guest_ip: [0; 4],
+        dst_ip: [0; 4],
+        icmp: Vec::new(),
+    })
 }
 
 /// A preallocated guest-TX frame slot. The producer (vCPU/TX path) acquires a
@@ -225,15 +431,17 @@ struct IcmpPool {
     queue: Mutex<VecDeque<IcmpJob>>,
     cv: Condvar,
     running: AtomicBool,
+    reply_pool: Arc<SyncBoxPool<IcmpReplyMsg>>,
 }
 
 impl IcmpPool {
-    fn new(iocp: Iocp) -> Self {
+    fn new(iocp: Iocp, reply_pool: Arc<SyncBoxPool<IcmpReplyMsg>>) -> Self {
         IcmpPool {
             iocp,
             queue: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
             running: AtomicBool::new(true),
+            reply_pool,
         }
     }
 
@@ -270,16 +478,16 @@ impl IcmpPool {
             // ICMP payload (after the 8-byte header) is the echo data.
             let data = if job.icmp.len() > 8 { &job.icmp[8..] } else { &[][..] };
             if sys::icmp_echo(h, job.dst_ip, data, ICMP_TIMEOUT_MS) {
-                let msg = Box::new(IcmpReplyMsg {
-                    guest_ip: job.guest_ip,
-                    dst_ip: job.dst_ip,
-                    icmp: job.icmp,
-                });
+                // Reuse a pooled reply (and its Vec capacity) for the handoff.
+                let mut msg = self.reply_pool.acquire();
+                msg.guest_ip = job.guest_ip;
+                msg.dst_ip = job.dst_ip;
+                msg.icmp.clear();
+                msg.icmp.extend_from_slice(&job.icmp);
                 let ptr = Box::into_raw(msg);
                 if !sys::post(self.iocp, 0, KEY_ICMP, ptr as *mut OVERLAPPED) {
-                    unsafe {
-                        drop(Box::from_raw(ptr));
-                    }
+                    // Handoff failed; reclaim the box to the pool.
+                    self.reply_pool.release(unsafe { Box::from_raw(ptr) });
                 }
             }
         }
@@ -305,15 +513,35 @@ struct UdpOp {
 }
 
 struct UdpFlow {
-    op: Box<UdpOp>,
+    // Option so the pooled box can be reclaimed at reap via take() while the
+    // struct still implements Drop: you can't move a field out of a Drop type,
+    // but you can take() an Option. Always Some while the flow is live.
+    op: Option<Box<UdpOp>>,
     last_use: u64,
     dead: bool,
 }
 
+// TcpFlow/UdpFlow keep a Drop impl as a socket-close safety net: even if a
+// future reap path forgets to clean up, the host socket is still closed. The
+// pooled boxes (Tcb / overlapped ops) are instead recycled explicitly at the
+// reap sites — Drop can't reach the pools (it has no &mut NatState). To allow
+// that without a partial move, each pooled field is an Option<Box<_>> the reap
+// site take()s; a debug_assert in Drop then flags any flow dropped with a box
+// still resident (a missed reap), turning a silent pool-drain into a loud test
+// failure. The worker's shutdown drain take()s the boxes first, so those
+// intentional drops don't trip the assert.
 impl Drop for UdpFlow {
     fn drop(&mut self) {
-        if self.op.sock != INVALID_SOCKET {
-            sys::close_sock(self.op.sock);
+        debug_assert!(
+            self.op.is_none(),
+            "UdpFlow dropped without reap: pooled UdpOp leaked (not returned to pool)"
+        );
+        // The host socket lives inside the op; if the op is still resident
+        // (un-reaped), close it so the handle can't leak in release builds.
+        if let Some(op) = self.op.as_ref() {
+            if op.sock != INVALID_SOCKET {
+                sys::close_sock(op.sock);
+            }
         }
     }
 }
@@ -354,10 +582,14 @@ struct TcpSendOp {
 }
 
 struct TcpFlow {
-    tcb: Box<Tcb>,
+    // Option so the pooled boxes can be take()n into their pools at reap while
+    // TcpFlow still implements Drop (socket-close safety net). Always Some while
+    // the flow is live.
+    tcb: Option<Box<dyn TcbDyn>>,
+    tier: usize, // which compile-time Tcb size-tier pool to recycle into
     sock: SOCKET,
-    op: Box<TcpOp>,           // connect/recv op
-    send_op: Box<TcpSendOp>,  // send op
+    op: Option<Box<TcpOp>>,           // connect/recv op
+    send_op: Option<Box<TcpSendOp>>,  // send op
     connected: bool,
     connect_pending: bool,    // ConnectEx is in flight on `op`
     recv_pending: bool,
@@ -374,6 +606,10 @@ struct TcpFlow {
 
 impl Drop for TcpFlow {
     fn drop(&mut self) {
+        debug_assert!(
+            self.tcb.is_none() && self.op.is_none() && self.send_op.is_none(),
+            "TcpFlow dropped without reap: pooled boxes leaked (not returned to pool)"
+        );
         if self.sock != INVALID_SOCKET {
             sys::close_sock(self.sock);
         }
@@ -383,7 +619,7 @@ impl Drop for TcpFlow {
 /// Push buffered host->guest bytes into the tcb send ring (as much as fits).
 fn flush_to_tcb(flow: &mut TcpFlow) {
     while !flow.pending_to_guest.is_empty() {
-        match flow.tcb.send(&flow.pending_to_guest) {
+        match flow.tcb.as_mut().unwrap().send(&flow.pending_to_guest) {
             Ok(0) => break,
             Ok(n) => {
                 flow.pending_to_guest.drain(..n);
@@ -402,7 +638,7 @@ fn maybe_post_recv(flow: &mut TcpFlow) {
     if flow.pending_to_guest.len() > TCP_BUF {
         return;
     }
-    let op = &mut *flow.op;
+    let op = flow.op.as_mut().unwrap();
     op.kind = 1;
     let p = op.buf.as_mut_ptr();
     let l = op.buf.len();
@@ -434,14 +670,14 @@ fn pump_send(flow: &mut TcpFlow) -> bool {
     }
     let n = flow.pending_to_host.len().min(TCP_BUF);
     {
-        let op = &mut *flow.send_op;
+        let op = flow.send_op.as_mut().unwrap();
         op.kind = 2;
         op.buf[..n].copy_from_slice(&flow.pending_to_host[..n]);
         op.wsabuf = sys::wsabuf(op.buf.as_mut_ptr(), n);
     }
     let sock = flow.sock;
-    let wb = &flow.send_op.wsabuf as *const WSABUF;
-    let ovl = &mut flow.send_op.overlapped as *mut OVERLAPPED;
+    let wb = &flow.send_op.as_ref().unwrap().wsabuf as *const WSABUF;
+    let ovl = &mut flow.send_op.as_mut().unwrap().overlapped as *mut OVERLAPPED;
     if unsafe { sys::wsa_send_ov(sock, wb, ovl) } {
         flow.pending_to_host.drain(..n);
         flow.send_inflight = true;
@@ -461,6 +697,15 @@ struct NatState {
     tcp: HashMap<FlowKey, TcpFlow>,
     icmp: Arc<IcmpPool>,
     pool: Arc<FramePool>,
+    // Preallocated control-plane object pools (no steady-state allocation).
+    tcb_pools: Vec<BoxPool<dyn TcbDyn>>, // one free-list per compile-time tier
+    tcp_op_pool: BoxPool<TcpOp>,
+    tcp_send_op_pool: BoxPool<TcpSendOp>,
+    udp_op_pool: BoxPool<UdpOp>,
+    accept_pool: Arc<SyncBoxPool<AcceptMsg>>,
+    icmp_reply_pool: Arc<SyncBoxPool<IcmpReplyMsg>>,
+    default_tier: usize,
+    port_tier: HashMap<u16, usize>,
     start: Instant,
     rng: u32,
     last_tick: u64,
@@ -524,10 +769,14 @@ impl NatState {
                     KEY_ICMP => {
                         let msg = unsafe { Box::from_raw(ov as *mut IcmpReplyMsg) };
                         self.on_icmp_reply(&msg);
+                        self.icmp_reply_pool.release(msg);
                     }
                     KEY_ACCEPT => {
                         let msg = unsafe { Box::from_raw(ov as *mut AcceptMsg) };
-                        self.new_inbound_flow(msg.sock, msg.guest_ip, msg.guest_port);
+                        let (sock, guest_ip, guest_port) =
+                            (msg.sock, msg.guest_ip, msg.guest_port);
+                        self.accept_pool.release(msg);
+                        self.new_inbound_flow(sock, guest_ip, guest_port);
                     }
                     KEY_TCP => {
                         // The completion key comes from the socket's IOCP
@@ -559,10 +808,36 @@ impl NatState {
                 self.expire_idle(now);
             }
         }
+        // Shutdown: drop all live flows. take() the pooled boxes first (the
+        // pools are dying, so just discard them) so the Drop-bomb treats these
+        // intentional drops as reaped. TcpFlow::drop then closes the host
+        // socket; for UDP the socket lives in the op, so close it here.
+        for (_, mut f) in self.tcp.drain() {
+            f.tcb.take();
+            f.op.take();
+            f.send_op.take();
+            // TcpFlow::drop closes f.sock
+        }
+        for (_, mut f) in self.udp.drain() {
+            if let Some(op) = f.op.take() {
+                if op.sock != INVALID_SOCKET {
+                    sys::close_sock(op.sock);
+                }
+            }
+        }
     }
 
     fn now(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
+    }
+
+    /// Pick the Tcb size-tier for a flow from its service port, falling back to
+    /// the configured default. No mid-flow promotion: the tier is fixed here.
+    fn choose_tier(&self, port: u16) -> usize {
+        self.port_tier
+            .get(&port)
+            .copied()
+            .unwrap_or(self.default_tier)
     }
 
     fn next_iss(&mut self) -> u32 {
@@ -661,7 +936,7 @@ impl NatState {
         let now = self.now();
         if let Some(f) = self.udp.get_mut(&key) {
             f.last_use = now;
-            return Some(f.op.sock);
+            return Some(f.op.as_ref().unwrap().sock);
         }
         if self.udp.len() >= MAX_UDP_FLOWS {
             return None;
@@ -672,17 +947,14 @@ impl NatState {
             sys::close_sock(sock);
             return None;
         }
-        let mut op = Box::new(UdpOp {
-            overlapped: unsafe { core::mem::zeroed() },
-            buf: [0u8; UDP_BUF],
-            wsabuf: unsafe { core::mem::zeroed() },
-            sock,
-            guest_ip: gip,
-            guest_port: gport,
-            dst_ip: dip,
-            dst_port: dport,
-            key,
-        });
+        let mut op = self.udp_op_pool.acquire();
+        op.overlapped = unsafe { core::mem::zeroed() };
+        op.sock = sock;
+        op.guest_ip = gip;
+        op.guest_port = gport;
+        op.dst_ip = dip;
+        op.dst_port = dport;
+        op.key = key;
         let p = op.buf.as_mut_ptr();
         let l = op.buf.len();
         op.wsabuf = sys::wsabuf(p, l);
@@ -693,12 +965,27 @@ impl NatState {
         self.udp.insert(
             key,
             UdpFlow {
-                op,
+                op: Some(op),
                 last_use: now,
                 dead: false,
             },
         );
         Some(sock)
+    }
+
+    /// Remove a UDP flow: close its socket if still open and return the pooled
+    /// op buffer. The pending recv has already drained (called from the recv
+    /// completion, or after expire_idle closed the socket).
+    fn reap_udp(&mut self, key: FlowKey) {
+        if let Some(mut f) = self.udp.remove(&key) {
+            if let Some(op) = f.op.take() {
+                if op.sock != INVALID_SOCKET {
+                    sys::close_sock(op.sock);
+                }
+                self.udp_op_pool.release(op);
+            }
+            // f drops here with op == None: Drop-bomb passes, socket closed.
+        }
     }
 
     fn on_udp_recv(&mut self, opp: *mut UdpOp, ok: bool, bytes: u32) {
@@ -712,13 +999,13 @@ impl NatState {
         // closed (aborting it); the op has now drained, so free it safely.
         let dead = self.udp.get(&key).map(|f| f.dead).unwrap_or(true);
         if dead {
-            self.udp.remove(&key);
+            self.reap_udp(key);
             return;
         }
         if !ok || bytes == 0 {
             // Socket error/closed (e.g. ICMP port-unreachable). Drop the flow;
             // a later guest send recreates it. No other op is pending.
-            self.udp.remove(&key);
+            self.reap_udp(key);
             return;
         }
         let n = (bytes as usize).min(op.buf.len());
@@ -770,8 +1057,8 @@ impl NatState {
         }
         let now = self.now();
         if let Some(flow) = self.tcp.get_mut(&key) {
-            flow.tcb.set_now(now);
-            let _ = flow.tcb.inject_packet(ip.datagram);
+            flow.tcb.as_mut().unwrap().set_now(now);
+            let _ = flow.tcb.as_mut().unwrap().inject_packet(ip.datagram);
             flow.last_activity = now;
         }
         self.tcp_drive(key);
@@ -787,9 +1074,7 @@ impl NatState {
             iss,
             initial_rto_ms: 1000,
         };
-        let mut tcb = Box::new(Tcb::new(cfg).ok()?);
-        tcb.set_now(now);
-        tcb.listen().ok()?;
+        // Set up the host socket first so an early failure needs no pool cleanup.
         let sock = sys::new_tcp_socket()?;
         if !sys::bind_any(sock) {
             sys::close_sock(sock);
@@ -799,33 +1084,42 @@ impl NatState {
             sys::close_sock(sock);
             return None;
         }
-        let mut op = Box::new(TcpOp {
-            overlapped: unsafe { core::mem::zeroed() },
-            kind: 0,
-            key,
-            buf: [0u8; TCP_BUF],
-            wsabuf: unsafe { core::mem::zeroed() },
-        });
-        let send_op = Box::new(TcpSendOp {
-            overlapped: unsafe { core::mem::zeroed() },
-            kind: 2,
-            key,
-            buf: [0u8; TCP_BUF],
-            wsabuf: unsafe { core::mem::zeroed() },
-        });
+        // Acquire a Tcb of the chosen size-tier plus the overlapped ops, all
+        // from preallocated pools, and arm them for this connection.
+        let tier = self.choose_tier(dport);
+        let mut tcb = self.tcb_pools[tier].acquire();
+        tcb.reinit(cfg);
+        tcb.set_now(now);
+        if tcb.listen().is_err() {
+            self.tcb_pools[tier].release(tcb);
+            sys::close_sock(sock);
+            return None;
+        }
+        let mut op = self.tcp_op_pool.acquire();
+        op.overlapped = unsafe { core::mem::zeroed() };
+        op.kind = 0;
+        op.key = key;
+        let mut send_op = self.tcp_send_op_pool.acquire();
+        send_op.overlapped = unsafe { core::mem::zeroed() };
+        send_op.kind = 2;
+        send_op.key = key;
         let ovl = &mut op.overlapped as *mut OVERLAPPED;
         let started = unsafe { sys::connect_ex(sock, dip, dport, ovl) };
         if !started {
             sys::close_sock(sock);
+            self.tcb_pools[tier].release(tcb);
+            self.tcp_op_pool.release(op);
+            self.tcp_send_op_pool.release(send_op);
             return None;
         }
         self.tcp.insert(
             key,
             TcpFlow {
-                tcb,
+                tcb: Some(tcb),
+                tier,
                 sock,
-                op,
-                send_op,
+                op: Some(op),
+                send_op: Some(send_op),
                 connected: false,
                 connect_pending: true,
                 recv_pending: false,
@@ -885,41 +1179,38 @@ impl NatState {
             iss,
             initial_rto_ms: 1000,
         };
-        let make = || -> Option<Box<Tcb>> {
-            let mut tcb = Box::new(Tcb::new(cfg).ok()?);
-            tcb.set_now(now);
-            tcb.connect().ok()?; // active open: emits a SYN toward the guest
-            Some(tcb)
-        };
-        let Some(tcb) = make() else {
-            sys::close_sock(host_sock);
-            return;
-        };
-        if !sys::associate(self.iocp, host_sock, KEY_TCP) {
+        // Acquire a Tcb of the chosen tier and actively open it toward the guest.
+        let tier = self.choose_tier(guest_port);
+        let mut tcb = self.tcb_pools[tier].acquire();
+        tcb.reinit(cfg);
+        tcb.set_now(now);
+        if tcb.connect().is_err() {
+            // active open: emits a SYN toward the guest
+            self.tcb_pools[tier].release(tcb);
             sys::close_sock(host_sock);
             return;
         }
-        let op = Box::new(TcpOp {
-            overlapped: unsafe { core::mem::zeroed() },
-            kind: 0,
-            key,
-            buf: [0u8; TCP_BUF],
-            wsabuf: unsafe { core::mem::zeroed() },
-        });
-        let send_op = Box::new(TcpSendOp {
-            overlapped: unsafe { core::mem::zeroed() },
-            kind: 2,
-            key,
-            buf: [0u8; TCP_BUF],
-            wsabuf: unsafe { core::mem::zeroed() },
-        });
+        if !sys::associate(self.iocp, host_sock, KEY_TCP) {
+            self.tcb_pools[tier].release(tcb);
+            sys::close_sock(host_sock);
+            return;
+        }
+        let mut op = self.tcp_op_pool.acquire();
+        op.overlapped = unsafe { core::mem::zeroed() };
+        op.kind = 0;
+        op.key = key;
+        let mut send_op = self.tcp_send_op_pool.acquire();
+        send_op.overlapped = unsafe { core::mem::zeroed() };
+        send_op.kind = 2;
+        send_op.key = key;
         self.tcp.insert(
             key,
             TcpFlow {
-                tcb,
+                tcb: Some(tcb),
+                tier,
                 sock: host_sock,
-                op,
-                send_op,
+                op: Some(op),
+                send_op: Some(send_op),
                 connected: true, // host side is already connected (accepted)
                 connect_pending: false,
                 recv_pending: false,
@@ -947,9 +1238,9 @@ impl NatState {
             if flow.dead {
                 dead = true;
             } else {
-                flow.tcb.set_now(now);
+                flow.tcb.as_mut().unwrap().set_now(now);
                 if !ok {
-                    let _ = flow.tcb.abort();
+                    let _ = flow.tcb.as_mut().unwrap().abort();
                 } else {
                     sys::update_connect_ctx(flow.sock);
                     flow.connected = true;
@@ -977,15 +1268,16 @@ impl NatState {
             if flow.dead {
                 dead = true;
             } else {
-                flow.tcb.set_now(now);
+                flow.tcb.as_mut().unwrap().set_now(now);
                 if !ok || bytes == 0 {
-                    let _ = flow.tcb.close();
+                    let _ = flow.tcb.as_mut().unwrap().close();
                     flow.closing = true;
                 } else {
-                    let n = (bytes as usize).min(flow.op.buf.len());
+                    let n = (bytes as usize).min(flow.op.as_ref().unwrap().buf.len());
                     // op.buf and pending_to_guest are disjoint fields, so this
                     // extends in place with no temporary Vec.
-                    flow.pending_to_guest.extend_from_slice(&flow.op.buf[..n]);
+                    flow.pending_to_guest
+                        .extend_from_slice(&flow.op.as_ref().unwrap().buf[..n]);
                     flow.last_activity = now;
                 }
             }
@@ -1013,12 +1305,14 @@ impl NatState {
                 // the safe borrow. Overlapped stream sends normally transfer
                 // the whole request; requeue any short tail at the front to
                 // preserve byte order.
-                let req = flow.send_op.wsabuf.len as usize;
+                let req = flow.send_op.as_ref().unwrap().wsabuf.len as usize;
                 let sent = (bytes as usize).min(req);
                 if sent < req {
                     // Requeue the unsent tail at the front (disjoint fields, no
                     // temporary Vec).
-                    let tail = flow.send_op.buf[sent..req].iter().copied();
+                    let tail = flow.send_op.as_ref().unwrap().buf[sent..req]
+                        .iter()
+                        .copied();
                     flow.pending_to_host.splice(0..0, tail);
                 }
                 flow.last_activity = now;
@@ -1050,7 +1344,7 @@ impl NatState {
             flush_to_tcb(flow);
             let mut pbuf = [0u8; tcp_sans_io::MAX_PACKET];
             loop {
-                match flow.tcb.extract_packet(&mut pbuf) {
+                match flow.tcb.as_mut().unwrap().extract_packet(&mut pbuf) {
                     Ok(0) => break,
                     Ok(n) => {
                         if let Some(d) = &dev {
@@ -1063,14 +1357,14 @@ impl NatState {
                     Err(_) => break,
                 }
             }
-            let ev = flow.tcb.poll();
+            let ev = flow.tcb.as_ref().unwrap().poll();
             if ev & EV_READABLE != 0 {
                 // Drain the tcb receive ring into the guest->host queue, but
                 // stop at the cap so a slow host send keeps the guest window
                 // closed (backpressure) instead of buffering without bound.
                 let mut rb = [0u8; 4096];
                 while flow.pending_to_host.len() < TO_HOST_CAP {
-                    match flow.tcb.recv(&mut rb) {
+                    match flow.tcb.as_mut().unwrap().recv(&mut rb) {
                         Ok(0) => break,
                         Ok(n) => flow.pending_to_host.extend_from_slice(&rb[..n]),
                         Err(_) => break,
@@ -1120,7 +1414,23 @@ impl NatState {
             .map(|f| f.dead && !f.recv_pending && !f.send_inflight && !f.connect_pending)
             .unwrap_or(false);
         if reap {
-            self.tcp.remove(&key);
+            if let Some(mut f) = self.tcp.remove(&key) {
+                // The socket was already closed by begin_teardown and all ops
+                // have drained, so recycle the pooled Tcb (into its size-tier)
+                // and the overlapped op buffers via take(); TcpFlow::drop then
+                // closes the socket (a no-op — already INVALID) and the Drop-bomb
+                // confirms every box was reclaimed.
+                let tier = f.tier;
+                if let Some(tcb) = f.tcb.take() {
+                    self.tcb_pools[tier].release(tcb);
+                }
+                if let Some(op) = f.op.take() {
+                    self.tcp_op_pool.release(op);
+                }
+                if let Some(send_op) = f.send_op.take() {
+                    self.tcp_send_op_pool.release(send_op);
+                }
+            }
         }
     }
 
@@ -1140,9 +1450,10 @@ impl NatState {
         for k in udp_dead {
             if let Some(f) = self.udp.get_mut(&k) {
                 f.dead = true;
-                if f.op.sock != INVALID_SOCKET {
-                    sys::close_sock(f.op.sock);
-                    f.op.sock = INVALID_SOCKET;
+                let op = f.op.as_mut().unwrap();
+                if op.sock != INVALID_SOCKET {
+                    sys::close_sock(op.sock);
+                    op.sock = INVALID_SOCKET;
                 }
             }
         }
@@ -1156,7 +1467,7 @@ impl NatState {
                     return false;
                 }
                 let idle = now.wrapping_sub(f.last_activity);
-                let st = f.tcb.state();
+                let st = f.tcb.as_ref().unwrap().state();
                 let half = matches!(
                     st,
                     State::FinWait1
@@ -1177,7 +1488,7 @@ impl NatState {
             .collect();
         for k in tcp_victims {
             if let Some(f) = self.tcp.get_mut(&k) {
-                let _ = f.tcb.abort();
+                let _ = f.tcb.as_mut().unwrap().abort();
             }
             self.begin_teardown(k);
         }
@@ -1195,8 +1506,8 @@ impl NatState {
             let mut tick = false;
             if let Some(flow) = self.tcp.get_mut(&key) {
                 if !flow.dead {
-                    flow.tcb.set_now(now);
-                    let _ = flow.tcb.tick();
+                    flow.tcb.as_mut().unwrap().set_now(now);
+                    let _ = flow.tcb.as_mut().unwrap().tick();
                     tick = true;
                 }
             }
@@ -1238,8 +1549,13 @@ impl NatBackend {
                 });
             }
         };
+        // Cross-thread message pools: producer threads (listeners / ICMP
+        // workers) acquire+fill, the NAT worker releases. Warmed lightly; they
+        // grow on demand and recycle, so steady state is allocation-free.
+        let accept_pool = Arc::new(SyncBoxPool::new(32, make_accept_msg));
+        let icmp_reply_pool = Arc::new(SyncBoxPool::new(MAX_ICMP_INFLIGHT, make_icmp_reply));
         // Precreate the ICMP echo worker pool (blocking IcmpSendEcho threads).
-        let icmp = Arc::new(IcmpPool::new(iocp));
+        let icmp = Arc::new(IcmpPool::new(iocp, icmp_reply_pool.clone()));
         let mut icmp_workers = Vec::with_capacity(ICMP_WORKERS);
         for i in 0..ICMP_WORKERS {
             let pool = icmp.clone();
@@ -1266,11 +1582,29 @@ impl NatBackend {
             };
             listeners.push(lsock);
             let pf = *pf;
+            let ap = accept_pool.clone();
             if let Ok(h) = std::thread::Builder::new()
                 .name(format!("nat-listen-{}", pf.host_port))
-                .spawn(move || listener_loop(lsock, iocp, pf))
+                .spawn(move || listener_loop(lsock, iocp, pf, ap))
             {
                 listener_threads.push(h);
+            }
+        }
+        // Worker-only object pools: one Tcb free-list per compile-time tier,
+        // plus the overlapped op buffers. Built here (heap-buffers keeps each
+        // boxed Tcb small on the stack) and owned solely by the worker thread.
+        let default_tier = if opts.default_tier < N_TCB_TIERS {
+            opts.default_tier
+        } else {
+            DEFAULT_TIER
+        };
+        let tcb_pools: Vec<BoxPool<dyn TcbDyn>> = (0..N_TCB_TIERS)
+            .map(|i| BoxPool::new(opts.tcb_warm[i], TIER_MAKE[i]))
+            .collect();
+        let mut port_tier = HashMap::new();
+        for &(port, tier) in &opts.tcb_port_tier {
+            if tier < N_TCB_TIERS {
+                port_tier.insert(port, tier);
             }
         }
         let state = NatState {
@@ -1283,6 +1617,14 @@ impl NatBackend {
             tcp: HashMap::new(),
             icmp: icmp.clone(),
             pool: pool.clone(),
+            tcb_pools,
+            tcp_op_pool: BoxPool::new(MAX_TCP_FLOWS, make_tcp_op),
+            tcp_send_op_pool: BoxPool::new(MAX_TCP_FLOWS, make_tcp_send_op),
+            udp_op_pool: BoxPool::new(MAX_UDP_FLOWS, make_udp_op),
+            accept_pool,
+            icmp_reply_pool,
+            default_tier,
+            port_tier,
             start: Instant::now(),
             rng: 0x2545_F491,
             last_tick: 0,
@@ -1291,11 +1633,9 @@ impl NatBackend {
             tx_scratch: Vec::with_capacity(FRAME_CAP),
             l3_scratch: Vec::with_capacity(FRAME_CAP),
         };
-        // The nat-worker is the sole thread that constructs Tcbs. The
-        // `heap-buffers` feature boxes the 1 MiB rings, so a Tcb is now small and
-        // `Box::new(Tcb::new())` no longer materialises a multi-MiB stack
-        // temporary; the generous stack is kept purely as headroom for the TCP
-        // state machine's call depth.
+        // With `heap-buffers` the Tcb rings are boxed, so a Tcb is no longer a
+        // multi-MiB stack temporary; pooled construction above is cheap. The
+        // worker still gets a generous stack for deep packet-processing frames.
         let handle = std::thread::Builder::new()
             .name("nat-worker".into())
             .stack_size(16 * 1024 * 1024)
@@ -1314,22 +1654,24 @@ impl NatBackend {
 }
 
 /// Accept loop for one port-forward listener; runs on its own thread.
-fn listener_loop(lsock: SOCKET, iocp: Iocp, pf: PortForward) {
+fn listener_loop(
+    lsock: SOCKET,
+    iocp: Iocp,
+    pf: PortForward,
+    accept_pool: Arc<SyncBoxPool<AcceptMsg>>,
+) {
     loop {
         let c = sys::accept_one(lsock);
         if c == INVALID_SOCKET {
             break; // listener closed for shutdown
         }
-        let msg = Box::new(AcceptMsg {
-            sock: c,
-            guest_ip: pf.guest_ip,
-            guest_port: pf.guest_port,
-        });
+        let mut msg = accept_pool.acquire();
+        msg.sock = c;
+        msg.guest_ip = pf.guest_ip;
+        msg.guest_port = pf.guest_port;
         let ptr = Box::into_raw(msg);
         if !sys::post(iocp, 0, KEY_ACCEPT, ptr as *mut OVERLAPPED) {
-            unsafe {
-                drop(Box::from_raw(ptr));
-            }
+            accept_pool.release(unsafe { Box::from_raw(ptr) });
             sys::close_sock(c);
         }
     }
