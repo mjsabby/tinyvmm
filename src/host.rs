@@ -5,6 +5,10 @@
 
 pub use winsys::host::{enable_lock_memory_privilege, random_fill};
 
+pub mod audio {
+    pub use winsys::audio::*;
+}
+
 pub mod block_file {
     pub use winsys::host::block_file::*;
 }

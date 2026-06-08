@@ -40,6 +40,7 @@ use crate::virtio::input::{InputDevice, InputEvent};
 use crate::virtio::net::{LoopbackBackend, NetDevice};
 use crate::virtio::p9::P9Device;
 use crate::virtio::rng::RngDevice;
+use crate::virtio::snd::SndDevice;
 use crate::virtio::transport::{self, PciTransport};
 use crate::whp::cpu_affinity::{self, AffinityMode};
 use crate::whp::cpuid::{build_static_cpuid_result_list, cached_tsc_hz, set_hide_tsc_deadline};
@@ -63,7 +64,9 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::System::Hypervisor::{
     WHV_INTERRUPT_CONTROL, WHV_PARTITION_HANDLE, WHvCapabilityCodeHypervisorPresent,
-    WHvGetCapability, WHvRequestInterrupt, WHvX64LocalApicEmulationModeX2Apic,
+    WHvGetCapability, WHvMapGpaRange, WHvMapGpaRange2, WHvMapGpaRangeFlagRead,
+    WHvMapGpaRangeFlagWrite, WHvRequestInterrupt, WHvUnmapGpaRange,
+    WHvX64LocalApicEmulationModeX2Apic,
 };
 
 const MAX_VCPUS: u32 = boot::acpi::MAX_VCPUS;
@@ -136,7 +139,7 @@ fn print_usage() {
          \x20 tinyvmm --blk-selftest        host-side virtio-blk DISCARD/WRITE_ZEROES test\n\
          \x20 tinyvmm --pci-selftest        host-side PCI host-bridge + BAR + sizing test\n\
          \x20 tinyvmm --pvh-info <vmlinux>\n\
-         \x20 tinyvmm --pvh-run [--initrd <cpio>] [--ram-mb N] [--vcpus N] [--rng] [--input]\n\
+         \x20 tinyvmm --pvh-run [--initrd <cpio>] [--ram-mb N] [--vcpus N] [--rng] [--input] [--sound]\n\
          \x20              [--net [--net-backend loopback|nat] [--portfwd H:G]...]...  (repeat --net per NIC)\n\
          \x20              [--drive <path>[,readonly]]... [--cpu-affinity all|p|e|p-physical]\n\
          \x20              [--virtio-9p-share <tag>=<host_path>[,ro]]...\n\
@@ -144,7 +147,11 @@ fn print_usage() {
          \x20              [--save <path> [--unsafe-save-mutable-drive]]\n\
          \x20              [--watchdog-secs N] [--debug-boot] <vmlinux> [-- <cmdline>]\n\
          \x20 tinyvmm --restore <path> [--drive <path>[,ro|rw]]... [--cpu-affinity all|p|e|p-physical]\n\
-         \x20              [--watchdog-secs N] [--unsafe-restore-mutable-drive]\n"
+         \x20              [--watchdog-secs N] [--unsafe-restore-mutable-drive]\n\
+         \x20 tinyvmm --dda-probe <PnpInstanceId>   probe a host PCI device for Discrete Device\n\
+         \x20              Assignment (no VM boot): dump IDs/BARs/MSI-X, test direct MMIO mapping.\n\
+         \x20              Get the id from Device Manager (Details -> Device instance path) or\n\
+         \x20              `Get-PnpDevice`. Dismount it first: Dismount-VMHostAssignableDevice.\n"
     );
 }
 
@@ -556,6 +563,7 @@ struct PvhArgs {
     save_path: Option<String>,
     unsafe_save_mutable_drive: bool,
     with_input: bool,
+    with_sound: bool,
 }
 
 /// Parse a `--portfwd HOSTPORT:GUESTPORT` rule. The host side binds 127.0.0.1
@@ -608,6 +616,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
     let mut save_path: Option<String> = None;
     let mut unsafe_save_mutable_drive = false;
     let mut with_input = false;
+    let mut with_sound = false;
 
     let mut i = 2;
     while i < args.len() && args[i].starts_with("--") && args[i] != "--" {
@@ -718,6 +727,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
                 }
             }
             "--input" => with_input = true,
+            "--sound" => with_sound = true,
             "--cpu-affinity" => {
                 i += 1;
                 let m = args
@@ -871,6 +881,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
         save_path,
         unsafe_save_mutable_drive,
         with_input,
+        with_sound,
     })
 }
 
@@ -938,6 +949,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         .u32("rng", cfg.with_rng as u32)
         .u32("drives", cfg.drives.len() as u32)
         .u32("gpu", cfg.with_gpu as u32)
+        .u32("sound", cfg.with_sound as u32)
         .write();
 
     if host::enable_lock_memory_privilege() {
@@ -1190,6 +1202,44 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         println!(
             "[pvh-run] virtio-rng on PCI 00:{:02x}.0 (/dev/hwrng)",
             rbdf.device
+        );
+    }
+
+    // --- virtio-snd (optional, --sound): one playback + one capture PCM
+    // stream over WASAPI (shared mode). The device manages its own audio worker
+    // threads, so no transport doorbells are installed. ---
+    if cfg.with_sound {
+        let snd = SndDevice::new(ram.clone());
+        let snd_dev: Arc<dyn VirtioDevice> = snd.clone();
+        let sopts = transport::Options {
+            vendor_id: 0x1AF4,
+            sub_vendor_id: 0x1AF4,
+            sub_id: virtio::device::DEVICE_ID_SOUND as u16,
+            num_msix_vectors: 5, // controlq + eventq + txq + rxq + config-change
+            pci_class: 0x04,     // multimedia controller
+            pci_subclass: 0x01,  // audio device
+            doorbells: false,    // host-driven: WASAPI worker threads pace the I/O
+        };
+        let st = PciTransport::new(
+            "virtio-pci-snd",
+            snd_dev,
+            sopts,
+            mmio_bus.clone(),
+            part_handle,
+        );
+        let wt = Arc::downgrade(&st);
+        snd.set_irq_callback(Box::new(move |q| {
+            if let Some(t) = wt.upgrade() {
+                t.raise_queue_interrupt(q);
+            }
+        }));
+        let sfunc: Arc<dyn PciFunction> = st.clone();
+        let sbdf = pci_bus.add_device(sfunc);
+        transports.push(st.clone());
+        snd.start_audio();
+        println!(
+            "[pvh-run] virtio-snd on PCI 00:{:02x}.0 (1 playback + 1 capture, WASAPI)",
+            sbdf.device
         );
     }
 
@@ -1915,6 +1965,7 @@ fn write_snapshot(
         .bool("hide_tsc_deadline", true)
         .bool("with_rng", cfg.with_rng)
         .bool("with_gpu", cfg.with_gpu)
+        .bool("with_sound", cfg.with_sound)
         .u64("gpu_width", cfg.gpu_width as u64)
         .u64("gpu_height", cfg.gpu_height as u64)
         .bool("with_input", cfg.with_input)
@@ -2120,6 +2171,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
     let tsc_hz_at_save = jr.get_u64("tsc_hz_at_save").unwrap_or(0);
     let with_rng = jr.get_bool("with_rng").unwrap_or(false);
     let with_gpu = jr.get_bool("with_gpu").unwrap_or(false);
+    let with_sound = jr.get_bool("with_sound").unwrap_or(false);
     let gpu_width = jr.get_u64("gpu_width").unwrap_or(1280) as u32;
     let gpu_height = jr.get_u64("gpu_height").unwrap_or(800) as u32;
     let with_input = jr.get_bool("with_input").unwrap_or(false);
@@ -2304,6 +2356,36 @@ fn run_restore(args: &[String]) -> Result<i32> {
         }));
         pci_bus.add_device(rt.clone() as Arc<dyn PciFunction>);
         transports.push(rt.clone());
+    }
+
+    if with_sound {
+        let snd = SndDevice::new(ram.clone());
+        let snd_dev: Arc<dyn VirtioDevice> = snd.clone();
+        let sopts = transport::Options {
+            vendor_id: 0x1AF4,
+            sub_vendor_id: 0x1AF4,
+            sub_id: virtio::device::DEVICE_ID_SOUND as u16,
+            num_msix_vectors: 5,
+            pci_class: 0x04,
+            pci_subclass: 0x01,
+            doorbells: false,
+        };
+        let st = PciTransport::new(
+            "virtio-pci-snd",
+            snd_dev,
+            sopts,
+            mmio_bus.clone(),
+            part_handle,
+        );
+        let wt = Arc::downgrade(&st);
+        snd.set_irq_callback(Box::new(move |q| {
+            if let Some(t) = wt.upgrade() {
+                t.raise_queue_interrupt(q);
+            }
+        }));
+        pci_bus.add_device(st.clone() as Arc<dyn PciFunction>);
+        transports.push(st.clone());
+        snd.start_audio();
     }
 
     let mut blk_backends: Vec<Arc<BlockFile>> = Vec::with_capacity(drive_count);
@@ -3515,6 +3597,268 @@ fn vk_to_linux_keycode(vk: u16) -> Option<u16> {
     })
 }
 
+/// Pretty-print one MSI/MSI-X/PCIe/PM capability while walking the chain.
+fn describe_capability(dev: &whp::vpci::VpciDevice, cap_off: u32) -> Option<u32> {
+    let v = dev.read_config_dword(cap_off).ok()?;
+    let cap_id = (v & 0xFF) as u8;
+    let next = (v >> 8) & 0xFF;
+    let msg_ctrl = (v >> 16) & 0xFFFF;
+    match cap_id {
+        0x01 => println!("  cap@0x{cap_off:02x} Power Management (PMC=0x{msg_ctrl:04x})"),
+        0x05 => {
+            let mm_capable = 1u32 << ((msg_ctrl >> 1) & 0x7);
+            println!(
+                "  cap@0x{cap_off:02x} MSI (enabled={}, up to {mm_capable} vectors, 64-bit={})",
+                (msg_ctrl & 0x1) != 0,
+                (msg_ctrl & 0x80) != 0
+            );
+        }
+        0x10 => println!("  cap@0x{cap_off:02x} PCI Express (extended/ECAM config likely present)"),
+        0x11 => {
+            let table_size = (msg_ctrl & 0x7FF) + 1;
+            let (table_bir, table_off, pba_bir, pba_off) = match (
+                dev.read_config_dword(cap_off + 4),
+                dev.read_config_dword(cap_off + 8),
+            ) {
+                (Ok(t), Ok(p)) => (t & 0x7, t & !0x7, p & 0x7, p & !0x7),
+                _ => (0, 0, 0, 0),
+            };
+            println!(
+                "  cap@0x{cap_off:02x} MSI-X: {table_size} vectors, enabled={}, masked={}, \
+                 table=BAR{table_bir}+0x{table_off:x}, pba=BAR{pba_bir}+0x{pba_off:x}",
+                (msg_ctrl & 0x8000) != 0,
+                (msg_ctrl & 0x4000) != 0
+            );
+        }
+        other => println!("  cap@0x{cap_off:02x} id=0x{other:02x}"),
+    }
+    if next == 0 { None } else { Some(next) }
+}
+
+/// Phase 0 of Discrete Device Assignment: allocate + create the VPCI device for
+/// a host PCI function, dump everything we can learn about it, and empirically
+/// test whether its MMIO can be mapped straight into a guest (the make-or-break
+/// question for zero-exit BAR performance on user-mode WHP). Boots no VM.
+fn run_dda_probe(args: &[String]) -> Result<i32> {
+    let id = args
+        .get(2)
+        .filter(|s| !s.starts_with("--"))
+        .cloned()
+        .ok_or_else(|| {
+            Error::msg(
+                "--dda-probe: expected a PnP device instance id, e.g. \
+                 'PCI\\VEN_10DE&DEV_2206&SUBSYS_...&REV_A1\\4&abcd&0&0019'",
+            )
+        })?;
+    println!("[dda-probe] target PnP instance id: {id}");
+
+    check_whp_available()?;
+    println!("[dda-probe] WHP available");
+
+    // A 1-vCPU partition that permits device assignment (property set pre-setup).
+    let mut part = Partition::new(1)?;
+    part.set_allow_device_assignment(true)?;
+    part.setup()?;
+    let ph = part.handle();
+    println!("[dda-probe] partition created (AllowDeviceAssignment=TRUE)");
+
+    let resource = whp::vpci::VpciResource::new(&id).map_err(|e| {
+        Error::msg(format!(
+            "{e}\n  WHvAllocateVpciResource failed. Checklist:\n\
+             \x20 - Is the IOMMU (VT-d / AMD-Vi) enabled in firmware?\n\
+             \x20 - Is the device dismounted from its host driver? Run as admin:\n\
+             \x20     Disable-PnpDevice -InstanceId '<id>' -Confirm:$false\n\
+             \x20     Dismount-VMHostAssignableDevice -Force -InstancePath '<locationPath>'\n\
+             \x20 - Is it in its own IOMMU group (no siblings still bound to the host)?"
+        ))
+    })?;
+    println!("[dda-probe] WHvAllocateVpciResource: OK");
+
+    let dev = whp::vpci::VpciDevice::new(ph, 0, resource)?;
+    println!("[dda-probe] WHvCreateVpciDevice(PhysicallyBacked): OK");
+
+    // --- Identity ---
+    match dev.hardware_ids() {
+        Ok(h) => println!(
+            "[dda-probe] HardwareIDs: VID=0x{:04x} DID=0x{:04x} rev=0x{:02x} \
+             class=0x{:02x}{:02x}{:02x} subsys={:04x}:{:04x}",
+            h.VendorID,
+            h.DeviceID,
+            h.RevisionID,
+            h.BaseClass,
+            h.SubClass,
+            h.ProgIf,
+            h.SubVendorID,
+            h.SubSystemID
+        ),
+        Err(e) => println!("[dda-probe] HardwareIDs: ERROR {e}"),
+    }
+
+    // --- BARs (sizes/types) ---
+    let probed = match dev.probed_bars() {
+        Ok(p) => {
+            println!("[dda-probe] ProbedBARs raw: {:08x?}", p);
+            let bars = whp::vpci::decode_probed_bars(&p);
+            let mut total_mmio: u64 = 0;
+            for b in &bars {
+                let kind = if b.is_io {
+                    "IO".to_string()
+                } else {
+                    format!(
+                        "MEM{}{}",
+                        if b.is_64bit { "64" } else { "32" },
+                        if b.prefetchable { ",pref" } else { "" }
+                    )
+                };
+                println!(
+                    "  BAR{} {kind} size={} ({:.1} MiB)",
+                    b.index,
+                    b.size,
+                    b.size as f64 / (1024.0 * 1024.0)
+                );
+                if !b.is_io {
+                    total_mmio += b.size;
+                }
+            }
+            let low_window = mem_layout::MMIO_WINDOW_END - mem_layout::MMIO_WINDOW_BASE;
+            if total_mmio > low_window {
+                println!(
+                    "  NOTE: total MMIO {:.0} MiB exceeds the current sub-4GiB window ({:.0} MiB) \
+                     — a high MMIO window above guest RAM is required for this device.",
+                    total_mmio as f64 / (1024.0 * 1024.0),
+                    low_window as f64 / (1024.0 * 1024.0)
+                );
+            }
+            Some(p)
+        }
+        Err(e) => {
+            println!("[dda-probe] ProbedBARs: ERROR {e}");
+            None
+        }
+    };
+    let _ = probed;
+
+    // --- Capabilities + MSI-X + extended (ECAM) config ---
+    println!("[dda-probe] config-space capabilities:");
+    match (dev.read_config_dword(0x00), dev.read_config_dword(0x04)) {
+        (Ok(id_reg), Ok(sc)) => {
+            println!(
+                "  vendor:device=0x{:04x}:0x{:04x} command=0x{:04x} status=0x{:04x}",
+                id_reg & 0xFFFF,
+                id_reg >> 16,
+                sc & 0xFFFF,
+                sc >> 16
+            );
+            let has_cap_list = (sc >> 16) & (1 << 4) != 0;
+            if has_cap_list {
+                if let Ok(capptr) = dev.read_config_dword(0x34) {
+                    let mut cap = capptr & 0xFC;
+                    let mut guard = 0;
+                    while cap != 0 && guard < 48 {
+                        match describe_capability(&dev, cap) {
+                            Some(next) => cap = next & 0xFC,
+                            None => break,
+                        }
+                        guard += 1;
+                    }
+                }
+            } else {
+                println!("  (no capability list)");
+            }
+        }
+        _ => println!("  ERROR reading config space via WHvReadVpciDeviceRegister"),
+    }
+    match dev.read_config_dword(0x100) {
+        Ok(0xFFFF_FFFF) | Ok(0) => {
+            println!("  extended config @0x100: none (legacy 256-byte config only)")
+        }
+        Ok(v) => println!(
+            "  extended config @0x100: 0x{v:08x} (PCIe extended/ECAM config present; \
+             cap_id=0x{:03x})",
+            v & 0xFFFF
+        ),
+        Err(e) => println!("  extended config @0x100: ERROR {e}"),
+    }
+
+    // --- THE EXPERIMENT: can device MMIO be mapped straight into a guest? ---
+    println!("[dda-probe] testing direct guest MMIO mapping (zero-exit BAR feasibility)...");
+    dev.set_power_on(true)?;
+    println!("  WHvSetVpciDevicePowerState(D0): OK");
+    match dev.map_mmio_ranges() {
+        Ok(mappings) => {
+            println!("  WHvMapVpciDeviceMmioRanges: {} region(s)", mappings.len());
+            for (i, m) in mappings.iter().enumerate() {
+                println!(
+                    "    [{i}] BAR{} off=0x{:x} size=0x{:x} access={}{} hostVA=0x{:x}",
+                    m.bar,
+                    m.offset,
+                    m.size,
+                    if m.read { "R" } else { "-" },
+                    if m.write { "W" } else { "-" },
+                    m.va
+                );
+            }
+            if let Some(m) = mappings.iter().find(|m| m.va != 0 && m.size >= 0x1000) {
+                let scratch_gpa: u64 = 0x10_0000_0000; // 64 GiB: above any RAM/BAR
+                let map_size: u64 = 0x1000; // one page is enough to prove it
+                let proc = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() };
+                let flags = WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite;
+                let hr2 = unsafe {
+                    WHvMapGpaRange2(
+                        ph,
+                        proc,
+                        m.va as *const c_void,
+                        scratch_gpa,
+                        map_size,
+                        flags,
+                    )
+                };
+                if hr2 >= 0 {
+                    println!(
+                        "  *** WHvMapGpaRange2(device MMIO -> guest GPA) SUCCEEDED *** \
+                         zero-exit BAR passthrough IS possible on this machine — native GPU MMIO \
+                         performance is achievable."
+                    );
+                    unsafe {
+                        WHvUnmapGpaRange(ph, scratch_gpa, map_size);
+                    }
+                } else {
+                    println!(
+                        "  WHvMapGpaRange2(device MMIO -> guest GPA) FAILED HRESULT=0x{:08x} — \
+                         device MMIO can't be SLAT-mapped directly; BAR access must be \
+                         trap-and-forwarded (DMA stays native).",
+                        hr2 as u32
+                    );
+                    let hr1 = unsafe {
+                        WHvMapGpaRange(ph, m.va as *const c_void, scratch_gpa, map_size, flags)
+                    };
+                    if hr1 >= 0 {
+                        println!("  (legacy WHvMapGpaRange unexpectedly succeeded: 0x{hr1:08x})");
+                        unsafe {
+                            WHvUnmapGpaRange(ph, scratch_gpa, map_size);
+                        }
+                    } else {
+                        println!(
+                            "  (legacy WHvMapGpaRange also failed: 0x{:08x})",
+                            hr1 as u32
+                        );
+                    }
+                }
+            } else {
+                println!("  (no mappable MMIO region with a host VA to test)");
+            }
+            let _ = dev.unmap_mmio_ranges();
+        }
+        Err(e) => println!("  WHvMapVpciDeviceMmioRanges: ERROR {e}"),
+    }
+
+    println!(
+        "[dda-probe] done. Device left dismounted; re-enable on the host with \
+         Mount-VMHostAssignableDevice / Enable-PnpDevice when finished."
+    );
+    Ok(0)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -3531,6 +3875,7 @@ fn main() {
         "--pvh-info" => run_pvh_info(&args),
         "--pvh-run" => run_pvh_run(&args),
         "--restore" => run_restore(&args),
+        "--dda-probe" => run_dda_probe(&args),
         other => {
             eprintln!("unknown command: {other}");
             print_usage();

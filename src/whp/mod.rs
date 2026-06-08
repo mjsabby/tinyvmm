@@ -36,6 +36,9 @@ pub mod msi {
 pub mod emulator {
     pub use whpsys::emulator::*;
 }
+pub mod vpci {
+    pub use whpsys::vpci::*;
+}
 
 pub use memory::GuestMemory;
 pub use partition::Partition;

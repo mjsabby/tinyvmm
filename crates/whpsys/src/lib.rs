@@ -20,6 +20,7 @@ pub mod msi;
 pub mod partition;
 pub mod regs;
 pub mod vcpu;
+pub mod vpci;
 pub use memory::GuestMemory;
 pub use partition::Partition;
 pub use vcpu::Vcpu;

@@ -128,6 +128,7 @@ The first argument selects a **mode** (`main.rs:3500`):
 | `--pvh-info <vmlinux>` | Parse and print a kernel's PVH ELF-Note entry point. |
 | `--pvh-run [flags] <vmlinux> [-- <cmdline>]` | Boot a microVM (the main mode). |
 | `--restore <path> [flags]` | Resume a microVM from a snapshot file (instant resume). |
+| `--dda-probe <PnpInstanceId>` | **Experimental** — probe a host PCI device for Discrete Device Assignment (PCI passthrough): allocate the WHP VPCI resource, dump IDs/BARs/MSI-X/ECAM, and test direct guest MMIO mapping. Boots no VM. |
 
 ### `--pvh-run` flags
 
@@ -147,6 +148,7 @@ Parsed in `parse_pvh_args` (`main.rs:590`). Defaults and clamps are exact.
 | `--virtio-9p-share <tag>=<host_dir>[,ro]` | — | Share a host directory over virtio-9p (9P2000.L). **Repeatable up to 8.** Tag 1–256 bytes; host path canonicalized and must be a directory; duplicate tags rejected. |
 | `--gpu [WxH]` | off | Add a virtio-gpu 2D device and open a Win32 window showing its scanout (CPU blit). Optional `WxH` (e.g. `--gpu 1024x768`) sets the preferred size (default **1280×800**). Dropping `nofb nomodeset` from the default cmdline so the guest DRM driver mode-sets. With `--input`, the window is also the host input source. |
 | `--input` | off | Add **two** virtio-input devices — a keyboard and an absolute tablet (pointer + scroll + buttons). With `--gpu`, the host source is the GPU window (1:1 pixel coordinates); otherwise it falls back to the interactive console. Needs a guest kernel with `CONFIG_VIRTIO_INPUT`. |
+| `--sound` | off | Add a virtio-snd sound card — one playback + one capture PCM stream (48 kHz / S16_LE / stereo) backed by Windows **WASAPI** (shared mode). Needs a guest kernel with `CONFIG_SND_VIRTIO`. On a host with no audio endpoint the card still appears but plays/records silence. |
 | `--cpu-affinity all\|p\|e\|p-physical` | `all` | Pin every vCPU thread to a CPU-set class (P/E cores via `EfficiencyClass`). |
 | `--save <path>` | — | Arm snapshot-on-trigger: when the guest issues `CPUID(0x4000DE57)`, quiesce the machine, write `<path>`, and exit. |
 | `--unsafe-save-mutable-drive` | off | Allow `--save` with a *writable* `--drive` attached (otherwise refused — the disk is not part of the snapshot, so a mutated disk would diverge from restored RAM). |
@@ -190,6 +192,47 @@ The text console forwards raw stdin to the virtio-console RX queue; **Ctrl+A the
 X** quits. The guest can also request a clean shutdown by printing a sentinel on
 hvc0, which a watcher thread detects to stop the VM.
 
+### Discrete Device Assignment / PCI passthrough (experimental, `--dda-probe`)
+
+tinyvmm can drive the Windows Hypervisor Platform **VPCI** APIs
+(`WHvAllocateVpciResource`, `WHvCreateVpciDevice`, `WHvMapVpciDeviceMmioRanges`,
+`WHvMapVpciDeviceInterrupt`, …). These ship in `winhvplatform.dll` since Windows
+10 RS4 but are **absent from the public WHP docs**; Microsoft's OpenVMM is the
+reference. The wrappers live in `crates/whpsys/src/vpci.rs`.
+
+`--dda-probe` is the first step: it allocates the device, reads its identity,
+BAR layout (incl. resizable BARs above 4 GiB), MSI-X vector count and extended
+(ECAM) config, and — crucially — **tests whether the device's MMIO can be mapped
+straight into a guest** (`WHvMapGpaRange2`), which determines whether zero-exit
+BAR access (native GPU performance) is achievable on your machine.
+
+**Host prep (run as Administrator):**
+
+```powershell
+# 1. Find the device's PnP instance id and location path:
+Get-PnpDevice -Class Display | Format-List FriendlyName, InstanceId
+$loc = (Get-PnpDeviceProperty -InstanceId '<InstanceId>' `
+        -KeyName 'DEVPKEY_Device_LocationPaths').Data[0]
+
+# 2. Disable + dismount it from the host (needs IOMMU/VT-d enabled in firmware,
+#    and the device in its own IOMMU group):
+Disable-PnpDevice -InstanceId '<InstanceId>' -Confirm:$false
+Dismount-VMHostAssignableDevice -Force -LocationPath $loc
+
+# 3. Probe it:
+tinyvmm --dda-probe '<InstanceId>'
+
+# 4. When finished, give it back to the host:
+Mount-VMHostAssignableDevice -LocationPath $loc
+Enable-PnpDevice -InstanceId '<InstanceId>' -Confirm:$false
+```
+
+> **Status & limits.** Only the probe ships today. A modern discrete GPU
+> additionally needs a high MMIO window above guest RAM (multi-GiB BARs), ECAM
+> extended config, option-ROM/VBIOS exposure, and FLR reset — these are planned
+> follow-ups gated on the probe's findings. MSI-X is the target interrupt model
+> (legacy INTx is not supported by DDA).
+
 ---
 
 ## 3. Devices in detail
@@ -200,7 +243,7 @@ Mechanism #1 (ports `0xCF8/0xCFC`), with MSI-X interrupts. PCI vendor ID is
 `0x1AF4`. BAR0 is a `0x4000`-byte MMIO region carved into common-cfg / ISR /
 notify / device-cfg / MSI-X table+PBA windows. Devices occupy PCI slots in the
 order they are created — that order is fixed (it is also the snapshot
-`device_index`): **console(0) → net* → rng → blk* → input(keyboard, tablet) →
+`device_index`): **console(0) → net* → rng → sound → blk* → input(keyboard, tablet) →
 9p* → gpu(last)**.
 
 | Device | Flag | Guest node | virtio ID | MSI-X | Doorbell |
@@ -212,6 +255,7 @@ order they are created — that order is fixed (it is also the snapshot
 | virtio-input | `--input` | `/dev/input/event*` | 18 | 3 each | **no** (inline) |
 | virtio-9p | `--virtio-9p-share` (×8) | `mount -t 9p` | 9 | 2 (rq/cfg) | yes |
 | virtio-gpu | `--gpu` | `/dev/dri/card0`, `/dev/fb0` | 16 | 3 (ctrl/cursor/cfg) | **no** (inline) |
+| virtio-snd | `--sound` | `/dev/snd/*` (ALSA `virtio`) | 25 | 5 (ctl/evt/tx/rx/cfg) | **no** (worker threads) |
 
 * **virtio-console** — always present so `/init` has a console.
 * **virtio-net** — MAC `52:54:00:12:34:56`, `+1` in the last octet per extra NIC
@@ -239,6 +283,26 @@ order they are created — that order is fixed (it is also the snapshot
   `RESOURCE_FLUSH`; on flush it swizzles the bound resource to BGRA into a reused
   shadow buffer and presents it to a **Win32 GDI window** (`src/display.rs`) via a
   CPU blit.
+* **virtio-snd** — sound card (`src/virtio/snd.rs`) with one playback and one
+  capture PCM stream, plus one jack and one channel-map per direction. Four queues
+  (`controlq=0`, `eventq=1`, `txq=2`, `rxq=3`); the control queue (PCM/jack/chmap
+  info, set-params, prepare/start/stop/release) is serviced inline on the vCPU
+  thread, while `txq`/`rxq` carry PCM frames on the hot path. A single fixed format
+  — **48 kHz / S16_LE / stereo** — is advertised to the guest; the host endpoints
+  are opened in WASAPI **shared mode** with `AUTOCONVERTPCM`, so the audio engine
+  resamples/reformats to the device mix format and the guest PCM and the WASAPI
+  buffer share a byte layout: the data path is a plain `copy_from_slice` with **no
+  per-period allocation** and no software DSP. Two dedicated worker threads own the
+  WASAPI render/capture clients and pace I/O off the buffer-ready event; on
+  `RELEASE` the device completes all pending I/O messages so the guest's
+  `sync_stop()` drains (spec §5.14). With no usable endpoint (a headless host) the
+  card still enumerates and the workers fall back to a period timer — playback is
+  discarded and capture yields silence — so the guest audio pipeline keeps
+  flowing. All COM/WASAPI `unsafe` lives in `crates/winsys/src/audio.rs`:
+  `windows-sys` ships the WASAPI constants/structs/CLSIDs but **no COM interface
+  vtables**, so `IMMDeviceEnumerator` / `IMMDevice` / `IAudioClient` /
+  `IAudioRenderClient` / `IAudioCaptureClient` are hand-rolled and called through
+  their function pointers. The device model itself is `unsafe`-free.
 
 **Legacy / emulated devices** (always present, for boot correctness only):
 

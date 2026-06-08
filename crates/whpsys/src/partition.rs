@@ -5,9 +5,10 @@ use core::ffi::c_void;
 use windows_sys::Win32::System::Hypervisor::{
     WHV_PARTITION_HANDLE, WHV_PARTITION_PROPERTY_CODE, WHV_X64_CPUID_RESULT,
     WHV_X64_LOCAL_APIC_EMULATION_MODE, WHvCreatePartition, WHvDeletePartition,
-    WHvPartitionPropertyCodeCpuidResultList, WHvPartitionPropertyCodeExceptionExitBitmap,
-    WHvPartitionPropertyCodeExtendedVmExits, WHvPartitionPropertyCodeLocalApicEmulationMode,
-    WHvPartitionPropertyCodeProcessorCount, WHvSetPartitionProperty, WHvSetupPartition,
+    WHvPartitionPropertyCodeAllowDeviceAssignment, WHvPartitionPropertyCodeCpuidResultList,
+    WHvPartitionPropertyCodeExceptionExitBitmap, WHvPartitionPropertyCodeExtendedVmExits,
+    WHvPartitionPropertyCodeLocalApicEmulationMode, WHvPartitionPropertyCodeProcessorCount,
+    WHvSetPartitionProperty, WHvSetupPartition,
 };
 
 pub struct Partition {
@@ -68,6 +69,13 @@ impl Partition {
 
     pub fn set_local_apic_emulation(&self, mode: WHV_X64_LOCAL_APIC_EMULATION_MODE) -> Result<()> {
         self.set_property(WHvPartitionPropertyCodeLocalApicEmulationMode, &mode)
+    }
+
+    /// Permit Discrete Device Assignment (VPCI) in this partition. MUST be set
+    /// *before* [`Self::setup`]; `WHvCreateVpciDevice` fails otherwise.
+    pub fn set_allow_device_assignment(&self, allow: bool) -> Result<()> {
+        let value: i32 = if allow { 1 } else { 0 };
+        self.set_property(WHvPartitionPropertyCodeAllowDeviceAssignment, &value)
     }
 
     pub fn set_cpuid_result_list(&self, entries: &[WHV_X64_CPUID_RESULT]) -> Result<()> {

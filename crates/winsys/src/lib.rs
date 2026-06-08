@@ -14,6 +14,7 @@
 //! outlive the operation) are marked `unsafe fn` with `# Safety` docs.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+pub mod audio;
 pub mod cpu_affinity;
 pub mod error;
 pub mod etw;
