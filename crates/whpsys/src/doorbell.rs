@@ -5,8 +5,8 @@
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::System::Hypervisor::{
-    WHvRegisterPartitionDoorbellEvent, WHvUnregisterPartitionDoorbellEvent,
-    WHV_DOORBELL_MATCH_DATA, WHV_PARTITION_HANDLE,
+    WHV_DOORBELL_MATCH_DATA, WHV_PARTITION_HANDLE, WHvRegisterPartitionDoorbellEvent,
+    WHvUnregisterPartitionDoorbellEvent,
 };
 use windows_sys::Win32::System::Threading::CreateEventW;
 

@@ -1,7 +1,7 @@
 [package]
 name = "winsys"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "Safe wrappers over the Win32 host APIs tinyvmm uses (file I/O, memory-mapping, privileges, CNG random). All host-FFI unsafe is concentrated + audited here."
 license = "MIT"
 

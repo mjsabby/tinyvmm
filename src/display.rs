@@ -29,21 +29,21 @@ use std::thread::JoinHandle;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, InvalidateRect, SetStretchBltMode, StretchDIBits, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, COLORONCOLOR, DIB_RGB_COLORS, PAINTSTRUCT, SRCCOPY,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, COLORONCOLOR, DIB_RGB_COLORS, EndPaint,
+    InvalidateRect, PAINTSTRUCT, SRCCOPY, SetStretchBltMode, StretchDIBits,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW,
-    GetWindowLongPtrW, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, CREATESTRUCTW, CW_USEDEFAULT,
-    GWLP_USERDATA, IDC_ARROW, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_SHOW, WM_APP,
-    WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCCREATE, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CAPTION, WS_MINIMIZEBOX,
-    WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
+    AdjustWindowRectEx, CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
+    DispatchMessageW, GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MSG,
+    PostMessageW, PostQuitMessage, RegisterClassW, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WM_APP, WM_CLOSE,
+    WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
+    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
+    WS_VISIBLE,
 };
 
 /// Custom messages posted from the present thread to the window thread.
@@ -361,204 +361,209 @@ unsafe extern "system" fn wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    // Stash the Shared pointer on first message so later messages can find it.
-    if msg == WM_NCCREATE {
-        let cs = lparam as *const CREATESTRUCTW;
-        if !cs.is_null() {
-            let p = (*cs).lpCreateParams as isize;
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, p);
-        }
-        return DefWindowProcW(hwnd, msg, wparam, lparam);
-    }
-
-    let sp = shared_ptr(hwnd);
-    if sp.is_null() {
-        return DefWindowProcW(hwnd, msg, wparam, lparam);
-    }
-    let shared = &*sp;
-
-    match msg {
-        WM_APP_PAINT => {
-            shared.paint_pending.store(false, Ordering::Release);
-            InvalidateRect(hwnd, std::ptr::null(), 0);
-            0
-        }
-        WM_APP_RESIZE => {
-            let cw = wparam as u32;
-            let ch = lparam as u32;
-            let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE;
-            let (ww, wh) = outer_size(cw, ch, style);
-            SetWindowPos(
-                hwnd,
-                std::ptr::null_mut(),
-                0,
-                0,
-                ww,
-                wh,
-                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-            InvalidateRect(hwnd, std::ptr::null(), 0);
-            0
-        }
-        WM_ERASEBKGND => 1, // we paint everything; skip the erase to avoid flicker
-        WM_PAINT => {
-            let mut ps: PAINTSTRUCT = std::mem::zeroed();
-            let hdc = BeginPaint(hwnd, &mut ps);
-            if !hdc.is_null() {
-                let f = shared.frame.lock().unwrap();
-                if f.width > 0 && f.height > 0 && f.buf.len() >= (f.width * f.height * 4) as usize {
-                    let mut bmi: BITMAPINFO = std::mem::zeroed();
-                    bmi.bmiHeader = BITMAPINFOHEADER {
-                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                        biWidth: f.width as i32,
-                        // Negative height => top-down DIB (row 0 is the top).
-                        biHeight: -(f.height as i32),
-                        biPlanes: 1,
-                        biBitCount: 32,
-                        biCompression: BI_RGB,
-                        biSizeImage: 0,
-                        biXPelsPerMeter: 0,
-                        biYPelsPerMeter: 0,
-                        biClrUsed: 0,
-                        biClrImportant: 0,
-                    };
-                    SetStretchBltMode(hdc, COLORONCOLOR);
-                    StretchDIBits(
-                        hdc,
-                        0,
-                        0,
-                        f.width as i32,
-                        f.height as i32,
-                        0,
-                        0,
-                        f.width as i32,
-                        f.height as i32,
-                        f.buf.as_ptr() as *const c_void,
-                        &bmi,
-                        DIB_RGB_COLORS,
-                        SRCCOPY,
-                    );
-                }
+    unsafe {
+        // Stash the Shared pointer on first message so later messages can find it.
+        if msg == WM_NCCREATE {
+            let cs = lparam as *const CREATESTRUCTW;
+            if !cs.is_null() {
+                let p = (*cs).lpCreateParams as isize;
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, p);
             }
-            EndPaint(hwnd, &ps);
-            0
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
-        WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
-            let pressed = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
-            let l = lparam as u32;
-            let scancode = ((l >> 16) & 0xFF) as u16;
-            let extended = (l >> 24) & 1 != 0;
-            let repeat = pressed && ((l >> 30) & 1 != 0);
-            emit(
-                shared,
-                WindowEvent::Key {
-                    vkey: (wparam & 0xFFFF) as u16,
-                    scancode,
-                    extended,
-                    pressed,
-                    repeat,
-                },
-            );
-            // Keep default behaviour (Alt+F4 close, system menu, WM_CHAR).
-            DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        let sp = shared_ptr(hwnd);
+        if sp.is_null() {
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
-        WM_MOUSEMOVE => {
-            let l = lparam as u32;
-            emit(
-                shared,
-                WindowEvent::PointerMotion {
-                    x: lo_i16(l),
-                    y: hi_i16(l),
-                },
-            );
-            0
-        }
-        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN | WM_LBUTTONUP
-        | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP => {
-            let pressed = matches!(
-                msg,
-                WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
-            );
-            let button = match msg {
-                WM_LBUTTONDOWN | WM_LBUTTONUP => MouseButton::Left,
-                WM_RBUTTONDOWN | WM_RBUTTONUP => MouseButton::Right,
-                WM_MBUTTONDOWN | WM_MBUTTONUP => MouseButton::Middle,
-                _ => {
-                    if hi_i16(wparam as u32) == 2 {
-                        MouseButton::X2
-                    } else {
-                        MouseButton::X1
+        let shared = &*sp;
+
+        match msg {
+            WM_APP_PAINT => {
+                shared.paint_pending.store(false, Ordering::Release);
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+                0
+            }
+            WM_APP_RESIZE => {
+                let cw = wparam as u32;
+                let ch = lparam as u32;
+                let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE;
+                let (ww, wh) = outer_size(cw, ch, style);
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    ww,
+                    wh,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+                0
+            }
+            WM_ERASEBKGND => 1, // we paint everything; skip the erase to avoid flicker
+            WM_PAINT => {
+                let mut ps: PAINTSTRUCT = std::mem::zeroed();
+                let hdc = BeginPaint(hwnd, &mut ps);
+                if !hdc.is_null() {
+                    let f = shared.frame.lock().unwrap();
+                    if f.width > 0
+                        && f.height > 0
+                        && f.buf.len() >= (f.width * f.height * 4) as usize
+                    {
+                        let mut bmi: BITMAPINFO = std::mem::zeroed();
+                        bmi.bmiHeader = BITMAPINFOHEADER {
+                            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                            biWidth: f.width as i32,
+                            // Negative height => top-down DIB (row 0 is the top).
+                            biHeight: -(f.height as i32),
+                            biPlanes: 1,
+                            biBitCount: 32,
+                            biCompression: BI_RGB,
+                            biSizeImage: 0,
+                            biXPelsPerMeter: 0,
+                            biYPelsPerMeter: 0,
+                            biClrUsed: 0,
+                            biClrImportant: 0,
+                        };
+                        SetStretchBltMode(hdc, COLORONCOLOR);
+                        StretchDIBits(
+                            hdc,
+                            0,
+                            0,
+                            f.width as i32,
+                            f.height as i32,
+                            0,
+                            0,
+                            f.width as i32,
+                            f.height as i32,
+                            f.buf.as_ptr() as *const c_void,
+                            &bmi,
+                            DIB_RGB_COLORS,
+                            SRCCOPY,
+                        );
                     }
                 }
-            };
-            // Capture during a drag so motion/up outside the window still arrive.
-            if pressed {
-                SetCapture(hwnd);
-            } else {
-                ReleaseCapture();
+                EndPaint(hwnd, &ps);
+                0
             }
-            let l = lparam as u32;
-            emit(
-                shared,
-                WindowEvent::Button {
-                    button,
-                    pressed,
-                    x: lo_i16(l),
-                    y: hi_i16(l),
-                },
-            );
-            0
+            WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
+                let pressed = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+                let l = lparam as u32;
+                let scancode = ((l >> 16) & 0xFF) as u16;
+                let extended = (l >> 24) & 1 != 0;
+                let repeat = pressed && ((l >> 30) & 1 != 0);
+                emit(
+                    shared,
+                    WindowEvent::Key {
+                        vkey: (wparam & 0xFFFF) as u16,
+                        scancode,
+                        extended,
+                        pressed,
+                        repeat,
+                    },
+                );
+                // Keep default behaviour (Alt+F4 close, system menu, WM_CHAR).
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_MOUSEMOVE => {
+                let l = lparam as u32;
+                emit(
+                    shared,
+                    WindowEvent::PointerMotion {
+                        x: lo_i16(l),
+                        y: hi_i16(l),
+                    },
+                );
+                0
+            }
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN | WM_LBUTTONUP
+            | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP => {
+                let pressed = matches!(
+                    msg,
+                    WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
+                );
+                let button = match msg {
+                    WM_LBUTTONDOWN | WM_LBUTTONUP => MouseButton::Left,
+                    WM_RBUTTONDOWN | WM_RBUTTONUP => MouseButton::Right,
+                    WM_MBUTTONDOWN | WM_MBUTTONUP => MouseButton::Middle,
+                    _ => {
+                        if hi_i16(wparam as u32) == 2 {
+                            MouseButton::X2
+                        } else {
+                            MouseButton::X1
+                        }
+                    }
+                };
+                // Capture during a drag so motion/up outside the window still arrive.
+                if pressed {
+                    SetCapture(hwnd);
+                } else {
+                    ReleaseCapture();
+                }
+                let l = lparam as u32;
+                emit(
+                    shared,
+                    WindowEvent::Button {
+                        button,
+                        pressed,
+                        x: lo_i16(l),
+                        y: hi_i16(l),
+                    },
+                );
+                0
+            }
+            WM_MOUSEWHEEL => {
+                emit(
+                    shared,
+                    WindowEvent::Wheel {
+                        dx: 0,
+                        dy: hi_i16(wparam as u32),
+                    },
+                );
+                0
+            }
+            WM_MOUSEHWHEEL => {
+                emit(
+                    shared,
+                    WindowEvent::Wheel {
+                        dx: hi_i16(wparam as u32),
+                        dy: 0,
+                    },
+                );
+                0
+            }
+            WM_SETFOCUS => {
+                emit(shared, WindowEvent::Focus { gained: true });
+                0
+            }
+            WM_KILLFOCUS => {
+                emit(shared, WindowEvent::Focus { gained: false });
+                0
+            }
+            WM_SIZE => {
+                let l = lparam as u32;
+                emit(
+                    shared,
+                    WindowEvent::Resized {
+                        width: (l & 0xFFFF),
+                        height: ((l >> 16) & 0xFFFF),
+                    },
+                );
+                0
+            }
+            WM_CLOSE => {
+                shared.open.store(false, Ordering::Release);
+                emit(shared, WindowEvent::CloseRequested);
+                // Destroy the window -> WM_DESTROY -> PostQuitMessage -> pump exits.
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_DESTROY => {
+                PostQuitMessage(0);
+                0
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
-        WM_MOUSEWHEEL => {
-            emit(
-                shared,
-                WindowEvent::Wheel {
-                    dx: 0,
-                    dy: hi_i16(wparam as u32),
-                },
-            );
-            0
-        }
-        WM_MOUSEHWHEEL => {
-            emit(
-                shared,
-                WindowEvent::Wheel {
-                    dx: hi_i16(wparam as u32),
-                    dy: 0,
-                },
-            );
-            0
-        }
-        WM_SETFOCUS => {
-            emit(shared, WindowEvent::Focus { gained: true });
-            0
-        }
-        WM_KILLFOCUS => {
-            emit(shared, WindowEvent::Focus { gained: false });
-            0
-        }
-        WM_SIZE => {
-            let l = lparam as u32;
-            emit(
-                shared,
-                WindowEvent::Resized {
-                    width: (l & 0xFFFF),
-                    height: ((l >> 16) & 0xFFFF),
-                },
-            );
-            0
-        }
-        WM_CLOSE => {
-            shared.open.store(false, Ordering::Release);
-            emit(shared, WindowEvent::CloseRequested);
-            // Destroy the window -> WM_DESTROY -> PostQuitMessage -> pump exits.
-            DefWindowProcW(hwnd, msg, wparam, lparam)
-        }
-        WM_DESTROY => {
-            PostQuitMessage(0);
-            0
-        }
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
 

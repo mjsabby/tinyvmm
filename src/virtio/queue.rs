@@ -2,8 +2,8 @@
 //! src/virtio/virtqueue.cpp.
 
 use crate::whp::GuestMemory;
-use std::sync::atomic::{fence, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{Ordering, fence};
 
 pub const VRING_DESC_F_NEXT: u16 = 1;
 pub const VRING_DESC_F_WRITE: u16 = 2;
@@ -351,11 +351,7 @@ impl Virtqueue {
     /// Allocating convenience wrapper around [`Self::pop_into`] for cold paths.
     pub fn pop(&mut self) -> Option<PoppedChain> {
         let mut c = PoppedChain::default();
-        if self.pop_into(&mut c) {
-            Some(c)
-        } else {
-            None
-        }
+        if self.pop_into(&mut c) { Some(c) } else { None }
     }
 
     pub fn push(&mut self, head_index: u16, used_len: u32) {

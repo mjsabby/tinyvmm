@@ -1,20 +1,20 @@
 //! Thin wrappers over the Winsock + IOCP FFI used by the NAT backend. Kept
 //! small and explicit; all the unsafe is funnelled here.
 
-use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho, ICMP_ECHO_REPLY,
+    ICMP_ECHO_REPLY, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho,
 };
 use windows_sys::Win32::Networking::WinSock::{
-    accept, bind, closesocket, connect, listen, setsockopt, shutdown, socket, WSAGetLastError,
-    WSAIoctl, WSARecv, WSASend, WSAStartup, AF_INET, INVALID_SOCKET, IN_ADDR, IN_ADDR_0,
-    IPPROTO_TCP, IPPROTO_UDP, SD_SEND, SOCKADDR, SOCKADDR_IN, SOCKET, SOCK_DGRAM, SOCK_STREAM,
-    SOL_SOCKET, WSABUF, WSADATA, WSA_IO_PENDING,
+    AF_INET, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IPPROTO_TCP, IPPROTO_UDP, SD_SEND, SOCK_DGRAM,
+    SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKET, SOL_SOCKET, WSA_IO_PENDING, WSABUF, WSADATA,
+    WSAGetLastError, WSAIoctl, WSARecv, WSASend, WSAStartup, accept, bind, closesocket, connect,
+    listen, setsockopt, shutdown, socket,
 };
 use windows_sys::Win32::System::IO::{
-    CreateIoCompletionPort, GetQueuedCompletionStatus, PostQueuedCompletionStatus, OVERLAPPED,
+    CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED, PostQueuedCompletionStatus,
 };
+use windows_sys::core::GUID;
 
 use core::ffi::c_void;
 use std::sync::{Once, OnceLock};
@@ -45,11 +45,7 @@ unsafe impl Sync for Iocp {}
 
 pub fn create_iocp() -> Option<Iocp> {
     let h = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 0) };
-    if h.is_null() {
-        None
-    } else {
-        Some(Iocp(h))
-    }
+    if h.is_null() { None } else { Some(Iocp(h)) }
 }
 
 pub fn associate(iocp: Iocp, sock: SOCKET, key: usize) -> bool {
@@ -92,20 +88,12 @@ pub fn sockaddr_in(ip: [u8; 4], port: u16) -> SOCKADDR_IN {
 
 pub fn new_udp_socket() -> Option<SOCKET> {
     let s = unsafe { socket(AF_INET as i32, SOCK_DGRAM, IPPROTO_UDP) };
-    if s == INVALID_SOCKET {
-        None
-    } else {
-        Some(s)
-    }
+    if s == INVALID_SOCKET { None } else { Some(s) }
 }
 
 pub fn new_tcp_socket() -> Option<SOCKET> {
     let s = unsafe { socket(AF_INET as i32, SOCK_STREAM, IPPROTO_TCP) };
-    if s == INVALID_SOCKET {
-        None
-    } else {
-        Some(s)
-    }
+    if s == INVALID_SOCKET { None } else { Some(s) }
 }
 
 /// Set the default peer for a (UDP or connected-TCP) socket.
@@ -273,11 +261,7 @@ fn connect_ex_ptr() -> Option<ConnectExFn> {
         unsafe {
             closesocket(s);
         }
-        if rc != 0 {
-            0
-        } else {
-            func
-        }
+        if rc != 0 { 0 } else { func }
     });
     if p == 0 {
         None

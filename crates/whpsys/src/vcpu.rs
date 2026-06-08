@@ -1,8 +1,10 @@
 //! Thin wrapper around a single virtual processor.
 
-use crate::error::{check_hr, Error, Result};
+use crate::error::{Error, Result, check_hr};
 use core::ffi::c_void;
 use windows_sys::Win32::System::Hypervisor::{
+    WHV_MEMORY_ACCESS_CONTEXT, WHV_PARTITION_HANDLE, WHV_REGISTER_NAME, WHV_REGISTER_VALUE,
+    WHV_RUN_VP_EXIT_CONTEXT, WHV_VP_EXIT_CONTEXT, WHV_X64_IO_PORT_ACCESS_CONTEXT,
     WHvCancelRunVirtualProcessor, WHvCreateVirtualProcessor, WHvDeleteVirtualProcessor,
     WHvGetVirtualProcessorInterruptControllerState2, WHvGetVirtualProcessorRegisters,
     WHvGetVirtualProcessorXsaveState, WHvRunVirtualProcessor, WHvRunVpExitReasonCanceled,
@@ -12,9 +14,7 @@ use windows_sys::Win32::System::Hypervisor::{
     WHvRunVpExitReasonX64ApicEoi, WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt,
     WHvRunVpExitReasonX64InterruptWindow, WHvRunVpExitReasonX64IoPortAccess,
     WHvRunVpExitReasonX64MsrAccess, WHvSetVirtualProcessorInterruptControllerState2,
-    WHvSetVirtualProcessorRegisters, WHvSetVirtualProcessorXsaveState, WHV_MEMORY_ACCESS_CONTEXT,
-    WHV_PARTITION_HANDLE, WHV_REGISTER_NAME, WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_CONTEXT,
-    WHV_VP_EXIT_CONTEXT, WHV_X64_IO_PORT_ACCESS_CONTEXT,
+    WHvSetVirtualProcessorRegisters, WHvSetVirtualProcessorXsaveState,
 };
 
 /// Reinterpret a 16-byte register value as the WHP union (LE byte image).

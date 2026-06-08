@@ -27,7 +27,7 @@ use crate::devices::pic::Pic8259;
 use crate::devices::pit::Pit8254;
 use crate::devices::serial::Serial8250;
 use crate::display::Display;
-use crate::error::{check_hr, Error, Result};
+use crate::error::{Error, Result, check_hr};
 use crate::host::block_file::BlockFile;
 use crate::net::nat::{NatBackend, NatOptions, PortForward};
 use crate::pci::{PciBus, PciFunction};
@@ -47,22 +47,22 @@ use crate::whp::run_loop::{RunLoop, StopReason};
 use crate::whp::{GuestMemory, Partition, Vcpu};
 
 use core::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::HANDLE;
-use windows_sys::Win32::Storage::FileSystem::{GetFileType, ReadFile, FILE_TYPE_CHAR};
+use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_CHAR, GetFileType, ReadFile};
 use windows_sys::Win32::System::Console::{
-    GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, ReadConsoleInputW, SetConsoleMode,
     CONSOLE_SCREEN_BUFFER_INFO, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT,
     ENABLE_MOUSE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE,
     ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT,
-    FROM_LEFT_1ST_BUTTON_PRESSED, FROM_LEFT_2ND_BUTTON_PRESSED, INPUT_RECORD, KEY_EVENT,
-    MOUSE_EVENT, MOUSE_EVENT_RECORD, MOUSE_HWHEELED, MOUSE_WHEELED, RIGHTMOST_BUTTON_PRESSED,
-    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    FROM_LEFT_1ST_BUTTON_PRESSED, FROM_LEFT_2ND_BUTTON_PRESSED, GetConsoleMode,
+    GetConsoleScreenBufferInfo, GetStdHandle, INPUT_RECORD, KEY_EVENT, MOUSE_EVENT,
+    MOUSE_EVENT_RECORD, MOUSE_HWHEELED, MOUSE_WHEELED, RIGHTMOST_BUTTON_PRESSED, ReadConsoleInputW,
+    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
 };
 use windows_sys::Win32::System::Hypervisor::{
-    WHvCapabilityCodeHypervisorPresent, WHvGetCapability, WHvRequestInterrupt,
-    WHvX64LocalApicEmulationModeX2Apic, WHV_INTERRUPT_CONTROL, WHV_PARTITION_HANDLE,
+    WHV_INTERRUPT_CONTROL, WHV_PARTITION_HANDLE, WHvCapabilityCodeHypervisorPresent,
+    WHvGetCapability, WHvRequestInterrupt, WHvX64LocalApicEmulationModeX2Apic,
 };
 
 const MAX_VCPUS: u32 = boot::acpi::MAX_VCPUS;
@@ -196,7 +196,7 @@ fn run_smoke() -> Result<i32> {
     // the whole WHP run path (map RAM, set regs, enter guest, decode exit) works,
     // not just that the handles were created. Mirrors the C++ `RunSmoke`.
     use crate::whp::regs::{reg64, seg};
-    use crate::whp::vcpu::{exit_reason_name, ExitReason};
+    use crate::whp::vcpu::{ExitReason, exit_reason_name};
     use windows_sys::Win32::System::Hypervisor::{
         WHvX64RegisterCs, WHvX64RegisterDs, WHvX64RegisterEs, WHvX64RegisterFs, WHvX64RegisterGs,
         WHvX64RegisterRflags, WHvX64RegisterRip, WHvX64RegisterSs,
@@ -741,7 +741,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
                             other => {
                                 return Err(Error::msg(format!(
                                     "--drive: unknown option '{other}' (want readonly)"
-                                )))
+                                )));
                             }
                         }
                     }
@@ -776,7 +776,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
                             other => {
                                 return Err(Error::msg(format!(
                                     "--virtio-9p-share: unknown option '{other}' (want ro)"
-                                )))
+                                )));
                             }
                         }
                     }
@@ -2018,7 +2018,7 @@ fn parse_drive_override(spec: &str) -> Result<(String, Option<bool>)> {
                 other => {
                     return Err(Error::msg(format!(
                         "--drive: unknown option '{other}' (want readonly|ro|rw)"
-                    )))
+                    )));
                 }
             }
         }
@@ -3047,11 +3047,7 @@ fn push_abs(tab: &mut Vec<InputEvent>, x: i32, y: i32, cw: u32, ch: u32, abs_x: 
 /// WHEEL_DELTA (120) units -> evdev notch count (at least ±1 for any motion).
 fn wheel_notches(delta: i32) -> i32 {
     let c = delta / 120;
-    if c != 0 {
-        c
-    } else {
-        delta.signum()
-    }
+    if c != 0 { c } else { delta.signum() }
 }
 
 /// Put the console into raw VT mode and spawn a detached reader thread that

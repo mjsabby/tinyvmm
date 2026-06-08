@@ -14,7 +14,7 @@
 use crate::diag::etw;
 use crate::host::block_file::{BlockFile, Op, Request};
 use crate::virtio::device::{
-    VirtioDevice, DEVICE_ID_BLOCK, FEATURE_RING_EVENT_IDX, FEATURE_VERSION_1,
+    DEVICE_ID_BLOCK, FEATURE_RING_EVENT_IDX, FEATURE_VERSION_1, VirtioDevice,
 };
 use crate::virtio::queue::{ChainBuf, ChainScratch, Virtqueue};
 use crate::whp::GuestMemory;
@@ -52,7 +52,7 @@ const CFG_CAPACITY: usize = 0; // le64 sectors
 const CFG_SIZE_MAX: usize = 8; // le32
 const CFG_SEG_MAX: usize = 12; // le32
 const CFG_BLK_SIZE: usize = 20; // le32 (after geometry[4])
-                                // DISCARD / WRITE_ZEROES sub-config.
+// DISCARD / WRITE_ZEROES sub-config.
 const CFG_MAX_DISCARD_SECTORS: usize = 36; // le32
 const CFG_MAX_DISCARD_SEG: usize = 40; // le32
 const CFG_DISCARD_SECTOR_ALIGN: usize = 44; // le32
@@ -702,11 +702,7 @@ impl VirtioDevice for BlockDevice {
     }
 
     fn queue_max(&self, idx: u32) -> u32 {
-        if idx == 0 {
-            self.queue_max
-        } else {
-            0
-        }
+        if idx == 0 { self.queue_max } else { 0 }
     }
 
     fn enable_queue(&self, idx: u32, desc: u64, avail: u64, used: u64, size: u16, event_idx: bool) {

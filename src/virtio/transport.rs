@@ -6,9 +6,9 @@
 use crate::devices::mmio_bus::{MmioAccess, MmioBus};
 use crate::pci::config::{BarEvent, BarKind, PciConfigSpace};
 use crate::pci::msix::MsiX;
-use crate::pci::{PciFunction, CAP_ID_VENDOR};
+use crate::pci::{CAP_ID_VENDOR, PciFunction};
 use crate::virtio::device::{
-    VirtioDevice, FEATURE_RING_EVENT_IDX, STATUS_DRIVER_OK, STATUS_FEATURES_OK, STATUS_NEEDS_RESET,
+    FEATURE_RING_EVENT_IDX, STATUS_DRIVER_OK, STATUS_FEATURES_OK, STATUS_NEEDS_RESET, VirtioDevice,
 };
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -800,7 +800,7 @@ impl PciFunction for PciTransport {
 // not stored in the virtqueues), per-queue programming, and device-specific
 // bytes. Rust-self-consistent only -- NOT cross-compatible with the C++ format.
 
-use crate::virtio::queue::{QueueState as VqState, QUEUE_STATE_ENCODED};
+use crate::virtio::queue::{QUEUE_STATE_ENCODED, QueueState as VqState};
 
 pub struct DeviceSnapshot {
     cfg: [u8; 256],

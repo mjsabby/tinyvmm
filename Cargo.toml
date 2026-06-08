@@ -1,7 +1,7 @@
 [package]
 name = "tinyvmm"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "A tiny user-mode VMM on the Windows Hypervisor Platform (Rust rewrite)"
 license = "MIT"
 

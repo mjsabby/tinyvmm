@@ -14,7 +14,7 @@
 use crate::diag::etw;
 use crate::host;
 use crate::virtio::device::{
-    VirtioDevice, DEVICE_ID_RNG, FEATURE_RING_EVENT_IDX, FEATURE_VERSION_1,
+    DEVICE_ID_RNG, FEATURE_RING_EVENT_IDX, FEATURE_VERSION_1, VirtioDevice,
 };
 use crate::virtio::queue::{PoppedChain, Virtqueue};
 use crate::whp::GuestMemory;

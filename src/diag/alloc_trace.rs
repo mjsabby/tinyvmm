@@ -37,29 +37,37 @@ pub struct TracingAllocator;
 unsafe impl GlobalAlloc for TracingAllocator {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = System.alloc(layout);
-        etw::trace_alloc(ptr, layout.size());
-        ptr
+        unsafe {
+            let ptr = System.alloc(layout);
+            etw::trace_alloc(ptr, layout.size());
+            ptr
+        }
     }
 
     #[inline]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let ptr = System.alloc_zeroed(layout);
-        etw::trace_alloc(ptr, layout.size());
-        ptr
+        unsafe {
+            let ptr = System.alloc_zeroed(layout);
+            etw::trace_alloc(ptr, layout.size());
+            ptr
+        }
     }
 
     #[inline]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let new_ptr = System.realloc(ptr, layout, new_size);
-        etw::trace_realloc(ptr, new_ptr, new_size);
-        new_ptr
+        unsafe {
+            let new_ptr = System.realloc(ptr, layout, new_size);
+            etw::trace_realloc(ptr, new_ptr, new_size);
+            new_ptr
+        }
     }
 
     #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        etw::trace_free(ptr, layout.size());
-        System.dealloc(ptr, layout);
+        unsafe {
+            etw::trace_free(ptr, layout.size());
+            System.dealloc(ptr, layout);
+        }
     }
 }
 

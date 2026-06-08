@@ -21,19 +21,19 @@ use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::thread::JoinHandle;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    CloseHandle, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
     INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FlushFileBuffers, GetFileSizeEx, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, FlushFileBuffers,
+    GetFileSizeEx, OPEN_EXISTING, ReadFile, WriteFile,
+};
+use windows_sys::Win32::System::IO::{
+    CreateIoCompletionPort, DeviceIoControl, GetQueuedCompletionStatus, OVERLAPPED,
+    PostQueuedCompletionStatus,
 };
 use windows_sys::Win32::System::Ioctl::{
     FILE_SET_SPARSE_BUFFER, FILE_ZERO_DATA_INFORMATION, FSCTL_SET_SPARSE, FSCTL_SET_ZERO_DATA,
-};
-use windows_sys::Win32::System::IO::{
-    CreateIoCompletionPort, DeviceIoControl, GetQueuedCompletionStatus, PostQueuedCompletionStatus,
-    OVERLAPPED,
 };
 
 use super::wide;
@@ -320,74 +320,76 @@ impl BlockFile {
     /// `req` must point to a live [`Request`] embedded in a caller-owned
     /// allocation that outlives the completion.
     pub unsafe fn submit(&self, req: *mut Request) -> bool {
-        let inner = &self.inner;
-        inner.submitted.fetch_add(1, Ordering::Relaxed);
-        (*req).ok = false;
+        unsafe {
+            let inner = &self.inner;
+            inner.submitted.fetch_add(1, Ordering::Relaxed);
+            (*req).ok = false;
 
-        // High-water mark of outstanding requests (queue depth actually
-        // reached). The blk-test asserts this exceeds 1.
-        let cur = inner.inflight.fetch_add(1, Ordering::Relaxed) + 1;
-        let mut prev = inner.max_inflight.load(Ordering::Relaxed);
-        while cur > prev {
-            match inner.max_inflight.compare_exchange_weak(
-                prev,
-                cur,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(p) => prev = p,
+            // High-water mark of outstanding requests (queue depth actually
+            // reached). The blk-test asserts this exceeds 1.
+            let cur = inner.inflight.fetch_add(1, Ordering::Relaxed) + 1;
+            let mut prev = inner.max_inflight.load(Ordering::Relaxed);
+            while cur > prev {
+                match inner.max_inflight.compare_exchange_weak(
+                    prev,
+                    cur,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(p) => prev = p,
+                }
             }
-        }
 
-        let op = (*req).op;
-        if op == Op::Flush {
-            // Defer the (sync) FlushFileBuffers to the worker so the vCPU
-            // thread doesn't stall; FLUSH_KEY lets the worker recognise it.
+            let op = (*req).op;
+            if op == Op::Flush {
+                // Defer the (sync) FlushFileBuffers to the worker so the vCPU
+                // thread doesn't stall; FLUSH_KEY lets the worker recognise it.
+                core::ptr::write_bytes(&mut (*req).ovl as *mut OVERLAPPED, 0, 1);
+                if PostQueuedCompletionStatus(inner.iocp, 0, FLUSH_KEY, &(*req).ovl) == 0 {
+                    inner.inflight.fetch_sub(1, Ordering::Relaxed);
+                    inner.errors.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+                return true;
+            }
+
             core::ptr::write_bytes(&mut (*req).ovl as *mut OVERLAPPED, 0, 1);
-            if PostQueuedCompletionStatus(inner.iocp, 0, FLUSH_KEY, &(*req).ovl) == 0 {
-                inner.inflight.fetch_sub(1, Ordering::Relaxed);
-                inner.errors.fetch_add(1, Ordering::Relaxed);
-                return false;
-            }
-            return true;
-        }
+            (*req).ovl.Anonymous.Anonymous.Offset = ((*req).file_offset & 0xFFFF_FFFF) as u32;
+            (*req).ovl.Anonymous.Anonymous.OffsetHigh = ((*req).file_offset >> 32) as u32;
 
-        core::ptr::write_bytes(&mut (*req).ovl as *mut OVERLAPPED, 0, 1);
-        (*req).ovl.Anonymous.Anonymous.Offset = ((*req).file_offset & 0xFFFF_FFFF) as u32;
-        (*req).ovl.Anonymous.Anonymous.OffsetHigh = ((*req).file_offset >> 32) as u32;
-
-        let started = if op == Op::Read {
-            ReadFile(
-                inner.handle,
-                (*req).buf,
-                (*req).bytes,
-                core::ptr::null_mut(),
-                &mut (*req).ovl,
-            )
-        } else {
-            if inner.readonly {
-                inner.inflight.fetch_sub(1, Ordering::Relaxed);
-                inner.errors.fetch_add(1, Ordering::Relaxed);
-                return false;
+            let started = if op == Op::Read {
+                ReadFile(
+                    inner.handle,
+                    (*req).buf,
+                    (*req).bytes,
+                    core::ptr::null_mut(),
+                    &mut (*req).ovl,
+                )
+            } else {
+                if inner.readonly {
+                    inner.inflight.fetch_sub(1, Ordering::Relaxed);
+                    inner.errors.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+                WriteFile(
+                    inner.handle,
+                    (*req).buf,
+                    (*req).bytes,
+                    core::ptr::null_mut(),
+                    &mut (*req).ovl,
+                )
+            };
+            if started == 0 {
+                let err = GetLastError();
+                if err != ERROR_IO_PENDING {
+                    inner.inflight.fetch_sub(1, Ordering::Relaxed);
+                    inner.errors.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
             }
-            WriteFile(
-                inner.handle,
-                (*req).buf,
-                (*req).bytes,
-                core::ptr::null_mut(),
-                &mut (*req).ovl,
-            )
-        };
-        if started == 0 {
-            let err = GetLastError();
-            if err != ERROR_IO_PENDING {
-                inner.inflight.fetch_sub(1, Ordering::Relaxed);
-                inner.errors.fetch_add(1, Ordering::Relaxed);
-                return false;
-            }
+            true
         }
-        true
     }
 }
 

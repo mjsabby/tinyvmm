@@ -4,14 +4,14 @@
 
 use crate::devices::io_bus::{IoAccess, IoBus};
 use crate::devices::mmio_bus::{MmioAccess, MmioBus};
-use crate::whp::cpuid::{resolve_cpuid, CpuidContext};
+use crate::whp::cpuid::{CpuidContext, resolve_cpuid};
 use crate::whp::emulator::{EmuError, Emulator, EmulatorBus};
 use crate::whp::hv::{HvEnlightenment, MsrHandled};
 use crate::whp::regs::reg64;
-use crate::whp::vcpu::{exit_reason_name, Exit, ExitReason, Vcpu};
+use crate::whp::vcpu::{Exit, ExitReason, Vcpu, exit_reason_name};
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use windows_sys::Win32::System::Hypervisor::{
     WHvRegisterPendingInterruption, WHvX64RegisterRax, WHvX64RegisterRbx, WHvX64RegisterRcx,
     WHvX64RegisterRdx, WHvX64RegisterRip,

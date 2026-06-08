@@ -18,7 +18,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::virtio::device::{
-    VirtioDevice, DEVICE_ID_P9, FEATURE_RING_EVENT_IDX, FEATURE_VERSION_1,
+    DEVICE_ID_P9, FEATURE_RING_EVENT_IDX, FEATURE_VERSION_1, VirtioDevice,
 };
 use crate::virtio::queue::{ChainBuf, ChainScratch, Virtqueue};
 use crate::whp::GuestMemory;
@@ -534,7 +534,7 @@ impl SlotPool {
     /// SAFETY: the caller must currently own slot `i` per the handoff discipline.
     #[allow(clippy::mut_from_ref)]
     unsafe fn slot(&self, i: u16) -> &mut P9Slot {
-        &mut *self.slots[i as usize].get()
+        unsafe { &mut *self.slots[i as usize].get() }
     }
 }
 

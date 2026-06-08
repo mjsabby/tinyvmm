@@ -457,9 +457,10 @@ mod tests {
             2,
             CMD_MEMORY_SPACE as u32 | CMD_IO_SPACE as u32,
         );
-        assert!(ev
-            .iter()
-            .any(|e| matches!(e, BarEvent::Unmapped { idx: 0 })));
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, BarEvent::Unmapped { idx: 0 }))
+        );
         assert!(ev.iter().any(|e| matches!(
             e,
             BarEvent::Mapped {

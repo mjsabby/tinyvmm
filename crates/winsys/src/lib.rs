@@ -24,7 +24,7 @@ pub mod qpc;
 pub mod sock;
 pub mod wintun;
 
-pub use error::{check_hr, succeeded, Error, Result};
+pub use error::{Error, Result, check_hr, succeeded};
 pub use host::block_file;
 pub use host::mapped_file;
 pub use ptr::SharedPtr;

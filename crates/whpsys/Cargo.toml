@@ -1,7 +1,7 @@
 [package]
 name = "whpsys"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "Safe wrappers over the Windows Hypervisor Platform (WHP): partition, guest memory, virtual processors, MSI injection. Concentrates the hypervisor-FFI unsafe in one auditable crate."
 license = "MIT"
 

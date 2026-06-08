@@ -3,7 +3,7 @@
 //! Port of src/virtio/virtio_console.cpp.
 
 use crate::virtio::device::{
-    VirtioDevice, DEVICE_ID_CONSOLE, FEATURE_RING_EVENT_IDX, FEATURE_VERSION_1,
+    DEVICE_ID_CONSOLE, FEATURE_RING_EVENT_IDX, FEATURE_VERSION_1, VirtioDevice,
 };
 use crate::virtio::queue::{ChainScratch, PoppedChain, Virtqueue};
 use crate::whp::GuestMemory;

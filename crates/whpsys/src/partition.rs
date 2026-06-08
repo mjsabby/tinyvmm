@@ -1,13 +1,13 @@
 //! RAII wrapper around a WHV partition handle.
 
-use crate::error::{check_hr, Result};
+use crate::error::{Result, check_hr};
 use core::ffi::c_void;
 use windows_sys::Win32::System::Hypervisor::{
-    WHvCreatePartition, WHvDeletePartition, WHvPartitionPropertyCodeCpuidResultList,
-    WHvPartitionPropertyCodeExceptionExitBitmap, WHvPartitionPropertyCodeExtendedVmExits,
-    WHvPartitionPropertyCodeLocalApicEmulationMode, WHvPartitionPropertyCodeProcessorCount,
-    WHvSetPartitionProperty, WHvSetupPartition, WHV_PARTITION_HANDLE, WHV_PARTITION_PROPERTY_CODE,
-    WHV_X64_CPUID_RESULT, WHV_X64_LOCAL_APIC_EMULATION_MODE,
+    WHV_PARTITION_HANDLE, WHV_PARTITION_PROPERTY_CODE, WHV_X64_CPUID_RESULT,
+    WHV_X64_LOCAL_APIC_EMULATION_MODE, WHvCreatePartition, WHvDeletePartition,
+    WHvPartitionPropertyCodeCpuidResultList, WHvPartitionPropertyCodeExceptionExitBitmap,
+    WHvPartitionPropertyCodeExtendedVmExits, WHvPartitionPropertyCodeLocalApicEmulationMode,
+    WHvPartitionPropertyCodeProcessorCount, WHvSetPartitionProperty, WHvSetupPartition,
 };
 
 pub struct Partition {

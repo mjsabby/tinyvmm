@@ -13,15 +13,15 @@ use super::wide;
 use crate::error::{Error, Result};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, GENERIC_READ, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, GetFileSizeEx, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_SEQUENTIAL_SCAN, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_SEQUENTIAL_SCAN, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, GetFileSizeEx, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS,
-    PAGE_READONLY,
+    CreateFileMappingW, FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READONLY,
+    UnmapViewOfFile,
 };
 
 pub struct MappedFile {

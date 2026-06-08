@@ -3,7 +3,7 @@
 //! src/pci/pci_bus.cpp.
 
 use super::config::BarKind;
-use super::{decode_config_address, Bdf, PciFunction, CONFIG_ADDRESS_PORT, CONFIG_DATA_PORT};
+use super::{Bdf, CONFIG_ADDRESS_PORT, CONFIG_DATA_PORT, PciFunction, decode_config_address};
 use crate::devices::io_bus::{IoAccess, IoBus};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};

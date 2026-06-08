@@ -11,16 +11,16 @@
 //! Callers pass NUL-terminated UTF-16 paths (`&[u16]`); building those (and any
 //! `\\?\` long-path / path-security policy) stays the caller's concern.
 
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, FILETIME, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, GetLastError, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, CreateFileW, DeleteFileW, FindClose, FindFirstFileW, FindNextFileW,
+    BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, DeleteFileW,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_BEGIN, FindClose, FindFirstFileW, FindNextFileW,
     FlushFileBuffers, GetDiskFreeSpaceExW, GetFileAttributesW, GetFileInformationByHandle,
     GetFinalPathNameByHandleW, MoveFileExW, ReadFile, RemoveDirectoryW, SetEndOfFile,
-    SetFilePointerEx, SetFileTime, WriteFile, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_BEGIN, WIN32_FIND_DATAW,
+    SetFilePointerEx, SetFileTime, WIN32_FIND_DATAW, WriteFile,
 };
-use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
 use windows_sys::Win32::System::IO::OVERLAPPED;
+use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
 
 pub use windows_sys::Win32::Foundation::HANDLE;
 

@@ -5,7 +5,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use windows_sys::Win32::System::Hypervisor::{
-    WHvRequestInterrupt, WHV_INTERRUPT_CONTROL, WHV_PARTITION_HANDLE,
+    WHV_INTERRUPT_CONTROL, WHV_PARTITION_HANDLE, WHvRequestInterrupt,
 };
 
 static MSI_INJECT_COUNT: AtomicU64 = AtomicU64::new(0);

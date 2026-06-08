@@ -2,4 +2,4 @@
 //! wrappers can share it). Re-exported here as `crate::error` so existing paths
 //! throughout the binary keep working unchanged.
 
-pub use winsys::error::{check_hr, Error, Result};
+pub use winsys::error::{Error, Result, check_hr};

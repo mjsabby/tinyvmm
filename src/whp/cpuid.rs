@@ -4,8 +4,8 @@
 //! src/whp/cpuid.cpp.
 
 use core::arch::x86_64::{__cpuid, __cpuid_count, _rdtsc};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::System::Hypervisor::WHV_X64_CPUID_RESULT;
 
 #[derive(Clone, Copy, Default)]

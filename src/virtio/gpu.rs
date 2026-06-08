@@ -24,7 +24,7 @@
 
 use crate::diag::etw;
 use crate::virtio::device::{
-    VirtioDevice, DEVICE_ID_GPU, FEATURE_RING_EVENT_IDX, FEATURE_VERSION_1,
+    DEVICE_ID_GPU, FEATURE_RING_EVENT_IDX, FEATURE_VERSION_1, VirtioDevice,
 };
 use crate::virtio::queue::{ChainScratch, PoppedChain, Virtqueue};
 use crate::whp::GuestMemory;
@@ -382,11 +382,7 @@ impl GpuDevice {
             }
             ok
         };
-        if ok {
-            RESP_OK_NODATA
-        } else {
-            RESP_ERR_UNSPEC
-        }
+        if ok { RESP_OK_NODATA } else { RESP_ERR_UNSPEC }
     }
 
     fn cmd_attach_backing(&self, st: &mut GpuState) -> u32 {

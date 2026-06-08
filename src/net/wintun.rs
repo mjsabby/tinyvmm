@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects};
-use winsys::wintun::{assign_unicast_ipv4, last_error, AdapterHandle, SessionHandle, WintunApi};
+use winsys::wintun::{AdapterHandle, SessionHandle, WintunApi, assign_unicast_ipv4, last_error};
 
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const ETHERTYPE_ARP: u16 = 0x0806;

@@ -4,8 +4,8 @@
 //! Control register (enable/funcmask) here via `set_control` after each config
 //! write, so the hot Trigger path never touches the config-space lock.
 
-use super::config::PciConfigSpace;
 use super::CAP_ID_MSIX;
+use super::config::PciConfigSpace;
 use crate::devices::mmio_bus::{MmioAccess, MmioBus};
 use crate::diag::etw;
 use crate::whp::msi::inject_msi;
@@ -134,11 +134,7 @@ impl MsiX {
         let table_size = num_vectors * 16;
         let pba_size = num_vectors.div_ceil(64) * 8;
         let hi = (table_offset + table_size).max(pba_offset + pba_size);
-        if hi < 16 {
-            16
-        } else {
-            next_pow2(hi)
-        }
+        if hi < 16 { 16 } else { next_pow2(hi) }
     }
 
     /// Write the MSI-X capability into a config space (construction-time).

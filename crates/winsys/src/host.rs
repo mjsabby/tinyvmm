@@ -12,7 +12,7 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 use std::sync::OnceLock;
 
 use windows_sys::Win32::Security::Cryptography::{
-    BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+    BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
 };
 
 pub mod block_file;

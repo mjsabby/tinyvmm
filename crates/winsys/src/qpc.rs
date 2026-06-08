@@ -18,9 +18,5 @@ pub fn frequency() -> i64 {
     let mut f: i64 = 0;
     // SAFETY: as above.
     unsafe { QueryPerformanceFrequency(&mut f) };
-    if f == 0 {
-        1
-    } else {
-        f
-    }
+    if f == 0 { 1 } else { f }
 }

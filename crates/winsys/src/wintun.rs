@@ -9,13 +9,13 @@
 //! domain-side operation, mirroring guest-buffer access).
 
 use core::ffi::c_void;
-use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{GetLastError, HANDLE, HMODULE};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     CreateUnicastIpAddressEntry, InitializeUnicastIpAddressEntry, MIB_UNICASTIPADDRESS_ROW,
 };
 use windows_sys::Win32::Networking::WinSock::{AF_INET, IN_ADDR, IN_ADDR_0, SOCKADDR_IN};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows_sys::core::GUID;
 
 /// Opaque WinTun adapter handle (WINTUN_ADAPTER_HANDLE).
 pub type AdapterHandle = *mut c_void;
@@ -63,10 +63,12 @@ impl WintunApi {
             ));
         }
         unsafe fn sym(m: HMODULE, name: &str) -> Result<*const (), String> {
-            let c: Vec<u8> = name.bytes().chain([0]).collect();
-            match GetProcAddress(m, c.as_ptr()) {
-                Some(f) => Ok(f as *const ()),
-                None => Err(format!("wintun.dll missing export {name}")),
+            unsafe {
+                let c: Vec<u8> = name.bytes().chain([0]).collect();
+                match GetProcAddress(m, c.as_ptr()) {
+                    Some(f) => Ok(f as *const ()),
+                    None => Err(format!("wintun.dll missing export {name}")),
+                }
             }
         }
         unsafe {

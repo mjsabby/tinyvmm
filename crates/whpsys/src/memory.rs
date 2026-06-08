@@ -1,17 +1,17 @@
 //! One contiguous slab of guest physical memory backed by a host VirtualAlloc
 //! region and mapped into the partition at a fixed GPA.
 
-use crate::error::{check_hr, Error, Result};
+use crate::error::{Error, Result, check_hr};
 use crate::host;
 use core::ffi::c_void;
 use std::sync::atomic::{AtomicU16, Ordering};
 use windows_sys::Win32::System::Hypervisor::{
-    WHvMapGpaRange, WHvMapGpaRangeFlagExecute, WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite,
-    WHvUnmapGpaRange, WHV_PARTITION_HANDLE,
+    WHV_PARTITION_HANDLE, WHvMapGpaRange, WHvMapGpaRangeFlagExecute, WHvMapGpaRangeFlagRead,
+    WHvMapGpaRangeFlagWrite, WHvUnmapGpaRange,
 };
 use windows_sys::Win32::System::Memory::{
-    VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_LARGE_PAGES, MEM_RELEASE, MEM_RESERVE,
-    PAGE_READWRITE,
+    MEM_COMMIT, MEM_LARGE_PAGES, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+    VirtualFree,
 };
 use winsys::SharedPtr;
 

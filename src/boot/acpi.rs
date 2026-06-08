@@ -62,7 +62,7 @@ pub fn build(gpa_base: u64, vcpu_count: u32) -> Vec<u8> {
         let e = MADT_OFFSET + 44 + (i as usize) * 16;
         buf[e] = 9; // type: Local x2APIC
         buf[e + 1] = 16; // length
-                         // reserved u16 @ +2 stays 0
+        // reserved u16 @ +2 stays 0
         put_u32(&mut buf, e + 4, i); // local_apic_id
         put_u32(&mut buf, e + 8, 1); // flags: enabled
         put_u32(&mut buf, e + 12, i); // acpi_processor_uid

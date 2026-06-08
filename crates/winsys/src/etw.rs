@@ -26,15 +26,15 @@
 
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::OnceLock;
-use windows_sys::core::GUID;
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, Ordering};
 use windows_sys::Win32::System::Diagnostics::Etw::{
-    EventProviderSetTraits, EventRegister, EventSetInformation, EventUnregister,
-    EventWriteTransfer, EVENT_DATA_DESCRIPTOR, EVENT_DATA_DESCRIPTOR_0, EVENT_DATA_DESCRIPTOR_0_0,
+    EVENT_DATA_DESCRIPTOR, EVENT_DATA_DESCRIPTOR_0, EVENT_DATA_DESCRIPTOR_0_0,
     EVENT_DATA_DESCRIPTOR_TYPE_EVENT_METADATA, EVENT_DATA_DESCRIPTOR_TYPE_PROVIDER_METADATA,
-    EVENT_DESCRIPTOR, EVENT_FILTER_DESCRIPTOR,
+    EVENT_DESCRIPTOR, EVENT_FILTER_DESCRIPTOR, EventProviderSetTraits, EventRegister,
+    EventSetInformation, EventUnregister, EventWriteTransfer,
 };
+use windows_sys::core::GUID;
 
 // Provider: "Tinyvmm-Core" / {0fb6c4d5-9b9b-4e1f-9d5a-7a6d8a9b3c4d} (matches C++).
 const PROVIDER_NAME: &str = "Tinyvmm-Core";

@@ -9,11 +9,12 @@
 use crate::vcpu::Exit;
 use core::ffi::c_void;
 use windows_sys::Win32::System::Hypervisor::{
-    WHvEmulatorCreateEmulator, WHvEmulatorDestroyEmulator, WHvEmulatorTryIoEmulation,
-    WHvEmulatorTryMmioEmulation, WHvGetVirtualProcessorRegisters, WHvSetVirtualProcessorRegisters,
-    WHvTranslateGvaResultPrivilegeViolation, WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_IO_ACCESS_INFO,
-    WHV_EMULATOR_MEMORY_ACCESS_INFO, WHV_EMULATOR_STATUS, WHV_PARTITION_HANDLE, WHV_REGISTER_NAME,
-    WHV_REGISTER_VALUE, WHV_TRANSLATE_GVA_FLAGS, WHV_TRANSLATE_GVA_RESULT_CODE,
+    WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_IO_ACCESS_INFO, WHV_EMULATOR_MEMORY_ACCESS_INFO,
+    WHV_EMULATOR_STATUS, WHV_PARTITION_HANDLE, WHV_REGISTER_NAME, WHV_REGISTER_VALUE,
+    WHV_TRANSLATE_GVA_FLAGS, WHV_TRANSLATE_GVA_RESULT_CODE, WHvEmulatorCreateEmulator,
+    WHvEmulatorDestroyEmulator, WHvEmulatorTryIoEmulation, WHvEmulatorTryMmioEmulation,
+    WHvGetVirtualProcessorRegisters, WHvSetVirtualProcessorRegisters,
+    WHvTranslateGvaResultPrivilegeViolation,
 };
 use winsys::SharedPtr;
 
@@ -165,41 +166,45 @@ unsafe extern "system" fn on_io_port(
     context: *const c_void,
     io: *mut WHV_EMULATOR_IO_ACCESS_INFO,
 ) -> i32 {
-    let c = &*(context as *const EmuCtx);
-    let io = &mut *io;
-    let mut acc = IoAccess {
-        port: io.Port,
-        access_size: io.AccessSize,
-        is_write: io.Direction == 1,
-        value: io.Data,
-    };
-    c.bus.io(&mut acc);
-    if !acc.is_write {
-        io.Data = acc.value;
+    unsafe {
+        let c = &*(context as *const EmuCtx);
+        let io = &mut *io;
+        let mut acc = IoAccess {
+            port: io.Port,
+            access_size: io.AccessSize,
+            is_write: io.Direction == 1,
+            value: io.Data,
+        };
+        c.bus.io(&mut acc);
+        if !acc.is_write {
+            io.Data = acc.value;
+        }
+        0 // S_OK
     }
-    0 // S_OK
 }
 
 unsafe extern "system" fn on_memory(
     context: *const c_void,
     mem: *mut WHV_EMULATOR_MEMORY_ACCESS_INFO,
 ) -> i32 {
-    let c = &*(context as *const EmuCtx);
-    let mem = &mut *mem;
-    let mut acc = MmioAccess {
-        gpa: mem.GpaAddress,
-        access_size: mem.AccessSize,
-        is_write: mem.Direction == 1,
-        data: [0u8; 8],
-    };
-    if acc.is_write {
-        acc.data = mem.Data;
+    unsafe {
+        let c = &*(context as *const EmuCtx);
+        let mem = &mut *mem;
+        let mut acc = MmioAccess {
+            gpa: mem.GpaAddress,
+            access_size: mem.AccessSize,
+            is_write: mem.Direction == 1,
+            data: [0u8; 8],
+        };
+        if acc.is_write {
+            acc.data = mem.Data;
+        }
+        c.bus.mmio(&mut acc);
+        if !acc.is_write {
+            mem.Data = acc.data;
+        }
+        0
     }
-    c.bus.mmio(&mut acc);
-    if !acc.is_write {
-        mem.Data = acc.data;
-    }
-    0
 }
 
 unsafe extern "system" fn on_get_registers(
@@ -208,8 +213,10 @@ unsafe extern "system" fn on_get_registers(
     count: u32,
     values: *mut WHV_REGISTER_VALUE,
 ) -> i32 {
-    let c = &*(context as *const EmuCtx);
-    WHvGetVirtualProcessorRegisters(c.part, c.vp, names, count, values)
+    unsafe {
+        let c = &*(context as *const EmuCtx);
+        WHvGetVirtualProcessorRegisters(c.part, c.vp, names, count, values)
+    }
 }
 
 unsafe extern "system" fn on_set_registers(
@@ -218,8 +225,10 @@ unsafe extern "system" fn on_set_registers(
     count: u32,
     values: *const WHV_REGISTER_VALUE,
 ) -> i32 {
-    let c = &*(context as *const EmuCtx);
-    WHvSetVirtualProcessorRegisters(c.part, c.vp, names, count, values)
+    unsafe {
+        let c = &*(context as *const EmuCtx);
+        WHvSetVirtualProcessorRegisters(c.part, c.vp, names, count, values)
+    }
 }
 
 unsafe extern "system" fn on_translate_gva(
@@ -229,7 +238,9 @@ unsafe extern "system" fn on_translate_gva(
     result_code: *mut WHV_TRANSLATE_GVA_RESULT_CODE,
     _gpa: *mut u64,
 ) -> i32 {
-    // Fail closed -- our minimal device model never exercises GVA translation.
-    *result_code = WHvTranslateGvaResultPrivilegeViolation;
-    -2147467263 // E_NOTIMPL
+    unsafe {
+        // Fail closed -- our minimal device model never exercises GVA translation.
+        *result_code = WHvTranslateGvaResultPrivilegeViolation;
+        -2147467263 // E_NOTIMPL
+    }
 }

@@ -26,11 +26,11 @@
 
 use crate::diag::etw;
 use crate::virtio::device::{
-    VirtioDevice, DEVICE_ID_INPUT, FEATURE_RING_EVENT_IDX, FEATURE_VERSION_1,
+    DEVICE_ID_INPUT, FEATURE_RING_EVENT_IDX, FEATURE_VERSION_1, VirtioDevice,
 };
 use crate::virtio::queue::{ChainScratch, PoppedChain, QueueState, Virtqueue};
 use crate::whp::GuestMemory;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub const EVENT_QUEUE: u32 = 0;

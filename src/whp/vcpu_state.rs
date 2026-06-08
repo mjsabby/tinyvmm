@@ -11,23 +11,23 @@
 use crate::error::{Error, Result};
 use crate::whp::vcpu::Vcpu;
 use windows_sys::Win32::System::Hypervisor::{
-    WHvRegisterInternalActivityState, WHvRegisterInterruptState, WHvRegisterPendingInterruption,
-    WHvX64RegisterApicBase, WHvX64RegisterCr0, WHvX64RegisterCr2, WHvX64RegisterCr3,
-    WHvX64RegisterCr4, WHvX64RegisterCr8, WHvX64RegisterCs, WHvX64RegisterCstar,
+    WHV_REGISTER_NAME, WHvRegisterInternalActivityState, WHvRegisterInterruptState,
+    WHvRegisterPendingInterruption, WHvX64RegisterApicBase, WHvX64RegisterCr0, WHvX64RegisterCr2,
+    WHvX64RegisterCr3, WHvX64RegisterCr4, WHvX64RegisterCr8, WHvX64RegisterCs, WHvX64RegisterCstar,
     WHvX64RegisterDeliverabilityNotifications, WHvX64RegisterDr0, WHvX64RegisterDr1,
     WHvX64RegisterDr2, WHvX64RegisterDr3, WHvX64RegisterDr6, WHvX64RegisterDr7, WHvX64RegisterDs,
     WHvX64RegisterEfer, WHvX64RegisterEs, WHvX64RegisterFs, WHvX64RegisterGdtr, WHvX64RegisterGs,
     WHvX64RegisterIdtr, WHvX64RegisterInterruptSspTableAddr, WHvX64RegisterKernelGsBase,
     WHvX64RegisterLdtr, WHvX64RegisterLstar, WHvX64RegisterPat, WHvX64RegisterPl0Ssp,
-    WHvX64RegisterPl1Ssp, WHvX64RegisterPl2Ssp, WHvX64RegisterPl3Ssp, WHvX64RegisterR10,
-    WHvX64RegisterR11, WHvX64RegisterR12, WHvX64RegisterR13, WHvX64RegisterR14, WHvX64RegisterR15,
-    WHvX64RegisterR8, WHvX64RegisterR9, WHvX64RegisterRax, WHvX64RegisterRbp, WHvX64RegisterRbx,
+    WHvX64RegisterPl1Ssp, WHvX64RegisterPl2Ssp, WHvX64RegisterPl3Ssp, WHvX64RegisterR8,
+    WHvX64RegisterR9, WHvX64RegisterR10, WHvX64RegisterR11, WHvX64RegisterR12, WHvX64RegisterR13,
+    WHvX64RegisterR14, WHvX64RegisterR15, WHvX64RegisterRax, WHvX64RegisterRbp, WHvX64RegisterRbx,
     WHvX64RegisterRcx, WHvX64RegisterRdi, WHvX64RegisterRdx, WHvX64RegisterRflags,
     WHvX64RegisterRip, WHvX64RegisterRsi, WHvX64RegisterRsp, WHvX64RegisterSCet,
     WHvX64RegisterSfmask, WHvX64RegisterSs, WHvX64RegisterSsp, WHvX64RegisterStar,
     WHvX64RegisterSysenterCs, WHvX64RegisterSysenterEip, WHvX64RegisterSysenterEsp,
     WHvX64RegisterTr, WHvX64RegisterTsc, WHvX64RegisterTscAux, WHvX64RegisterUCet,
-    WHvX64RegisterXCr0, WHvX64RegisterXss, WHV_REGISTER_NAME,
+    WHvX64RegisterXCr0, WHvX64RegisterXss,
 };
 
 pub const ARCH_REGS: &[WHV_REGISTER_NAME] = &[
