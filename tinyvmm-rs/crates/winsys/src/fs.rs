@@ -17,8 +17,9 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, DeleteFileW, FindClose, FindFirstFileW, FindNextFileW,
     FlushFileBuffers, GetDiskFreeSpaceExW, GetFileAttributesW, GetFileInformationByHandle,
-    MoveFileExW, ReadFile, RemoveDirectoryW, SetEndOfFile, SetFilePointerEx, SetFileTime, WriteFile,
-    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_BEGIN, WIN32_FIND_DATAW,
+    GetFinalPathNameByHandleW, MoveFileExW, ReadFile, RemoveDirectoryW, SetEndOfFile,
+    SetFilePointerEx, SetFileTime, WriteFile, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_BEGIN, WIN32_FIND_DATAW,
 };
 use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
 use windows_sys::Win32::System::IO::OVERLAPPED;
@@ -88,6 +89,32 @@ pub fn close(h: HANDLE) {
     if !h.is_null() && h != INVALID_HANDLE_VALUE {
         unsafe { CloseHandle(h) };
     }
+}
+
+/// Resolve an open handle to its final canonical path (`\\?\C:\...`, with
+/// symlinks / junctions / mount points fully resolved) via
+/// `GetFinalPathNameByHandleW` (flags 0 == `FILE_NAME_NORMALIZED |
+/// VOLUME_NAME_DOS`). Returns the NUL-free UTF-16 path, or `None` on failure.
+///
+/// The 9p backend uses this to re-check that an opened handle still lands inside
+/// the share root: a lexical path check passes for a reparse point that lives
+/// inside the share but targets a directory outside it, so the *real* path of
+/// the opened handle must be re-validated to defeat that escape.
+pub fn final_path_by_handle(h: HANDLE) -> Option<Vec<u16>> {
+    // First probe with a zero-length buffer: the return is the required length
+    // INCLUDING the terminating NUL.
+    let needed = unsafe { GetFinalPathNameByHandleW(h, core::ptr::null_mut(), 0, 0) };
+    if needed == 0 {
+        return None;
+    }
+    let mut buf = vec![0u16; needed as usize];
+    // On success the return is the length WITHOUT the NUL (and < needed).
+    let written = unsafe { GetFinalPathNameByHandleW(h, buf.as_mut_ptr(), needed, 0) };
+    if written == 0 || written >= needed {
+        return None;
+    }
+    buf.truncate(written as usize);
+    Some(buf)
 }
 
 /// `GetFileInformationByHandle` decoded into a [`FileInfo`].

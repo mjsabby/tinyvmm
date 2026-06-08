@@ -471,6 +471,64 @@ if grep -q 'tinyvmm.test=snapshot' /proc/cmdline 2>/dev/null; then
     exec cat
 fi
 
+# --- optional virtio-9p save/restore round-trip test --------------------
+# Enabled via kernel cmdline marker `tinyvmm.test=p9snapshot`. Driven by
+# tools/p9_save_restore_test.py, which stages a host dir containing
+# snapfile.txt (a known marker) exposed as 9p tag "host", then runs --save
+# followed by --restore against the same kernel + initramfs.
+#
+# This block proves an OPEN 9p fid survives a snapshot:
+#   * mount the share and OPEN snapfile.txt on FD 3 (this issues a 9p Tlopen,
+#     so the host holds an OPEN fid for that file),
+#   * fire /bin/cpuid_trigger while FD 3 is still held open,
+#   * on --save the host captures the fid table (FD 3's fid marked open) + RAM
+#     and exits; nothing past the trigger runs in the save invocation,
+#   * on --restore the host reopens FD 3's backing handle from the captured
+#     path (P9Device::apply_device_state), the vCPU resumes past the cpuid, and
+#     this block reads snapfile.txt back through the SAME FD 3 -- which only
+#     works if the open fid was captured and its host handle reopened.
+# A brand-new open (fresh fid) is re-checked too. The 9p share root itself is
+# reconstructed from the snapshot header, so --restore needs no --virtio-9p-share.
+if grep -q 'tinyvmm.test=p9snapshot' /proc/cmdline 2>/dev/null; then
+    log "--- P9SNAP-TEST start ---"
+    mkdir -p /mnt/p9
+    if mount -t 9p -o trans=virtio,version=9p2000.L,msize=1048576 host /mnt/p9 2>/dev/kmsg; then
+        log "P9SNAP: mounted tag=host -> /mnt/p9"
+        if [ -r /mnt/p9/snapfile.txt ]; then
+            exec 3< /mnt/p9/snapfile.txt
+            PRE=$(head -c 64 /mnt/p9/snapfile.txt)
+            log "P9SNAP: pre-trigger read [$PRE]"
+            log "P9SNAP: pre-trigger sentinel"
+            sync
+            sleep 1
+            # Snapshot fires here while FD 3 (an open 9p fid) is held open.
+            /bin/cpuid_trigger
+            rc=$?
+            log "P9SNAP: POST-RESTORE-CONTINUE rc=$rc"
+            # Read the fixture back through the SAME still-open FD 3 (offset 0):
+            # exercises the host fid reopened by apply_device_state on restore.
+            POST=$(head -c 64 <&3)
+            log "P9SNAP: post-restore read [$POST]"
+            # A brand-new open (fresh fid) must also still work post-restore.
+            FRESH=$(head -c 64 /mnt/p9/snapfile.txt)
+            log "P9SNAP: post-restore fresh-read [$FRESH]"
+            exec 3<&-
+        else
+            log "P9SNAP: FAIL snapfile.txt not readable"
+        fi
+        umount /mnt/p9 2>/dev/kmsg && log "P9SNAP: umount ok" || log "P9SNAP: umount FAIL"
+    else
+        log "P9SNAP: FAIL mount"
+    fi
+    log "--- P9SNAP-TEST end ---"
+    sync
+    sleep 1
+    log "=== tinyvmm shutdown requested ==="
+    sleep 1
+    poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
+    exec cat
+fi
+
 # --- optional TSC-watchdog stress mode ----------------------------------
 # Enabled via kernel cmdline marker `tinyvmm.test=tsc`. Spins one busy
 # `yes`-into-/dev/null loop on every online CPU for ~20s to give Linux's

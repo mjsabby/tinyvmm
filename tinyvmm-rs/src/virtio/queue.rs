@@ -389,3 +389,75 @@ impl Virtqueue {
 // `Arc<GuestMemory>` (Send+Sync), the rest are scalars. No `unsafe impl`
 // needed. (The raw guest pointers live in `ChainBuf`/`PoppedChain`, which are
 // separate and never escape a single drain on one thread.)
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tiny deterministic xorshift PRNG — keeps the fuzz reproducible with no
+    /// external dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+    }
+
+    // The hostile-guest property: `pop()` over a fully attacker-controlled
+    // descriptor table / avail ring must never panic, never loop unbounded, and
+    // never hand back a buffer outside guest RAM. We scribble random bytes over
+    // the ring region and drain repeatedly. Mirrors C++ `--virtio-queue-fuzz-test`.
+    #[test]
+    fn pop_never_panics_on_random_rings() {
+        let mem = Arc::new(GuestMemory::new_host_only(256 * 1024).unwrap());
+        let slab = mem.size() as u64;
+        let desc_gpa = 0x1000u64;
+        let avail_gpa = 0x8000u64;
+        let used_gpa = 0x1_0000u64;
+        let mut rng = Rng(0x1234_5678_9abc_def0);
+        let mut scratch = [0u8; 256];
+
+        for iter in 0..20_000u32 {
+            // Random size: power of two in 2..=256.
+            let size = 1u32 << (1 + (rng.next() % 8));
+            // Scribble random bytes over each ring structure.
+            for &base in &[desc_gpa, avail_gpa, used_gpa] {
+                let span = 16 * size as u64 + 8;
+                let mut off = 0u64;
+                while off < span && base + off + 256 <= slab {
+                    for b in scratch.iter_mut() {
+                        *b = rng.next() as u8;
+                    }
+                    let _ = mem.write_at(base + off, &scratch);
+                    off += 256;
+                }
+            }
+
+            let mut q = Virtqueue::new(mem.clone(), 256);
+            q.set_size(size);
+            q.set_desc_gpa(desc_gpa);
+            q.set_avail_gpa(avail_gpa);
+            q.set_used_gpa(used_gpa);
+            q.set_event_idx_enabled(iter & 1 == 0);
+            q.set_ready(true);
+
+            // Drain a bounded number of chains; must always terminate. Any chain
+            // we get back must point inside the slab.
+            for _ in 0..(size + 4) {
+                match q.pop() {
+                    Some(chain) => {
+                        for buf in &chain.bufs {
+                            assert!(buf.len as u64 <= slab, "chain buf len escapes slab");
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+}

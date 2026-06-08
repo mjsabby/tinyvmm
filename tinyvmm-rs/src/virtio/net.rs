@@ -136,6 +136,13 @@ impl NetDevice {
         if let Some(b) = self.backend.get() {
             b.stop();
         }
+        if etw::enabled(etw::INFO, etw::kw::LIFECYCLE) {
+            let m = self.mac();
+            let mac = m.iter().fold(0u64, |a, &b| (a << 8) | b as u64);
+            etw::Event::new("NetBackendStop", etw::INFO, etw::kw::LIFECYCLE)
+                .hex64("mac", mac)
+                .write();
+        }
     }
     pub fn tx_packets(&self) -> u64 {
         self.tx_packets.load(Ordering::Relaxed)
@@ -216,6 +223,11 @@ impl NetDevice {
         {
             let mut rx = self.rx.lock().unwrap();
             let Some(idx) = rx.free.pop() else {
+                if etw::enabled(etw::VERBOSE, etw::kw::NET) {
+                    etw::Event::new("NetRxDrop", etw::VERBOSE, etw::kw::NET)
+                        .u32("len", n as u32)
+                        .write();
+                }
                 return;
             };
             rx.slots[idx as usize][..n].copy_from_slice(frame);

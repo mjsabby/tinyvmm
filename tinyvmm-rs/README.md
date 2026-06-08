@@ -689,9 +689,12 @@ there is **no extra dependency** — just the raw `EventRegister`/
 |-------|-----------------|--------|
 | `VmStart` | INFO / LIFECYCLE | kernel, ram_mb, vcpus, nics, rng, drives |
 | `VmStop` | INFO / LIFECYCLE | reason, io, cpuid, msr, uart_tx, total_ms |
+| `NetBackendStart` / `NetBackendStop` | INFO / LIFECYCLE | backend, mac |
 | `BootMark` | INFO / BOOT | phase, total_ms, delta_ms |
 | `VmExit` | VERBOSE / VMEXIT | reason, vp, rip |
 | `NetTx` / `NetRx` | VERBOSE / NET | len |
+| `NetTxDrop` / `NetRxDrop` | VERBOSE / NET | len |
+| `MsiInject` | VERBOSE / MSI | vector, addr, data |
 | `RngFill` | VERBOSE / VIRTIO | ops, bytes |
 | `BlkSubmit` | VERBOSE / BLOCK | type, sector, segs, head |
 | `BlkComplete` | VERBOSE / BLOCK | type, used_len, failed, head |

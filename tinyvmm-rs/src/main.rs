@@ -124,6 +124,8 @@ fn print_usage() {
          \n\
          Usage:\n\
          \x20 tinyvmm --smoke\n\
+         \x20 tinyvmm --blk-selftest        host-side virtio-blk DISCARD/WRITE_ZEROES test\n\
+         \x20 tinyvmm --pci-selftest        host-side PCI host-bridge + BAR + sizing test\n\
          \x20 tinyvmm --pvh-info <vmlinux>\n\
          \x20 tinyvmm --pvh-run [--initrd <cpio>] [--ram-mb N] [--vcpus N] [--rng]\n\
          \x20              [--net [--net-backend loopback|nat] [--portfwd H:G]...]...  (repeat --net per NIC)\n\
@@ -131,7 +133,8 @@ fn print_usage() {
          \x20              [--virtio-9p-share <tag>=<host_path>[,ro]]...\n\
          \x20              [--save <path> [--unsafe-save-mutable-drive]]\n\
          \x20              [--watchdog-secs N] [--debug-boot] <vmlinux> [-- <cmdline>]\n\
-         \x20 tinyvmm --restore <path>\n"
+         \x20 tinyvmm --restore <path> [--drive <path>[,ro|rw]]... [--cpu-affinity all|p|e|p-physical]\n\
+         \x20              [--watchdog-secs N] [--unsafe-restore-mutable-drive]\n"
     );
 }
 
@@ -159,12 +162,10 @@ fn check_whp_available() -> Result<()> {
 fn run_smoke() -> Result<i32> {
     check_whp_available()?;
     println!("[smoke] WHP available");
+    // Minimal partition: just a processor count + setup. No extended exits, no
+    // CPUID list, no LAPIC emulation — the smoke only needs the raw run path,
+    // and x2APIC emulation changes HLT semantics. Mirrors the C++ `RunSmoke`.
     let mut part = Partition::new(1)?;
-    part.enable_extended_exits(true, true, false)?;
-    set_hide_tsc_deadline(true);
-    let list = build_static_cpuid_result_list(true);
-    part.set_cpuid_result_list(&list)?;
-    part.set_local_apic_emulation(WHvX64LocalApicEmulationModeX2Apic)?;
     part.setup()?;
     let ram = GuestMemory::new(part.handle(), 0, 16 * 1024 * 1024, true, true)?;
     println!(
@@ -176,8 +177,58 @@ fn run_smoke() -> Result<i32> {
             "4 KiB pages"
         }
     );
-    let _vcpu = Vcpu::new(part.handle(), 0)?;
     println!("[smoke] partition + vCPU created OK (tsc_hz={})", cached_tsc_hz());
+
+    // Drop a HLT (0xF4) at GPA 0x1000 and point CS:IP at it in real mode, then
+    // run until the next exit. We expect WHvRunVpExitReasonX64Halt — this proves
+    // the whole WHP run path (map RAM, set regs, enter guest, decode exit) works,
+    // not just that the handles were created. Mirrors the C++ `RunSmoke`.
+    use crate::whp::regs::{reg64, seg};
+    use crate::whp::vcpu::{exit_reason_name, ExitReason};
+    use windows_sys::Win32::System::Hypervisor::{
+        WHvX64RegisterCs, WHvX64RegisterDs, WHvX64RegisterEs, WHvX64RegisterFs, WHvX64RegisterGs,
+        WHvX64RegisterRflags, WHvX64RegisterRip, WHvX64RegisterSs,
+    };
+
+    const CODE_GPA: u64 = 0x1000;
+    ram.write_at(CODE_GPA, &[0xF4])?;
+
+    let vcpu = Vcpu::new(part.handle(), 0)?;
+    // Real-mode segment attributes (high byte of the access rights): code =
+    // Type(0xB)|S|P = 0x9B, data = Type(0x3)|S|P = 0x93. CS.Base = CODE_GPA so
+    // CS:IP = cs:0 resolves to linear CODE_GPA. RFLAGS bit 1 is reserved-1, IF=0.
+    const CODE_ATTR: u16 = 0x9B;
+    const DATA_ATTR: u16 = 0x93;
+    let code = seg(CODE_GPA, 0xFFFF, (CODE_GPA >> 4) as u16, CODE_ATTR);
+    let data = seg(0, 0xFFFF, 0, DATA_ATTR);
+    let names = [
+        WHvX64RegisterCs,
+        WHvX64RegisterDs,
+        WHvX64RegisterEs,
+        WHvX64RegisterSs,
+        WHvX64RegisterFs,
+        WHvX64RegisterGs,
+        WHvX64RegisterRflags,
+        WHvX64RegisterRip,
+    ];
+    let values = [code, data, data, data, data, data, reg64(0x2), reg64(0)];
+    vcpu.set_registers(&names, &values)?;
+
+    println!("[smoke] running vCPU until next exit...");
+    let exit = vcpu.run_exit()?;
+    println!(
+        "[smoke] exit reason = {} RIP={:#x}",
+        exit_reason_name(exit.raw_reason()),
+        exit.rip()
+    );
+    if exit.reason() != ExitReason::Halt {
+        eprintln!(
+            "[smoke] FAIL: expected Halt, got {}",
+            exit_reason_name(exit.raw_reason())
+        );
+        return Ok(2);
+    }
+    println!("[smoke] PASS");
     Ok(0)
 }
 
@@ -310,6 +361,137 @@ fn run_blk_selftest() -> Result<i32> {
     }
 }
 
+/// A minimal host-side `PciFunction` for `--pci-selftest`: one 16 KiB 64-bit
+/// MMIO BAR over a real `PciConfigSpace`, no guest. Lets the selftest exercise
+/// the PCI host bridge (0xCF8/0xCFC routing + BAR pre-assignment + sizing)
+/// without standing up a partition. Mirrors the spirit of C++ `--pci-test`.
+struct SelftestPciDevice {
+    cfg: std::sync::Mutex<crate::pci::config::PciConfigSpace>,
+}
+
+impl SelftestPciDevice {
+    fn new() -> Arc<Self> {
+        use crate::pci::config::PciConfigSpace;
+        let mut c = PciConfigSpace::new();
+        c.set_ids(0x1AF4, 0x1052, 0x1AF4, 0x0001);
+        c.set_class(0xFF, 0x00, 0x00, 0x01);
+        c.declare_mmio64_bar(0, 0x4000, false); // 16 KiB MMIO64
+        Arc::new(SelftestPciDevice {
+            cfg: std::sync::Mutex::new(c),
+        })
+    }
+}
+
+impl PciFunction for SelftestPciDevice {
+    fn name(&self) -> &str {
+        "pci-selftest-dummy"
+    }
+    fn config_read(&self, offset: u32, size: u32) -> u32 {
+        self.cfg.lock().unwrap().read(offset, size)
+    }
+    fn config_write(&self, offset: u32, size: u32, value: u32) {
+        let _ = self.cfg.lock().unwrap().write(offset, size, value);
+    }
+    fn bar_layout(&self) -> [(crate::pci::config::BarKind, u32); 6] {
+        self.cfg.lock().unwrap().bar_layout()
+    }
+    fn assign_bar_base(&self, idx: usize, gpa: u64) {
+        self.cfg.lock().unwrap().set_bar_base(idx, gpa);
+    }
+}
+
+/// Drive one Type-0 config read through the 0xCF8/0xCFC port pair.
+fn pci_cfg_read(io: &IoBus, dev: u8, off: u32, size: u16) -> u32 {
+    use crate::devices::io_bus::IoAccess;
+    use crate::pci::CONFIG_ADDRESS_ENABLE;
+    let addr = CONFIG_ADDRESS_ENABLE | ((dev as u32) << 11) | (off & 0xFC);
+    let mut a = IoAccess { port: 0xCF8, access_size: 4, is_write: true, value: addr };
+    io.dispatch(&mut a);
+    let mut d = IoAccess {
+        port: 0xCFC + (off & 0x3) as u16,
+        access_size: size,
+        is_write: false,
+        value: 0,
+    };
+    io.dispatch(&mut d);
+    d.value
+}
+
+/// Drive one Type-0 config write through the 0xCF8/0xCFC port pair.
+fn pci_cfg_write(io: &IoBus, dev: u8, off: u32, size: u16, value: u32) {
+    use crate::devices::io_bus::IoAccess;
+    use crate::pci::CONFIG_ADDRESS_ENABLE;
+    let addr = CONFIG_ADDRESS_ENABLE | ((dev as u32) << 11) | (off & 0xFC);
+    let mut a = IoAccess { port: 0xCF8, access_size: 4, is_write: true, value: addr };
+    io.dispatch(&mut a);
+    let mut d = IoAccess {
+        port: 0xCFC + (off & 0x3) as u16,
+        access_size: size,
+        is_write: true,
+        value,
+    };
+    io.dispatch(&mut d);
+}
+
+/// Host-side PCI host-bridge selftest (no guest): builds a PciBus + one dummy
+/// device, then drives 0xCF8/0xCFC config cycles to verify ID reads, BAR
+/// pre-assignment into the MMIO window, the BAR sizing dance, and master-abort
+/// reads for absent functions. Mirrors C++ `--pci-test`.
+fn run_pci_selftest() -> Result<i32> {
+    let bus = PciBus::new();
+    let dev = SelftestPciDevice::new();
+    let bdf = bus.add_device(dev);
+    let mut io = IoBus::new();
+    bus.attach_io_bus(&mut io);
+    let d = bdf.device;
+
+    let mut fails = 0u32;
+    let mut check = |cond: bool, msg: &str| {
+        println!("[pci-selftest] {} {msg}", if cond { " ok:" } else { "FAIL:" });
+        if !cond {
+            fails += 1;
+        }
+    };
+
+    // 1. Vendor / device ID readable through CF8/CFC.
+    check(pci_cfg_read(&io, d, 0x00, 2) == 0x1AF4, "vendor id 0x1AF4");
+    check(pci_cfg_read(&io, d, 0x02, 2) == 0x1052, "device id 0x1052");
+
+    // 2. BAR0 pre-assigned into [0xE000_0000, 0xFEC0_0000) and flagged 64-bit.
+    let bar0_raw = pci_cfg_read(&io, d, 0x10, 4);
+    let bar0 = (bar0_raw & 0xFFFF_FFF0) as u64;
+    check(
+        (0xE000_0000..0xFEC0_0000).contains(&bar0),
+        "BAR0 pre-assigned in MMIO window",
+    );
+    check(bar0_raw & 0x6 == 0x4, "BAR0 advertises 64-bit memory");
+    check(
+        pci_cfg_read(&io, d, 0x14, 4) == 0,
+        "BAR0 high dword reads 0 (base < 4 GiB)",
+    );
+
+    // 3. BAR sizing dance through CF8/CFC: write all-ones, read size mask.
+    let saved = pci_cfg_read(&io, d, 0x10, 4);
+    pci_cfg_write(&io, d, 0x10, 4, 0xFFFF_FFFF);
+    let sized = pci_cfg_read(&io, d, 0x10, 4) & 0xFFFF_FFF0;
+    check((!sized).wrapping_add(1) == 0x4000, "BAR0 sizes to 16 KiB");
+    pci_cfg_write(&io, d, 0x10, 4, saved); // restore the programmed base
+
+    // 4. An absent function reads all-ones (master abort).
+    check(
+        pci_cfg_read(&io, 31, 0x00, 4) == 0xFFFF_FFFF,
+        "absent device reads all-ones",
+    );
+
+    if fails == 0 {
+        println!("[pci-selftest] PASS");
+        Ok(0)
+    } else {
+        println!("[pci-selftest] FAIL ({fails} check(s) failed)");
+        Ok(2)
+    }
+}
+
 fn run_pvh_info(args: &[String]) -> Result<i32> {
     let path = args
         .get(2)
@@ -384,10 +566,23 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
             }
             "--ram-mb" => {
                 i += 1;
-                ram_mb = args
+                let v: u32 = args
                     .get(i)
                     .and_then(|s| s.parse().ok())
-                    .ok_or_else(|| Error::msg("--ram-mb wants an integer"))?;
+                    .ok_or_else(|| {
+                        Error::msg("--ram-mb wants a positive integer in MiB (128..3584)")
+                    })?;
+                // Hard range: the PCI MMIO window opens at 0xE000_0000 = 3584 MiB,
+                // so a larger contiguous region would collide with device BARs.
+                // Reject (don't clamp) so a typo surfaces instead of silently
+                // running a differently-sized VM. Mirrors the C++ --ram-mb.
+                if !(128..=3584).contains(&v) {
+                    return Err(Error::msg(format!(
+                        "--ram-mb: {v} out of range [128..3584] MiB (>3584 needs a low/high \
+                         RAM split around the PCI MMIO hole; not supported)"
+                    )));
+                }
+                ram_mb = v;
             }
             "--vcpus" => {
                 i += 1;
@@ -590,7 +785,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
         vmlinux,
         cmdline,
         initrd,
-        ram_mb: ram_mb.clamp(128, 3584),
+        ram_mb,
         vcpus: vcpus.clamp(1, MAX_VCPUS),
         watchdog_secs,
         nics,
@@ -603,31 +798,51 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
     })
 }
 
+/// Heavy post-mortem diagnostics (per-vCPU exit breakdown + a guest-RAM dump)
+/// are gated behind the `TINYVMM_DIAG` env var so normal runs stay quiet.
+/// Enabled when set to a non-empty value whose first char isn't '0'. Mirrors the
+/// C++ `TINYVMM_DIAG=1` gate.
+fn diag_enabled() -> bool {
+    std::env::var("TINYVMM_DIAG")
+        .map(|v| !v.is_empty() && !v.starts_with('0'))
+        .unwrap_or(false)
+}
+
+/// Dump the first `min(64 MiB, ram)` of guest RAM to `path` for post-mortem
+/// inspection (grep printk strings, parse the dmesg ringbuffer, ...). Best
+/// effort: a failure is warned about, not fatal.
+fn dump_guest_ram(ram: &GuestMemory, path: &str) {
+    const DUMP_BYTES: usize = 64 * 1024 * 1024;
+    let n = DUMP_BYTES.min(ram.size());
+    // SAFETY: host_base()..+size() is the live guest RAM slab; we read n <= size.
+    let slice = unsafe { std::slice::from_raw_parts(ram.host_base(), n) };
+    match std::fs::write(path, slice) {
+        Ok(()) => eprintln!(
+            "[pvh-run] dumped {} MiB of guest RAM to {path}",
+            n / (1024 * 1024)
+        ),
+        Err(e) => eprintln!("[pvh-run] WARN: guest RAM dump to {path} failed: {e}"),
+    }
+}
+
 fn run_pvh_run(args: &[String]) -> Result<i32> {
     let cfg = parse_pvh_args(args)?;
 
     // Snapshot save preconditions (mirror the C++, relaxed for net): a snapshot
-    // must capture a self-contained machine. virtio-net IS snapshottable -- the
-    // device model is captured and a FRESH backend is wired in on restore (live
-    // external flows reset, but new flows + the device work). virtio-9p is still
-    // refused: its open fids -> host file handles are live state we don't yet
-    // re-open on restore. Drives must be read-only unless the operator opts in.
-    if cfg.save_path.is_some() {
-        if !cfg.p9_shares.is_empty() {
-            return Err(Error::msg(
-                "--save is incompatible with --virtio-9p-share (open fids -> host handles are \
-                 live state not yet restorable)",
-            ));
-        }
-        if !cfg.unsafe_save_mutable_drive {
-            for d in &cfg.drives {
-                if !d.readonly {
-                    return Err(Error::msg(format!(
-                        "--save refuses the mutable drive '{}' (pass --unsafe-save-mutable-drive \
-                         to override, or mark the drive ,readonly)",
-                        d.path
-                    )));
-                }
+    // must capture a self-contained machine. virtio-net AND virtio-9p are both
+    // snapshottable: the net device model is captured and a FRESH backend is
+    // wired in on restore (live external flows reset, but new flows + the device
+    // work); the 9p device captures its fid table (paths + open modes) and
+    // reopens the host handles on restore. Drives must be read-only unless the
+    // operator opts in (the disk is not part of the snapshot).
+    if cfg.save_path.is_some() && !cfg.unsafe_save_mutable_drive {
+        for d in &cfg.drives {
+            if !d.readonly {
+                return Err(Error::msg(format!(
+                    "--save refuses the mutable drive '{}' (pass --unsafe-save-mutable-drive \
+                     to override, or mark the drive ,readonly)",
+                    d.path
+                )));
             }
         }
     }
@@ -936,6 +1151,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     // Each share becomes one virtio-9p PCI device exposing one host directory.
     // The guest mounts via:
     //   mount -t 9p -o trans=virtio,version=9p2000.L <tag> /mnt/...
+    let mut p9_devices: Vec<Arc<P9Device>> = Vec::with_capacity(cfg.p9_shares.len());
     for (i, s) in cfg.p9_shares.iter().enumerate() {
         let p9 = P9Device::new(ram.clone(), s.tag.clone(), s.host_root.clone(), s.readonly);
         let p9_dev: Arc<dyn VirtioDevice> = p9.clone();
@@ -964,6 +1180,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         let pfunc: Arc<dyn PciFunction> = pt.clone();
         let pbdf = pci_bus.add_device(pfunc);
         transports.push(pt.clone());
+        p9_devices.push(p9.clone());
         println!(
             "[pvh-run] virtio-9p[{}] on PCI 00:{:02x}.0 tag={} host={}{}",
             i,
@@ -1095,6 +1312,13 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
 
     // BSP runs on the main thread; APs each get their own thread. Every vCPU
     // thread pins itself to the resolved CPU set before its run loop.
+    //
+    // Capture every vCPU's counters BEFORE consuming `loops`, so the shutdown
+    // summary can aggregate across ALL vCPUs (not just the BSP) and TINYVMM_DIAG
+    // can print a per-vCPU breakdown. Index 0 is the BSP.
+    let vcpu_counters: Vec<Arc<crate::whp::run_loop::Counters>> =
+        loops.iter().map(|l| l.counters()).collect();
+
     let bsp = loops.remove(0);
     let mut ap_handles = Vec::new();
     for (i, l) in loops.into_iter().enumerate() {
@@ -1113,11 +1337,25 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     let reason = bsp.run();
     btimer.mark("guest exited");
 
-    // Tear down: stop APs, signal watchdog, join.
+    // Tear down: stop APs, signal watchdog, join. Capture each AP's stop reason
+    // and surface any abnormal one — otherwise an AP that died on an exception /
+    // unhandled exit is invisible (only the BSP's reason is the process result).
     stop_all();
     watchdog_done.store(true, Ordering::Release);
+    let mut ap_reasons: Vec<StopReason> = Vec::with_capacity(ap_handles.len());
     for h in ap_handles {
-        let _ = h.join();
+        match h.join() {
+            Ok(r) => ap_reasons.push(r),
+            Err(_) => eprintln!("[pvh-run] WARN: an AP vCPU thread panicked"),
+        }
+    }
+    for (i, r) in ap_reasons.iter().enumerate() {
+        if !matches!(
+            r,
+            StopReason::GuestHalted | StopReason::Cancelled | StopReason::SnapshotRequested
+        ) {
+            eprintln!("[pvh-run] vCPU {} (AP) stopped abnormally: {:?}", i + 1, r);
+        }
     }
     if let Some(w) = watchdog {
         let _ = w.join();
@@ -1138,10 +1376,14 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     // snapshot is not written.
     if let Some(ref save_path) = cfg.save_path {
         if matches!(reason, StopReason::SnapshotRequested) {
-            // Still every net data plane before capturing so no inbound frame
-            // mutates an RX queue / guest RAM mid-snapshot.
+            // Quiesce every net data plane and 9p worker pool before capturing,
+            // so no inbound frame or 9p reply mutates an RX/used ring or guest
+            // RAM after the device + RAM sections are taken.
             for nd in &net_devices {
                 nd.quiesce_backend();
+            }
+            for p9 in &p9_devices {
+                p9.quiesce();
             }
             write_snapshot(
                 save_path, &cfg, part_handle, &vcpus, &ram, &hv, &pic, &pit, &com1, &legacy,
@@ -1174,28 +1416,47 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         );
     }
 
-    let c = bsp.counters();
     btimer.mark("teardown done");
+
+    // Aggregate exit counters across ALL vCPUs (the previous summary only
+    // reported the BSP's, undercounting on SMP guests).
+    let io: u64 = vcpu_counters.iter().map(|c| c.io.load(Ordering::Relaxed)).sum();
+    let mmio: u64 = vcpu_counters.iter().map(|c| c.mmio.load(Ordering::Relaxed)).sum();
+    let cpuid: u64 = vcpu_counters.iter().map(|c| c.cpuid.load(Ordering::Relaxed)).sum();
+    let msr: u64 = vcpu_counters.iter().map(|c| c.msr.load(Ordering::Relaxed)).sum();
+    let halt: u64 = vcpu_counters.iter().map(|c| c.halt.load(Ordering::Relaxed)).sum();
+    let other: u64 = vcpu_counters.iter().map(|c| c.other.load(Ordering::Relaxed)).sum();
+
     diag::etw::Event::new("VmStop", diag::etw::INFO, diag::etw::kw::LIFECYCLE)
         .str("reason", &format!("{reason:?}"))
-        .u64("io", c.io.load(Ordering::Relaxed))
-        .u64("cpuid", c.cpuid.load(Ordering::Relaxed))
-        .u64("msr", c.msr.load(Ordering::Relaxed))
+        .u64("io", io)
+        .u64("cpuid", cpuid)
+        .u64("msr", msr)
         .u64("uart_tx", com1.tx_bytes())
         .f64("total_ms", btimer.elapsed_ms())
         .write();
 
     println!(
-        "[pvh-run] stopped: reason={:?} uart_tx={} exits[io={} mmio={} cpuid={} msr={} halt={} other={}]",
-        reason,
+        "[pvh-run] stopped: reason={reason:?} uart_tx={} \
+         exits[io={io} mmio={mmio} cpuid={cpuid} msr={msr} halt={halt} other={other}]",
         com1.tx_bytes(),
-        c.io.load(Ordering::Relaxed),
-        c.mmio.load(Ordering::Relaxed),
-        c.cpuid.load(Ordering::Relaxed),
-        c.msr.load(Ordering::Relaxed),
-        c.halt.load(Ordering::Relaxed),
-        c.other.load(Ordering::Relaxed),
     );
+
+    // TINYVMM_DIAG: per-vCPU exit breakdown + a guest-RAM dump for post-mortem.
+    if diag_enabled() {
+        for (i, cc) in vcpu_counters.iter().enumerate() {
+            eprintln!(
+                "[pvh-run] vCPU {i} exits: io={} mmio={} cpuid={} msr={} halt={} other={}",
+                cc.io.load(Ordering::Relaxed),
+                cc.mmio.load(Ordering::Relaxed),
+                cc.cpuid.load(Ordering::Relaxed),
+                cc.msr.load(Ordering::Relaxed),
+                cc.halt.load(Ordering::Relaxed),
+                cc.other.load(Ordering::Relaxed),
+            );
+        }
+        dump_guest_ram(&ram, "tinyvmm-guest-ram.bin");
+    }
 
     Ok(match reason {
         StopReason::GuestHalted | StopReason::Cancelled => 0,
@@ -1256,7 +1517,7 @@ fn fmt_mac(m: &[u8; 6]) -> String {
 /// is applied), so a restored NIC keeps its configured backend kind. Fallible:
 /// the WinTun backend can fail to bring up its adapter (e.g. not elevated).
 fn wire_net_backend(net: &Arc<NetDevice>, nic: &NicSpec) -> Result<String> {
-    Ok(match nic.backend {
+    let label = match nic.backend {
         NetBackendKind::Loopback => {
             net.set_backend(LoopbackBackend::new(net));
             "loopback".to_string()
@@ -1288,7 +1549,16 @@ fn wire_net_backend(net: &Arc<NetDevice>, nic: &NicSpec) -> Result<String> {
                 host[0], host[1], host[2], host[3]
             )
         }
-    })
+    };
+    if diag::etw::enabled(diag::etw::INFO, diag::etw::kw::LIFECYCLE) {
+        let m = net.mac();
+        let mac = m.iter().fold(0u64, |a, &b| (a << 8) | b as u64);
+        diag::etw::Event::new("NetBackendStart", diag::etw::INFO, diag::etw::kw::LIFECYCLE)
+            .str("backend", &label)
+            .hex64("mac", mac)
+            .write();
+    }
+    Ok(label)
 }
 
 /// Reconstruct one NIC's spec + MAC from the snapshot header under `prefix`
@@ -1379,7 +1649,8 @@ fn write_snapshot(
         .bool("hide_tsc_deadline", true)
         .bool("with_rng", cfg.with_rng)
         .u64("nic_count", cfg.nics.len() as u64)
-        .u64("drive_count", cfg.drives.len() as u64);
+        .u64("drive_count", cfg.drives.len() as u64)
+        .u64("p9_count", cfg.p9_shares.len() as u64);
     // Per-NIC config so restore rebuilds each NIC + its (fresh) backend, even
     // when NICs use different backends. MAC comes from the live device so it
     // matches what the guest cached.
@@ -1408,6 +1679,13 @@ fn write_snapshot(
         jw.str(&format!("drive{i}_path"), &d.path)
             .u64(&format!("drive{i}_size"), blk_backends[i].size())
             .bool(&format!("drive{i}_readonly"), d.readonly);
+    }
+    // Per-9p-share config so restore rebuilds each virtio-9p device with the same
+    // tag/root/RO. The device's own fid table is captured in its PciDevice section.
+    for (i, s) in cfg.p9_shares.iter().enumerate() {
+        jw.str(&format!("p9{i}_tag"), &s.tag)
+            .str(&format!("p9{i}_root"), &s.host_root.to_string_lossy())
+            .bool(&format!("p9{i}_readonly"), s.readonly);
     }
 
     let mut w = SnapshotWriter::create(path)?;
@@ -1460,12 +1738,88 @@ fn write_snapshot(
 }
 
 /// Restore a machine from a snapshot file and resume it. The device tree + RAM
-/// size come entirely from the snapshot header; `--restore` takes no other args.
+/// size come entirely from the snapshot header; `--restore` also accepts optional
+/// `--drive` (positional path/RO overrides), `--cpu-affinity`, `--watchdog-secs`,
+/// and `--unsafe-restore-mutable-drive`.
+/// Parse a restore-time `--drive` override: `<path>[,readonly|ro|rw]`. Returns
+/// the path and an OPTIONAL readonly flag — `None` means "inherit the saved
+/// drive's readonly state". (The boot-time `--drive` parse instead defaults RO
+/// to false; here we must distinguish "unspecified" from "rw".)
+fn parse_drive_override(spec: &str) -> Result<(String, Option<bool>)> {
+    let mut parts = spec.splitn(2, ',');
+    let path = parts.next().unwrap_or("").to_string();
+    if path.is_empty() {
+        return Err(Error::msg("--drive: empty path"));
+    }
+    let mut ro: Option<bool> = None;
+    if let Some(opts) = parts.next() {
+        for kv in opts.split(',') {
+            match kv {
+                "readonly" | "ro" => ro = Some(true),
+                "rw" | "readwrite" => ro = Some(false),
+                other => {
+                    return Err(Error::msg(format!(
+                        "--drive: unknown option '{other}' (want readonly|ro|rw)"
+                    )))
+                }
+            }
+        }
+    }
+    Ok((path, ro))
+}
+
 fn run_restore(args: &[String]) -> Result<i32> {
     let path = args
         .get(2)
         .ok_or_else(|| Error::msg("--restore wants a snapshot path"))?
         .clone();
+
+    // Restore-time overrides (parity with the C++ --restore flags). Drives are
+    // overridden positionally (the i-th --drive overrides saved drive i).
+    let mut drive_overrides: Vec<(String, Option<bool>)> = Vec::new();
+    let mut affinity_mode = AffinityMode::All;
+    let mut watchdog_secs = 0u32;
+    let mut unsafe_restore_mutable_drive = false;
+    {
+        let mut i = 3;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--drive" => {
+                    i += 1;
+                    let spec = args
+                        .get(i)
+                        .ok_or_else(|| Error::msg("--restore --drive wants <path>[,readonly|ro]"))?;
+                    drive_overrides.push(parse_drive_override(spec)?);
+                }
+                "--cpu-affinity" => {
+                    i += 1;
+                    let m = args
+                        .get(i)
+                        .ok_or_else(|| Error::msg("--cpu-affinity wants all|p|e|p-physical"))?;
+                    affinity_mode = cpu_affinity::parse_affinity_mode(m).ok_or_else(|| {
+                        Error::msg(format!(
+                            "--cpu-affinity: unknown mode '{m}' (want all|p|e|p-physical)"
+                        ))
+                    })?;
+                }
+                "--watchdog-secs" => {
+                    i += 1;
+                    watchdog_secs = args
+                        .get(i)
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| Error::msg("--watchdog-secs wants an integer"))?;
+                }
+                "--unsafe-restore-mutable-drive" => unsafe_restore_mutable_drive = true,
+                other => {
+                    return Err(Error::msg(format!(
+                        "--restore: unknown flag '{other}' (want --drive, --cpu-affinity, \
+                         --watchdog-secs, --unsafe-restore-mutable-drive)"
+                    )));
+                }
+            }
+            i += 1;
+        }
+    }
 
     use crate::whp::snapshot_file::{JsonReader, SectionType, SnapshotReader};
     use crate::whp::vcpu_state as vs;
@@ -1484,6 +1838,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
     let tsc_hz_at_save = jr.get_u64("tsc_hz_at_save").unwrap_or(0);
     let with_rng = jr.get_bool("with_rng").unwrap_or(false);
     let drive_count = jr.get_u64("drive_count").unwrap_or(0) as usize;
+    let p9_count = jr.get_u64("p9_count").unwrap_or(0) as usize;
     // Reconstruct the per-NIC specs (backend + port-forwards) and MACs from the
     // header. Back-compat: an older single-NIC snapshot used with_net + net_*.
     let mut restore_nics: Vec<(NicSpec, [u8; 6])> = Vec::new();
@@ -1530,8 +1885,8 @@ fn run_restore(args: &[String]) -> Result<i32> {
     }
 
     // --- Device model: mirror run_pvh_run's creation ORDER exactly so the
-    // per-device snapshot indices line up: console(0), [rng], [blk...]. NET and
-    // 9p are never present (the save path refuses them). ---
+    // per-device snapshot indices line up: console(0), nets, [rng], [blk...],
+    // [9p...]. ---
     let mut io_bus = IoBus::new();
     let mmio_bus = Arc::new(MmioBus::new());
 
@@ -1648,14 +2003,45 @@ fn run_restore(args: &[String]) -> Result<i32> {
 
     let mut blk_backends: Vec<Arc<BlockFile>> = Vec::with_capacity(drive_count);
     for i in 0..drive_count {
-        let dpath = jr.get_str(&format!("drive{i}_path"))?;
-        let dro = jr.get_bool(&format!("drive{i}_readonly")).unwrap_or(true);
+        let saved_path = jr.get_str(&format!("drive{i}_path"))?;
+        let saved_ro = jr.get_bool(&format!("drive{i}_readonly")).unwrap_or(true);
+        let saved_size = jr.get_u64(&format!("drive{i}_size")).unwrap_or(0);
+        // Apply a positional --drive override (relocate the disk / change RO).
+        let (dpath, dro) = match drive_overrides.get(i) {
+            Some((p, ro)) => (p.clone(), ro.unwrap_or(saved_ro)),
+            None => (saved_path.clone(), saved_ro),
+        };
+        // The virtio-blk RO feature bit the guest negotiated is part of the
+        // restored device model; flipping it on restore desyncs the guest.
+        if dro != saved_ro && !unsafe_restore_mutable_drive {
+            return Err(Error::msg(format!(
+                "--restore: drive {i} readonly mismatch (saved={saved_ro}, requested={dro}); \
+                 pass --unsafe-restore-mutable-drive to force"
+            )));
+        }
         let backend = Arc::new(BlockFile::new(&dpath, dro));
         if !backend.open() {
             return Err(Error::msg(format!(
                 "--restore: failed to reopen drive '{}' (readonly={}): err={}",
                 dpath, dro as u32, backend.open_err()
             )));
+        }
+        // The disk is NOT captured in the snapshot, so a size change means the
+        // on-disk state no longer matches the restored RAM. Reject unless forced.
+        let actual = backend.size();
+        if saved_size != 0 && actual != saved_size {
+            if unsafe_restore_mutable_drive {
+                eprintln!(
+                    "[restore] WARN: drive {i} '{dpath}' size {actual} != saved {saved_size} \
+                     bytes (forced by --unsafe-restore-mutable-drive)"
+                );
+            } else {
+                return Err(Error::msg(format!(
+                    "--restore: drive {i} '{dpath}' size {actual} != saved {saved_size} bytes \
+                     (a resized/changed disk diverges from restored RAM); pass \
+                     --unsafe-restore-mutable-drive to force"
+                )));
+            }
         }
         let blk = BlockDevice::new(ram.clone(), backend.clone(), 256);
         let blk_dev: Arc<dyn VirtioDevice> = blk.clone();
@@ -1687,6 +2073,46 @@ fn run_restore(args: &[String]) -> Result<i32> {
         blk_backends.push(backend);
     }
 
+    // virtio-9p devices (reconstructed from the header; each device's fid table
+    // is restored from its PciDevice section's device-state, which reopens the
+    // host handles). Same creation ORDER as run_pvh_run so PCI/device indices
+    // line up: console, nets, rng, blk, 9p.
+    for i in 0..p9_count {
+        let tag = jr.get_str(&format!("p9{i}_tag"))?;
+        let root = jr.get_str(&format!("p9{i}_root"))?;
+        let ro = jr.get_bool(&format!("p9{i}_readonly")).unwrap_or(false);
+        let p9 = P9Device::new(ram.clone(), tag.clone(), std::path::PathBuf::from(&root), ro);
+        let p9_dev: Arc<dyn VirtioDevice> = p9.clone();
+        let popts = transport::Options {
+            vendor_id: 0x1AF4,
+            sub_vendor_id: 0x1AF4,
+            sub_id: virtio::device::DEVICE_ID_P9 as u16,
+            num_msix_vectors: 2,
+            pci_class: 0xFF,
+            pci_subclass: 0x00,
+            doorbells: true,
+        };
+        let pt = PciTransport::new(
+            &format!("virtio-pci-9p[{i}]"),
+            p9_dev,
+            popts,
+            mmio_bus.clone(),
+            part_handle,
+        );
+        let wt = Arc::downgrade(&pt);
+        p9.set_irq_callback(Box::new(move |q| {
+            if let Some(t) = wt.upgrade() {
+                t.raise_queue_interrupt(q);
+            }
+        }));
+        pci_bus.add_device(pt.clone() as Arc<dyn PciFunction>);
+        transports.push(pt.clone());
+        println!(
+            "[restore] virtio-9p[{i}] tag={tag} host={root}{}",
+            if ro { " (ro)" } else { "" }
+        );
+    }
+
     pci_bus.attach_io_bus(&mut io_bus);
     let io_bus = Arc::new(io_bus);
 
@@ -1702,10 +2128,16 @@ fn run_restore(args: &[String]) -> Result<i32> {
     let mut sec_devices: Vec<(u16, Vec<u8>)> = Vec::new();
     let mut caps: Vec<vs::CapturedVcpuState> =
         (0..vcpu_count).map(|_| vs::CapturedVcpuState::default()).collect();
+    // Section-cardinality counters: a well-formed snapshot has exactly one RAM
+    // section and one VcpuRegs section per vCPU. A wrong count means a truncated
+    // or foreign file, which we reject below rather than resuming half a machine.
+    let mut n_ram = 0u32;
+    let mut n_vcpu_regs = 0u32;
 
     while let Some(s) = reader.next_section()? {
         match s.ty {
             SectionType::RamRaw => {
+                n_ram += 1;
                 ram.write_at(0, s.payload)?;
             }
             SectionType::HvEnlightenment => sec_hv = Some(s.payload.to_vec()),
@@ -1722,6 +2154,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
                 sec_devices.push((idx, s.payload[2..].to_vec()));
             }
             SectionType::VcpuRegs => {
+                n_vcpu_regs += 1;
                 let (i, v) = vs::decode_regs(s.payload, vs::ARCH_REGS)?;
                 if (i as usize) < caps.len() {
                     caps[i as usize].arch = v;
@@ -1761,6 +2194,39 @@ fn run_restore(args: &[String]) -> Result<i32> {
             }
             _ => {}
         }
+    }
+
+    // Validate section cardinality before touching device state: a Rust-written
+    // snapshot always carries exactly one RAM section, one VcpuRegs per vCPU, all
+    // six HV/legacy singletons, and one PciDevice section per device. A mismatch
+    // means a truncated, corrupt, or foreign (e.g. C++-written) file.
+    if n_ram != 1 {
+        return Err(Error::msg(format!(
+            "snapshot: expected exactly 1 RAM section, found {n_ram}"
+        )));
+    }
+    if n_vcpu_regs != vcpu_count {
+        return Err(Error::msg(format!(
+            "snapshot: expected {vcpu_count} VcpuRegs section(s), found {n_vcpu_regs}"
+        )));
+    }
+    if sec_hv.is_none()
+        || sec_pic.is_none()
+        || sec_pit.is_none()
+        || sec_serial.is_none()
+        || sec_isa.is_none()
+        || sec_bus.is_none()
+    {
+        return Err(Error::msg(
+            "snapshot: missing one or more HV/legacy singleton sections",
+        ));
+    }
+    if sec_devices.len() != transports.len() {
+        return Err(Error::msg(format!(
+            "snapshot: expected {} PciDevice section(s), found {}",
+            transports.len(),
+            sec_devices.len()
+        )));
     }
 
     // Apply legacy singletons.
@@ -1816,10 +2282,14 @@ fn run_restore(args: &[String]) -> Result<i32> {
     let tsc_now = cached_tsc_hz();
     if tsc_hz_at_save != 0 && tsc_now != 0 {
         let drift = (tsc_now as i64 - tsc_hz_at_save as i64).unsigned_abs();
-        if drift > tsc_hz_at_save / 100 {
+        // 100 ppm = tsc_hz / 10_000. The reference-TSC page scales by tsc_hz, so
+        // a host whose TSC frequency differs from the save host by more than this
+        // will skew the guest clock until it re-syncs.
+        if drift > tsc_hz_at_save / 10_000 {
+            let ppm = drift.saturating_mul(1_000_000) / tsc_hz_at_save;
             eprintln!(
-                "[restore] WARN: TSC frequency drift {tsc_hz_at_save} -> {tsc_now} Hz (>1%); \
-                 guest timekeeping may skew until it re-syncs"
+                "[restore] WARN: TSC frequency drift {tsc_hz_at_save} -> {tsc_now} Hz \
+                 (~{ppm} ppm > 100 ppm); guest timekeeping may skew until it re-syncs"
             );
         }
     }
@@ -1872,22 +2342,93 @@ fn run_restore(args: &[String]) -> Result<i32> {
         vs::apply_timing(vp, &caps[i])?;
     }
 
+    // Watchdog (optional): stop everything after N seconds, printing per-second
+    // exit counters. Mirrors the --pvh-run watchdog. Must be set up while `loops`
+    // is still intact (it reads each loop's counters).
+    let watchdog_done = Arc::new(AtomicBool::new(false));
+    let watchdog = if watchdog_secs > 0 {
+        let stop_all = stop_all.clone();
+        let done = watchdog_done.clone();
+        let secs = watchdog_secs;
+        let counters: Vec<_> = loops.iter().map(|l| l.counters()).collect();
+        Some(std::thread::spawn(move || {
+            for s in 1..=secs {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                if done.load(Ordering::Acquire) {
+                    return;
+                }
+                let io: u64 = counters.iter().map(|c| c.io.load(Ordering::Relaxed)).sum();
+                let cpuid: u64 = counters.iter().map(|c| c.cpuid.load(Ordering::Relaxed)).sum();
+                let msr: u64 = counters.iter().map(|c| c.msr.load(Ordering::Relaxed)).sum();
+                eprintln!("[restore] @{s:2}s  io={io} cpuid={cpuid} msr={msr}");
+            }
+            eprintln!("[restore] watchdog: {secs}s elapsed, requesting stop");
+            stop_all();
+        }))
+    } else {
+        None
+    };
+
+    // CPU-affinity: resolve the CPU-set IDs once; each vCPU thread pins itself
+    // just before entering its run loop. Empty = no pinning.
+    let cpu_set_ids = Arc::new(cpu_affinity::resolve_cpu_set_ids(affinity_mode));
+    if affinity_mode != AffinityMode::All {
+        let top = cpu_affinity::topology();
+        println!(
+            "[cpu-affinity] mode={} -> {} CPU-set(s) (host: {} logical, {} P-logical, \
+             {} P-physical, {} E-logical, hybrid={})",
+            cpu_affinity::affinity_mode_name(affinity_mode),
+            cpu_set_ids.len(),
+            top.total_logical,
+            top.p_logical,
+            top.p_physical,
+            top.e_logical,
+            top.hybrid
+        );
+        if cpu_set_ids.is_empty() {
+            eprintln!(
+                "[cpu-affinity] WARN: mode '{}' resolved to no CPU sets on this host; \
+                 running unpinned",
+                cpu_affinity::affinity_mode_name(affinity_mode)
+            );
+        }
+    }
+
     println!("[restore] resuming {vcpu_count} vCPU(s)");
 
     let bsp = loops.remove(0);
     let mut ap_handles = Vec::new();
     for (i, l) in loops.into_iter().enumerate() {
+        let ids = cpu_set_ids.clone();
         let h = std::thread::Builder::new()
             .name(format!("vcpu-{}", i + 1))
-            .spawn(move || l.run())
+            .spawn(move || {
+                cpu_affinity::pin_current_thread(&ids);
+                l.run()
+            })
             .map_err(|e| Error::msg(format!("spawn AP thread: {e}")))?;
         ap_handles.push(h);
     }
+    cpu_affinity::pin_current_thread(&cpu_set_ids);
     let reason = bsp.run();
 
     stop_all();
+    watchdog_done.store(true, Ordering::Release);
+    // Surface any AP that stopped abnormally (exception / unhandled exit).
+    let mut ap_reasons: Vec<StopReason> = Vec::with_capacity(ap_handles.len());
     for h in ap_handles {
-        let _ = h.join();
+        match h.join() {
+            Ok(r) => ap_reasons.push(r),
+            Err(_) => eprintln!("[restore] WARN: an AP vCPU thread panicked"),
+        }
+    }
+    for (i, r) in ap_reasons.iter().enumerate() {
+        if !matches!(r, StopReason::GuestHalted | StopReason::Cancelled) {
+            eprintln!("[restore] vCPU {} (AP) stopped abnormally: {:?}", i + 1, r);
+        }
+    }
+    if let Some(w) = watchdog {
+        let _ = w.join();
     }
     console_restore.restore();
     for b in &blk_backends {
@@ -2015,6 +2556,7 @@ fn main() {
     let result = match args[1].as_str() {
         "--smoke" => run_smoke(),
         "--blk-selftest" => run_blk_selftest(),
+        "--pci-selftest" => run_pci_selftest(),
         "--pvh-info" => run_pvh_info(&args),
         "--pvh-run" => run_pvh_run(&args),
         "--restore" => run_restore(&args),

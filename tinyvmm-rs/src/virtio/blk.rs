@@ -7,8 +7,9 @@
 //! a per-request state machine; after the last segment + the status byte it
 //! pushes the used ring and raises the queue interrupt via the transport.
 //!
-//! This is the core READ / WRITE / FLUSH device (+ the RO feature bit).
-//! DISCARD / WRITE_ZEROES are not implemented.
+//! Implements READ / WRITE / FLUSH plus the RO, DISCARD, and WRITE_ZEROES
+//! feature bits. DISCARD / WRITE_ZEROES are served synchronously on the host
+//! file via `FSCTL_SET_ZERO_DATA` (sparse-unmap) from `notify_queue`.
 
 use crate::diag::etw;
 use crate::host::block_file::{BlockFile, Op, Request};

@@ -23,7 +23,7 @@ use crate::virtio::device::{
 use crate::virtio::queue::{ChainBuf, ChainScratch, Virtqueue};
 use crate::whp::GuestMemory;
 use std::collections::HashMap;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -630,6 +630,22 @@ impl P9Device {
         self.rlerrors.load(Ordering::Relaxed)
     }
 
+    /// Wait for all in-flight 9p requests to drain (the slot pool becomes fully
+    /// free) so a snapshot captures a consistent device — no reply landing in
+    /// guest RAM / the used ring after the queue + device-state were captured.
+    /// Bounded spin: the guest is already stopped, so no new requests arrive and
+    /// the worker pool completes the in-flight ones promptly.
+    pub fn quiesce(&self) {
+        let total = self.engine.pool.slots.len();
+        for _ in 0..5_000 {
+            if self.engine.pool.free.lock().unwrap().len() >= total {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        eprintln!("[9p] WARN: quiesce timed out with requests still in flight");
+    }
+
     fn raise(&self, qidx: u32) {
         if let Some(cb) = self.irq.get() {
             cb(qidx);
@@ -655,16 +671,95 @@ impl P9Device {
         pn[root.len()] == b'\\' as u16
     }
 
+    /// Re-check containment against the *real* path of an opened handle. The
+    /// lexical [`path_contained`] check runs on the guest-supplied path, but
+    /// `CreateFileW` follows reparse points (symlinks / NTFS junctions). A
+    /// reparse point that lives lexically inside the share but targets a
+    /// directory outside it would pass the lexical check yet open an external
+    /// file. `GetFinalPathNameByHandleW` resolves the handle to its true path
+    /// (`\\?\C:\...`, same canonical form as the share root, which is
+    /// `std::fs::canonicalize`d at construction), so re-running the prefix check
+    /// on that real path closes the symlink/junction escape. Fails closed: if
+    /// the path can't be resolved, treat as not contained. This restores parity
+    /// with the C++ backend's `weakly_canonical`-based normalization.
+    fn handle_contained(&self, h: HANDLE) -> bool {
+        match fs::final_path_by_handle(h) {
+            Some(real) => {
+                let os = std::ffi::OsString::from_wide(&real);
+                self.path_contained(Path::new(&os))
+            }
+            None => false,
+        }
+    }
+
     // Open a handle for attribute-only queries (works on directories too).
     fn open_for_attrs(&self, p: &Path) -> Result<HANDLE, u32> {
         let w = to_win32_long_path(p);
-        fs::create_file(
+        let h = fs::create_file(
             &w,
             FILE_READ_ATTRIBUTES,
             FILE_SHARE_RWD,
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS,
-        )
+        )?;
+        // The path was lexically contained, but the open may have traversed a
+        // reparse point out of the share. Validate the resolved handle path.
+        if !self.handle_contained(h) {
+            fs::close(h);
+            return Err(ERROR_ACCESS_DENIED);
+        }
+        Ok(h)
+    }
+
+    /// Reopen a fid's host handle on restore from its saved (path, is_dir,
+    /// open_flags). Uses `OPEN_EXISTING` (never `TRUNCATE_EXISTING` — any
+    /// truncation already happened pre-snapshot and is reflected in captured
+    /// RAM/disk) and the same access derivation as `h_lopen`, then re-validates
+    /// containment. Returns null on failure (the fid is left unopened; the guest
+    /// just re-errors on its next use of that fid).
+    fn reopen_fid_handle(&self, path: &Path, is_dir: bool, open_flags: u32) -> HANDLE {
+        let acc = open_flags & O_ACCMODE;
+        let want_append = open_flags & O_APPEND != 0;
+        let access = if is_dir {
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES
+        } else {
+            match acc {
+                O_RDONLY => GENERIC_READ,
+                O_WRONLY => {
+                    if want_append {
+                        FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES
+                    } else {
+                        GENERIC_WRITE
+                    }
+                }
+                O_RDWR => {
+                    GENERIC_READ
+                        | if want_append {
+                            FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES
+                        } else {
+                            GENERIC_WRITE
+                        }
+                }
+                _ => return core::ptr::null_mut(),
+            }
+        };
+        let flags_attr = if is_dir {
+            FILE_FLAG_BACKUP_SEMANTICS
+        } else {
+            FILE_ATTRIBUTE_NORMAL
+        };
+        let wp = to_win32_long_path(path);
+        match fs::create_file(&wp, access, FILE_SHARE_RWD, OPEN_EXISTING, flags_attr) {
+            Ok(h) => {
+                if self.handle_contained(h) {
+                    h
+                } else {
+                    fs::close(h);
+                    core::ptr::null_mut()
+                }
+            }
+            Err(_) => core::ptr::null_mut(),
+        }
     }
 
     // Stat a path (no kept handle): fill qid type/path + is_dir.
@@ -1130,6 +1225,13 @@ impl P9Device {
                 return;
             }
         };
+        // Re-validate against the real path: the open may have followed a
+        // reparse point out of the share (the lexical walk check can't see it).
+        if !self.handle_contained(h) {
+            fs::close(h);
+            build_rlerror(reply, tag, E_ACCES);
+            return;
+        }
         {
             let mut f = self.fids.lock().unwrap();
             let Some(e) = f.map.get_mut(&fid) else {
@@ -1221,6 +1323,13 @@ impl P9Device {
                 return;
             }
         };
+        // A pre-existing reparse point at this name (non-exclusive create) could
+        // have been followed out of the share — validate the real handle path.
+        if !self.handle_contained(h) {
+            fs::close(h);
+            build_rlerror(reply, tag, E_ACCES);
+            return;
+        }
         let mut qp = match fs::file_info(h) {
             Ok(info) => info.file_index,
             Err(e) => {
@@ -2116,6 +2225,103 @@ impl VirtioDevice for P9Device {
         self.fids.lock().unwrap().map.clear();
     }
 
+    // ---- save/restore ----
+    fn capture_queue(&self, idx: u32) -> Option<crate::virtio::queue::QueueState> {
+        if idx == P9_REQUEST_QUEUE {
+            Some(self.queue.lock().unwrap().capture())
+        } else {
+            None
+        }
+    }
+
+    fn apply_queue(&self, idx: u32, st: &crate::virtio::queue::QueueState) {
+        if idx == P9_REQUEST_QUEUE {
+            self.queue.lock().unwrap().apply(st);
+        }
+    }
+
+    /// Encode driver_ok + negotiated features/msize + the qid allocator + the
+    /// whole fid table (path + open mode per fid). Host handles are NOT encoded;
+    /// they are reopened from each fid's path on `apply_device_state`.
+    fn capture_device_state(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.push(1u8); // format version
+        b.push(self.driver_ok.load(Ordering::Relaxed) as u8);
+        b.extend_from_slice(&self.acked_features.load(Ordering::Relaxed).to_le_bytes());
+        b.extend_from_slice(&self.negotiated_msize.load(Ordering::Relaxed).to_le_bytes());
+        b.extend_from_slice(&self.next_qid_path.load(Ordering::Relaxed).to_le_bytes());
+        let fids = self.fids.lock().unwrap();
+        b.extend_from_slice(&(fids.map.len() as u32).to_le_bytes());
+        for (id, e) in fids.map.iter() {
+            b.extend_from_slice(&id.to_le_bytes());
+            b.extend_from_slice(&e.qid_path.to_le_bytes());
+            b.push(e.is_dir as u8);
+            b.push(e.opened as u8);
+            b.extend_from_slice(&e.open_flags.to_le_bytes());
+            let path = e.host_path.to_string_lossy();
+            let pb = path.as_bytes();
+            b.extend_from_slice(&(pb.len() as u32).to_le_bytes());
+            b.extend_from_slice(pb);
+        }
+        b
+    }
+
+    /// Rebuild the device state captured above. Reopens each previously-open
+    /// fid's host handle (best effort: a since-deleted file leaves the fid
+    /// unopened). Bounds-checked: a short/corrupt blob aborts the parse rather
+    /// than panicking.
+    fn apply_device_state(&self, bytes: &[u8]) {
+        let mut p = 0usize;
+        macro_rules! take {
+            ($n:expr) => {{
+                if p + $n > bytes.len() {
+                    return;
+                }
+                let s = &bytes[p..p + $n];
+                p += $n;
+                s
+            }};
+        }
+        let _ver = take!(1)[0];
+        let drv_ok = take!(1)[0] != 0;
+        let acked = u64::from_le_bytes(take!(8).try_into().unwrap());
+        let msize = u32::from_le_bytes(take!(4).try_into().unwrap());
+        let next_qid = u64::from_le_bytes(take!(8).try_into().unwrap());
+        self.driver_ok.store(drv_ok, Ordering::Relaxed);
+        self.acked_features.store(acked, Ordering::Relaxed);
+        self.negotiated_msize.store(msize, Ordering::Relaxed);
+        self.next_qid_path.store(next_qid, Ordering::Relaxed);
+
+        let count = u32::from_le_bytes(take!(4).try_into().unwrap());
+        let mut new_map: HashMap<u32, FidEntry> = HashMap::new();
+        for _ in 0..count {
+            let id = u32::from_le_bytes(take!(4).try_into().unwrap());
+            let qid = u64::from_le_bytes(take!(8).try_into().unwrap());
+            let is_dir = take!(1)[0] != 0;
+            let opened = take!(1)[0] != 0;
+            let flags = u32::from_le_bytes(take!(4).try_into().unwrap());
+            let plen = u32::from_le_bytes(take!(4).try_into().unwrap()) as usize;
+            let pbytes = take!(plen);
+            let path = PathBuf::from(String::from_utf8_lossy(pbytes).into_owned());
+            let mut e = FidEntry::new(path.clone(), is_dir, qid);
+            if opened {
+                let h = self.reopen_fid_handle(&path, is_dir, flags);
+                if h.is_null() {
+                    eprintln!(
+                        "[9p] restore: could not reopen fid {id} ({}); leaving it unopened",
+                        path.display()
+                    );
+                } else {
+                    e.handle = h;
+                    e.opened = true;
+                    e.open_flags = flags;
+                }
+            }
+            new_map.insert(id, e);
+        }
+        self.fids.lock().unwrap().map = new_map;
+    }
+
     fn read_config(&self, offset: u32, size: u32) -> u32 {
         let mut v = 0u32;
         for i in 0..size {
@@ -2125,5 +2331,124 @@ impl VirtioDevice for P9Device {
             }
         }
         v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A directory junction planted inside the share that targets a directory
+    /// outside it must be rejected: the lexical path is inside the share, but
+    /// the resolved handle path is not. `mklink /J` needs no elevation.
+    #[test]
+    fn junction_escape_is_denied() {
+        let base = std::env::temp_dir().join(format!("tinyvmm_p9_esc_{}", std::process::id()));
+        let share = base.join("share");
+        let sub = share.join("sub");
+        let outside = base.join("outside");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"top secret").unwrap();
+
+        // Plant a directory junction <share>/escape -> <outside>.
+        let escape = share.join("escape");
+        let out = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&escape)
+            .arg(&outside)
+            .output();
+        if out.map(|o| !o.status.success()).unwrap_or(true) || !escape.exists() {
+            // Junctions unavailable in this environment; skip rather than fail.
+            eprintln!("[p9-test] skipping: could not create a directory junction");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        let canon_root = std::fs::canonicalize(&share).unwrap();
+        let mem = std::sync::Arc::new(whpsys::memory::GuestMemory::new_host_only(4096).unwrap());
+        let dev = P9Device::new(mem, "test".into(), canon_root, false);
+
+        // A genuine subdir of the share opens fine.
+        assert!(
+            dev.open_for_attrs(&sub).is_ok(),
+            "a real subdir of the share must be reachable"
+        );
+        // Opening through the junction resolves outside the share -> denied.
+        assert_eq!(
+            dev.open_for_attrs(&escape.join("secret.txt")),
+            Err(ERROR_ACCESS_DENIED),
+            "a file reached through a junction out of the share must be denied"
+        );
+        // The junction directory itself also resolves outside -> denied.
+        assert_eq!(
+            dev.open_for_attrs(&escape),
+            Err(ERROR_ACCESS_DENIED),
+            "the escaping junction directory itself must be denied"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Capturing then re-applying the 9p device state must restore the negotiated
+    /// state and the whole fid table, reopening the host handles of fids that
+    /// were open at capture time.
+    #[test]
+    fn device_state_roundtrip_reopens_fids() {
+        let base = std::env::temp_dir().join(format!("tinyvmm_p9_snap_{}", std::process::id()));
+        let share = base.join("share");
+        let sub = share.join("sub");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(share.join("file.txt"), b"hello").unwrap();
+        let root = std::fs::canonicalize(&share).unwrap();
+
+        let mem = std::sync::Arc::new(whpsys::memory::GuestMemory::new_host_only(4096).unwrap());
+        let dev = P9Device::new(mem.clone(), "t".into(), root.clone(), false);
+        dev.driver_ok.store(true, Ordering::Relaxed);
+        let feats = dev.device_features();
+        dev.acked_features.store(feats, Ordering::Relaxed);
+        dev.negotiated_msize.store(512_000, Ordering::Relaxed);
+        dev.next_qid_path.store(42, Ordering::Relaxed);
+        {
+            let file = share.join("file.txt");
+            let hf = dev.reopen_fid_handle(&file, false, O_RDONLY);
+            let hd = dev.reopen_fid_handle(&sub, true, O_RDONLY);
+            assert!(!hf.is_null() && !hd.is_null());
+            let mut fids = dev.fids.lock().unwrap();
+            let mut ef = FidEntry::new(file, false, 7);
+            ef.handle = hf;
+            ef.opened = true;
+            ef.open_flags = O_RDONLY;
+            fids.map.insert(1, ef);
+            let mut ed = FidEntry::new(sub.clone(), true, 8);
+            ed.handle = hd;
+            ed.opened = true;
+            ed.open_flags = O_RDONLY;
+            fids.map.insert(2, ed);
+            // A walked-but-not-opened fid: path only, no handle.
+            fids.map.insert(3, FidEntry::new(root.clone(), true, 1));
+        }
+
+        let blob = dev.capture_device_state();
+
+        let dev2 = P9Device::new(mem, "t".into(), root, false);
+        dev2.apply_device_state(&blob);
+        assert!(dev2.driver_ok.load(Ordering::Relaxed));
+        assert_eq!(dev2.acked_features.load(Ordering::Relaxed), feats);
+        assert_eq!(dev2.negotiated_msize.load(Ordering::Relaxed), 512_000);
+        assert_eq!(dev2.next_qid_path.load(Ordering::Relaxed), 42);
+        let fids = dev2.fids.lock().unwrap();
+        assert_eq!(fids.map.len(), 3);
+        let f1 = fids.map.get(&1).unwrap();
+        assert!(!f1.is_dir && f1.opened && !f1.handle.is_null() && f1.qid_path == 7);
+        let f2 = fids.map.get(&2).unwrap();
+        assert!(f2.is_dir && f2.opened && !f2.handle.is_null() && f2.qid_path == 8);
+        let f3 = fids.map.get(&3).unwrap();
+        assert!(f3.is_dir && !f3.opened && f3.handle.is_null() && f3.qid_path == 1);
+        drop(fids);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

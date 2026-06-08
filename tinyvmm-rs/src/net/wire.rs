@@ -430,3 +430,111 @@ pub fn build_tcp_rst_for_syn_into(
         0,
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MAC_A: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+    const MAC_B: [u8; 6] = [0x52, 0x54, 0x00, 0xAB, 0xCD, 0xEF];
+    const IP_A: [u8; 4] = [10, 0, 0, 2];
+    const IP_B: [u8; 4] = [10, 0, 0, 1];
+
+    #[test]
+    fn checksum_of_consistent_ip_header_is_zero() {
+        let pkt = build_ipv4(IP_A, IP_B, IP_PROTO_TCP, &[0u8; 8]);
+        // A correct IPv4 header checksums to 0 over its own 20 bytes.
+        assert_eq!(checksum16(&[&pkt[..20]]), 0);
+    }
+
+    #[test]
+    fn eth_roundtrip() {
+        let frame = build_eth(MAC_A, MAC_B, ETHERTYPE_IPV4, &[1, 2, 3, 4]);
+        let v = parse_eth(&frame).unwrap();
+        assert_eq!(v.dst, MAC_A);
+        assert_eq!(v.src, MAC_B);
+        assert_eq!(v.ethertype, ETHERTYPE_IPV4);
+        assert_eq!(v.payload, &[1, 2, 3, 4]);
+        // Too-short frames are rejected, not panicked.
+        assert!(parse_eth(&[0u8; 8]).is_none());
+    }
+
+    #[test]
+    fn arp_reply_roundtrip() {
+        let reply = build_arp_reply(MAC_B, IP_B, MAC_A, IP_A);
+        let v = parse_arp(&reply).unwrap();
+        assert_eq!(v.op, 2); // reply
+        assert_eq!(v.sha, MAC_B);
+        assert_eq!(v.spa, IP_B);
+        assert_eq!(v.tpa, IP_A);
+    }
+
+    #[test]
+    fn ipv4_roundtrip_and_checksum() {
+        let pkt = build_ipv4(IP_A, IP_B, IP_PROTO_UDP, &[9, 8, 7, 6, 5]);
+        let v = parse_ipv4(&pkt).unwrap();
+        assert_eq!(v.proto, IP_PROTO_UDP);
+        assert_eq!(v.src, IP_A);
+        assert_eq!(v.dst, IP_B);
+        assert_eq!(v.payload, &[9, 8, 7, 6, 5]);
+        assert_eq!(v.datagram.len(), 25);
+        assert!(parse_ipv4(&[0u8; 10]).is_none());
+    }
+
+    #[test]
+    fn udp_roundtrip_and_checksum() {
+        let seg = build_udp(IP_A, IP_B, 1234, 53, b"hello");
+        let v = parse_udp(&seg).unwrap();
+        assert_eq!(v.src_port, 1234);
+        assert_eq!(v.dst_port, 53);
+        assert_eq!(v.payload, b"hello");
+        // The UDP checksum (with pseudo-header) verifies to zero.
+        let mut pseudo = [0u8; 12];
+        pseudo[0..4].copy_from_slice(&IP_A);
+        pseudo[4..8].copy_from_slice(&IP_B);
+        pseudo[9] = IP_PROTO_UDP;
+        pseudo[10..12].copy_from_slice(&(seg.len() as u16).to_be_bytes());
+        assert_eq!(checksum16(&[&pseudo, &seg]), 0);
+    }
+
+    #[test]
+    fn icmp_echo_reply_flips_type() {
+        // Minimal echo request: type=8, code=0, csum=0, id/seq=0, 4 data bytes.
+        let mut req = vec![ICMP_ECHO_REQUEST, 0, 0, 0, 0, 0, 0, 1, 0xDE, 0xAD, 0xBE, 0xEF];
+        // Fill a valid request checksum first (not strictly needed for the test).
+        let c = checksum16(&[&req]);
+        req[2..4].copy_from_slice(&c.to_be_bytes());
+        let reply = build_icmp_echo_reply(&req).unwrap();
+        assert_eq!(reply[0], ICMP_ECHO_REPLY);
+        assert_eq!(checksum16(&[&reply]), 0);
+        // A non-echo message returns None.
+        assert!(build_icmp_echo_reply(&[3u8, 0, 0, 0, 0, 0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn tcp_roundtrip_and_checksum() {
+        let seg = build_tcp(IP_A, IP_B, 40000, 80, 0x1111_2222, 0, TCP_SYN, 64240);
+        let v = parse_tcp(&seg).unwrap();
+        assert_eq!(v.src_port, 40000);
+        assert_eq!(v.dst_port, 80);
+        assert_eq!(v.seq, 0x1111_2222);
+        assert_eq!(v.flags, TCP_SYN);
+        let mut pseudo = [0u8; 12];
+        pseudo[0..4].copy_from_slice(&IP_A);
+        pseudo[4..8].copy_from_slice(&IP_B);
+        pseudo[9] = IP_PROTO_TCP;
+        pseudo[10..12].copy_from_slice(&(seg.len() as u16).to_be_bytes());
+        assert_eq!(checksum16(&[&pseudo, &seg]), 0);
+    }
+
+    #[test]
+    fn tcp_rst_for_syn_swaps_endpoints() {
+        let mut out = Vec::new();
+        build_tcp_rst_for_syn_into(&mut out, IP_A, 40000, IP_B, 80, 0x1000);
+        let v = parse_tcp(&out).unwrap();
+        // Source/dest swapped so it looks like it came from the connect target.
+        assert_eq!(v.src_port, 80);
+        assert_eq!(v.dst_port, 40000);
+        assert_eq!(v.flags, TCP_RST | TCP_ACK);
+    }
+}

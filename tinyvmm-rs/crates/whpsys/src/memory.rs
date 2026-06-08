@@ -113,6 +113,36 @@ impl GuestMemory {
         })
     }
 
+    /// Allocate a host-backed slab that is **not** mapped into any partition
+    /// (`part == 0`, `gpa == 0`). For host-side selftests / fuzzers (e.g. the
+    /// virtqueue fuzzer) that exercise the bounds-checked guest-memory accessors
+    /// without a live WHP partition. `Drop` frees the `VirtualAlloc` but skips
+    /// `WHvUnmapGpaRange` since there is no GPA mapping to undo.
+    pub fn new_host_only(size_bytes: usize) -> Result<Self> {
+        if size_bytes == 0 {
+            return Err(Error::msg("GuestMemory::new_host_only: size must be non-zero"));
+        }
+        let alloc_size = align_up(size_bytes, PAGE);
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                alloc_size,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
+        if p.is_null() {
+            return Err(Error::msg("VirtualAlloc(host-only guest RAM) failed"));
+        }
+        Ok(GuestMemory {
+            part: 0,
+            base: SharedPtr::new(p as *mut u8),
+            gpa: 0,
+            size: alloc_size,
+            large_pages: false,
+        })
+    }
+
     pub fn host_base(&self) -> *mut u8 {
         self.base.get()
     }
@@ -263,7 +293,10 @@ impl Drop for GuestMemory {
     fn drop(&mut self) {
         if !self.base.is_null() {
             unsafe {
-                WHvUnmapGpaRange(self.part, self.gpa, self.size as u64);
+                // part == 0 => host-only slab (new_host_only): no GPA mapping to undo.
+                if self.part != 0 {
+                    WHvUnmapGpaRange(self.part, self.gpa, self.size as u64);
+                }
                 VirtualFree(self.base.get() as *mut c_void, 0, MEM_RELEASE);
             }
         }

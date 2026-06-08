@@ -366,3 +366,121 @@ impl PciConfigSpace {
         events
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pci::msix::MsiX;
+
+    fn dev() -> PciConfigSpace {
+        let mut c = PciConfigSpace::new();
+        c.set_ids(0x1AF4, 0x1042, 0x1AF4, 0x0001);
+        c.set_class(0x01, 0x00, 0x00, 0x01);
+        c
+    }
+
+    #[test]
+    fn ids_and_class_read_back() {
+        let c = dev();
+        assert_eq!(c.read(CFG_VENDOR_ID, 2), 0x1AF4);
+        assert_eq!(c.read(CFG_DEVICE_ID, 2), 0x1042);
+        assert_eq!(c.read(CFG_SUBSYS_VENDOR_ID, 2), 0x1AF4);
+        assert_eq!(c.read(CFG_SUBSYS_ID, 2), 0x0001);
+        assert_eq!(c.read(CFG_CLASS_CODE, 1), 0x01);
+        assert_eq!(c.read(CFG_HEADER_TYPE, 1), HEADER_TYPE_NORMAL as u32);
+        // Out-of-range / master-abort style read returns all-ones.
+        assert_eq!(c.read(CFG_SPACE_SIZE, 4), 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn mmio64_bar_sizing_dance() {
+        let mut c = dev();
+        // 16 KiB prefetchable 64-bit BAR in BAR0/BAR1.
+        c.declare_mmio64_bar(0, 0x4000, true);
+        // Write all-ones, read back the size mask + type bits (MMIO64|PREFETCH).
+        c.write(CFG_BAR0, 4, 0xFFFF_FFFF);
+        assert_eq!(c.read(CFG_BAR0, 4), 0xFFFF_C00C);
+        // Decoding the size from the low dword: clear type bits, invert, +1.
+        let masked = c.read(CFG_BAR0, 4) & 0xFFFF_FFF0;
+        assert_eq!((!masked).wrapping_add(1), 0x4000);
+        // High dword sizes to all-ones for a 64-bit BAR.
+        c.write(CFG_BAR0 + 4, 4, 0xFFFF_FFFF);
+        assert_eq!(c.read(CFG_BAR0 + 4, 4), 0xFFFF_FFFF);
+        // Type bits: bit0=0 (memory), bits[2:1]=10 (64-bit), bit3=1 (prefetch).
+        assert_eq!(c.read(CFG_BAR0, 4) & 0xF, BAR_MMIO64 | BAR_PREFETCHABLE);
+    }
+
+    #[test]
+    fn command_mem_space_maps_and_unmaps_bar() {
+        let mut c = dev();
+        c.declare_mmio64_bar(0, 0x4000, false);
+        // Program a base GPA into the 64-bit BAR.
+        c.write(CFG_BAR0, 4, 0xE000_0000);
+        c.write(CFG_BAR0 + 4, 4, 0x0000_0000);
+        // Enabling COMMAND.MEM_SPACE maps BAR0 at the programmed GPA.
+        let ev = c.write(CFG_COMMAND, 2, CMD_MEMORY_SPACE as u32);
+        assert!(matches!(
+            ev.as_slice(),
+            [BarEvent::Mapped { idx: 0, gpa: 0xE000_0000, size: 0x4000 }]
+        ));
+        // Clearing it unmaps.
+        let ev = c.write(CFG_COMMAND, 2, 0);
+        assert!(matches!(ev.as_slice(), [BarEvent::Unmapped { idx: 0 }]));
+    }
+
+    #[test]
+    fn moving_a_mapped_bar_unmaps_then_remaps() {
+        let mut c = dev();
+        c.declare_mmio64_bar(0, 0x1000, false);
+        c.write(CFG_BAR0, 4, 0xE000_0000);
+        let _ = c.write(CFG_COMMAND, 2, CMD_MEMORY_SPACE as u32);
+        // Reprogram the base while mapped: expect unmap(old) + map(new).
+        c.write(CFG_BAR0, 4, 0xE100_0000);
+        // The remap is observed on the next COMMAND touch (recompute on cmd write).
+        let ev = c.write(CFG_COMMAND, 2, CMD_MEMORY_SPACE as u32 | CMD_IO_SPACE as u32);
+        assert!(ev.iter().any(|e| matches!(e, BarEvent::Unmapped { idx: 0 })));
+        assert!(ev
+            .iter()
+            .any(|e| matches!(e, BarEvent::Mapped { idx: 0, gpa: 0xE100_0000, .. })));
+    }
+
+    #[test]
+    fn config_snapshot_roundtrip() {
+        let mut c = dev();
+        c.declare_mmio64_bar(0, 0x2000, true);
+        c.write(CFG_BAR0, 4, 0xE000_0000);
+        c.write(CFG_COMMAND, 2, CMD_MEMORY_SPACE as u32);
+        let (cfg, bars) = c.snapshot_capture();
+        let mut c2 = dev();
+        c2.declare_mmio64_bar(0, 0x2000, true);
+        c2.snapshot_apply(&cfg, &bars);
+        assert_eq!(c2.command(), c.command());
+        assert_eq!(c2.read(CFG_BAR0, 4), c.read(CFG_BAR0, 4));
+        assert_eq!(c2.read(CFG_VENDOR_ID, 2), 0x1AF4);
+    }
+
+    #[test]
+    fn decode_config_address_fields() {
+        // enable | bus=0 | dev=3 | fn=0 | reg=0x10
+        let addr = CONFIG_ADDRESS_ENABLE | (3 << 11) | 0x10;
+        let d = decode_config_address(addr);
+        assert!(d.enable);
+        assert_eq!(d.bus, 0);
+        assert_eq!(d.dev, 3);
+        assert_eq!(d.fn_, 0);
+        assert_eq!(d.reg, 0x10);
+        // Low two bits of the register are masked off (dword aligned).
+        let d2 = decode_config_address(CONFIG_ADDRESS_ENABLE | 0x13);
+        assert_eq!(d2.reg, 0x10);
+    }
+
+    #[test]
+    fn msix_required_bar_size_rounds_up_to_pow2() {
+        // 3 vectors, table at 0, PBA at 0x800: table=48B, pba=8B -> hi=0x808 -> 4 KiB.
+        assert_eq!(MsiX::required_bar_size(3, 0, 0x800), 0x1000);
+        // 1 vector, both at 0: table=16, pba=8 -> hi=16 -> 16 (min).
+        assert_eq!(MsiX::required_bar_size(1, 0, 0), 16);
+        // 2048 vectors: table=32768, pba=256 -> hi=0x8000 -> 32 KiB.
+        assert_eq!(MsiX::required_bar_size(2048, 0, 0x8000), 0x1_0000);
+    }
+}

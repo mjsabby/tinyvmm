@@ -8,9 +8,11 @@
 //! state; `on_guest_frame` just copies the frame and posts it to the IOCP, so
 //! the worker is the sole accessor of the flow tables (lock-free by
 //! single-threading). Host socket completions arrive on the same IOCP.
-//! Implemented: ARP, ICMP-echo to the gateway, and UDP NAT. TCP is layered on
-//! next (tcp-sans-io + ConnectEx).
+//! Implemented: ARP, ICMP echo (local gateway reply + proxied via
+//! `IcmpSendEcho`), UDP NAT, and TCP terminate-and-proxy (guest-facing TCB in
+//! `tcp-sans-io`, host socket via `ConnectEx`), plus inbound `--portfwd`.
 
+use crate::diag::etw;
 use crate::net::sys::{self, Iocp};
 use crate::net::wire::*;
 use crate::virtio::net::{NetBackend, NetDevice};
@@ -1685,6 +1687,11 @@ impl NetBackend for NatBackend {
         // Acquire a preallocated slot (no heap alloc on the hot path); if the
         // pool is exhausted, drop the frame (the guest will retransmit).
         let Some(idx) = self.pool.acquire() else {
+            if etw::enabled(etw::VERBOSE, etw::kw::NET) {
+                etw::Event::new("NetTxDrop", etw::VERBOSE, etw::kw::NET)
+                    .u32("len", frame.len() as u32)
+                    .write();
+            }
             return;
         };
         let n = self.pool.fill(idx, frame);

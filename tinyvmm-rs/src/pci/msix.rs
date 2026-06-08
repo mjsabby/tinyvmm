@@ -7,6 +7,7 @@
 use super::config::PciConfigSpace;
 use super::CAP_ID_MSIX;
 use crate::devices::mmio_bus::{MmioAccess, MmioBus};
+use crate::diag::etw;
 use crate::whp::msi::inject_msi;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -290,6 +291,13 @@ impl MsiX {
             (((e.addr_hi as u64) << 32) | e.addr_lo as u64, e.data)
         };
         self.injected_count.fetch_add(1, Ordering::Relaxed);
+        if etw::enabled(etw::VERBOSE, etw::kw::MSI) {
+            etw::Event::new("MsiInject", etw::VERBOSE, etw::kw::MSI)
+                .u32("vector", vector)
+                .hex64("addr", addr)
+                .u32("data", data)
+                .write();
+        }
         inject_msi(self.part, addr, data)
     }
 }
