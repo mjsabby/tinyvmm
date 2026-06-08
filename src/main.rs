@@ -15,6 +15,7 @@ mod diag;
 mod display;
 mod error;
 mod host;
+mod mem_layout;
 mod net;
 mod pci;
 mod virtio;
@@ -622,16 +623,18 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
             "--ram-mb" => {
                 i += 1;
                 let v: u32 = args.get(i).and_then(|s| s.parse().ok()).ok_or_else(|| {
-                    Error::msg("--ram-mb wants a positive integer in MiB (128..3584)")
+                    Error::msg("--ram-mb wants a positive integer in MiB (>= 128)")
                 })?;
-                // Hard range: the PCI MMIO window opens at 0xE000_0000 = 3584 MiB,
-                // so a larger contiguous region would collide with device BARs.
-                // Reject (don't clamp) so a typo surfaces instead of silently
-                // running a differently-sized VM. Mirrors the C++ --ram-mb.
-                if !(128..=3584).contains(&v) {
+                // RAM larger than the 3584 MiB PCI MMIO window is split around it
+                // (low RAM at GPA 0, the remainder relocated above 4 GiB by
+                // GuestMemory::new_split), so there is no upper cap beyond what the
+                // host can actually allocate. Keep a floor big enough for the
+                // kernel + boot artifacts, and reject (don't clamp) so a typo
+                // surfaces instead of silently running a differently-sized VM.
+                if v < 128 {
                     return Err(Error::msg(format!(
-                        "--ram-mb: {v} out of range [128..3584] MiB (>3584 needs a low/high \
-                         RAM split around the PCI MMIO hole; not supported)"
+                        "--ram-mb: {v} below the 128 MiB minimum (kernel + boot artifacts \
+                         need it)"
                     )));
                 }
                 ram_mb = v;
@@ -954,16 +957,37 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     let part_handle = part.handle();
 
     // --- Guest RAM ---
-    let ram = Arc::new(GuestMemory::new(part_handle, 0, ram_bytes, true, true)?);
-    println!(
-        "[pvh-run] guest RAM: {} MiB at GPA 0 ({})",
-        ram.size() / (1024 * 1024),
-        if ram.large_pages() {
-            "MEM_LARGE_PAGES"
-        } else {
-            "4 KiB pages"
-        }
-    );
+    // RAM up to the 3584 MiB PCI MMIO window stays at GPA 0; any remainder is
+    // mapped above 4 GiB so it doesn't collide with device BARs.
+    let ram = Arc::new(GuestMemory::new_split(
+        part_handle,
+        ram_bytes,
+        mem_layout::MMIO_WINDOW_BASE as usize,
+        mem_layout::HIGH_RAM_BASE,
+        true,
+        true,
+    )?);
+    let pages = if ram.large_pages() {
+        "MEM_LARGE_PAGES"
+    } else {
+        "4 KiB pages"
+    };
+    if ram_bytes as u64 > mem_layout::MMIO_WINDOW_BASE {
+        let low_mib = mem_layout::MMIO_WINDOW_BASE / (1024 * 1024);
+        let high_mib = (ram.size() as u64 - mem_layout::MMIO_WINDOW_BASE) / (1024 * 1024);
+        println!(
+            "[pvh-run] guest RAM: {} MiB ({}) — {low_mib} MiB at GPA 0 + {high_mib} MiB at \
+             GPA 0x{:x} (split around the PCI MMIO hole)",
+            ram.size() / (1024 * 1024),
+            pages,
+            mem_layout::HIGH_RAM_BASE,
+        );
+    } else {
+        println!(
+            "[pvh-run] guest RAM: {} MiB at GPA 0 ({pages})",
+            ram.size() / (1024 * 1024),
+        );
+    }
 
     // --- Hyper-V enlightenment (Reference TSC page + MSRs) ---
     let hv = Arc::new(HvEnlightenment::new(ram.clone(), cached_tsc_hz()));
@@ -2138,10 +2162,11 @@ fn run_restore(args: &[String]) -> Result<i32> {
     part.setup()?;
     let part_handle = part.handle();
 
-    let ram = Arc::new(GuestMemory::new(
+    let ram = Arc::new(GuestMemory::new_split(
         part_handle,
-        0,
         ram_size,
+        mem_layout::MMIO_WINDOW_BASE as usize,
+        mem_layout::HIGH_RAM_BASE,
         true,
         large_pages,
     )?);
@@ -2491,7 +2516,10 @@ fn run_restore(args: &[String]) -> Result<i32> {
         match s.ty {
             SectionType::RamRaw => {
                 n_ram += 1;
-                ram.write_at(0, s.payload)?;
+                // The image is a contiguous host-byte dump (low region then high
+                // region), so restore it the same way rather than by GPA — a GPA
+                // write of the whole image would span the MMIO hole.
+                ram.load_image(s.payload);
             }
             SectionType::HvEnlightenment => sec_hv = Some(s.payload.to_vec()),
             SectionType::LegacyPic8259 => sec_pic = Some(s.payload.to_vec()),

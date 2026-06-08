@@ -93,9 +93,9 @@ def parse_args() -> argparse.Namespace:
                    help="Size of the target disk to create if missing.")
     p.add_argument("--ram-mb", type=int, default=3072,
                    help=(
-                       "Guest RAM in MiB (128..3584). Subiquity + snap "
-                       "+ squashfs overlay needs ~2 GiB minimum; we "
-                       "default to 3 GiB."))
+                       "Guest RAM in MiB (minimum 128; no hard upper bound). "
+                       "Subiquity + snap + squashfs overlay needs ~2 GiB "
+                       "minimum; we default to 3 GiB."))
     p.add_argument("--vcpus", type=int, default=2,
                    help="Number of guest vCPUs (1..32).")
     p.add_argument("--net-backend", default="usernet",
@@ -505,8 +505,8 @@ def main() -> int:
             f"build first (cargo build --release).\n")
         return 2
 
-    if not (128 <= args.ram_mb <= 3584):
-        sys.stderr.write("--ram-mb must be in [128, 3584]\n")
+    if args.ram_mb < 128:
+        sys.stderr.write("--ram-mb must be at least 128\n")
         return 2
     if not (1 <= args.vcpus <= 32):
         sys.stderr.write("--vcpus must be in [1, 32]\n")

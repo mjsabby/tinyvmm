@@ -77,10 +77,8 @@ impl HvEnlightenment {
 
     fn page_for(&self, guest_pfn: u64) -> Option<&mut [u8]> {
         let gpa = guest_pfn << PAGE_SHIFT;
-        gpa.checked_add(PAGE_SIZE as u64)?;
-        if gpa as usize >= self.ram.size() || gpa as usize + PAGE_SIZE > self.ram.size() {
-            return None;
-        }
+        // slice_mut bounds-checks against the (possibly split) RAM mapping, so a
+        // PFN in the MMIO hole or past the top of RAM is rejected here.
         self.ram.slice_mut(gpa, PAGE_SIZE)
     }
 

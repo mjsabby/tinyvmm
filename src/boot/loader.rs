@@ -12,6 +12,7 @@ use windows_sys::Win32::System::Hypervisor::{
 };
 
 use crate::boot::acpi;
+use crate::mem_layout::{HIGH_RAM_BASE, MMIO_WINDOW_BASE};
 
 // Low-memory staging layout (mirrors pvh_loader.cpp).
 const GDT_GPA: u64 = 0x1000;
@@ -332,8 +333,14 @@ pub fn load_pvh(
         ISA_HOLE_END - ISA_HOLE_START,
         E820_RESERVED,
     ));
-    if ram_bytes > ISA_HOLE_END {
-        mm.push(mk(ISA_HOLE_END, ram_bytes - ISA_HOLE_END, E820_RAM));
+    // Low RAM stops at the PCI MMIO window; RAM beyond it is relocated above
+    // 4 GiB (see `mem_layout`), leaving the window free for device BARs.
+    let low_top = ram_bytes.min(MMIO_WINDOW_BASE);
+    if low_top > ISA_HOLE_END {
+        mm.push(mk(ISA_HOLE_END, low_top - ISA_HOLE_END, E820_RAM));
+    }
+    if ram_bytes > MMIO_WINDOW_BASE {
+        mm.push(mk(HIGH_RAM_BASE, ram_bytes - MMIO_WINDOW_BASE, E820_RAM));
     }
     let mut mm_bytes = Vec::with_capacity(mm.len() * 24);
     for e in &mm {

@@ -136,7 +136,7 @@ Parsed in `parse_pvh_args` (`main.rs:590`). Defaults and clamps are exact.
 | Flag | Default | Range / behaviour |
 |------|---------|-------------------|
 | `--initrd <cpio>` | none | initramfs; memory-mapped and copied into guest RAM. |
-| `--ram-mb <N>` | `256` | **Clamped to 128–3584.** The upper bound is hard: the PCI MMIO window opens at `0xE000_0000` (3584 MiB), so more contiguous RAM would collide with device BARs. |
+| `--ram-mb <N>` | `256` | **Minimum 128 MiB; no hard upper bound** (limited only by what the host can allocate). RAM up to the 3584 MiB PCI MMIO window (`0xE000_0000`) stays at GPA 0; anything larger is split so the remainder is mapped above 4 GiB (`0x1_0000_0000`), leaving the window free for device BARs. |
 | `--vcpus <N>` | `1` | **Clamped to 1–32.** BSP runs on the main thread; each AP gets its own host thread. |
 | `--rng` | off | Add a virtio-rng device (`/dev/hwrng`). |
 | `--net` | off | Add a virtio-net NIC. **Repeatable** — each `--net` appends a NIC; the NIC-scoped flags below modify the *most recent* NIC. |

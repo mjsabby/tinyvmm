@@ -5,12 +5,9 @@
 use super::config::BarKind;
 use super::{Bdf, CONFIG_ADDRESS_PORT, CONFIG_DATA_PORT, PciFunction, decode_config_address};
 use crate::devices::io_bus::{IoAccess, IoBus};
+use crate::mem_layout::{MMIO_WINDOW_BASE, MMIO_WINDOW_END};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-
-// Pre-assigned BAR windows (below the LAPIC window 0xFEE00000).
-const MMIO_WINDOW_BASE: u64 = 0xE000_0000;
-const MMIO_WINDOW_END: u64 = 0xFEC0_0000;
 
 struct Slot {
     bus: u8,
