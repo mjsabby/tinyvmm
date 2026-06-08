@@ -1,0 +1,55 @@
+[package]
+name = "tinyvmm"
+version = "0.1.0"
+edition = "2021"
+description = "A tiny user-mode VMM on the Windows Hypervisor Platform (Rust rewrite)"
+license = "MIT"
+
+[workspace]
+members = ["crates/winsys", "crates/whpsys"]
+
+[[bin]]
+name = "tinyvmm"
+path = "src/main.rs"
+
+[dependencies]
+winsys = { path = "crates/winsys" }
+whpsys = { path = "crates/whpsys" }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Hypervisor",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_SystemInformation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_Security_Cryptography",
+    "Win32_System_Ioctl",
+    "Win32_System_Performance",
+    "Win32_System_LibraryLoader",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
+] }
+# User-directed dependency: client-only sans-I/O TCP stack, pulled as a git
+# dependency from github.com/mjsabby/tcp-sans-io (publish=false, so it is sourced
+# from git rather than crates.io). `std` disables its no_std panic handler so it
+# links into our std binary. `heap-buffers` moves the 1 MiB/direction rings off
+# the stack into `Box<[u8]>` so `Box::new(Tcb::new())` no longer materialises a
+# ~2.1 MiB stack temporary: debug builds get no return-value optimization, so
+# that temporary overflows even the 16 MiB nat-worker stack (STATUS_STACK_OVERFLOW
+# at TCP connect). Ring SIZE is unchanged (still 1 MiB/direction), so throughput
+# and the per-Tcb window are unaffected.
+tcp-sans-io = { git = "https://github.com/mjsabby/tcp-sans-io", features = ["std", "heap-buffers"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

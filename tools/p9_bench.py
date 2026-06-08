@@ -15,7 +15,7 @@ engine change to quantify the win.
 
 Usage:
   python tools\\p9_bench.py
-    [--tinyvmm <path>]   (default tinyvmm-rs/target/debug/tinyvmm.exe)
+    [--tinyvmm <path>]   (default target/debug/tinyvmm.exe)
     [--vmlinux <path>]   (default repo/vmlinux)
     [--initrd  <path>]   (default repo/initramfs-p9.cpio.gz)
     [--readers N]        (default 8)
@@ -37,7 +37,7 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-DEFAULT_TINYVMM = REPO / "tinyvmm-rs" / "target" / "debug" / "tinyvmm.exe"
+DEFAULT_TINYVMM = REPO / "target" / "debug" / "tinyvmm.exe"
 DEFAULT_VMLINUX = REPO / "vmlinux"
 DEFAULT_INITRD = REPO / "initramfs-p9.cpio.gz"
 

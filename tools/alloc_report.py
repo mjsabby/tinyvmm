@@ -16,7 +16,7 @@ the stacks symbolicate to function names).
 Usage:
   # capture a workload (note the `--` before the command):
   python tools\\alloc_report.py --label p9 -- \\
-      python tools\\p9_bench.py --tinyvmm tinyvmm-rs\\target\\debug\\tinyvmm.exe ...
+      python tools\\p9_bench.py --tinyvmm target\\debug\\tinyvmm.exe ...
 
   # re-analyze a dump captured earlier (no admin / no re-run needed):
   python tools\\alloc_report.py --label p9 --dump %TEMP%\\tinyvmm-alloc\\p9_dump.txt
@@ -34,7 +34,7 @@ import subprocess
 import sys
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-DEFAULT_DEBUG_DIR = REPO / "tinyvmm-rs" / "target" / "debug"
+DEFAULT_DEBUG_DIR = REPO / "target" / "debug"
 
 # Provider GUID + keyword/level must match crates/winsys/src/etw.rs.
 GUID = "0fb6c4d5-9b9b-4e1f-9d5a-7a6d8a9b3c4d"

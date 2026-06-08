@@ -1,0 +1,79 @@
+name: CI
+
+# Build tinyvmm.exe and publish a GitHub Release on every push to main.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Needed so the workflow can create releases/tags with the built-in GITHUB_TOKEN.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build & release (windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Install the toolchain via rustup (preinstalled on windows runners) rather
+      # than a third-party toolchain action.
+      - name: Install Rust (stable, MSVC)
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add rustfmt
+          rustc --version
+          cargo --version
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Cache cargo registry and git deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build tinyvmm.exe (release)
+        run: cargo build --release
+
+      - name: Run tests
+        run: cargo test --release
+
+      - name: Upload tinyvmm.exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tinyvmm-windows-x86_64
+          path: target/release/tinyvmm.exe
+          if-no-files-found: error
+
+      # Publish a GitHub Release using the gh CLI (preinstalled on runners)
+      # instead of a third-party release action.
+      - name: Publish GitHub Release
+        if: github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # `gh release delete` is expected to fail when no prior release exists;
+          # pwsh 7.4 turns native non-zero exits into terminating errors, so opt
+          # out for this step and rely on `gh release create`'s exit code instead.
+          $PSNativeCommandUseErrorActionPreference = $false
+          $tag = "build-$env:GITHUB_RUN_NUMBER"
+          $title = "tinyvmm build $env:GITHUB_RUN_NUMBER"
+          $notes = "Automated build from commit $env:GITHUB_SHA on $env:GITHUB_REF_NAME."
+          # Make re-runs idempotent: drop any existing release+tag with this name.
+          gh release delete $tag --yes --cleanup-tag 2>$null
+          gh release create $tag "target/release/tinyvmm.exe" `
+            --title $title `
+            --notes $notes `
+            --target $env:GITHUB_SHA

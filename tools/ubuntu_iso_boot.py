@@ -105,7 +105,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tinyvmm", type=Path, default=None,
                    help=(
                        "Path to tinyvmm.exe. Defaults to "
-                       "<repo>/build/bin/tinyvmm.exe based on this "
+                       "<repo>/target/release/tinyvmm.exe based on this "
                        "script's location."))
     p.add_argument("--workspace", type=Path, default=None,
                    help=(
@@ -435,7 +435,7 @@ def ensure_target_disk(path: Path, size_gb: int) -> None:
 # ---------------------------------------------------------------------------
 def default_tinyvmm_path() -> Path:
     return (Path(__file__).resolve().parent.parent
-            / "build" / "bin" / "tinyvmm.exe")
+            / "target" / "release" / "tinyvmm.exe")
 
 
 def build_tinyvmm_argv(
@@ -502,7 +502,7 @@ def main() -> int:
     if not tinyvmm.is_file():
         sys.stderr.write(
             f"tinyvmm.exe not found at {tinyvmm}. Pass --tinyvmm or "
-            f"build first (cmake --build build).\n")
+            f"build first (cargo build --release).\n")
         return 2
 
     if not (128 <= args.ram_mb <= 3584):

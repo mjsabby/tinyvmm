@@ -23,7 +23,7 @@ Three phases:
 
 Usage:
   python tools\\save_restore_test.py
-    [--tinyvmm <path>]   default repo/build/bin/tinyvmm.exe
+    [--tinyvmm <path>]   default repo/target/release/tinyvmm.exe
     [--vmlinux <path>]   default repo/vmlinux
     [--initrd  <path>]   default repo/initramfs-snapshot.cpio.gz
     [--snap-path <path>] default repo/snap_test.tvm
@@ -48,7 +48,7 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parent.parent
-DEFAULT_TINYVMM = REPO / "build" / "bin" / "tinyvmm.exe"
+DEFAULT_TINYVMM = REPO / "target" / "release" / "tinyvmm.exe"
 DEFAULT_VMLINUX = REPO / "vmlinux"
 DEFAULT_INITRD = REPO / "initramfs-snapshot.cpio.gz"
 DEFAULT_SNAP = REPO / "snap_test.tvm"

@@ -1,27 +1,30 @@
-build/
-out/
+# Rust build output
+/target
+Cargo.lock
+
+# IDE / editor
 .vs/
 .vscode/
-*.obj
-*.exe
-*.pdb
-*.ilk
 *.user
-CMakeUserPresets.json
-boot.err.log
-boot.log
-boot.txt
-build_asan/
-build_ubsan/
+
+# Guest / test artifacts produced by tools/
 busybox-x86_64
-dbg_*
-guest_ram.bin
+vmlinux*
 initramfs*
-p9-test/
+guest_ram.bin
+boot.log
+boot.err.log
+boot.txt
 pvh.log
 trace.txt
-ubsan_build.log
-vmlinux*
+p9-test/
+dbg_*
+
+# Windows build leftovers
+*.pdb
+*.exe
+
+# Python caches
 tools/__pycache__/
 __pycache__/
 *.pyc

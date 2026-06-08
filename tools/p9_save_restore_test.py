@@ -30,7 +30,7 @@ Phases
 Usage
 -----
   python tools\\p9_save_restore_test.py
-    [--tinyvmm <path>]   default repo/tinyvmm-rs/target/release/tinyvmm.exe
+    [--tinyvmm <path>]   default repo/target/release/tinyvmm.exe
     [--vmlinux <path>]   default repo/vmlinux
     [--initrd  <path>]   default repo/initramfs-p9snap.cpio.gz
     [--snap-path <path>] default repo/p9snap_test.tvm
@@ -60,7 +60,7 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parent.parent
-DEFAULT_TINYVMM = REPO / "tinyvmm-rs" / "target" / "release" / "tinyvmm.exe"
+DEFAULT_TINYVMM = REPO / "target" / "release" / "tinyvmm.exe"
 DEFAULT_VMLINUX = REPO / "vmlinux"
 DEFAULT_INITRD = REPO / "initramfs-p9snap.cpio.gz"
 DEFAULT_SNAP = REPO / "p9snap_test.tvm"

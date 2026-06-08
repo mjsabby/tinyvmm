@@ -28,7 +28,7 @@ the guest log, and asserts:
 
 Usage:
   python tools\\p9_test.py
-    [--tinyvmm <path>]     (default repo/build/bin/tinyvmm.exe)
+    [--tinyvmm <path>]     (default repo/target/release/tinyvmm.exe)
     [--vmlinux <path>]     (default repo/vmlinux)
     [--initrd  <path>]     (default repo/initramfs-p9.cpio.gz)
     [--workdir <path>]     (default %TEMP%/tinyvmm-p9-test)
@@ -56,7 +56,7 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parent.parent
-DEFAULT_TINYVMM = REPO / "build" / "bin" / "tinyvmm.exe"
+DEFAULT_TINYVMM = REPO / "target" / "release" / "tinyvmm.exe"
 DEFAULT_VMLINUX = REPO / "vmlinux"
 DEFAULT_INITRD = REPO / "initramfs-p9.cpio.gz"
 

@@ -46,7 +46,7 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parent.parent
-DEFAULT_TINYVMM = REPO / "build" / "bin" / "tinyvmm.exe"
+DEFAULT_TINYVMM = REPO / "target" / "release" / "tinyvmm.exe"
 DEFAULT_VMLINUX = REPO / "vmlinux"
 DEFAULT_INITRD = REPO / "initramfs-net.cpio"
 
