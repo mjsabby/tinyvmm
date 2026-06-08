@@ -63,11 +63,12 @@ use windows_sys::Win32::System::Console::{
     STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
 };
 use windows_sys::Win32::System::Hypervisor::{
-    WHV_INTERRUPT_CONTROL, WHV_PARTITION_HANDLE, WHvCapabilityCodeHypervisorPresent,
-    WHvGetCapability, WHvMapGpaRange, WHvMapGpaRange2, WHvMapGpaRangeFlagRead,
-    WHvMapGpaRangeFlagWrite, WHvRequestInterrupt, WHvUnmapGpaRange,
+    WHV_INTERRUPT_CONTROL, WHV_PARTITION_HANDLE, WHvCapabilityCodeFeatures,
+    WHvCapabilityCodeHypervisorPresent, WHvGetCapability, WHvMapGpaRange, WHvMapGpaRange2,
+    WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite, WHvRequestInterrupt, WHvUnmapGpaRange,
     WHvX64LocalApicEmulationModeX2Apic,
 };
+use windows_sys::Win32::System::SystemInformation::GetSystemFirmwareTable;
 
 const MAX_VCPUS: u32 = boot::acpi::MAX_VCPUS;
 
@@ -3597,6 +3598,69 @@ fn vk_to_linux_keycode(vk: u16) -> Option<u16> {
     })
 }
 
+/// Query `WHvCapabilityCodeFeatures` (a 64-bit feature bitfield). Bit positions
+/// are from WinHvPlatformDefs.h (x64): see [`describe_whp_features`].
+fn whp_feature_caps() -> Result<u64> {
+    let mut features: u64 = 0;
+    let mut written: u32 = 0;
+    let hr = unsafe {
+        WHvGetCapability(
+            WHvCapabilityCodeFeatures,
+            &mut features as *mut u64 as *mut c_void,
+            std::mem::size_of::<u64>() as u32,
+            &mut written,
+        )
+    };
+    check_hr(hr, "WHvGetCapability(Features)")?;
+    Ok(features)
+}
+
+// WHV_CAPABILITY_FEATURES bit positions (x64), from WinHvPlatformDefs.h.
+const FEAT_VIRTUAL_PCI_DEVICE_SUPPORT: u64 = 1 << 7;
+const FEAT_IOMMU_SUPPORT: u64 = 1 << 8;
+const FEAT_DEVICE_ACCESS_TRACKING: u64 = 1 << 10;
+
+/// Pretty-print the WHP feature bitfield.
+fn describe_whp_features(features: u64) {
+    let bit = |b: u64| if features & b != 0 { "yes" } else { "no " };
+    println!("[dda-probe] WHP feature caps: 0x{features:016x}");
+    println!("  PartialUnmap          (b0): {}", bit(1 << 0));
+    println!("  LocalApicEmulation    (b1): {}", bit(1 << 1));
+    println!("  Xsave                 (b2): {}", bit(1 << 2));
+    println!("  DirtyPageTracking     (b3): {}", bit(1 << 3));
+    println!("  SpeculationControl    (b4): {}", bit(1 << 4));
+    println!("  ApicRemoteRead        (b5): {}", bit(1 << 5));
+    println!("  IdleSuspend           (b6): {}", bit(1 << 6));
+    println!(
+        "  VirtualPciDeviceSupport (b7): {}  (advisory; OpenVMM never checks this)",
+        bit(FEAT_VIRTUAL_PCI_DEVICE_SUPPORT)
+    );
+    println!(
+        "  IommuSupport            (b8): {}  (advisory; OpenVMM never checks this)",
+        bit(FEAT_IOMMU_SUPPORT)
+    );
+    println!("  VpHotAddRemove        (b9): {}", bit(1 << 9));
+    println!(
+        "  DeviceAccessTracking  (b10): {}",
+        bit(FEAT_DEVICE_ACCESS_TRACKING)
+    );
+}
+
+/// True if the ACPI **DMAR** table is present — i.e. an Intel VT-d IOMMU is
+/// enabled in firmware and described to Windows. Absent ⇒ VT-d is disabled in
+/// the BIOS, or we're running inside a VM with no virtual IOMMU. This is the
+/// firmware-level ground truth that disambiguates *why* WHP reports
+/// `IommuSupport=no`.
+fn acpi_dmar_present() -> bool {
+    // GetSystemFirmwareTable: the provider 'ACPI' is a packed DWORD (not
+    // reversed); the table id is the 4-char signature byte-reversed
+    // ('DMAR' → 'RAMD'), matching the documented 'FACP' → 'PCAF' convention.
+    const ACPI: u32 = u32::from_be_bytes(*b"ACPI"); // 0x41435049
+    const DMAR: u32 = u32::from_le_bytes(*b"DMAR"); // 0x52414D44 ('RAMD')
+    let n = unsafe { GetSystemFirmwareTable(ACPI, DMAR, std::ptr::null_mut(), 0) };
+    n > 0
+}
+
 /// Pretty-print one MSI/MSI-X/PCIe/PM capability while walking the chain.
 fn describe_capability(dev: &whp::vpci::VpciDevice, cap_off: u32) -> Option<u32> {
     let v = dev.read_config_dword(cap_off).ok()?;
@@ -3655,9 +3719,66 @@ fn run_dda_probe(args: &[String]) -> Result<i32> {
     check_whp_available()?;
     println!("[dda-probe] WHP available");
 
+    // Print the capability bits + firmware DMAR as ADVISORY diagnostics only.
+    // OpenVMM defines IommuSupport/VirtualPciDeviceSupport in its ABI but never
+    // reads them (it enables assignment purely from `--device` being passed and
+    // lets the real WHvSetPartitionProperty / WHvCreateVpciDevice calls be the
+    // truth). We do the same: report, then attempt the real path regardless.
+    match whp_feature_caps() {
+        Ok(features) => {
+            describe_whp_features(features);
+            let dmar = acpi_dmar_present();
+            println!(
+                "[dda-probe] ACPI DMAR table (Intel VT-d in firmware): {}",
+                if dmar { "present" } else { "ABSENT" }
+            );
+            let vpci = features & FEAT_VIRTUAL_PCI_DEVICE_SUPPORT != 0;
+            let iommu = features & FEAT_IOMMU_SUPPORT != 0;
+            if !vpci || !iommu {
+                println!(
+                    "[dda-probe] note: caps report VirtualPciDeviceSupport={vpci}, \
+                     IommuSupport={iommu} — but OpenVMM never gates on these, so attempting \
+                     the real assignment path anyway (the calls below are the actual test)."
+                );
+                if !dmar {
+                    println!(
+                        "[dda-probe] note: no DMAR table — VT-d looks OFF in firmware (or this is \
+                         a VM). If the calls below fail, enable Intel VT-d in BIOS."
+                    );
+                } else {
+                    println!(
+                        "[dda-probe] note: DMAR present (VT-d on). If the calls below fail with \
+                         0x80070032, run (elevated) `bcdedit /set hypervisordmaremap on` + reboot."
+                    );
+                }
+            } else {
+                println!(
+                    "[dda-probe] device assignment fully advertised (VirtualPciDeviceSupport + \
+                     IommuSupport)"
+                );
+            }
+        }
+        Err(e) => {
+            println!("[dda-probe] WARN: could not read WHP feature caps: {e}");
+        }
+    }
+
     // A 1-vCPU partition that permits device assignment (property set pre-setup).
     let mut part = Partition::new(1)?;
-    part.set_allow_device_assignment(true)?;
+    part.set_allow_device_assignment(true).map_err(|e| {
+        Error::msg(format!(
+            "{e}\n  WHvSetPartitionProperty(AllowDeviceAssignment) failed (HRESULT above).\n\
+             \x20 OpenVMM issues the IDENTICAL call (whp set_property, code 0xC, BOOL) with no \
+             capability gate, so it fails the same way here — this is NOT a tinyvmm bug.\n\
+             \x20 If 0x80070032 (ERROR_NOT_SUPPORTED) AND VT-d is on (DMAR present) AND DMA \
+             remapping is enabled (DeviceGuard AvailableSecurityProperties contains 3), the \
+             cause is the WINDOWS EDITION: WHP/Hyper-V device assignment (DDA) is gated to \
+             Windows Server (2019/2022/2025) and is unavailable on Windows 10/11 client SKUs. \
+             There is no client-side flag that unlocks it — run on Windows Server to proceed.\n\
+             \x20 If you have NOT yet enabled the IOMMU: set Intel VT-d in BIOS, then (elevated) \
+             `bcdedit /set hypervisordmaremap on` + reboot, and re-check."
+        ))
+    })?;
     part.setup()?;
     let ph = part.handle();
     println!("[dda-probe] partition created (AllowDeviceAssignment=TRUE)");

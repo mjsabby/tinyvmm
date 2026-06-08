@@ -3,6 +3,7 @@
 pub mod bus;
 pub mod config;
 pub mod msix;
+pub mod passthrough;
 
 pub use bus::PciBus;
 pub use config::BarKind;
