@@ -20,7 +20,7 @@
 use crate::virtio::device::{
     VirtioDevice, DEVICE_ID_P9, FEATURE_RING_EVENT_IDX, FEATURE_VERSION_1,
 };
-use crate::virtio::queue::{ChainBuf, Virtqueue};
+use crate::virtio::queue::{ChainBuf, ChainScratch, Virtqueue};
 use crate::whp::GuestMemory;
 use std::collections::HashMap;
 use std::os::windows::ffi::OsStrExt;
@@ -329,19 +329,32 @@ fn to_win32_long_path(p: &Path) -> Vec<u16> {
     }
     let q = b'?' as u16;
     let dot = b'.' as u16;
-    let mut result = if w.len() >= 4 && w[0] == bs && w[1] == bs && (w[2] == q || w[2] == dot) && w[3] == bs {
-        w
+    // Build the result in a single pre-sized allocation (prefix + body + NUL),
+    // instead of materialising a second Vec and growing it.
+    let mut result;
+    if w.len() >= 4 && w[0] == bs && w[1] == bs && (w[2] == q || w[2] == dot) && w[3] == bs {
+        // Already \\?\ or \\.\ — pass through.
+        result = Vec::with_capacity(w.len() + 1);
+        result.extend_from_slice(&w);
     } else if w.len() >= 2 && w[0] == bs && w[1] == bs {
-        let mut v: Vec<u16> = "\\\\?\\UNC\\".encode_utf16().collect();
-        v.extend_from_slice(&w[2..]);
-        v
-    } else if w.len() >= 3 && (w[0] as u8 as char).is_ascii_alphabetic() && w[1] == b':' as u16 && w[2] == bs {
-        let mut v: Vec<u16> = "\\\\?\\".encode_utf16().collect();
-        v.extend_from_slice(&w);
-        v
+        // \\server\share -> \\?\UNC\server\share (drop the leading "\\").
+        let body = &w[2..];
+        result = Vec::with_capacity(8 + body.len() + 1);
+        result.extend("\\\\?\\UNC\\".encode_utf16());
+        result.extend_from_slice(body);
+    } else if w.len() >= 3
+        && (w[0] as u8 as char).is_ascii_alphabetic()
+        && w[1] == b':' as u16
+        && w[2] == bs
+    {
+        // C:\... -> \\?\C:\...
+        result = Vec::with_capacity(4 + w.len() + 1);
+        result.extend("\\\\?\\".encode_utf16());
+        result.extend_from_slice(&w);
     } else {
-        w
-    };
+        result = Vec::with_capacity(w.len() + 1);
+        result.extend_from_slice(&w);
+    }
     result.push(0);
     result
 }
@@ -562,6 +575,8 @@ pub struct P9Device {
     fids: Mutex<Fids>,
     irq: OnceLock<IrqFn>,
     engine: P9Engine,
+    // Reused across drain calls so submit allocates nothing (see `drain`).
+    drain_chain: Mutex<ChainScratch>,
 }
 
 impl P9Device {
@@ -588,6 +603,7 @@ impl P9Device {
             fids: Mutex::new(Fids { map: HashMap::new() }),
             irq: OnceLock::new(),
             engine: P9Engine { iocp, pool: SlotPool::new(P9_QUEUE_MAX as usize) },
+            drain_chain: Mutex::new(ChainScratch::default()),
         });
         // Precreate the worker pool. Each worker holds a strong Arc<P9Device>
         // (the device never strong-refs the workers back, so there's no cycle);
@@ -729,17 +745,22 @@ impl P9Device {
     /// doorbell pump thread (or the MMIO-fallback vCPU thread); never blocks on
     /// I/O and never pushes the used ring — a worker does that on completion.
     fn drain(&self) {
+        // Reuse one PoppedChain across the whole drain AND across drain calls so
+        // submit never allocates: each popped chain is copied into the slot's
+        // reused t_msg/wbufs before the next pop. Holding `drain_chain` (instead
+        // of the queue lock) serialises the rare concurrent drain without
+        // extending the contended queue-lock hold time.
+        let mut chain = self.drain_chain.lock().unwrap();
         loop {
-            let chain = {
+            {
                 let mut q = self.queue.lock().unwrap();
                 if !q.ready() {
                     return;
                 }
-                match q.pop() {
-                    Some(c) => c,
-                    None => return,
+                if !q.pop_into(&mut chain) {
+                    return;
                 }
-            };
+            }
             let Some(idx) = self.engine.pool.acquire() else {
                 // Pool exhausted (impossible when sized to ring depth): retire the
                 // descriptor empty so the guest isn't wedged, then stop draining.

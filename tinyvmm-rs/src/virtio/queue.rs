@@ -82,6 +82,29 @@ pub struct PoppedChain {
     pub bufs: Vec<ChainBuf>,
 }
 
+/// A reusable [`PoppedChain`] a device can hold in a `Mutex` field to drain its
+/// ring without per-request allocation. Its `ChainBuf` raw pointers are only
+/// dereferenced under the device's queue lock during a drain (and cleared then
+/// refilled on each `pop_into`), so sending the owning device between threads is
+/// safe — the same reasoning the net device uses for its reused scratch. Only
+/// `Send` is asserted (all that `Mutex<T>: Sync` requires).
+#[derive(Default)]
+pub struct ChainScratch(PoppedChain);
+
+unsafe impl Send for ChainScratch {}
+
+impl std::ops::Deref for ChainScratch {
+    type Target = PoppedChain;
+    fn deref(&self) -> &PoppedChain {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for ChainScratch {
+    fn deref_mut(&mut self) -> &mut PoppedChain {
+        &mut self.0
+    }
+}
+
 struct Desc {
     addr: u64,
     len: u32,

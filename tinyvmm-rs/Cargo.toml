@@ -35,11 +35,14 @@ windows-sys = { version = "0.61", features = [
     "Win32_NetworkManagement_Ndis",
 ] }
 # User-directed dependency: client-only sans-I/O TCP stack (local path; the
-# crate is publish=false/private). `std` disables its no_std panic handler so
-# it links into our std binary. Rings are the crate default 1 MiB/direction
-# (~2.1 MiB per Tcb) — per user, kept as-is; the nat-worker thread is given a
-# large stack so each Tcb can be constructed.
-tcp-sans-io = { path = "C:/tcp-sans-io", features = ["std"] }
+# crate is publish=false/private). `std` disables its no_std panic handler so it
+# links into our std binary. `heap-buffers` moves the 1 MiB/direction rings off
+# the stack into `Box<[u8]>` so `Box::new(Tcb::new())` no longer materialises a
+# ~2.1 MiB stack temporary: debug builds get no return-value optimization, so
+# that temporary overflows even the 16 MiB nat-worker stack (STATUS_STACK_OVERFLOW
+# at TCP connect). Ring SIZE is unchanged (still 1 MiB/direction), so throughput
+# and the per-Tcb window are unaffected.
+tcp-sans-io = { path = "C:/tcp-sans-io", features = ["std", "heap-buffers"] }
 
 [profile.release]
 opt-level = 3

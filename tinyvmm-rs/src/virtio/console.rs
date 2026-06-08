@@ -3,7 +3,7 @@
 //! Port of src/virtio/virtio_console.cpp.
 
 use crate::virtio::device::{VirtioDevice, DEVICE_ID_CONSOLE, FEATURE_RING_EVENT_IDX, FEATURE_VERSION_1};
-use crate::virtio::queue::Virtqueue;
+use crate::virtio::queue::{ChainScratch, PoppedChain, Virtqueue};
 use crate::whp::GuestMemory;
 use std::collections::VecDeque;
 use std::io::Write;
@@ -28,6 +28,10 @@ pub struct ConsoleDevice {
     irq: OnceLock<IrqFn>,
     byte_observer: Mutex<Option<ByteObserverFn>>,
     tx_bytes: AtomicU64,
+    // Reused descriptor-chain scratch per direction so draining the ring
+    // allocates nothing (the console TX path carries every hvc0 byte).
+    tx_scratch: Mutex<ChainScratch>,
+    rx_scratch: Mutex<ChainScratch>,
 }
 
 impl ConsoleDevice {
@@ -41,6 +45,8 @@ impl ConsoleDevice {
             irq: OnceLock::new(),
             byte_observer: Mutex::new(None),
             tx_bytes: AtomicU64::new(0),
+            tx_scratch: Mutex::new(ChainScratch::default()),
+            rx_scratch: Mutex::new(ChainScratch::default()),
         })
     }
 
@@ -71,7 +77,8 @@ impl ConsoleDevice {
             pending.extend(data.iter().copied());
             let mut q = self.rxq.lock().unwrap();
             if q.ready() {
-                interrupt = drain_rx(&mut q, &mut pending);
+                let mut chain = self.rx_scratch.lock().unwrap();
+                interrupt = drain_rx(&mut q, &mut pending, &mut chain);
             }
         }
         if interrupt {
@@ -89,7 +96,8 @@ impl ConsoleDevice {
             }
             let mut observer = self.byte_observer.lock().unwrap();
             let mut out = std::io::stdout().lock();
-            while let Some(chain) = q.pop() {
+            let mut chain = self.tx_scratch.lock().unwrap();
+            while q.pop_into(&mut chain) {
                 for buf in &chain.bufs {
                     if buf.write || buf.len == 0 {
                         continue;
@@ -115,14 +123,14 @@ impl ConsoleDevice {
     }
 }
 
-/// Drain pending host input into the RX queue. Caller holds rx_pending + rxq.
-/// Returns whether an RX interrupt should be raised.
-fn drain_rx(q: &mut Virtqueue, pending: &mut VecDeque<u8>) -> bool {
+/// Drain pending host input into the RX queue. Caller holds rx_pending + rxq +
+/// the reusable `chain` scratch. Returns whether an RX interrupt should be raised.
+fn drain_rx(q: &mut Virtqueue, pending: &mut VecDeque<u8>, chain: &mut PoppedChain) -> bool {
     let mut any = false;
     while !pending.is_empty() {
-        let Some(mut chain) = q.pop() else {
+        if !q.pop_into(chain) {
             break;
-        };
+        }
         let mut total = 0u32;
         for buf in chain.bufs.iter_mut() {
             if !buf.write || buf.len == 0 {
@@ -218,7 +226,8 @@ impl VirtioDevice for ConsoleDevice {
                 let mut pending = self.rx_pending.lock().unwrap();
                 let mut q = self.rxq.lock().unwrap();
                 if q.ready() {
-                    interrupt = drain_rx(&mut q, &mut pending);
+                    let mut chain = self.rx_scratch.lock().unwrap();
+                    interrupt = drain_rx(&mut q, &mut pending, &mut chain);
                 }
             }
             if interrupt {

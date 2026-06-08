@@ -15,7 +15,7 @@ use crate::host::block_file::{BlockFile, Op, Request};
 use crate::virtio::device::{
     VirtioDevice, DEVICE_ID_BLOCK, FEATURE_RING_EVENT_IDX, FEATURE_VERSION_1,
 };
-use crate::virtio::queue::{ChainBuf, PoppedChain, Virtqueue};
+use crate::virtio::queue::{ChainBuf, ChainScratch, Virtqueue};
 use crate::whp::GuestMemory;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -155,6 +155,8 @@ pub struct BlockDevice {
     driver_features: AtomicU64,
     /// Preallocated in-flight request pool (no per-request heap allocation).
     pool: Mutex<ReqPool>,
+    /// Reused across drain calls so submit allocates nothing (see `drain`).
+    drain_chain: Mutex<ChainScratch>,
 
     ops_in: AtomicU64,
     ops_out: AtomicU64,
@@ -214,6 +216,7 @@ impl BlockDevice {
             readonly: backend.readonly(),
             driver_features: AtomicU64::new(0),
             pool: Mutex::new(ReqPool::new(queue_max as usize)),
+            drain_chain: Mutex::new(ChainScratch::default()),
             ops_in: AtomicU64::new(0),
             ops_out: AtomicU64::new(0),
             ops_flush: AtomicU64::new(0),
@@ -320,10 +323,12 @@ impl BlockDevice {
     }
 
     fn drain(&self) {
-        // Reusable across the whole drain (and reset on each pop_into), so the
-        // submit hot path allocates nothing: the chain buffer is reused and the
-        // request itself comes from the preallocated ReqPool.
-        let mut scratch = PoppedChain::default();
+        // One reused chain scratch across the whole drain AND across drain calls
+        // so submit never allocates: each request's data segments are copied into
+        // the preallocated ReqPool slot (begin_request) before the next pop_into,
+        // and holding `drain_chain` serialises the rare concurrent drain without
+        // extending the contended queue-lock hold time.
+        let mut scratch = self.drain_chain.lock().unwrap();
         loop {
             let got = {
                 let mut q = self.queue.lock().unwrap();

@@ -1,5 +1,6 @@
 //! Diagnostics: ETW (Event Tracing for Windows) instrumentation + boot timing.
 
+pub mod alloc_trace;
 pub mod boot_timer;
 
 /// ETW TraceLogging now lives in the `winsys` crate (FFI concentration);

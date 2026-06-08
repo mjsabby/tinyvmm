@@ -66,6 +66,9 @@ pub mod kw {
     pub const BLOCK: u64 = 0x0000_0100;
     pub const CPUID: u64 = 0x0000_0200;
     pub const MSI: u64 = 0x0000_0400;
+    /// Rust global-allocator tracing (alloc/realloc/free). Rust-only (no C++
+    /// counterpart); the next free bit after `MSI`.
+    pub const HEAP: u64 = 0x0000_0800;
 }
 
 // TraceLogging field in-types (_TlgIn*).
@@ -348,4 +351,53 @@ fn data_desc(ptr: *const u8, size: u32, ty: u8) -> EVENT_DATA_DESCRIPTOR {
             },
         },
     }
+}
+
+// --- Heap-allocation tracing -------------------------------------------------
+//
+// These run *inside* the process global-allocator hook (see
+// `src/diag/alloc_trace.rs`), so they MUST NOT allocate. That invariant holds
+// because `Event` is entirely stack-resident and `write()` only hands the event
+// to the ETW FFI (`EventWriteTransfer`), which never routes back through Rust's
+// allocator — so the hook cannot recurse. When no session is listening,
+// `enabled()` short-circuits on a single relaxed atomic load, keeping the
+// allocator fast path essentially free. Capture with the `HEAP` keyword at
+// `VERBOSE` and `xperf … :'stack'` to walk the call stack of every allocation.
+
+/// Emit a `HeapAlloc { ptr, size }` event for a successful allocation.
+#[inline]
+pub fn trace_alloc(ptr: *mut u8, size: usize) {
+    if !enabled(VERBOSE, kw::HEAP) {
+        return;
+    }
+    Event::new("HeapAlloc", VERBOSE, kw::HEAP)
+        .hex64("ptr", ptr as u64)
+        .u64("size", size as u64)
+        .write();
+}
+
+/// Emit a `HeapRealloc { old, ptr, size }` event for a reallocation (`old` is
+/// the pre-realloc pointer, `ptr` the post-realloc pointer, `size` the new size).
+#[inline]
+pub fn trace_realloc(old: *mut u8, new: *mut u8, new_size: usize) {
+    if !enabled(VERBOSE, kw::HEAP) {
+        return;
+    }
+    Event::new("HeapRealloc", VERBOSE, kw::HEAP)
+        .hex64("old", old as u64)
+        .hex64("ptr", new as u64)
+        .u64("size", new_size as u64)
+        .write();
+}
+
+/// Emit a `HeapFree { ptr, size }` event for a deallocation.
+#[inline]
+pub fn trace_free(ptr: *mut u8, size: usize) {
+    if !enabled(VERBOSE, kw::HEAP) {
+        return;
+    }
+    Event::new("HeapFree", VERBOSE, kw::HEAP)
+        .hex64("ptr", ptr as u64)
+        .u64("size", size as u64)
+        .write();
 }

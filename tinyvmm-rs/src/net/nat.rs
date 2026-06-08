@@ -1291,9 +1291,11 @@ impl NatBackend {
             tx_scratch: Vec::with_capacity(FRAME_CAP),
             l3_scratch: Vec::with_capacity(FRAME_CAP),
         };
-        // The nat-worker is the sole thread that constructs Tcbs. With the
-        // crate's default 1 MiB rings a Tcb is ~2.1 MiB, so it needs a large
-        // stack to build (the C++ relies on /STACK:16MB for the same reason).
+        // The nat-worker is the sole thread that constructs Tcbs. The
+        // `heap-buffers` feature boxes the 1 MiB rings, so a Tcb is now small and
+        // `Box::new(Tcb::new())` no longer materialises a multi-MiB stack
+        // temporary; the generous stack is kept purely as headroom for the TCP
+        // state machine's call depth.
         let handle = std::thread::Builder::new()
             .name("nat-worker".into())
             .stack_size(16 * 1024 * 1024)
