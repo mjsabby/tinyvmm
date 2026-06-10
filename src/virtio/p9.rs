@@ -1595,14 +1595,17 @@ impl P9Device {
             }
         }
 
-        let snapshot: Vec<DirEntryCached> = {
-            let f = self.fids.lock().unwrap();
-            let Some(e) = f.map.get(&fid) else {
-                build_rlerror(reply, tag, E_BADF);
-                return;
-            };
-            e.dir_cache.clone()
+        // Encode the requested chunk directly from the cached entries under the
+        // fids lock — no per-call clone of the whole directory (that made a
+        // multi-chunk readdir O(N^2) in the entry count). The encode loop is pure
+        // CPU bounded by `count` (<= msize), so the lock hold is short and in fact
+        // shorter than the previous O(N) clone.
+        let f = self.fids.lock().unwrap();
+        let Some(e) = f.map.get(&fid) else {
+            build_rlerror(reply, tag, E_BADF);
+            return;
         };
+        let cache = &e.dir_cache;
 
         reply.clear();
         enc4(reply, 0);
@@ -1612,21 +1615,18 @@ impl P9Device {
         enc4(reply, 0);
         let start_payload = reply.len();
 
-        let start_index = if req_offset as usize >= snapshot.len() {
-            snapshot.len()
-        } else {
-            req_offset as usize
-        };
-        for (i, e) in snapshot.iter().enumerate().skip(start_index) {
-            let need = 13 + 8 + 1 + 2 + e.name.len();
+        let start_index = (req_offset as usize).min(cache.len());
+        for (i, de) in cache.iter().enumerate().skip(start_index) {
+            let need = 13 + 8 + 1 + 2 + de.name.len();
             if (reply.len() - start_payload) + need > count as usize {
                 break;
             }
-            enc_qid(reply, e.qid_type, e.qid_version, e.qid_path);
+            enc_qid(reply, de.qid_type, de.qid_version, de.qid_path);
             enc8(reply, (i + 1) as u64);
-            enc1(reply, e.d_type);
-            enc_str(reply, &e.name);
+            enc1(reply, de.d_type);
+            enc_str(reply, &de.name);
         }
+        drop(f);
         let payload_len = (reply.len() - start_payload) as u32;
         reply[count_off..count_off + 4].copy_from_slice(&payload_len.to_le_bytes());
         finalize(reply);
