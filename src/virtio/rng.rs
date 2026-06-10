@@ -23,6 +23,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 pub const RNG_REQUEST_QUEUE: u32 = 0;
 pub const RNG_QUEUE_MAX: u32 = 64;
+/// Cap on random bytes generated per request chain. `BCryptGenRandom` runs
+/// synchronously on the vCPU thread (rng has no doorbell), and a hostile chain
+/// can present device-writable buffers summing to gigabytes — which would freeze
+/// the issuing vCPU. Returning fewer bytes than requested is spec-legal (the
+/// guest simply re-requests).
+const RNG_MAX_FILL: u32 = 1 << 20;
 
 pub type IrqFn = Box<dyn Fn(u32) + Send + Sync>;
 
@@ -82,8 +88,12 @@ impl RngDevice {
                     if !buf.write || buf.len == 0 {
                         continue;
                     }
-                    if host::random_fill(buf.as_mut_slice()) {
-                        total += buf.len as u32;
+                    if total >= RNG_MAX_FILL {
+                        break;
+                    }
+                    let want = buf.len.min((RNG_MAX_FILL - total) as usize);
+                    if host::random_fill(&mut buf.as_mut_slice()[..want]) {
+                        total += want as u32;
                     }
                 }
                 q.push(chain.head_index, total);

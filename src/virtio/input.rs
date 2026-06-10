@@ -669,9 +669,11 @@ impl VirtioDevice for InputDevice {
         // the payload union are read-only, reserved bytes are ignored.
         let bytes = value.to_le_bytes();
         for (i, &b) in bytes.iter().take((size as usize).min(4)).enumerate() {
-            match offset + i as u32 {
-                0 => self.cfg_select.store(b, Ordering::Relaxed),
-                1 => self.cfg_subsel.store(b, Ordering::Relaxed),
+            // checked_add so a near-u32::MAX guest offset can't overflow (a debug
+            // panic / release wrap); only select/subsel are writable anyway.
+            match offset.checked_add(i as u32) {
+                Some(0) => self.cfg_select.store(b, Ordering::Relaxed),
+                Some(1) => self.cfg_subsel.store(b, Ordering::Relaxed),
                 _ => {}
             }
         }

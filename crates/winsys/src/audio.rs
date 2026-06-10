@@ -445,7 +445,14 @@ impl CaptureClient {
                 core::ptr::null_mut(),
                 core::ptr::null_mut(),
             );
-            if failed(hr) || frames == 0 {
+            if failed(hr) {
+                return None;
+            }
+            if frames == 0 {
+                // GetBuffer succeeded with an empty packet (AUDCLNT_S_BUFFER_EMPTY):
+                // we still must ReleaseBuffer(0) to keep the GetBuffer/ReleaseBuffer
+                // pairing intact, or the capture client desyncs.
+                let _ = ((*(*self.capture).vtbl).release_buffer)(self.capture.cast(), 0);
                 return None;
             }
             self.cur_frames = frames;

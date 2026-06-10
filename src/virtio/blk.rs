@@ -135,9 +135,6 @@ impl ReqPool {
     fn inflight(&self) -> usize {
         self.slab.len() - self.free.len()
     }
-    fn reset(&mut self) {
-        self.free = (0..self.slab.len() as u16).rev().collect();
-    }
 }
 
 // BlkReq holds raw pointers into guest RAM (kept alive by GuestMemory) and the
@@ -733,9 +730,22 @@ impl VirtioDevice for BlockDevice {
     fn driver_ok(&self) {}
 
     fn reset(&self) {
-        // Best-effort. The caller is expected to have quiesced the backend
-        // (stopped the IOCP worker) before reset.
-        self.pool.lock().unwrap().reset();
+        // A guest-triggered reset (status write of 0) can race with reads/writes
+        // still outstanding on the IOCP worker — the worker is NOT stopped here.
+        // Two rules keep that memory-safe without draining (which would deadlock:
+        // reset runs under the transport `common` lock, and a completion's IRQ
+        // path re-takes `common`):
+        //  1. Reset the virtqueue. With `ready == false`, an in-flight completion
+        //     finds `push` / `should_interrupt_driver` early-returning, so it
+        //     retires through the normal path — releasing its pool slot — without
+        //     touching the guest ring or raising an interrupt.
+        //  2. Do NOT rebuild the pool free-list. A slot whose ReadFile/WriteFile
+        //     is still outstanding must never be reissued to a new request: that
+        //     would alias one BlkReq across the pump and worker threads (a data
+        //     race + double free, and a path to a wild host write via a torn
+        //     `data_segs`). The free-list self-heals as completions land — every
+        //     acquired slot is released exactly once in `finish_request`.
+        self.queue.lock().unwrap().reset();
         self.driver_features.store(0, Ordering::Relaxed);
     }
 

@@ -40,6 +40,10 @@ pub const P9_QUEUE_MAX: u32 = 128;
 const P9_F_MOUNT_TAG: u64 = 1 << 0;
 const FEATURE_RING_INDIRECT_DESC: u64 = 1 << 28;
 const P9_MSIZE_MAX: u32 = 1 << 20;
+/// Cap on live fids. A malicious guest can `Twalk` a fresh `newfid` indefinitely;
+/// without a bound the fid table (and one host handle per opened fid) grows until
+/// the host is out of memory. Real workloads use at most a few thousand.
+const MAX_FIDS: usize = 1 << 16;
 const P9_MSIZE_MIN: u32 = 4096;
 
 // ---- 9P2000.L message types (Linux include/net/9p/9p.h) ------------------
@@ -421,20 +425,43 @@ struct DirEntryCached {
     name: String,
 }
 
+/// Owns a host file HANDLE and closes it exactly once on drop. Stored as an
+/// `Arc<OwnedHandle>` inside a `FidEntry` so a worker can clone the `Arc` under
+/// the `fids` lock and then do its blocking I/O lock-free: a concurrent `Tclunk`
+/// / `Tremove` / `Trename` drops the map's `Arc`, but the real `CloseHandle` is
+/// deferred until the last in-flight user drops its clone. That closes the
+/// use-after-close race without serialising the concurrent worker pool.
+struct OwnedHandle(HANDLE);
+
+// The only access is `get()` (a copy of the value, used while at least one `Arc`
+// ref is held) and the one-shot close in `Drop`.
+unsafe impl Send for OwnedHandle {}
+unsafe impl Sync for OwnedHandle {}
+
+impl OwnedHandle {
+    fn get(&self) -> HANDLE {
+        self.0
+    }
+}
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        fs::close(self.0);
+    }
+}
+
 struct FidEntry {
     host_path: PathBuf,
     is_dir: bool,
     qid_path: u64,
-    handle: HANDLE, // null = none
+    /// `None` = not open. Shared so in-flight I/O keeps the handle alive past a
+    /// concurrent clunk/remove/rename (see [`OwnedHandle`]).
+    handle: Option<Arc<OwnedHandle>>,
     opened: bool,
     open_flags: u32,
     dir_cache: Vec<DirEntryCached>,
     dir_cache_built: bool,
 }
-
-// The HANDLE is an OS handle (process-global); moving the fid table across the
-// vCPU/notify threads is safe — access is serialised by the queue/fids mutexes.
-unsafe impl Send for FidEntry {}
 
 impl FidEntry {
     fn new(host_path: PathBuf, is_dir: bool, qid_path: u64) -> FidEntry {
@@ -442,7 +469,7 @@ impl FidEntry {
             host_path,
             is_dir,
             qid_path,
-            handle: core::ptr::null_mut(),
+            handle: None,
             opened: false,
             open_flags: 0,
             dir_cache: Vec::new(),
@@ -451,17 +478,14 @@ impl FidEntry {
     }
 
     fn close_handle(&mut self) {
-        fs::close(self.handle);
-        self.handle = core::ptr::null_mut();
+        // Drop our `Arc`; the real CloseHandle runs when the last in-flight user
+        // (if any) releases its clone. The `Option<Arc<OwnedHandle>>` also frees
+        // the handle automatically when a `FidEntry` is dropped, so there is no
+        // manual `Drop for FidEntry`.
+        self.handle = None;
         self.opened = false;
         self.dir_cache.clear();
         self.dir_cache_built = false;
-    }
-}
-
-impl Drop for FidEntry {
-    fn drop(&mut self) {
-        fs::close(self.handle);
     }
 }
 
@@ -883,7 +907,7 @@ impl P9Device {
             // writable descriptors stay valid until the worker pushes the used
             // ring, so copying them now (and writing through them later) is sound.
             let slot = unsafe { self.engine.pool.slot(idx) };
-            read_chain(&chain.bufs, &mut slot.t_msg);
+            read_chain(&chain.bufs, &mut slot.t_msg, P9_MSIZE_MAX as usize);
             slot.cap = writable_capacity(&chain.bufs);
             slot.head_index = chain.head_index;
             slot.wbufs.clear();
@@ -929,7 +953,11 @@ impl P9Device {
         let body = &t_msg[REPLY_HEADER_SIZE..];
 
         let neg = self.negotiated_msize.load(Ordering::Relaxed);
-        let mut cap = writable_cap;
+        // Bound the reply by the negotiated msize, or — before T_version — by the
+        // protocol ceiling, so a pre-negotiation Tread/Treaddir with a multi-GB
+        // writable descriptor can't drive a giant `reply.resize` (alloc failure
+        // → VMM abort).
+        let mut cap = writable_cap.min(P9_MSIZE_MAX);
         if neg != 0 && neg < cap {
             cap = neg;
         }
@@ -1012,11 +1040,16 @@ impl P9Device {
             build_rlerror(reply, tag, E_NOTDIR);
             return;
         }
-        self.fids
-            .lock()
-            .unwrap()
-            .map
-            .insert(fid, FidEntry::new(self.host_root.clone(), true, qp));
+        {
+            let mut f = self.fids.lock().unwrap();
+            if !f.map.contains_key(&fid) && f.map.len() >= MAX_FIDS {
+                drop(f);
+                build_rlerror(reply, tag, E_MFILE);
+                return;
+            }
+            f.map
+                .insert(fid, FidEntry::new(self.host_root.clone(), true, qp));
+        }
         reply.clear();
         enc4(reply, 0);
         enc1(reply, R_ATTACH);
@@ -1062,6 +1095,12 @@ impl P9Device {
             src_qid_path = src.qid_path;
             if newfid != fid && f.map.contains_key(&newfid) {
                 build_rlerror(reply, tag, E_INVAL);
+                return;
+            }
+            // A new fid grows the table; cap it. The actual insert runs under a
+            // later, fresh lock, so this can overshoot only by the worker count.
+            if newfid != fid && f.map.len() >= MAX_FIDS {
+                build_rlerror(reply, tag, E_MFILE);
                 return;
             }
         }
@@ -1262,7 +1301,7 @@ impl P9Device {
                 build_rlerror(reply, tag, E_INVAL);
                 return;
             }
-            e.handle = h;
+            e.handle = Some(Arc::new(OwnedHandle(h)));
             e.opened = true;
             e.open_flags = flags;
         }
@@ -1375,7 +1414,7 @@ impl P9Device {
             e.host_path = new_path;
             e.is_dir = false;
             e.qid_path = qp;
-            e.handle = h;
+            e.handle = Some(Arc::new(OwnedHandle(h)));
             e.opened = true;
             e.open_flags = flags;
         }
@@ -1401,11 +1440,11 @@ impl P9Device {
                 build_rlerror(reply, tag, E_BADF);
                 return;
             };
-            h = e.handle;
+            h = e.handle.clone();
             opened = e.opened;
             is_dir = e.is_dir;
         }
-        if !opened || h.is_null() || h == INVALID_HANDLE_VALUE {
+        if !opened || h.is_none() {
             build_rlerror(reply, tag, E_BADF);
             return;
         }
@@ -1413,6 +1452,8 @@ impl P9Device {
             build_rlerror(reply, tag, E_ISDIR);
             return;
         }
+        // Hold the Arc for the whole read so a concurrent clunk can't close it.
+        let h = h.unwrap();
         let max_payload = if cap as usize > RREAD_HEADER_SIZE {
             cap - RREAD_HEADER_SIZE as u32
         } else {
@@ -1432,7 +1473,7 @@ impl P9Device {
         if count > 0 {
             let base = reply.len();
             reply.resize(base + count as usize, 0);
-            match fs::read_at(h, &mut reply[base..], offset) {
+            match fs::read_at(h.get(), &mut reply[base..], offset) {
                 Ok(n) => got = n,
                 Err(e) => {
                     build_rlerror(reply, tag, errno_from_win32(e));
@@ -1467,12 +1508,12 @@ impl P9Device {
                 build_rlerror(reply, tag, E_BADF);
                 return;
             };
-            h = e.handle;
+            h = e.handle.clone();
             opened = e.opened;
             is_dir = e.is_dir;
             open_flags = e.open_flags;
         }
-        if !opened || h.is_null() || h == INVALID_HANDLE_VALUE {
+        if !opened || h.is_none() {
             build_rlerror(reply, tag, E_BADF);
             return;
         }
@@ -1480,13 +1521,15 @@ impl P9Device {
             build_rlerror(reply, tag, E_ISDIR);
             return;
         }
+        // Hold the Arc for the whole write so a concurrent clunk can't close it.
+        let h = h.unwrap();
         let mut wrote: u32 = 0;
         if count > 0 {
             let buf = &body[data_off..data_off + count as usize];
             let res = if open_flags & O_APPEND != 0 {
-                fs::write_append(h, buf)
+                fs::write_append(h.get(), buf)
             } else {
-                fs::write_at(h, buf, offset)
+                fs::write_at(h.get(), buf, offset)
             };
             match res {
                 Ok(n) => wrote = n,
@@ -1510,7 +1553,7 @@ impl P9Device {
             build_rlerror(reply, tag, E_PROTO);
             return;
         };
-        let (dir_path, is_dir, opened, h);
+        let (dir_path, is_dir, opened, has_handle);
         {
             let f = self.fids.lock().unwrap();
             let Some(e) = f.map.get(&fid) else {
@@ -1520,13 +1563,13 @@ impl P9Device {
             dir_path = e.host_path.clone();
             is_dir = e.is_dir;
             opened = e.opened;
-            h = e.handle;
+            has_handle = e.handle.is_some();
         }
         if !is_dir {
             build_rlerror(reply, tag, E_NOTDIR);
             return;
         }
-        if !opened || h.is_null() || h == INVALID_HANDLE_VALUE {
+        if !opened || !has_handle {
             build_rlerror(reply, tag, E_BADF);
             return;
         }
@@ -1668,13 +1711,14 @@ impl P9Device {
             };
             path = e.host_path.clone();
             was_open = e.opened;
-            existing = e.handle;
+            existing = e.handle.clone();
         }
         let mut opened_here = INVALID_HANDLE_VALUE;
-        let h = if was_open && !existing.is_null() && existing != INVALID_HANDLE_VALUE {
-            existing
-        } else {
-            match self.open_for_attrs(&path) {
+        // `existing` (the Arc) stays in scope through `read_attrs_by_handle`, so a
+        // concurrent clunk can't close the fid's handle under us.
+        let h = match &existing {
+            Some(a) if was_open => a.get(),
+            _ => match self.open_for_attrs(&path) {
                 Ok(nh) => {
                     opened_here = nh;
                     nh
@@ -1683,7 +1727,7 @@ impl P9Device {
                     build_rlerror(reply, tag, errno_from_win32(e));
                     return;
                 }
-            }
+            },
         };
         let attrs = self.read_attrs_by_handle(h);
         if opened_here != INVALID_HANDLE_VALUE {
@@ -1765,12 +1809,11 @@ impl P9Device {
             };
             path = e.host_path.clone();
             was_open = e.opened;
-            existing = e.handle;
+            existing = e.handle.clone();
             is_dir = e.is_dir;
         }
         let need_size = valid & SETATTR_SIZE != 0;
-        let need_handle =
-            need_size || !was_open || existing.is_null() || existing == INVALID_HANDLE_VALUE;
+        let need_handle = need_size || !was_open || existing.is_none();
         let mut opened_here = INVALID_HANDLE_VALUE;
         let h = if need_handle {
             let mut access = FILE_WRITE_ATTRIBUTES;
@@ -1790,10 +1833,20 @@ impl P9Device {
                     return;
                 }
             };
+            // Parity with h_lopen/h_lcreate/open_for_attrs: re-validate the
+            // resolved handle path so a reparse point can't redirect a setattr
+            // (truncate / utime) at a host file outside the share.
+            if !self.handle_contained(nh) {
+                fs::close(nh);
+                build_rlerror(reply, tag, E_ACCES);
+                return;
+            }
             opened_here = nh;
             nh
         } else {
-            existing
+            // `existing` (the Arc) stays in scope through the set_* calls below,
+            // so a concurrent clunk can't close the fid's handle under us.
+            existing.as_ref().unwrap().get()
         };
 
         if valid & SETATTR_SIZE != 0 {
@@ -1901,10 +1954,10 @@ impl P9Device {
                 build_rlerror(reply, tag, E_BADF);
                 return;
             };
-            e.handle
+            e.handle.clone()
         };
-        if !h.is_null() && h != INVALID_HANDLE_VALUE {
-            if let Err(err) = fs::flush(h) {
+        if let Some(a) = &h {
+            if let Err(err) = fs::flush(a.get()) {
                 if err != ERROR_ACCESS_DENIED && err != ERROR_INVALID_HANDLE {
                     build_rlerror(reply, tag, errno_from_win32(err));
                     return;
@@ -2162,10 +2215,21 @@ impl P9Device {
 // ============================================================
 // Chain I/O
 // ============================================================
-fn read_chain(bufs: &[ChainBuf], out: &mut Vec<u8>) {
+/// Gather the chain's device-readable buffers into `out`, capped at `max` bytes.
+/// A malicious guest can present a chain whose readable descriptors sum to
+/// gigabytes; without the cap that allocation runs on the drain/vCPU thread and
+/// an allocation failure aborts the whole VMM (`panic = "abort"`). A truncated
+/// message simply fails the per-handler length checks and is answered with an
+/// error, and a well-formed request never exceeds the negotiated msize.
+fn read_chain(bufs: &[ChainBuf], out: &mut Vec<u8>, max: usize) {
     out.clear();
     for b in bufs.iter().filter(|b| !b.write) {
-        out.extend_from_slice(b.as_slice());
+        if out.len() >= max {
+            break;
+        }
+        let s = b.as_slice();
+        let take = s.len().min(max - out.len());
+        out.extend_from_slice(&s[..take]);
     }
 }
 
@@ -2344,7 +2408,7 @@ impl VirtioDevice for P9Device {
                         path.display()
                     );
                 } else {
-                    e.handle = h;
+                    e.handle = Some(Arc::new(OwnedHandle(h)));
                     e.opened = true;
                     e.open_flags = flags;
                 }
@@ -2450,12 +2514,12 @@ mod tests {
             assert!(!hf.is_null() && !hd.is_null());
             let mut fids = dev.fids.lock().unwrap();
             let mut ef = FidEntry::new(file, false, 7);
-            ef.handle = hf;
+            ef.handle = Some(Arc::new(OwnedHandle(hf)));
             ef.opened = true;
             ef.open_flags = O_RDONLY;
             fids.map.insert(1, ef);
             let mut ed = FidEntry::new(sub.clone(), true, 8);
-            ed.handle = hd;
+            ed.handle = Some(Arc::new(OwnedHandle(hd)));
             ed.opened = true;
             ed.open_flags = O_RDONLY;
             fids.map.insert(2, ed);
@@ -2474,11 +2538,11 @@ mod tests {
         let fids = dev2.fids.lock().unwrap();
         assert_eq!(fids.map.len(), 3);
         let f1 = fids.map.get(&1).unwrap();
-        assert!(!f1.is_dir && f1.opened && !f1.handle.is_null() && f1.qid_path == 7);
+        assert!(!f1.is_dir && f1.opened && f1.handle.is_some() && f1.qid_path == 7);
         let f2 = fids.map.get(&2).unwrap();
-        assert!(f2.is_dir && f2.opened && !f2.handle.is_null() && f2.qid_path == 8);
+        assert!(f2.is_dir && f2.opened && f2.handle.is_some() && f2.qid_path == 8);
         let f3 = fids.map.get(&3).unwrap();
-        assert!(f3.is_dir && !f3.opened && f3.handle.is_null() && f3.qid_path == 1);
+        assert!(f3.is_dir && !f3.opened && f3.handle.is_none() && f3.qid_path == 1);
         drop(fids);
 
         let _ = std::fs::remove_dir_all(&base);

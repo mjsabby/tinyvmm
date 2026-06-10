@@ -463,7 +463,11 @@ impl SnapshotReader {
         let len =
             u64::from_le_bytes(self.buf[self.pos + 8..self.pos + 16].try_into().unwrap()) as usize;
         let body = self.pos + 16;
-        if body + len > end {
+        // `body <= end` here (checked just above), so `end - body` can't
+        // underflow; written as subtraction to avoid `body + len` overflowing for
+        // a crafted near-u64::MAX length (which would bypass the guard and then
+        // panic on the slice below).
+        if len > end - body {
             return Err(Error::msg("snapshot: section length out of range"));
         }
         let ty = SectionType::from_u32(ty_raw)

@@ -263,6 +263,9 @@ impl SndDevice {
                     }
                     io.cur_off = 0;
                     io.cur_payload = readable_len(&io.cur).saturating_sub(XFER_BYTES);
+                    // Mark the chain in-flight so a guest period larger than one
+                    // WASAPI tick is resumed (not re-popped + leaked) next call.
+                    io.cur_valid = true;
                 }
                 let n = copy_from_readable(&io.cur, XFER_BYTES, io.cur_off, &mut dst[written..]);
                 io.cur_off += n;
@@ -338,6 +341,9 @@ impl SndDevice {
                     }
                     io.cur_off = 0;
                     io.cur_payload = writable_len(&io.cur).saturating_sub(STATUS_BYTES);
+                    // Mark the chain in-flight so a capture period larger than one
+                    // WASAPI tick is resumed (not re-popped + leaked) next call.
+                    io.cur_valid = true;
                 }
                 let room = io.cur_payload - io.cur_off;
                 if room == 0 {
@@ -419,17 +425,29 @@ impl SndDevice {
         let mut completed = 0u64;
         let mut g = mux.lock().unwrap();
         let io = &mut *g;
+        // Playback (tx) buffers report just the status struct as used; capture
+        // (rx) buffers report the full device-writable length, matching the
+        // normal and silent-fallback completions.
+        let used_for = |io: &PcmIo| -> u32 {
+            if playback {
+                STATUS_BYTES as u32
+            } else {
+                writable_len(&io.cur) as u32
+            }
+        };
         if io.cur_valid {
             write_status(&mut io.cur, S_OK, 0);
             let head = io.cur.head_index;
-            io.q.push(head, STATUS_BYTES as u32);
+            let used = used_for(io);
+            io.q.push(head, used);
             io.cur_valid = false;
             completed += 1;
         }
         while io.q.pop_into(&mut io.cur) {
             write_status(&mut io.cur, S_OK, 0);
             let head = io.cur.head_index;
-            io.q.push(head, STATUS_BYTES as u32);
+            let used = used_for(io);
+            io.q.push(head, used);
             completed += 1;
         }
         io.cur_valid = false;
@@ -733,26 +751,27 @@ fn scatter(chain: &mut PoppedChain, resp: &[u8]) -> u32 {
 // Static item-information builders.
 // ---------------------------------------------------------------------------
 
-/// Append `count` info entries (each padded to `size` bytes) produced by `make`
-/// for ids `start..start+count`, prefixed by an `S_OK` status header.
-fn build_info<F: Fn(u32, &mut [u8; 64])>(req: &[u8], resp: &mut Vec<u8>, make: F) {
+/// Append info entries (each padded to `size` bytes) produced by `make` for the
+/// requested ids, prefixed by an `S_OK` status header. The guest-supplied
+/// `start`/`count`/`size` are untrusted: `count` is clamped to the device's real
+/// item count (`num_items`) and `size` to the 64-byte entry, so one control
+/// message can't drive `resp` to gigabytes (or spin ~4 billion iterations).
+fn build_info<F: Fn(u32, &mut [u8; 64])>(req: &[u8], resp: &mut Vec<u8>, num_items: u32, make: F) {
     let start = rd32(req, 4);
     let count = rd32(req, 8);
-    let size = rd32(req, 12) as usize;
+    let size = (rd32(req, 12) as usize).min(64);
     resp.extend_from_slice(&S_OK.to_le_bytes());
-    for i in 0..count {
+    let end = start.saturating_add(count).min(num_items);
+    let first = start.min(end);
+    for id in first..end {
         let mut entry = [0u8; 64];
-        make(start + i, &mut entry);
-        let n = size.min(entry.len());
-        resp.extend_from_slice(&entry[..n]);
-        for _ in entry.len()..size {
-            resp.push(0);
-        }
+        make(id, &mut entry);
+        resp.extend_from_slice(&entry[..size]);
     }
 }
 
 fn build_jack_info(req: &[u8], resp: &mut Vec<u8>) {
-    build_info(req, resp, |id, e| {
+    build_info(req, resp, NUM_JACKS, |id, e| {
         // virtio_snd_jack_info: hda_fn_nid(4) features(4) defconf(4) caps(4)
         // connected(1) padding[7]
         let defconf = if id == STREAM_INPUT {
@@ -766,7 +785,7 @@ fn build_jack_info(req: &[u8], resp: &mut Vec<u8>) {
 }
 
 fn build_pcm_info(req: &[u8], resp: &mut Vec<u8>) {
-    build_info(req, resp, |id, e| {
+    build_info(req, resp, NUM_STREAMS, |id, e| {
         // virtio_snd_pcm_info: hda_fn_nid(4) features(4) formats(8) rates(8)
         // direction(1) channels_min(1) channels_max(1) padding[5]
         let formats: u64 = 1u64 << FMT_S16;
@@ -784,7 +803,7 @@ fn build_pcm_info(req: &[u8], resp: &mut Vec<u8>) {
 }
 
 fn build_chmap_info(req: &[u8], resp: &mut Vec<u8>) {
-    build_info(req, resp, |id, e| {
+    build_info(req, resp, NUM_CHMAPS, |id, e| {
         // virtio_snd_chmap_info: hda_fn_nid(4) direction(1) channels(1)
         // positions[18]
         e[4] = if id == STREAM_INPUT {

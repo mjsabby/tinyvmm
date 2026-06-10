@@ -2167,7 +2167,21 @@ fn run_restore(args: &[String]) -> Result<i32> {
     let jr = JsonReader::parse(&header)?;
 
     let vcpu_count = jr.get_u64("vcpu_count")? as u32;
+    if !(1..=MAX_VCPUS).contains(&vcpu_count) {
+        return Err(Error::msg(format!(
+            "restore: vcpu_count {vcpu_count} out of range (1..={MAX_VCPUS})"
+        )));
+    }
     let ram_size = jr.get_u64("ram_size_bytes")? as usize;
+    // Bound a corrupt/hostile header before it feeds GuestMemory's alignment and
+    // pointer math (4 TiB is far above any real microVM, far below the
+    // usize-overflow point that the boot path's clamps otherwise prevent).
+    const MAX_RESTORE_RAM: u64 = 1 << 42;
+    if ram_size == 0 || ram_size as u64 > MAX_RESTORE_RAM {
+        return Err(Error::msg(format!(
+            "restore: ram_size_bytes {ram_size} out of range (1..={MAX_RESTORE_RAM})"
+        )));
+    }
     let large_pages = jr.get_bool("large_pages").unwrap_or(true);
     let tsc_hz_at_save = jr.get_u64("tsc_hz_at_save").unwrap_or(0);
     let with_rng = jr.get_bool("with_rng").unwrap_or(false);
