@@ -138,6 +138,7 @@ fn print_usage() {
          Usage:\n\
          \x20 tinyvmm --smoke\n\
          \x20 tinyvmm --blk-selftest        host-side virtio-blk DISCARD/WRITE_ZEROES test\n\
+         \x20 tinyvmm --blk-stress          host-side virtio-blk concurrency stress + failure-path test\n\
          \x20 tinyvmm --pci-selftest        host-side PCI host-bridge + BAR + sizing test\n\
          \x20 tinyvmm --pvh-info <vmlinux>\n\
          \x20 tinyvmm --pvh-run [--initrd <cpio>] [--ram-mb N] [--vcpus N] [--rng] [--input] [--sound]\n\
@@ -537,6 +538,283 @@ fn pci_cfg_write(io: &IoBus, dev: u8, off: u32, size: u16, value: u32) {
         value,
     };
     io.dispatch(&mut d);
+}
+
+/// Host-side virtio-blk stress + failure-path test (no guest). Drives the real
+/// `BlockDevice` + IOCP backend through a virtqueue in guest RAM:
+///   1. 24 concurrent 3-segment WRITEs (72 segment I/Os) submitted before a
+///      single notify, then 24 concurrent READs that verify every byte —
+///      exercises the parallel submit_request/submit_seg/on_seg_complete path at
+///      depth and asserts the backend reached `max_inflight > 1`.
+///   2. A read whose segment is past EOF -> BLK_S_IOERR (the bounds-fail path).
+///   3. A batch submitted then immediately `reset()` (racing in-flight I/O),
+///      then a fresh queue must recover — covers reset-while-in-flight.
+fn run_blk_stresstest() -> Result<i32> {
+    use crate::virtio::blk::BlockDevice;
+
+    const NEXT: u16 = 1;
+    const WRITE: u16 = 2; // VRING_DESC_F_WRITE
+    const T_IN: u32 = 0;
+    const T_OUT: u32 = 1;
+    const SEG: u32 = 512;
+
+    check_whp_available()?;
+    let mut part = Partition::new(1)?;
+    part.enable_extended_exits(true, true, false)?;
+    set_hide_tsc_deadline(true);
+    let list = build_static_cpuid_result_list(true);
+    part.set_cpuid_result_list(&list)?;
+    part.set_local_apic_emulation(WHvX64LocalApicEmulationModeX2Apic)?;
+    part.setup()?;
+    let ram = Arc::new(GuestMemory::new(
+        part.handle(),
+        0,
+        16 * 1024 * 1024,
+        false,
+        false,
+    )?);
+
+    let path = std::env::temp_dir().join("tinyvmm_blk_stress.img");
+    let path_str = path.to_string_lossy().to_string();
+    std::fs::write(&path, vec![0u8; 4 * 1024 * 1024])
+        .map_err(|e| Error::msg(format!("stress: write temp file: {e}")))?;
+    let backend = Arc::new(BlockFile::new(&path_str, false));
+    if !backend.open() {
+        let _ = std::fs::remove_file(&path);
+        return Err(Error::msg(format!(
+            "stress: open failed err={}",
+            backend.open_err()
+        )));
+    }
+    backend.start();
+
+    const QMAX: u32 = 128;
+    const QSIZE: u16 = 128;
+    let dev = BlockDevice::new(ram.clone(), backend.clone(), QMAX);
+
+    let desc_gpa: u64 = 0x1_0000;
+    let avail_gpa: u64 = 0x2_0000;
+    let used_gpa: u64 = 0x3_0000;
+
+    let put = |gpa: u64, b: &[u8]| ram.write_at(gpa, b).expect("stress write_at");
+    let getb = |gpa: u64| ram.slice_mut(gpa, 1).expect("stress read")[0];
+    let write_desc = |table: u64, i: u64, addr: u64, len: u32, flags: u16, next: u16| {
+        let base = table + i * 16;
+        put(base, &addr.to_le_bytes());
+        put(base + 8, &len.to_le_bytes());
+        put(base + 12, &flags.to_le_bytes());
+        put(base + 14, &next.to_le_bytes());
+    };
+
+    dev.enable_queue(0, desc_gpa, avail_gpa, used_gpa, QSIZE, false);
+
+    // Build a request chain (header + `segs` data descs + status) at descriptor
+    // base `d` and publish ring[slot] -> head. Slots MUST be assigned in the
+    // order the device consumes them (== its last_avail cursor). Returns the
+    // status-byte GPA (sentinel 0xAA until the device writes the real status).
+    let build = |slot: u16,
+                 d: u64,
+                 hdr_gpa: u64,
+                 data_gpa: u64,
+                 rtype: u32,
+                 sector: u64,
+                 segs: u64|
+     -> u64 {
+        let stat = hdr_gpa + 0xC00;
+        put(hdr_gpa, &rtype.to_le_bytes());
+        put(hdr_gpa + 4, &0u32.to_le_bytes());
+        put(hdr_gpa + 8, &sector.to_le_bytes());
+        put(stat, &[0xAAu8]);
+        write_desc(desc_gpa, d, hdr_gpa, 16, NEXT, (d + 1) as u16);
+        let dflags = if rtype == T_IN { WRITE | NEXT } else { NEXT };
+        for k in 0..segs {
+            write_desc(
+                desc_gpa,
+                d + 1 + k,
+                data_gpa + k * SEG as u64,
+                SEG,
+                dflags,
+                (d + 2 + k) as u16,
+            );
+        }
+        write_desc(desc_gpa, d + 1 + segs, stat, 1, WRITE, 0);
+        put(avail_gpa + 4 + 2 * slot as u64, &(d as u16).to_le_bytes());
+        stat
+    };
+
+    // Poll the status bytes off their 0xAA sentinel (async IOCP completions).
+    let wait_all = |stats: &[u64]| -> bool {
+        for _ in 0..10_000 {
+            if stats.iter().all(|&s| getb(s) != 0xAA) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        false
+    };
+
+    let mut ok = true;
+    let mut fail = |c: bool, m: &str| {
+        if !c {
+            ok = false;
+            eprintln!("[blk-stress] FAIL: {m}");
+        }
+    };
+
+    const N: u64 = 24;
+    const SEGS: u64 = 3; // 5 descriptors/request; N*5 = 120 < QSIZE
+    let data_base = |r: u64| 0x10_0000u64 + r * 0x1_0000;
+    let rdata_base = |r: u64| 0x40_0000u64 + r * 0x1_0000;
+    let hdr_base = |r: u64| 0x80_0000u64 + r * 0x1000;
+    let sector_of = |r: u64| r * SEGS; // request r owns SEGS contiguous sectors
+    let pat =
+        |r: u64, b: u64| -> u8 { (0x10u8.wrapping_add(r as u8)).wrapping_add((b & 0xff) as u8) };
+    let seg_bytes = SEGS * SEG as u64;
+
+    // ---- Phase 1: N concurrent multi-segment WRITEs ----
+    for r in 0..N {
+        for b in 0..seg_bytes {
+            put(data_base(r) + b, &[pat(r, b)]);
+        }
+    }
+    let wstat: Vec<u64> = (0..N)
+        .map(|r| {
+            build(
+                r as u16,
+                r * 5,
+                hdr_base(r),
+                data_base(r),
+                T_OUT,
+                sector_of(r),
+                SEGS,
+            )
+        })
+        .collect();
+    put(avail_gpa + 2, &(N as u16).to_le_bytes());
+    dev.notify_queue(0);
+    fail(wait_all(&wstat), "concurrent writes did not all complete");
+    fail(
+        wstat.iter().all(|&s| getb(s) == 0),
+        "a concurrent write returned non-OK",
+    );
+    let maxq = backend.max_inflight();
+    fail(maxq > 1, &format!("max_inflight={maxq}, expected >1"));
+    fail(dev.ops_err() == 0, "ops_err != 0 after writes");
+
+    // ---- Phase 2: read everything back and verify ----
+    for r in 0..N {
+        for b in 0..seg_bytes {
+            put(rdata_base(r) + b, &[0u8]);
+        }
+    }
+    let rstat: Vec<u64> = (0..N)
+        .map(|r| {
+            build(
+                (N + r) as u16,
+                r * 5,
+                hdr_base(r),
+                rdata_base(r),
+                T_IN,
+                sector_of(r),
+                SEGS,
+            )
+        })
+        .collect();
+    put(avail_gpa + 2, &((2 * N) as u16).to_le_bytes());
+    dev.notify_queue(0);
+    fail(wait_all(&rstat), "concurrent reads did not all complete");
+    fail(
+        rstat.iter().all(|&s| getb(s) == 0),
+        "a concurrent read returned non-OK",
+    );
+    let mut data_ok = true;
+    'verify: for r in 0..N {
+        for b in 0..seg_bytes {
+            if getb(rdata_base(r) + b) != pat(r, b) {
+                data_ok = false;
+                break 'verify;
+            }
+        }
+    }
+    fail(data_ok, "read-back data mismatch");
+
+    // ---- Phase 3: out-of-range segment -> IOERR ----
+    {
+        let s = build(
+            (2 * N) as u16,
+            0,
+            hdr_base(0),
+            rdata_base(0),
+            T_IN,
+            100_000,
+            1,
+        );
+        put(avail_gpa + 2, &((2 * N + 1) as u16).to_le_bytes());
+        dev.notify_queue(0);
+        fail(wait_all(&[s]), "out-of-range read did not complete");
+        fail(getb(s) == 1, "out-of-range read did not return BLK_S_IOERR");
+    }
+
+    // ---- Phase 4: reset while I/O may be in flight, then recover ----
+    {
+        for r in 0..8u64 {
+            // continue the ring cursor: slots (2N+1 + r)
+            let _ = build(
+                (2 * N + 1 + r) as u16,
+                r * 5,
+                hdr_base(r),
+                data_base(r),
+                T_OUT,
+                sector_of(r),
+                2,
+            );
+        }
+        put(avail_gpa + 2, &((2 * N + 1 + 8) as u16).to_le_bytes());
+        dev.notify_queue(0);
+        dev.reset(); // races the in-flight I/O; must not crash or write a stale ring
+        std::thread::sleep(std::time::Duration::from_millis(100)); // let completions drain
+    }
+    // Recover on a FRESH queue (clean rings): one request must succeed.
+    let recovered = {
+        let (d2, a2, u2) = (0x4_0000u64, 0x5_0000u64, 0x6_0000u64);
+        put(a2, &[0u8; 8]);
+        put(u2, &[0u8; 8]);
+        dev.enable_queue(0, d2, a2, u2, QSIZE, false);
+        let hdr = hdr_base(0);
+        let stat = hdr + 0xC00;
+        put(hdr, &T_OUT.to_le_bytes());
+        put(hdr + 4, &0u32.to_le_bytes());
+        put(hdr + 8, &0u64.to_le_bytes());
+        put(stat, &[0xAAu8]);
+        write_desc(d2, 0, hdr, 16, NEXT, 1);
+        write_desc(d2, 1, data_base(0), SEG, NEXT, 2);
+        write_desc(d2, 2, stat, 1, WRITE, 0);
+        put(a2 + 4, &0u16.to_le_bytes()); // ring[0] = head desc 0
+        put(a2 + 2, &1u16.to_le_bytes()); // avail.idx = 1
+        dev.notify_queue(0);
+        wait_all(&[stat]) && getb(stat) == 0
+    };
+    fail(
+        recovered,
+        "device did not recover after reset-with-inflight",
+    );
+
+    let final_err = dev.ops_err();
+    drop(dev);
+    drop(backend);
+    let _ = std::fs::remove_file(&path);
+
+    if ok {
+        println!(
+            "[blk-stress] PASS: {N}x{SEGS}-seg concurrent writes+reads verified, \
+             max_inflight={maxq} (>1), out-of-range->IOERR, reset-in-flight recovered \
+             (ops_err={final_err})"
+        );
+        Ok(0)
+    } else {
+        eprintln!("[blk-stress] FAIL");
+        Ok(1)
+    }
 }
 
 /// Host-side PCI host-bridge selftest (no guest): builds a PciBus + one dummy
@@ -4071,6 +4349,7 @@ fn main() {
     let result = match args[1].as_str() {
         "--smoke" => run_smoke(),
         "--blk-selftest" => run_blk_selftest(),
+        "--blk-stress" => run_blk_stresstest(),
         "--pci-selftest" => run_pci_selftest(),
         "--pvh-info" => run_pvh_info(&args),
         "--pvh-run" => run_pvh_run(&args),
