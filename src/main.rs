@@ -304,7 +304,7 @@ fn run_blk_selftest() -> Result<i32> {
     let desc_gpa: u64 = 0x1_0000;
     let avail_gpa: u64 = 0x1_1000;
     let used_gpa: u64 = 0x1_2000;
-    const QSIZE: u16 = 8;
+    const QSIZE: u16 = 16;
 
     let put = |gpa: u64, bytes: &[u8]| ram.write_at(gpa, bytes).expect("selftest write_at");
     let write_desc = |i: u64, addr: u64, len: u32, flags: u16, next: u16| {
@@ -346,10 +346,72 @@ fn run_blk_selftest() -> Result<i32> {
             ram.slice_mut(stat, 1).expect("selftest status")[0]
         };
 
+    // ---- READ/WRITE roundtrip through the parallel-submission path ----
+    // (descriptors 0..7, avail slots 0,1). WRITE a known multi-segment pattern to
+    // sector 0, then READ it back into a fresh buffer and compare. This is the
+    // only thing here that exercises submit_request / submit_seg / on_seg_complete
+    // / finish_request (the DISCARD/WRITE_ZEROES path below does not). The
+    // WRITE_ZEROES below then re-zeros sector 0, so the final file-content checks
+    // still hold.
+    const T_IN: u32 = 0;
+    const T_OUT: u32 = 1;
+    const SEG: u32 = 512; // one sector per data descriptor
+    let wsrc = 0x8_0000u64; // write-source buffers (2 sectors)
+    let rdst = 0x9_0000u64; // read-target buffers (2 sectors)
+    for k in 0..(2 * SEG as u64) {
+        put(wsrc + k, &[0x40 + (k % 64) as u8]);
+        put(rdst + k, &[0u8]);
+    }
+    // Build header(d) + `segs` data descs + status, kick, and wait for the async
+    // IOCP completion to write the status byte off its 0xAA sentinel.
+    let issue_rw =
+        |avail_slot: u16, d: u64, hdr_gpa: u64, data_gpa: u64, rtype: u32, segs: u64| -> u8 {
+            let stat = hdr_gpa + 0x800;
+            put(hdr_gpa, &rtype.to_le_bytes());
+            put(hdr_gpa + 4, &0u32.to_le_bytes());
+            put(hdr_gpa + 8, &0u64.to_le_bytes()); // sector 0
+            put(stat, &[0xAAu8]);
+            write_desc(d, hdr_gpa, 16, NEXT, (d + 1) as u16);
+            let dflags = if rtype == T_IN { WRITE | NEXT } else { NEXT };
+            for k in 0..segs {
+                write_desc(
+                    d + 1 + k,
+                    data_gpa + k * SEG as u64,
+                    SEG,
+                    dflags,
+                    (d + 2 + k) as u16,
+                );
+            }
+            write_desc(d + 1 + segs, stat, 1, WRITE, 0);
+            put(
+                avail_gpa + 4 + 2 * avail_slot as u64,
+                &(d as u16).to_le_bytes(),
+            );
+            put(avail_gpa + 2, &(avail_slot + 1).to_le_bytes());
+            dev.notify_queue(0);
+            for _ in 0..5000 {
+                let s = ram.slice_mut(stat, 1).expect("rw status")[0];
+                if s != 0xAA {
+                    return s;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            0xAA
+        };
+    let st_w = issue_rw(0, 0, 0x4_0000, wsrc, T_OUT, 2);
+    let st_r = issue_rw(1, 4, 0x5_0000, rdst, T_IN, 2);
+    let mut rw_data_ok = true;
+    for k in 0..(2 * SEG as u64) {
+        if ram.slice_mut(rdst + k, 1).expect("rw readback")[0] != 0x40 + (k % 64) as u8 {
+            rw_data_ok = false;
+            break;
+        }
+    }
+
     // WRITE_ZEROES on sectors [0, 16) -> bytes [0, 8192); DISCARD on sectors
     // [64, 80) -> bytes [32768, 40960).
-    let st_wz = issue(0, 0, 0x2_0000, T_WRITE_ZEROES, 0, 16);
-    let st_dc = issue(1, 3, 0x3_0000, T_DISCARD, 64, 16);
+    let st_wz = issue(2, 8, 0x2_0000, T_WRITE_ZEROES, 0, 16);
+    let st_dc = issue(3, 11, 0x3_0000, T_DISCARD, 64, 16);
 
     let ops_wz = dev.ops_write_zeroes();
     let ops_dc = dev.ops_discard();
@@ -371,6 +433,9 @@ fn run_blk_selftest() -> Result<i32> {
             eprintln!("[blk-selftest] FAIL: {msg}");
         }
     };
+    fail(st_w == 0, "multi-seg WRITE status != OK");
+    fail(st_r == 0, "multi-seg READ status != OK");
+    fail(rw_data_ok, "multi-seg READ-back != written pattern");
     fail(st_wz == 0, "WRITE_ZEROES status != OK");
     fail(st_dc == 0, "DISCARD status != OK");
     fail(ops_wz == 1, "ops_write_zeroes != 1");
