@@ -171,7 +171,12 @@ impl RunLoop {
             // interrupt-window exit -- so a queued vector is never stranded.
             self.deliver_interrupts();
 
-            let exit = match self.vcpu.run_exit() {
+            // Mark the run window so a device/timer thread only kicks (cancels)
+            // while we're actually inside WHvRunVirtualProcessor.
+            whpsys::lapic::global().set_in_run(true);
+            let run_result = self.vcpu.run_exit();
+            whpsys::lapic::global().set_in_run(false);
+            let exit = match run_result {
                 Ok(e) => e,
                 Err(e) => {
                     eprintln!("[loop] WHvRunVirtualProcessor failed: {e}");
@@ -350,17 +355,23 @@ impl RunLoop {
         if !whpsys::lapic::active() {
             return;
         }
-        // Live TPR class (CR8 = TPR[7:4]); the software LAPIC owns the priority
-        // decision, we just feed it the current processor priority.
-        let cr8 = self
-            .vcpu
-            .get_register(WHvX64RegisterCr8)
-            .map(|v| (unsafe { v.Reg64 } & 0xF) as u32)
-            .unwrap_or(0);
-        let Some(vector) = whpsys::lapic::global().next_vector(cr8) else {
+        // One batched WHP read of every register the decision needs (cr8 for the
+        // TPR class plus the four injectability inputs), rather than five calls.
+        let (cr8, rflags, istate, pint, pevent) = match self.vcpu.injectability_regs() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[loop] injectability read failed: {e}");
+                return;
+            }
+        };
+        // The software LAPIC owns the priority decision; feed it the live TPR.
+        let Some(vector) = whpsys::lapic::global().next_vector((cr8 & 0xF) as u32) else {
             return;
         };
-        match self.vcpu.try_inject_interrupt(vector) {
+        match self
+            .vcpu
+            .try_inject_interrupt(vector, rflags, istate, pint, pevent)
+        {
             // Accepted into service; clear it from the IRR.
             Ok(true) => whpsys::lapic::global().take_vector(vector),
             // Guest not interruptible right now (IF=0 / shadow / pending). Leave

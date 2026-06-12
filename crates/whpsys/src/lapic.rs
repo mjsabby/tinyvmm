@@ -21,11 +21,22 @@
 //!
 //! # Scope
 //!
-//! Single vCPU (BSP only) in x2APIC mode: no IPIs to other processors, no
+//! Deliberately minimal -- exactly what a single-vCPU PVH guest exercises, no
+//! more. Single vCPU (BSP only) in x2APIC mode: no IPIs to other processors, no
 //! SIPI/AP startup. The guest accesses the APIC through MSRs (0x800-0x83F) plus
 //! `IA32_APIC_BASE` (0x1B), all of which trap to [`read_msr`]/[`write_msr`].
 //! TSC-deadline mode is hidden from CPUID, so only the count-based timer is
 //! emulated.
+//!
+//! Implemented: IRR/ISR + PPR-vs-TPR priority, EOI, the spurious/software-enable
+//! bit, the count-based LVT timer (one-shot + periodic), and a self-IPI (ICR to
+//! self / `SELF IPI`). Edge-triggered fixed interrupts only.
+//!
+//! Intentionally **not** implemented (a fuller emulator like OpenVMM's
+//! `virt_support_apic` has these; nothing a PVH guest does reaches them):
+//! level-triggered delivery / the trigger-mode register (TMR), LVT delivery for
+//! NMI/thermal/perf/LINT/error, auto-EOI, and a complete error-status register.
+//! Extend here if a guest ever needs them.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -163,6 +174,11 @@ pub struct LocalApic {
     wake_cv: Condvar,
     /// Target (partition, vp) for the wake kick; `(0, 0)` until bound.
     target: Mutex<(WHV_PARTITION_HANDLE, u32)>,
+    /// True while the run loop is inside `WHvRunVirtualProcessor`. The kick only
+    /// fires then: a parked vCPU is woken by `wake_cv` instead, and one between
+    /// runs picks the vector up on its next delivery pass -- so cancelling would
+    /// just cost a spurious `Canceled` exit.
+    in_run: AtomicBool,
     tsc_hz: Mutex<u64>,
     thread_started: AtomicBool,
 }
@@ -187,6 +203,7 @@ pub fn global() -> &'static LocalApic {
         timer_cv: Condvar::new(),
         wake_cv: Condvar::new(),
         target: Mutex::new((0, 0)),
+        in_run: AtomicBool::new(false),
         tsc_hz: Mutex::new(0),
         thread_started: AtomicBool::new(false),
     })
@@ -224,12 +241,21 @@ impl LocalApic {
     /// re-enters and injects a freshly-queued vector promptly (rather than
     /// waiting for the guest's next natural exit).
     fn kick(&self) {
+        if !self.in_run.load(Ordering::Acquire) {
+            return; // not running -> wake_cv / next delivery pass handles it
+        }
         let (part, vp) = *self.target.lock().unwrap();
         if part != 0 {
             // SAFETY: `part` is a live partition handle; cancelling the vCPU run
             // from another thread is the documented WHP wake mechanism.
             unsafe { WHvCancelRunVirtualProcessor(part, vp, 0) };
         }
+    }
+
+    /// Marks whether the run loop is currently inside `WHvRunVirtualProcessor`,
+    /// gating [`kick`]. Set true immediately before the run and false after.
+    pub fn set_in_run(&self, running: bool) {
+        self.in_run.store(running, Ordering::Release);
     }
 
     /// Queue `vector` for delivery (sets its IRR bit) and wake the vCPU so the
@@ -422,8 +448,17 @@ impl LocalApic {
                             fire_vec = Some((g.lvt_timer & 0xFF) as u8);
                         }
                         if periodic && g.initial_count != 0 {
-                            let period = g.initial_count as u64 * divisor(g.divide_cfg);
-                            g.timer_deadline_tsc = g.timer_deadline_tsc.wrapping_add(period.max(1));
+                            let period = (g.initial_count as u64 * divisor(g.divide_cfg)).max(1);
+                            // Advance one period; but if we were descheduled past
+                            // the next deadline too, skip the missed periods rather
+                            // than firing once per period to catch up (the IRR
+                            // already coalesces, so those fires deliver nothing).
+                            let next = g.timer_deadline_tsc.wrapping_add(period);
+                            g.timer_deadline_tsc = if now >= next {
+                                now.wrapping_add(period)
+                            } else {
+                                next
+                            };
                             g.timer_start_tsc = now;
                         } else {
                             g.timer_deadline_tsc = 0;
