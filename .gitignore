@@ -28,3 +28,8 @@ dbg_*
 tools/__pycache__/
 __pycache__/
 *.pyc
+
+# Local nested-LAPIC test artifacts
+guest_*.log
+*.img
+/initrd
