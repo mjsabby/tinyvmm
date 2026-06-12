@@ -15,6 +15,7 @@ pub use winsys::host;
 
 pub mod doorbell;
 pub mod emulator;
+pub mod lapic;
 pub mod memory;
 pub mod msi;
 pub mod partition;

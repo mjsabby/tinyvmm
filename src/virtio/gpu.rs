@@ -40,6 +40,17 @@ const NUM_SCANOUTS: u32 = 1;
 const MAX_SCANOUTS: usize = 16; // sizeof display-info response is fixed at 16
 const MAX_DIM: u32 = 8192;
 const MAX_BACKING_ENTRIES: u32 = 1 << 16;
+/// Upper bound on a gathered control request. The largest legitimate command is
+/// RESOURCE_ATTACH_BACKING (32-byte header + MAX_BACKING_ENTRIES * 16 bytes);
+/// every other command is < 64 bytes. Caps the per-request gather so a malicious
+/// chain can't balloon `st.req` to gigabytes (alloc failure → VMM abort).
+const CTRL_REQ_MAX: usize = 64 + (MAX_BACKING_ENTRIES as usize) * 16;
+/// Caps on guest-pinned host-shadow memory: a bound on the number of live
+/// resources and on the aggregate `host` bytes across all of them, so
+/// RESOURCE_CREATE_2D can't drive the host to OOM (which aborts the VMM under
+/// panic=abort). 512 MiB comfortably holds several max-size scanouts.
+const MAX_RESOURCES: usize = 1024;
+const MAX_TOTAL_RESOURCE_BYTES: usize = 512 << 20;
 const BPP: u32 = 4;
 
 // virtio_gpu_ctrl_type — 2D control commands.
@@ -58,6 +69,7 @@ const CMD_MOVE_CURSOR: u32 = 0x0301;
 const RESP_OK_NODATA: u32 = 0x1100;
 const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 const RESP_ERR_UNSPEC: u32 = 0x1200;
+const RESP_ERR_OUT_OF_MEMORY: u32 = 0x1201;
 const RESP_ERR_INVALID_SCANOUT_ID: u32 = 0x1202;
 const RESP_ERR_INVALID_RESOURCE_ID: u32 = 0x1203;
 const RESP_ERR_INVALID_PARAMETER: u32 = 0x1205;
@@ -223,7 +235,12 @@ impl GpuDevice {
         st.req.clear();
         for buf in &chain.bufs {
             if !buf.write && buf.len != 0 {
-                st.req.extend_from_slice(buf.as_slice());
+                if st.req.len() >= CTRL_REQ_MAX {
+                    break;
+                }
+                let s = buf.as_slice();
+                let take = s.len().min(CTRL_REQ_MAX - st.req.len());
+                st.req.extend_from_slice(&s[..take]);
             }
         }
         self.dispatch(st);
@@ -289,6 +306,15 @@ impl GpuDevice {
             return RESP_ERR_INVALID_PARAMETER;
         }
         let size = (w as usize) * (h as usize) * BPP as usize;
+        // Bound live resources and aggregate host-shadow bytes so a guest can't
+        // pin the host into OOM (which aborts the VMM under panic=abort).
+        if st.resources.len() >= MAX_RESOURCES {
+            return RESP_ERR_OUT_OF_MEMORY;
+        }
+        let in_use: usize = st.resources.values().map(|r| r.host.len()).sum();
+        if in_use >= MAX_TOTAL_RESOURCE_BYTES || size > MAX_TOTAL_RESOURCE_BYTES - in_use {
+            return RESP_ERR_OUT_OF_MEMORY;
+        }
         st.resources.insert(
             id,
             Resource2d {
@@ -691,12 +717,16 @@ fn decode_state(bytes: &[u8]) -> Option<(bool, u64, u32, HashMap<u32, Resource2d
     let scanout = r.u32()?;
     let count = r.u32()?;
     let mut resources = HashMap::new();
+    let mut total_bytes: usize = 0;
     for _ in 0..count {
         let id = r.u32()?;
         let width = r.u32()?;
         let height = r.u32()?;
         let format = r.u32()?;
         let bcount = r.u32()?;
+        if bcount > MAX_BACKING_ENTRIES {
+            return None;
+        }
         // Don't pre-reserve from an untrusted count; each push validates length.
         let mut backing = Vec::new();
         for _ in 0..bcount {
@@ -704,6 +734,27 @@ fn decode_state(bytes: &[u8]) -> Option<(bool, u64, u32, HashMap<u32, Resource2d
         }
         let hlen = r.u32()? as usize;
         let host = r.take(hlen)?.to_vec();
+        // Re-establish the invariants the guest command path enforces and that
+        // cmd_transfer_2d's memory safety relies on: bounded geometry, a known
+        // format, host.len() == width*height*BPP, and the resource caps. A
+        // crafted/corrupt snapshot that violates these is rejected outright
+        // rather than left to panic (or worse) at transfer time.
+        if width == 0 || height == 0 || width > MAX_DIM || height > MAX_DIM {
+            return None;
+        }
+        if channel_indices(format).is_none() {
+            return None;
+        }
+        if host.len() != (width as usize) * (height as usize) * BPP as usize {
+            return None;
+        }
+        if resources.len() >= MAX_RESOURCES {
+            return None;
+        }
+        total_bytes = total_bytes.checked_add(host.len())?;
+        if total_bytes > MAX_TOTAL_RESOURCE_BYTES {
+            return None;
+        }
         resources.insert(
             id,
             Resource2d {

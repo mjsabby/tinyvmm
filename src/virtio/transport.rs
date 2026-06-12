@@ -4,6 +4,7 @@
 //! serviced synchronously on the vCPU thread).
 
 use crate::devices::mmio_bus::{MmioAccess, MmioBus};
+use crate::mem_layout::{MMIO_WINDOW_BASE, MMIO_WINDOW_END};
 use crate::pci::config::{BarEvent, BarKind, PciConfigSpace};
 use crate::pci::msix::MsiX;
 use crate::pci::{CAP_ID_VENDOR, PciFunction};
@@ -344,6 +345,19 @@ impl PciTransport {
     }
 
     fn on_bar_mapped(&self, gpa: u64) {
+        // The guest fully controls the BAR base. Refuse to wire a BAR that falls
+        // outside the PCI MMIO window or overlaps another device's mapped BAR:
+        // registering an overlapping range would otherwise abort the VMM. A
+        // mis-programmed BAR just leaves this device's MMIO unwired (the guest's
+        // own problem), never a host crash. `is_range_free` + the non-panicking
+        // `MmioBus::register` are the backstop for a concurrent reprogram race.
+        let end = gpa.checked_add(BAR_SIZE as u64);
+        let placement_ok = gpa >= MMIO_WINDOW_BASE
+            && end.is_some_and(|e| e <= MMIO_WINDOW_END)
+            && self.mmio_bus.is_range_free(gpa, BAR_SIZE as u64);
+        if !placement_ok {
+            return;
+        }
         self.bar_gpa.store(gpa, Ordering::Relaxed);
         self.bar_mapped.store(true, Ordering::Relaxed);
         self.install_bar_handlers(gpa);
@@ -628,7 +642,10 @@ impl PciTransport {
                 if sel < c.queues.len() {
                     let qs = (value & 0xFFFF) as u16;
                     let max = self.device.queue_max(c.queue_select as u32) as u16;
-                    if qs <= max {
+                    // virtio requires a power-of-two queue size; the ring index
+                    // and EVENT_IDX wrap math assume it. Reject anything else
+                    // (size keeps its previous value; the driver re-reads it).
+                    if qs <= max && qs.is_power_of_two() {
                         c.queues[sel].size = qs;
                     }
                     c.queues[sel].msix_vector = ((value >> 16) & 0xFFFF) as u16;

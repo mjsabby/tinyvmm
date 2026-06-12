@@ -7,15 +7,30 @@ use windows_sys::Win32::System::Hypervisor::{
     WHV_RUN_VP_EXIT_CONTEXT, WHV_VP_EXIT_CONTEXT, WHV_X64_IO_PORT_ACCESS_CONTEXT,
     WHvCancelRunVirtualProcessor, WHvCreateVirtualProcessor, WHvDeleteVirtualProcessor,
     WHvGetVirtualProcessorInterruptControllerState2, WHvGetVirtualProcessorRegisters,
-    WHvGetVirtualProcessorXsaveState, WHvRunVirtualProcessor, WHvRunVpExitReasonCanceled,
+    WHvGetVirtualProcessorXsaveState, WHvRegisterInterruptState, WHvRegisterPendingEvent,
+    WHvRegisterPendingInterruption, WHvRunVirtualProcessor, WHvRunVpExitReasonCanceled,
     WHvRunVpExitReasonException, WHvRunVpExitReasonInvalidVpRegisterValue,
     WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonNone,
     WHvRunVpExitReasonUnrecoverableException, WHvRunVpExitReasonUnsupportedFeature,
     WHvRunVpExitReasonX64ApicEoi, WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt,
     WHvRunVpExitReasonX64InterruptWindow, WHvRunVpExitReasonX64IoPortAccess,
     WHvRunVpExitReasonX64MsrAccess, WHvSetVirtualProcessorInterruptControllerState2,
-    WHvSetVirtualProcessorRegisters, WHvSetVirtualProcessorXsaveState,
+    WHvSetVirtualProcessorRegisters, WHvSetVirtualProcessorXsaveState, WHvX64RegisterRflags,
 };
+
+/// `WHV_REGISTER_VALUE` carries `DECLSPEC_ALIGN(16)` in the WHP headers (WHP
+/// reads/writes it with 16-byte-aligned SSE `movaps`), but the windows-sys
+/// binding drops the alignment and is only 8-byte aligned. Passing a buffer of
+/// the raw type to `WHvGet/SetVirtualProcessorRegisters` therefore faults inside
+/// WHP whenever the buffer happens to land on an 8-but-not-16 boundary. We copy
+/// through this 16-byte-aligned wrapper to guarantee the alignment WHP needs.
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+struct AlignedRegValue(WHV_REGISTER_VALUE);
+
+/// Stack capacity for the aligned register scratch buffer; larger batches spill
+/// to the heap. Covers every hot-path get/set and the snapshot register lists.
+const REG_SCRATCH: usize = 64;
 
 /// Reinterpret a 16-byte register value as the WHP union (LE byte image).
 fn bytes_to_val(b: &[u8; 16]) -> WHV_REGISTER_VALUE {
@@ -60,18 +75,32 @@ impl Vcpu {
         if names.len() != out.len() {
             return Err(Error::msg("Vcpu::get_registers: name/value size mismatch"));
         }
-        check_hr(
-            unsafe {
-                WHvGetVirtualProcessorRegisters(
-                    self.part,
-                    self.index,
-                    names.as_ptr(),
-                    names.len() as u32,
-                    out.as_mut_ptr(),
-                )
-            },
-            "WHvGetVirtualProcessorRegisters",
-        )
+        let n = names.len();
+        // WHP writes each value with an aligned SSE store; route through a
+        // 16-byte-aligned buffer (see AlignedRegValue), then copy back.
+        let zero = AlignedRegValue(WHV_REGISTER_VALUE { Reg64: 0 });
+        let mut stack = [zero; REG_SCRATCH];
+        let mut heap: Vec<AlignedRegValue>;
+        let buf: &mut [AlignedRegValue] = if n <= REG_SCRATCH {
+            &mut stack[..n]
+        } else {
+            heap = vec![zero; n];
+            &mut heap[..]
+        };
+        let hr = unsafe {
+            WHvGetVirtualProcessorRegisters(
+                self.part,
+                self.index,
+                names.as_ptr(),
+                n as u32,
+                buf.as_mut_ptr() as *mut WHV_REGISTER_VALUE,
+            )
+        };
+        check_hr(hr, "WHvGetVirtualProcessorRegisters")?;
+        for (o, a) in out.iter_mut().zip(buf.iter()) {
+            *o = a.0;
+        }
+        Ok(())
     }
 
     pub fn set_registers(
@@ -82,14 +111,29 @@ impl Vcpu {
         if names.len() != values.len() {
             return Err(Error::msg("Vcpu::set_registers: name/value size mismatch"));
         }
+        let n = names.len();
+        // WHP reads each value with an aligned SSE load; route through a
+        // 16-byte-aligned buffer (see AlignedRegValue).
+        let zero = AlignedRegValue(WHV_REGISTER_VALUE { Reg64: 0 });
+        let mut stack = [zero; REG_SCRATCH];
+        let heap: Vec<AlignedRegValue>;
+        let buf: &[AlignedRegValue] = if n <= REG_SCRATCH {
+            for (s, v) in stack.iter_mut().zip(values.iter()) {
+                *s = AlignedRegValue(*v);
+            }
+            &stack[..n]
+        } else {
+            heap = values.iter().map(|v| AlignedRegValue(*v)).collect();
+            &heap[..]
+        };
         check_hr(
             unsafe {
                 WHvSetVirtualProcessorRegisters(
                     self.part,
                     self.index,
                     names.as_ptr(),
-                    names.len() as u32,
-                    values.as_ptr(),
+                    n as u32,
+                    buf.as_ptr() as *const WHV_REGISTER_VALUE,
                 )
             },
             "WHvSetVirtualProcessorRegisters",
@@ -98,6 +142,45 @@ impl Vcpu {
 
     pub fn set_register(&self, name: WHV_REGISTER_NAME, value: WHV_REGISTER_VALUE) -> Result<()> {
         self.set_registers(&[name], &[value])
+    }
+
+    /// Try to deliver external-interrupt `vector` via VM-entry event injection
+    /// (`WHvRegisterPendingInterruption`). This is the nested-VM interrupt path:
+    /// `WHvRequestInterrupt`'s LAPIC delivery relies on hardware APIC
+    /// virtualization that Hyper-V doesn't expose to a nested guest, so we inject
+    /// the event directly instead. Mirrors OpenVMM's `virt_whp` `inject_interrupt`.
+    ///
+    /// Only injects when the guest is actually injectable (a blind injection
+    /// causes an invalid VM entry and crashes WHP); priority vs. the TPR is the
+    /// caller's job (the software LAPIC already filtered on PPR). MUST be called
+    /// while the vCPU is not running (between `run` calls). Returns `Ok(true)` if
+    /// injected, `Ok(false)` if the guest wasn't ready -- the vector stays queued
+    /// in the software LAPIC IRR and the run loop retries on the next exit.
+    pub fn try_inject_interrupt(&self, vector: u8) -> Result<bool> {
+        const RFLAGS_IF: u64 = 1 << 9;
+        // SAFETY: each register read returns the low 64 bits of the value union
+        // (`Reg64`); for the 128-bit PendingEvent that's the half holding the
+        // `EventPending` bit.
+        let rflags = unsafe { self.get_register(WHvX64RegisterRflags)?.Reg64 };
+        let istate = unsafe { self.get_register(WHvRegisterInterruptState)?.Reg64 };
+        let pint = unsafe { self.get_register(WHvRegisterPendingInterruption)?.Reg64 };
+        let pevent = unsafe { self.get_register(WHvRegisterPendingEvent)?.Reg64 };
+        // Not injectable if IF is clear, an interruption is already pending
+        // (PendingInterruption bit 0), an interrupt shadow is active
+        // (InterruptState bit 0), or an event is already pending (PendingEvent
+        // bit 0). Injecting over any of these is an invalid VM entry and faults
+        // WHP. (Priority vs. TPR is the caller's responsibility.)
+        if rflags & RFLAGS_IF == 0 || (pint & 1) != 0 || (istate & 1) != 0 || (pevent & 1) != 0 {
+            return Ok(false);
+        }
+        // WHV_X64_PENDING_INTERRUPTION_REGISTER: pending=bit0, type=bits1..3
+        // (0 = external interrupt), vector=bits16..31.
+        let inj = 1u64 | ((vector as u64) << 16);
+        self.set_register(
+            WHvRegisterPendingInterruption,
+            WHV_REGISTER_VALUE { Reg64: inj },
+        )?;
+        Ok(true)
     }
 
     pub fn get_register(&self, name: WHV_REGISTER_NAME) -> Result<WHV_REGISTER_VALUE> {

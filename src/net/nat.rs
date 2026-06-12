@@ -18,7 +18,7 @@ use crate::net::wire::*;
 use crate::virtio::net::{NetBackend, NetDevice};
 use std::cell::UnsafeCell;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -31,6 +31,10 @@ const KEY_UDP: usize = 2;
 const KEY_TCP: usize = 3;
 const KEY_ICMP: usize = 4;
 const KEY_ACCEPT: usize = 5;
+/// Cap on accepted-but-undrained port-forward connections in flight to the
+/// worker. A remote accept-flood is dropped past this rather than piling up host
+/// sockets/memory unboundedly.
+const MAX_ACCEPT_INFLIGHT: usize = 64;
 const KEY_STOP: usize = 9;
 
 const FRAME_CAP: usize = 2048;
@@ -643,12 +647,16 @@ fn flush_to_tcb(flow: &mut TcpFlow) {
 
 /// Re-arm a host receive if the flow is connected, idle, and the send ring
 /// has room (simple backpressure).
-fn maybe_post_recv(flow: &mut TcpFlow) {
+/// Returns false only if the receive failed synchronously (no completion will
+/// arrive) — the caller must tear the flow down rather than wait on a recv that
+/// will never complete.
+#[must_use]
+fn maybe_post_recv(flow: &mut TcpFlow) -> bool {
     if !flow.connected || flow.recv_pending || flow.closing || flow.dead {
-        return;
+        return true;
     }
     if flow.pending_to_guest.len() > TCP_BUF {
-        return;
+        return true;
     }
     let op = flow.op.as_mut().unwrap();
     op.kind = 1;
@@ -658,10 +666,11 @@ fn maybe_post_recv(flow: &mut TcpFlow) {
     let sock = flow.sock;
     let buf = &op.wsabuf as *const WSABUF;
     let ovl = &mut op.overlapped as *mut OVERLAPPED;
-    unsafe {
-        sys::wsa_recv(sock, buf, ovl);
+    let posted = unsafe { sys::wsa_recv(sock, buf, ovl) };
+    if posted {
+        flow.recv_pending = true;
     }
-    flow.recv_pending = true;
+    posted
 }
 
 /// Post the next queued guest->host chunk as an overlapped send (one in flight
@@ -715,6 +724,9 @@ struct NatState {
     tcp_send_op_pool: BoxPool<TcpSendOp>,
     udp_op_pool: BoxPool<UdpOp>,
     accept_pool: Arc<SyncBoxPool<AcceptMsg>>,
+    /// Count of accepted-but-undrained port-forward connections (bounds the
+    /// accept backlog; shared with each `listener_loop`).
+    accept_inflight: Arc<AtomicUsize>,
     icmp_reply_pool: Arc<SyncBoxPool<IcmpReplyMsg>>,
     default_tier: usize,
     port_tier: HashMap<u16, usize>,
@@ -793,6 +805,7 @@ impl NatState {
                         let msg = unsafe { Box::from_raw(ov as *mut AcceptMsg) };
                         let (sock, guest_ip, guest_port) = (msg.sock, msg.guest_ip, msg.guest_port);
                         self.accept_pool.release(msg);
+                        self.accept_inflight.fetch_sub(1, Ordering::AcqRel);
                         self.new_inbound_flow(sock, guest_ip, guest_port);
                     }
                     KEY_TCP => {
@@ -982,8 +995,14 @@ impl NatState {
         let l = op.buf.len();
         op.wsabuf = sys::wsabuf(p, l);
         let opp: *mut UdpOp = &mut *op;
-        unsafe {
-            sys::wsa_recv(sock, &(*opp).wsabuf, &mut (*opp).overlapped);
+        let posted = unsafe { sys::wsa_recv(sock, &(*opp).wsabuf, &mut (*opp).overlapped) };
+        if !posted {
+            // Recv failed synchronously: no completion will arrive, so a tracked
+            // flow could never be reaped through its recv. Release everything now
+            // instead of leaking it until the idle sweep.
+            sys::close_sock(sock);
+            self.udp_op_pool.release(op);
+            return None;
         }
         self.udp.insert(
             key,
@@ -1049,8 +1068,11 @@ impl NatState {
         let buf = &op.wsabuf as *const WSABUF;
         let ovl = &mut op.overlapped as *mut OVERLAPPED;
         let sock = op.sock;
-        unsafe {
-            sys::wsa_recv(sock, buf, ovl);
+        let posted = unsafe { sys::wsa_recv(sock, buf, ovl) };
+        if !posted {
+            // Re-arm failed synchronously: no further completion will arrive, so
+            // reap now (the op is not in flight).
+            self.reap_udp(key);
         }
     }
 
@@ -1409,8 +1431,8 @@ impl NatState {
             if !teardown && !pump_send(flow) {
                 teardown = true;
             }
-            if !teardown {
-                maybe_post_recv(flow);
+            if !teardown && !maybe_post_recv(flow) {
+                teardown = true;
             }
         }
         self.tx_scratch = scratch;
@@ -1582,6 +1604,7 @@ impl NatBackend {
         // workers) acquire+fill, the NAT worker releases. Warmed lightly; they
         // grow on demand and recycle, so steady state is allocation-free.
         let accept_pool = Arc::new(SyncBoxPool::new(32, make_accept_msg));
+        let accept_inflight = Arc::new(AtomicUsize::new(0));
         let icmp_reply_pool = Arc::new(SyncBoxPool::new(MAX_ICMP_INFLIGHT, make_icmp_reply));
         // Precreate the ICMP echo worker pool (blocking IcmpSendEcho threads).
         let icmp = Arc::new(IcmpPool::new(iocp, icmp_reply_pool.clone()));
@@ -1612,9 +1635,10 @@ impl NatBackend {
             listeners.push(lsock);
             let pf = *pf;
             let ap = accept_pool.clone();
+            let ai = accept_inflight.clone();
             if let Ok(h) = std::thread::Builder::new()
                 .name(format!("nat-listen-{}", pf.host_port))
-                .spawn(move || listener_loop(lsock, iocp, pf, ap))
+                .spawn(move || listener_loop(lsock, iocp, pf, ap, ai))
             {
                 listener_threads.push(h);
             }
@@ -1651,6 +1675,7 @@ impl NatBackend {
             tcp_send_op_pool: BoxPool::new(MAX_TCP_FLOWS, make_tcp_send_op),
             udp_op_pool: BoxPool::new(MAX_UDP_FLOWS, make_udp_op),
             accept_pool,
+            accept_inflight,
             icmp_reply_pool,
             default_tier,
             port_tier,
@@ -1688,18 +1713,28 @@ fn listener_loop(
     iocp: Iocp,
     pf: PortForward,
     accept_pool: Arc<SyncBoxPool<AcceptMsg>>,
+    accept_inflight: Arc<AtomicUsize>,
 ) {
     loop {
         let c = sys::accept_one(lsock);
         if c == INVALID_SOCKET {
             break; // listener closed for shutdown
         }
+        // Bound accepted-but-undrained connections: a remote accept-flood is
+        // dropped here (the client can retry) rather than piling up host sockets
+        // and AcceptMsg boxes faster than the single worker drains them.
+        if accept_inflight.load(Ordering::Acquire) >= MAX_ACCEPT_INFLIGHT {
+            sys::close_sock(c);
+            continue;
+        }
+        accept_inflight.fetch_add(1, Ordering::AcqRel);
         let mut msg = accept_pool.acquire();
         msg.sock = c;
         msg.guest_ip = pf.guest_ip;
         msg.guest_port = pf.guest_port;
         let ptr = Box::into_raw(msg);
         if !sys::post(iocp, 0, KEY_ACCEPT, ptr as *mut OVERLAPPED) {
+            accept_inflight.fetch_sub(1, Ordering::AcqRel);
             accept_pool.release(unsafe { Box::from_raw(ptr) });
             sys::close_sock(c);
         }

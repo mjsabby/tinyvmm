@@ -18,7 +18,9 @@ use winsys::SharedPtr;
 const PAGE: usize = 4096;
 
 fn align_up(v: usize, a: usize) -> usize {
-    (v + a - 1) & !(a - 1)
+    // Saturating so a near-usize::MAX size can't wrap to a tiny allocation (the
+    // allocation then simply fails instead of silently under-provisioning).
+    v.saturating_add(a - 1) & !(a - 1)
 }
 
 /// Describes guest RAM that straddles the 32-bit PCI MMIO hole: `[gpa, gpa +

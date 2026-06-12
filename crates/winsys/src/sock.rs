@@ -6,10 +6,10 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
     ICMP_ECHO_REPLY, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho,
 };
 use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IPPROTO_TCP, IPPROTO_UDP, SD_SEND, SOCK_DGRAM,
-    SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKET, SOL_SOCKET, WSA_IO_PENDING, WSABUF, WSADATA,
-    WSAGetLastError, WSAIoctl, WSARecv, WSASend, WSAStartup, accept, bind, closesocket, connect,
-    listen, setsockopt, shutdown, socket,
+    AF_INET, FIONBIO, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IPPROTO_TCP, IPPROTO_UDP, SD_SEND,
+    SOCK_DGRAM, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKET, SOL_SOCKET, WSA_IO_PENDING, WSABUF,
+    WSADATA, WSAGetLastError, WSAIoctl, WSARecv, WSASend, WSAStartup, accept, bind, closesocket,
+    connect, ioctlsocket, listen, setsockopt, shutdown, socket,
 };
 use windows_sys::Win32::System::IO::{
     CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED, PostQueuedCompletionStatus,
@@ -88,7 +88,16 @@ pub fn sockaddr_in(ip: [u8; 4], port: u16) -> SOCKADDR_IN {
 
 pub fn new_udp_socket() -> Option<SOCKET> {
     let s = unsafe { socket(AF_INET as i32, SOCK_DGRAM, IPPROTO_UDP) };
-    if s == INVALID_SOCKET { None } else { Some(s) }
+    if s == INVALID_SOCKET {
+        return None;
+    }
+    // Non-blocking so the single NAT worker's connected-UDP sends can never block
+    // on a full send buffer (a hostile UDP flood would otherwise stall the worker,
+    // starving all TCP/timer/ICMP/accept work). A full buffer drops the datagram
+    // (WSAEWOULDBLOCK) — fine for UDP. Overlapped receives ignore the blocking mode.
+    let mut nb: u32 = 1;
+    unsafe { ioctlsocket(s, FIONBIO, &mut nb) };
+    Some(s)
 }
 
 pub fn new_tcp_socket() -> Option<SOCKET> {
@@ -115,16 +124,20 @@ pub fn close_sock(s: SOCKET) {
     }
 }
 
-/// Post an overlapped receive. `wsabuf`/`ov` must outlive the operation.
+/// Post an overlapped receive. `wsabuf`/`ov` must outlive the operation. Returns
+/// true if a completion will be delivered (an inline success still queues one),
+/// false if the receive failed synchronously (no completion will arrive — the
+/// caller must NOT mark the op pending, or it will wedge its reap gate forever).
 ///
 /// # Safety
 /// `wsabuf` must point to a valid `WSABUF` whose buffer, and `ov` (an
 /// `OVERLAPPED`), both remain alive and pinned until the IOCP completion for
 /// this receive is dequeued.
-pub unsafe fn wsa_recv(s: SOCKET, wsabuf: *const WSABUF, ov: *mut OVERLAPPED) -> i32 {
+pub unsafe fn wsa_recv(s: SOCKET, wsabuf: *const WSABUF, ov: *mut OVERLAPPED) -> bool {
     let mut flags = 0u32;
     let mut recvd = 0u32;
-    unsafe { WSARecv(s, wsabuf, 1, &mut recvd, &mut flags, ov, None) }
+    let r = unsafe { WSARecv(s, wsabuf, 1, &mut recvd, &mut flags, ov, None) };
+    r == 0 || unsafe { WSAGetLastError() } == WSA_IO_PENDING
 }
 
 /// Synchronous send (no overlapped -> no IOCP completion). Used only for UDP,

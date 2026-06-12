@@ -199,6 +199,12 @@ pub fn parse_ipv4(p: &[u8]) -> Option<Ipv4View<'_>> {
     if ihl < 20 || p.len() < ihl {
         return None;
     }
+    // Drop fragments (More-Fragments set or non-zero fragment offset): the NAT
+    // doesn't reassemble, and forwarding a fragment as a standalone datagram
+    // yields garbage ports/payload and spurious flows. DF (0x4000) is fine.
+    if be16(&p[6..8]) & 0x3FFF != 0 {
+        return None;
+    }
     let total_len = be16(&p[2..4]) as usize;
     let end = total_len.min(p.len()).max(ihl);
     let mut src = [0u8; 4];

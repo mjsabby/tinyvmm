@@ -13,11 +13,16 @@ use crate::whp::vcpu::{Exit, ExitReason, Vcpu, exit_reason_name};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use windows_sys::Win32::System::Hypervisor::{
-    WHvRegisterPendingInterruption, WHvX64RegisterRax, WHvX64RegisterRbx, WHvX64RegisterRcx,
-    WHvX64RegisterRdx, WHvX64RegisterRip,
+    WHvRegisterPendingInterruption, WHvX64RegisterCr8, WHvX64RegisterRax, WHvX64RegisterRbx,
+    WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRip,
 };
 
 const RFLAGS_IF: u64 = 1 << 9;
+
+/// Safety-net cap on how long a halted guest parks waiting for an interrupt.
+/// The timer/device path normally wakes it in microseconds; this only bounds a
+/// missed wakeup and keeps shutdown responsive.
+const HALT_PARK: std::time::Duration = std::time::Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopReason {
@@ -142,6 +147,8 @@ impl RunLoop {
     pub fn request_stop(&self) {
         self.stop.store(true, Ordering::Release);
         let _ = self.vcpu.cancel();
+        // Also wake the loop if it's parked on a halted guest (not in `run`).
+        whpsys::lapic::global().wake();
     }
 
     pub fn run(&self) -> StopReason {
@@ -157,6 +164,13 @@ impl RunLoop {
             if self.stop.load(Ordering::Acquire) {
                 return StopReason::Cancelled;
             }
+
+            // Deliver any interrupt the software LAPIC has queued before
+            // re-entering the guest. Done on every iteration -- including those
+            // reached via `continue` (e.g. the HLT path) and after an
+            // interrupt-window exit -- so a queued vector is never stranded.
+            self.deliver_interrupts();
+
             let exit = match self.vcpu.run_exit() {
                 Ok(e) => e,
                 Err(e) => {
@@ -181,6 +195,16 @@ impl RunLoop {
                 ExitReason::Halt => {
                     self.counters.halt.fetch_add(1, Ordering::Relaxed);
                     if (exit.rflags() & RFLAGS_IF) != 0 {
+                        // Idle guest with interrupts enabled. When the software
+                        // LAPIC is driving, WHP doesn't know about our pending
+                        // interrupts, so re-running would just busy-cycle through
+                        // HLT exits. Instead park the thread until a device/timer
+                        // queues a vector (à la OpenVMM's poll-when-halted), then
+                        // loop so `deliver_interrupts` injects it. With WHP's
+                        // hardware LAPIC, WHP itself waits on HLT, so just re-run.
+                        if whpsys::lapic::active() {
+                            whpsys::lapic::global().park_while_idle(&self.stop, HALT_PARK);
+                        }
                         continue;
                     }
                     println!(
@@ -215,7 +239,11 @@ impl RunLoop {
                         return stop;
                     }
                 }
-                ExitReason::InterruptWindow | ExitReason::ApicEoi | ExitReason::Canceled => {}
+                // EOI now arrives as an x2APIC MSR write (LAPIC = None), handled
+                // in the software LAPIC; WHP's EOI-exit no longer fires. The
+                // interrupt-window and cancel exits just re-run the delivery pass
+                // at the top of the loop.
+                ExitReason::ApicEoi | ExitReason::InterruptWindow | ExitReason::Canceled => {}
                 ExitReason::Other(other) => {
                     self.counters.other.fetch_add(1, Ordering::Relaxed);
                     eprintln!(
@@ -315,31 +343,84 @@ impl RunLoop {
         None
     }
 
+    /// Inject the highest-priority interrupt the software LAPIC has queued, if
+    /// the guest can accept it now. Called before every guest re-entry. No-op on
+    /// bare metal, where WHP's hardware LAPIC delivers interrupts itself.
+    fn deliver_interrupts(&self) {
+        if !whpsys::lapic::active() {
+            return;
+        }
+        // Live TPR class (CR8 = TPR[7:4]); the software LAPIC owns the priority
+        // decision, we just feed it the current processor priority.
+        let cr8 = self
+            .vcpu
+            .get_register(WHvX64RegisterCr8)
+            .map(|v| (unsafe { v.Reg64 } & 0xF) as u32)
+            .unwrap_or(0);
+        let Some(vector) = whpsys::lapic::global().next_vector(cr8) else {
+            return;
+        };
+        match self.vcpu.try_inject_interrupt(vector) {
+            // Accepted into service; clear it from the IRR.
+            Ok(true) => whpsys::lapic::global().take_vector(vector),
+            // Guest not interruptible right now (IF=0 / shadow / pending). Leave
+            // the vector in the IRR; we retry on the next exit. The periodic
+            // timer, EOI MSR writes, and the cancel issued on every new MSI all
+            // force frequent exits, so the wait is short.
+            Ok(false) => {}
+            Err(e) => eprintln!("[loop] interrupt injection failed: {e}"),
+        }
+    }
+
     fn handle_msr(&self, exit: &Exit) -> Option<StopReason> {
         let m = exit.msr();
         let msr = m.msr;
         let is_write = m.is_write;
         let wr_val = ((m.rdx & 0xFFFF_FFFF) << 32) | (m.rax & 0xFFFF_FFFF);
 
-        let Some(hv) = self.hv.as_ref() else {
-            eprintln!(
-                "[loop] MSR exit with no enlightenment wired: {} msr=0x{:08x} at RIP=0x{:x}",
-                if is_write { "WRMSR" } else { "RDMSR" },
-                msr,
-                exit.rip()
-            );
-            return Some(StopReason::UnhandledExit);
-        };
-
+        // x2APIC / APIC_BASE MSRs are served by the software LAPIC (when active,
+        // i.e. LAPIC = None); everything else by the Hyper-V enlightenment. With
+        // the hardware LAPIC the APIC MSRs don't trap at all, so this is skipped.
         let mut rd_val: u64 = 0;
-        let result = if is_write {
-            hv.handle_wrmsr(self.vcpu.index(), msr, wr_val)
+        let handled = if !whpsys::lapic::active() {
+            false
+        } else if is_write {
+            let mut set_cr8 = None;
+            let h = whpsys::lapic::global().write_msr(msr, wr_val, &mut set_cr8);
+            if let Some(tpr_class) = set_cr8 {
+                // Guest set TPR via the APIC MSR; keep CR8 in sync.
+                let _ = self
+                    .vcpu
+                    .set_registers(&[WHvX64RegisterCr8], &[reg64(tpr_class as u64)]);
+            }
+            h
         } else {
-            hv.handle_rdmsr(self.vcpu.index(), msr, &mut rd_val)
+            let cr8 = self
+                .vcpu
+                .get_register(WHvX64RegisterCr8)
+                .map(|v| (unsafe { v.Reg64 } & 0xF) as u32)
+                .unwrap_or(0);
+            whpsys::lapic::global().read_msr(msr, cr8, &mut rd_val)
         };
 
-        if result == MsrHandled::NoInjectGp {
-            return self.inject_gp();
+        if !handled {
+            let Some(hv) = self.hv.as_ref() else {
+                eprintln!(
+                    "[loop] MSR exit with no enlightenment wired: {} msr=0x{:08x} at RIP=0x{:x}",
+                    if is_write { "WRMSR" } else { "RDMSR" },
+                    msr,
+                    exit.rip()
+                );
+                return Some(StopReason::UnhandledExit);
+            };
+            let result = if is_write {
+                hv.handle_wrmsr(self.vcpu.index(), msr, wr_val)
+            } else {
+                hv.handle_rdmsr(self.vcpu.index(), msr, &mut rd_val)
+            };
+            if result == MsrHandled::NoInjectGp {
+                return self.inject_gp();
+            }
         }
 
         let next_rip = exit.rip() + exit.instruction_length() as u64;

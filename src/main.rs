@@ -66,7 +66,7 @@ use windows_sys::Win32::System::Hypervisor::{
     WHV_INTERRUPT_CONTROL, WHV_PARTITION_HANDLE, WHvCapabilityCodeFeatures,
     WHvCapabilityCodeHypervisorPresent, WHvGetCapability, WHvMapGpaRange, WHvMapGpaRange2,
     WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite, WHvRequestInterrupt, WHvUnmapGpaRange,
-    WHvX64LocalApicEmulationModeX2Apic,
+    WHvX64LocalApicEmulationModeNone, WHvX64LocalApicEmulationModeX2Apic,
 };
 use windows_sys::Win32::System::SystemInformation::GetSystemFirmwareTable;
 
@@ -138,6 +138,7 @@ fn print_usage() {
          Usage:\n\
          \x20 tinyvmm --smoke\n\
          \x20 tinyvmm --blk-selftest        host-side virtio-blk DISCARD/WRITE_ZEROES test\n\
+         \x20 tinyvmm --blk-stress          host-side virtio-blk concurrency stress + failure-path test\n\
          \x20 tinyvmm --pci-selftest        host-side PCI host-bridge + BAR + sizing test\n\
          \x20 tinyvmm --pvh-info <vmlinux>\n\
          \x20 tinyvmm --pvh-run [--initrd <cpio>] [--ram-mb N] [--vcpus N] [--rng] [--input] [--sound]\n\
@@ -304,7 +305,7 @@ fn run_blk_selftest() -> Result<i32> {
     let desc_gpa: u64 = 0x1_0000;
     let avail_gpa: u64 = 0x1_1000;
     let used_gpa: u64 = 0x1_2000;
-    const QSIZE: u16 = 8;
+    const QSIZE: u16 = 16;
 
     let put = |gpa: u64, bytes: &[u8]| ram.write_at(gpa, bytes).expect("selftest write_at");
     let write_desc = |i: u64, addr: u64, len: u32, flags: u16, next: u16| {
@@ -346,10 +347,72 @@ fn run_blk_selftest() -> Result<i32> {
             ram.slice_mut(stat, 1).expect("selftest status")[0]
         };
 
+    // ---- READ/WRITE roundtrip through the parallel-submission path ----
+    // (descriptors 0..7, avail slots 0,1). WRITE a known multi-segment pattern to
+    // sector 0, then READ it back into a fresh buffer and compare. This is the
+    // only thing here that exercises submit_request / submit_seg / on_seg_complete
+    // / finish_request (the DISCARD/WRITE_ZEROES path below does not). The
+    // WRITE_ZEROES below then re-zeros sector 0, so the final file-content checks
+    // still hold.
+    const T_IN: u32 = 0;
+    const T_OUT: u32 = 1;
+    const SEG: u32 = 512; // one sector per data descriptor
+    let wsrc = 0x8_0000u64; // write-source buffers (2 sectors)
+    let rdst = 0x9_0000u64; // read-target buffers (2 sectors)
+    for k in 0..(2 * SEG as u64) {
+        put(wsrc + k, &[0x40 + (k % 64) as u8]);
+        put(rdst + k, &[0u8]);
+    }
+    // Build header(d) + `segs` data descs + status, kick, and wait for the async
+    // IOCP completion to write the status byte off its 0xAA sentinel.
+    let issue_rw =
+        |avail_slot: u16, d: u64, hdr_gpa: u64, data_gpa: u64, rtype: u32, segs: u64| -> u8 {
+            let stat = hdr_gpa + 0x800;
+            put(hdr_gpa, &rtype.to_le_bytes());
+            put(hdr_gpa + 4, &0u32.to_le_bytes());
+            put(hdr_gpa + 8, &0u64.to_le_bytes()); // sector 0
+            put(stat, &[0xAAu8]);
+            write_desc(d, hdr_gpa, 16, NEXT, (d + 1) as u16);
+            let dflags = if rtype == T_IN { WRITE | NEXT } else { NEXT };
+            for k in 0..segs {
+                write_desc(
+                    d + 1 + k,
+                    data_gpa + k * SEG as u64,
+                    SEG,
+                    dflags,
+                    (d + 2 + k) as u16,
+                );
+            }
+            write_desc(d + 1 + segs, stat, 1, WRITE, 0);
+            put(
+                avail_gpa + 4 + 2 * avail_slot as u64,
+                &(d as u16).to_le_bytes(),
+            );
+            put(avail_gpa + 2, &(avail_slot + 1).to_le_bytes());
+            dev.notify_queue(0);
+            for _ in 0..5000 {
+                let s = ram.slice_mut(stat, 1).expect("rw status")[0];
+                if s != 0xAA {
+                    return s;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            0xAA
+        };
+    let st_w = issue_rw(0, 0, 0x4_0000, wsrc, T_OUT, 2);
+    let st_r = issue_rw(1, 4, 0x5_0000, rdst, T_IN, 2);
+    let mut rw_data_ok = true;
+    for k in 0..(2 * SEG as u64) {
+        if ram.slice_mut(rdst + k, 1).expect("rw readback")[0] != 0x40 + (k % 64) as u8 {
+            rw_data_ok = false;
+            break;
+        }
+    }
+
     // WRITE_ZEROES on sectors [0, 16) -> bytes [0, 8192); DISCARD on sectors
     // [64, 80) -> bytes [32768, 40960).
-    let st_wz = issue(0, 0, 0x2_0000, T_WRITE_ZEROES, 0, 16);
-    let st_dc = issue(1, 3, 0x3_0000, T_DISCARD, 64, 16);
+    let st_wz = issue(2, 8, 0x2_0000, T_WRITE_ZEROES, 0, 16);
+    let st_dc = issue(3, 11, 0x3_0000, T_DISCARD, 64, 16);
 
     let ops_wz = dev.ops_write_zeroes();
     let ops_dc = dev.ops_discard();
@@ -371,6 +434,9 @@ fn run_blk_selftest() -> Result<i32> {
             eprintln!("[blk-selftest] FAIL: {msg}");
         }
     };
+    fail(st_w == 0, "multi-seg WRITE status != OK");
+    fail(st_r == 0, "multi-seg READ status != OK");
+    fail(rw_data_ok, "multi-seg READ-back != written pattern");
     fail(st_wz == 0, "WRITE_ZEROES status != OK");
     fail(st_dc == 0, "DISCARD status != OK");
     fail(ops_wz == 1, "ops_write_zeroes != 1");
@@ -474,6 +540,283 @@ fn pci_cfg_write(io: &IoBus, dev: u8, off: u32, size: u16, value: u32) {
     io.dispatch(&mut d);
 }
 
+/// Host-side virtio-blk stress + failure-path test (no guest). Drives the real
+/// `BlockDevice` + IOCP backend through a virtqueue in guest RAM:
+///   1. 24 concurrent 3-segment WRITEs (72 segment I/Os) submitted before a
+///      single notify, then 24 concurrent READs that verify every byte —
+///      exercises the parallel submit_request/submit_seg/on_seg_complete path at
+///      depth and asserts the backend reached `max_inflight > 1`.
+///   2. A read whose segment is past EOF -> BLK_S_IOERR (the bounds-fail path).
+///   3. A batch submitted then immediately `reset()` (racing in-flight I/O),
+///      then a fresh queue must recover — covers reset-while-in-flight.
+fn run_blk_stresstest() -> Result<i32> {
+    use crate::virtio::blk::BlockDevice;
+
+    const NEXT: u16 = 1;
+    const WRITE: u16 = 2; // VRING_DESC_F_WRITE
+    const T_IN: u32 = 0;
+    const T_OUT: u32 = 1;
+    const SEG: u32 = 512;
+
+    check_whp_available()?;
+    let mut part = Partition::new(1)?;
+    part.enable_extended_exits(true, true, false)?;
+    set_hide_tsc_deadline(true);
+    let list = build_static_cpuid_result_list(true);
+    part.set_cpuid_result_list(&list)?;
+    part.set_local_apic_emulation(WHvX64LocalApicEmulationModeX2Apic)?;
+    part.setup()?;
+    let ram = Arc::new(GuestMemory::new(
+        part.handle(),
+        0,
+        16 * 1024 * 1024,
+        false,
+        false,
+    )?);
+
+    let path = std::env::temp_dir().join("tinyvmm_blk_stress.img");
+    let path_str = path.to_string_lossy().to_string();
+    std::fs::write(&path, vec![0u8; 4 * 1024 * 1024])
+        .map_err(|e| Error::msg(format!("stress: write temp file: {e}")))?;
+    let backend = Arc::new(BlockFile::new(&path_str, false));
+    if !backend.open() {
+        let _ = std::fs::remove_file(&path);
+        return Err(Error::msg(format!(
+            "stress: open failed err={}",
+            backend.open_err()
+        )));
+    }
+    backend.start();
+
+    const QMAX: u32 = 128;
+    const QSIZE: u16 = 128;
+    let dev = BlockDevice::new(ram.clone(), backend.clone(), QMAX);
+
+    let desc_gpa: u64 = 0x1_0000;
+    let avail_gpa: u64 = 0x2_0000;
+    let used_gpa: u64 = 0x3_0000;
+
+    let put = |gpa: u64, b: &[u8]| ram.write_at(gpa, b).expect("stress write_at");
+    let getb = |gpa: u64| ram.slice_mut(gpa, 1).expect("stress read")[0];
+    let write_desc = |table: u64, i: u64, addr: u64, len: u32, flags: u16, next: u16| {
+        let base = table + i * 16;
+        put(base, &addr.to_le_bytes());
+        put(base + 8, &len.to_le_bytes());
+        put(base + 12, &flags.to_le_bytes());
+        put(base + 14, &next.to_le_bytes());
+    };
+
+    dev.enable_queue(0, desc_gpa, avail_gpa, used_gpa, QSIZE, false);
+
+    // Build a request chain (header + `segs` data descs + status) at descriptor
+    // base `d` and publish ring[slot] -> head. Slots MUST be assigned in the
+    // order the device consumes them (== its last_avail cursor). Returns the
+    // status-byte GPA (sentinel 0xAA until the device writes the real status).
+    let build = |slot: u16,
+                 d: u64,
+                 hdr_gpa: u64,
+                 data_gpa: u64,
+                 rtype: u32,
+                 sector: u64,
+                 segs: u64|
+     -> u64 {
+        let stat = hdr_gpa + 0xC00;
+        put(hdr_gpa, &rtype.to_le_bytes());
+        put(hdr_gpa + 4, &0u32.to_le_bytes());
+        put(hdr_gpa + 8, &sector.to_le_bytes());
+        put(stat, &[0xAAu8]);
+        write_desc(desc_gpa, d, hdr_gpa, 16, NEXT, (d + 1) as u16);
+        let dflags = if rtype == T_IN { WRITE | NEXT } else { NEXT };
+        for k in 0..segs {
+            write_desc(
+                desc_gpa,
+                d + 1 + k,
+                data_gpa + k * SEG as u64,
+                SEG,
+                dflags,
+                (d + 2 + k) as u16,
+            );
+        }
+        write_desc(desc_gpa, d + 1 + segs, stat, 1, WRITE, 0);
+        put(avail_gpa + 4 + 2 * slot as u64, &(d as u16).to_le_bytes());
+        stat
+    };
+
+    // Poll the status bytes off their 0xAA sentinel (async IOCP completions).
+    let wait_all = |stats: &[u64]| -> bool {
+        for _ in 0..10_000 {
+            if stats.iter().all(|&s| getb(s) != 0xAA) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        false
+    };
+
+    let mut ok = true;
+    let mut fail = |c: bool, m: &str| {
+        if !c {
+            ok = false;
+            eprintln!("[blk-stress] FAIL: {m}");
+        }
+    };
+
+    const N: u64 = 24;
+    const SEGS: u64 = 3; // 5 descriptors/request; N*5 = 120 < QSIZE
+    let data_base = |r: u64| 0x10_0000u64 + r * 0x1_0000;
+    let rdata_base = |r: u64| 0x40_0000u64 + r * 0x1_0000;
+    let hdr_base = |r: u64| 0x80_0000u64 + r * 0x1000;
+    let sector_of = |r: u64| r * SEGS; // request r owns SEGS contiguous sectors
+    let pat =
+        |r: u64, b: u64| -> u8 { (0x10u8.wrapping_add(r as u8)).wrapping_add((b & 0xff) as u8) };
+    let seg_bytes = SEGS * SEG as u64;
+
+    // ---- Phase 1: N concurrent multi-segment WRITEs ----
+    for r in 0..N {
+        for b in 0..seg_bytes {
+            put(data_base(r) + b, &[pat(r, b)]);
+        }
+    }
+    let wstat: Vec<u64> = (0..N)
+        .map(|r| {
+            build(
+                r as u16,
+                r * 5,
+                hdr_base(r),
+                data_base(r),
+                T_OUT,
+                sector_of(r),
+                SEGS,
+            )
+        })
+        .collect();
+    put(avail_gpa + 2, &(N as u16).to_le_bytes());
+    dev.notify_queue(0);
+    fail(wait_all(&wstat), "concurrent writes did not all complete");
+    fail(
+        wstat.iter().all(|&s| getb(s) == 0),
+        "a concurrent write returned non-OK",
+    );
+    let maxq = backend.max_inflight();
+    fail(maxq > 1, &format!("max_inflight={maxq}, expected >1"));
+    fail(dev.ops_err() == 0, "ops_err != 0 after writes");
+
+    // ---- Phase 2: read everything back and verify ----
+    for r in 0..N {
+        for b in 0..seg_bytes {
+            put(rdata_base(r) + b, &[0u8]);
+        }
+    }
+    let rstat: Vec<u64> = (0..N)
+        .map(|r| {
+            build(
+                (N + r) as u16,
+                r * 5,
+                hdr_base(r),
+                rdata_base(r),
+                T_IN,
+                sector_of(r),
+                SEGS,
+            )
+        })
+        .collect();
+    put(avail_gpa + 2, &((2 * N) as u16).to_le_bytes());
+    dev.notify_queue(0);
+    fail(wait_all(&rstat), "concurrent reads did not all complete");
+    fail(
+        rstat.iter().all(|&s| getb(s) == 0),
+        "a concurrent read returned non-OK",
+    );
+    let mut data_ok = true;
+    'verify: for r in 0..N {
+        for b in 0..seg_bytes {
+            if getb(rdata_base(r) + b) != pat(r, b) {
+                data_ok = false;
+                break 'verify;
+            }
+        }
+    }
+    fail(data_ok, "read-back data mismatch");
+
+    // ---- Phase 3: out-of-range segment -> IOERR ----
+    {
+        let s = build(
+            (2 * N) as u16,
+            0,
+            hdr_base(0),
+            rdata_base(0),
+            T_IN,
+            100_000,
+            1,
+        );
+        put(avail_gpa + 2, &((2 * N + 1) as u16).to_le_bytes());
+        dev.notify_queue(0);
+        fail(wait_all(&[s]), "out-of-range read did not complete");
+        fail(getb(s) == 1, "out-of-range read did not return BLK_S_IOERR");
+    }
+
+    // ---- Phase 4: reset while I/O may be in flight, then recover ----
+    {
+        for r in 0..8u64 {
+            // continue the ring cursor: slots (2N+1 + r)
+            let _ = build(
+                (2 * N + 1 + r) as u16,
+                r * 5,
+                hdr_base(r),
+                data_base(r),
+                T_OUT,
+                sector_of(r),
+                2,
+            );
+        }
+        put(avail_gpa + 2, &((2 * N + 1 + 8) as u16).to_le_bytes());
+        dev.notify_queue(0);
+        dev.reset(); // races the in-flight I/O; must not crash or write a stale ring
+        std::thread::sleep(std::time::Duration::from_millis(100)); // let completions drain
+    }
+    // Recover on a FRESH queue (clean rings): one request must succeed.
+    let recovered = {
+        let (d2, a2, u2) = (0x4_0000u64, 0x5_0000u64, 0x6_0000u64);
+        put(a2, &[0u8; 8]);
+        put(u2, &[0u8; 8]);
+        dev.enable_queue(0, d2, a2, u2, QSIZE, false);
+        let hdr = hdr_base(0);
+        let stat = hdr + 0xC00;
+        put(hdr, &T_OUT.to_le_bytes());
+        put(hdr + 4, &0u32.to_le_bytes());
+        put(hdr + 8, &0u64.to_le_bytes());
+        put(stat, &[0xAAu8]);
+        write_desc(d2, 0, hdr, 16, NEXT, 1);
+        write_desc(d2, 1, data_base(0), SEG, NEXT, 2);
+        write_desc(d2, 2, stat, 1, WRITE, 0);
+        put(a2 + 4, &0u16.to_le_bytes()); // ring[0] = head desc 0
+        put(a2 + 2, &1u16.to_le_bytes()); // avail.idx = 1
+        dev.notify_queue(0);
+        wait_all(&[stat]) && getb(stat) == 0
+    };
+    fail(
+        recovered,
+        "device did not recover after reset-with-inflight",
+    );
+
+    let final_err = dev.ops_err();
+    drop(dev);
+    drop(backend);
+    let _ = std::fs::remove_file(&path);
+
+    if ok {
+        println!(
+            "[blk-stress] PASS: {N}x{SEGS}-seg concurrent writes+reads verified, \
+             max_inflight={maxq} (>1), out-of-range->IOERR, reset-in-flight recovered \
+             (ops_err={final_err})"
+        );
+        Ok(0)
+    } else {
+        eprintln!("[blk-stress] FAIL");
+        Ok(1)
+    }
+}
+
 /// Host-side PCI host-bridge selftest (no guest): builds a PciBus + one dummy
 /// device, then drives 0xCF8/0xCFC config cycles to verify ID reads, BAR
 /// pre-assignment into the MMIO window, the BAR sizing dance, and master-abort
@@ -565,6 +908,8 @@ struct PvhArgs {
     unsafe_save_mutable_drive: bool,
     with_input: bool,
     with_sound: bool,
+    /// Force the software LAPIC on/off; `None` auto-detects (nested => on).
+    emulate_lapic: Option<bool>,
 }
 
 /// Parse a `--portfwd HOSTPORT:GUESTPORT` rule. The host side binds 127.0.0.1
@@ -618,6 +963,8 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
     let mut unsafe_save_mutable_drive = false;
     let mut with_input = false;
     let mut with_sound = false;
+    // None = auto-detect (software LAPIC only when running nested).
+    let mut emulate_lapic: Option<bool> = None;
 
     let mut i = 2;
     while i < args.len() && args[i].starts_with("--") && args[i] != "--" {
@@ -629,6 +976,15 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
                         .ok_or_else(|| Error::msg("--initrd wants a path"))?
                         .clone(),
                 );
+            }
+            "--emulate-lapic" => {
+                i += 1;
+                emulate_lapic = match args.get(i).map(|s| s.as_str()) {
+                    Some("auto") => None,
+                    Some("on") => Some(true),
+                    Some("off") => Some(false),
+                    _ => return Err(Error::msg("--emulate-lapic wants auto|on|off")),
+                };
             }
             "--ram-mb" => {
                 i += 1;
@@ -883,7 +1239,47 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
         unsafe_save_mutable_drive,
         with_input,
         with_sound,
+        emulate_lapic,
     })
+}
+
+/// Decide whether to drive interrupts through the software LAPIC. The hardware
+/// LAPIC (WHP) is faster but only delivers interrupts when APIC virtualization
+/// is available, which it isn't to a *nested* guest -- so emulate when running
+/// inside a VM. `forced` overrides the auto-detection (`--emulate-lapic on|off`).
+fn decide_emulate_lapic(forced: Option<bool>) -> bool {
+    forced.unwrap_or_else(host_is_vm)
+}
+
+/// True if this host is itself a virtual machine (so WHP runs nested). Reads the
+/// SMBIOS system product name from the registry; Hyper-V guests report
+/// "Virtual Machine" while bare-metal (even a Hyper-V root) reports real
+/// hardware. On any read failure we assume nested -- the software LAPIC works
+/// everywhere, it's just slower, so that's the safe default.
+fn host_is_vm() -> bool {
+    use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
+    let subkey: Vec<u16> = "HARDWARE\\DESCRIPTION\\System\\BIOS\0"
+        .encode_utf16()
+        .collect();
+    let value: Vec<u16> = "SystemProductName\0".encode_utf16().collect();
+    let mut buf = [0u16; 128];
+    let mut cb = std::mem::size_of_val(&buf) as u32;
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            &mut cb,
+        )
+    };
+    if rc != 0 {
+        return true; // can't tell -> assume nested (always-correct, just slower)
+    }
+    let n = (cb as usize / 2).saturating_sub(1).min(buf.len()); // drop trailing NUL
+    String::from_utf16_lossy(&buf[..n]).eq_ignore_ascii_case("Virtual Machine")
 }
 
 /// Heavy post-mortem diagnostics (per-vCPU exit breakdown + a guest-RAM dump)
@@ -965,9 +1361,31 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     set_hide_tsc_deadline(true);
     let static_cpuid = build_static_cpuid_result_list(true);
     part.set_cpuid_result_list(&static_cpuid)?;
-    part.set_local_apic_emulation(WHvX64LocalApicEmulationModeX2Apic)?;
+    // LAPIC emulation: nested guests need the software LAPIC (see whpsys::lapic)
+    // because WHP's own LAPIC delivery relies on APIC virtualization the L1
+    // hypervisor doesn't expose to an L2 guest, so device/timer interrupts would
+    // never reach an idle guest. On bare metal that virtualization is present, so
+    // keep WHP's faster hardware LAPIC. Auto-detected unless --emulate-lapic says.
+    let emulate_lapic = decide_emulate_lapic(cfg.emulate_lapic);
+    let apic_mode = if emulate_lapic {
+        WHvX64LocalApicEmulationModeNone
+    } else {
+        WHvX64LocalApicEmulationModeX2Apic
+    };
+    part.set_local_apic_emulation(apic_mode)?;
     part.setup()?;
     let part_handle = part.handle();
+    println!(
+        "[pvh-run] LAPIC: {}",
+        if emulate_lapic {
+            "software-emulated (nested)"
+        } else {
+            "hardware (WHP x2APIC)"
+        }
+    );
+    if emulate_lapic {
+        whpsys::lapic::init(part_handle, 0, cached_tsc_hz());
+    }
 
     // --- Guest RAM ---
     // RAM up to the 3584 MiB PCI MMIO window stays at GPA 0; any remainder is
@@ -2167,7 +2585,21 @@ fn run_restore(args: &[String]) -> Result<i32> {
     let jr = JsonReader::parse(&header)?;
 
     let vcpu_count = jr.get_u64("vcpu_count")? as u32;
+    if !(1..=MAX_VCPUS).contains(&vcpu_count) {
+        return Err(Error::msg(format!(
+            "restore: vcpu_count {vcpu_count} out of range (1..={MAX_VCPUS})"
+        )));
+    }
     let ram_size = jr.get_u64("ram_size_bytes")? as usize;
+    // Bound a corrupt/hostile header before it feeds GuestMemory's alignment and
+    // pointer math (4 TiB is far above any real microVM, far below the
+    // usize-overflow point that the boot path's clamps otherwise prevent).
+    const MAX_RESTORE_RAM: u64 = 1 << 42;
+    if ram_size == 0 || ram_size as u64 > MAX_RESTORE_RAM {
+        return Err(Error::msg(format!(
+            "restore: ram_size_bytes {ram_size} out of range (1..={MAX_RESTORE_RAM})"
+        )));
+    }
     let large_pages = jr.get_bool("large_pages").unwrap_or(true);
     let tsc_hz_at_save = jr.get_u64("tsc_hz_at_save").unwrap_or(0);
     let with_rng = jr.get_bool("with_rng").unwrap_or(false);
@@ -2211,9 +2643,20 @@ fn run_restore(args: &[String]) -> Result<i32> {
     set_hide_tsc_deadline(true);
     let static_cpuid = build_static_cpuid_result_list(true);
     part.set_cpuid_result_list(&static_cpuid)?;
-    part.set_local_apic_emulation(WHvX64LocalApicEmulationModeX2Apic)?;
+    // Match the boot path's LAPIC choice (nested => software-emulated). Auto by
+    // default; restore on a different host than the save honours this host's env.
+    let emulate_lapic = decide_emulate_lapic(None);
+    let apic_mode = if emulate_lapic {
+        WHvX64LocalApicEmulationModeNone
+    } else {
+        WHvX64LocalApicEmulationModeX2Apic
+    };
+    part.set_local_apic_emulation(apic_mode)?;
     part.setup()?;
     let part_handle = part.handle();
+    if emulate_lapic {
+        whpsys::lapic::init(part_handle, 0, cached_tsc_hz());
+    }
 
     let ram = Arc::new(GuestMemory::new_split(
         part_handle,
@@ -3992,6 +4435,7 @@ fn main() {
     let result = match args[1].as_str() {
         "--smoke" => run_smoke(),
         "--blk-selftest" => run_blk_selftest(),
+        "--blk-stress" => run_blk_stresstest(),
         "--pci-selftest" => run_pci_selftest(),
         "--pvh-info" => run_pvh_info(&args),
         "--pvh-run" => run_pvh_run(&args),

@@ -35,18 +35,18 @@ impl MmioBus {
         MmioBus::default()
     }
 
-    pub fn register(&self, base: u64, size: u64, name: &str, handler: Handler) {
+    /// Register a handler for `[base, base+size)`. Returns `false` (registering
+    /// nothing) if the range overlaps an existing entry. A guest can reprogram a
+    /// device BAR to any GPA, so an overlap must NEVER panic — that would abort
+    /// the whole VMM. Callers validate BAR placement up front (see
+    /// `PciTransport::on_bar_mapped`); this is the backstop for a concurrent
+    /// reprogram race.
+    pub fn register(&self, base: u64, size: u64, name: &str, handler: Handler) -> bool {
         assert!(size > 0, "MmioBus::register: size must be > 0");
         let mut entries = self.entries.write().unwrap();
         for e in entries.iter() {
             if ranges_overlap(base, size, e.base, e.size) {
-                panic!(
-                    "MmioBus::register: range [{:x}..{:x}) for '{}' overlaps '{}'",
-                    base,
-                    base + size,
-                    name,
-                    e.name
-                );
+                return false;
             }
         }
         entries.push(Entry {
@@ -55,6 +55,15 @@ impl MmioBus {
             name: name.to_string(),
             handler,
         });
+        true
+    }
+
+    /// True iff `[base, base+size)` overlaps no currently-registered range.
+    pub fn is_range_free(&self, base: u64, size: u64) -> bool {
+        let entries = self.entries.read().unwrap();
+        !entries
+            .iter()
+            .any(|e| ranges_overlap(base, size, e.base, e.size))
     }
 
     pub fn unregister(&self, base: u64) -> bool {

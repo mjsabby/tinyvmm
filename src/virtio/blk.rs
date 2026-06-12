@@ -3,9 +3,10 @@
 //! Single requestq (queue 0). Backed by an async [`BlockFile`] (one IOCP
 //! worker thread per disk). `notify_queue` (on the vCPU thread) drains the
 //! avail ring, decodes each `virtio_blk_req` header, and submits the data
-//! segments to the backend. The IOCP worker runs `on_complete`, which advances
-//! a per-request state machine; after the last segment + the status byte it
-//! pushes the used ring and raises the queue interrupt via the transport.
+//! segments to the backend as independent, concurrent ops. The IOCP worker
+//! runs `on_seg_complete` per segment; the completion that retires a request's
+//! last segment pushes the used ring and raises the queue interrupt via the
+//! transport.
 //!
 //! Implements READ / WRITE / FLUSH plus the RO, DISCARD, and WRITE_ZEROES
 //! feature bits. DISCARD / WRITE_ZEROES are served synchronously on the host
@@ -18,7 +19,7 @@ use crate::virtio::device::{
 };
 use crate::virtio::queue::{ChainBuf, ChainScratch, Virtqueue};
 use crate::whp::GuestMemory;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 // virtio-blk feature bits (spec §5.2.3).
@@ -67,50 +68,75 @@ const BLK_MAX_RANGE_SEG: usize = 1;
 
 pub type IrqFn = Box<dyn Fn(u32) + Send + Sync>;
 
-/// Per virtio-blk request. `req` MUST be the first field so a `*mut Request`
-/// handed back by the backend can be recovered as a `*mut BlkReq`.
-#[repr(C)]
+/// Parent of one virtio-blk request. Its data segments are issued as independent
+/// [`SegOp`]s that run concurrently; `segs_outstanding` counts how many are still
+/// in flight (plus one submission guard), and whichever decrement drives it to 0
+/// finishes the request. It is shared between the submit thread and the IOCP
+/// worker, so the cross-thread fields are atomic (the refcount idiom: the plain
+/// fields are written before submission and read only at refcount 0, after the
+/// `segs_outstanding` release/acquire edge).
 struct BlkReq {
-    req: Request,
-    /// Index of this request's slot in the `ReqPool`, so completion can release
-    /// it in O(1) instead of searching the in-flight list.
+    /// Index of this request's slot in the `ReqPool` (O(1) release).
     slot: u16,
     head_idx: u16,
     rtype: u32,
-    data_segs: Vec<ChainBuf>,
-    cur_seg: usize,
-    cur_file_offset: u64,
-    total_done: u32,
     status_ptr: *mut u8,
-    failed: bool,
+    /// Outstanding segment I/Os + 1 submission guard; reaching 0 finishes.
+    segs_outstanding: AtomicU32,
+    /// Bytes read so far (the read used_len); only segment completions write it.
+    total_done: AtomicU32,
+    failed: AtomicBool,
 }
 
 impl BlkReq {
     fn empty(slot: u16) -> BlkReq {
         BlkReq {
-            req: Request::zeroed(),
             slot,
             head_idx: 0,
             rtype: 0,
-            data_segs: Vec::new(),
-            cur_seg: 0,
-            cur_file_offset: 0,
-            total_done: 0,
             status_ptr: std::ptr::null_mut(),
-            failed: false,
+            segs_outstanding: AtomicU32::new(0),
+            total_done: AtomicU32::new(0),
+            failed: AtomicBool::new(false),
         }
     }
 }
 
-/// Preallocated pool of in-flight request slots. Each slot is a heap-stable
-/// `Box<BlkReq>` whose address is the IOCP completion context; slots are reused
-/// via a free-list, so submit/complete allocate nothing on the hot path. Sized
-/// to the virtqueue depth (the maximum possible in-flight). Each slot keeps its
-/// `data_segs` Vec and reuses its capacity across requests.
+/// One in-flight segment I/O. `req` MUST be the first field so the backend's
+/// completion `*mut Request` is recovered as a `*mut SegOp`. `parent` points at
+/// the owning [`BlkReq`] whose `segs_outstanding` this op decrements on
+/// completion. Ownership is linear (one submit -> one completion).
+#[repr(C)]
+struct SegOp {
+    req: Request,
+    parent: *mut BlkReq,
+    slot: u16,
+}
+
+impl SegOp {
+    fn empty(slot: u16) -> SegOp {
+        SegOp {
+            req: Request::zeroed(),
+            parent: std::ptr::null_mut(),
+            slot,
+        }
+    }
+}
+
+// SegOp holds raw pointers (req.buf into guest RAM, parent into the ReqPool); it
+// is handed to the IOCP and recovered on completion, with ownership passed
+// linearly between the submit and worker threads -- so it is Send.
+unsafe impl Send for SegOp {}
+
+/// Preallocated pool of parent request slots. Each slot is a heap-stable
+/// `Box<BlkReq>` whose address is stored as the `parent` back-pointer in every
+/// in-flight `SegOp`, so it must not move; slots are reused via a free-list, so
+/// submit/complete allocate nothing on the hot path. Sized to the virtqueue
+/// depth (the maximum possible in-flight requests).
 struct ReqPool {
-    // Box (not inline) is REQUIRED: each slot's address is handed to the IOCP
-    // backend as the completion context and must stay stable for the slab's
-    // lifetime; `Vec<BlkReq>` would move slots on realloc.
+    // Box (not inline) is REQUIRED: each slot's address is handed to in-flight
+    // SegOps as their `parent` and must stay stable for the slab's lifetime;
+    // `Vec<BlkReq>` would move slots on realloc.
     #[allow(clippy::vec_box)]
     slab: Vec<Box<BlkReq>>,
     free: Vec<u16>,
@@ -135,16 +161,40 @@ impl ReqPool {
     fn inflight(&self) -> usize {
         self.slab.len() - self.free.len()
     }
-    fn reset(&mut self) {
-        self.free = (0..self.slab.len() as u16).rev().collect();
-    }
 }
 
-// BlkReq holds raw pointers into guest RAM (kept alive by GuestMemory) and the
-// embedded Request buffer pointer. Ownership of a request is handed off
-// linearly (submitting thread -> IOCP worker), so no two threads touch the
-// same BlkReq concurrently.
+// BlkReq's only raw field is `status_ptr` (into guest RAM, kept alive by
+// GuestMemory). It is shared between the submit and worker threads, but every
+// cross-thread field is atomic, so it is Send.
 unsafe impl Send for BlkReq {}
+
+/// Preallocated pool of in-flight segment-op slots. Each is a heap-stable
+/// `Box<SegOp>` whose address is the IOCP completion context, reused via a
+/// free-list. Total in-flight segments are bounded by the descriptor-table size,
+/// so this is sized to the virtqueue depth.
+struct SegPool {
+    #[allow(clippy::vec_box)]
+    slab: Vec<Box<SegOp>>,
+    free: Vec<u16>,
+}
+
+impl SegPool {
+    fn new(n: usize) -> SegPool {
+        let n = n.clamp(1, u16::MAX as usize);
+        let mut slab = Vec::with_capacity(n);
+        for i in 0..n {
+            slab.push(Box::new(SegOp::empty(i as u16)));
+        }
+        let free: Vec<u16> = (0..n as u16).rev().collect();
+        SegPool { slab, free }
+    }
+    fn acquire(&mut self) -> Option<u16> {
+        self.free.pop()
+    }
+    fn release(&mut self, slot: u16) {
+        self.free.push(slot);
+    }
+}
 
 pub struct BlockDevice {
     backend: Arc<BlockFile>,
@@ -154,8 +204,10 @@ pub struct BlockDevice {
     queue_max: u32,
     readonly: bool,
     driver_features: AtomicU64,
-    /// Preallocated in-flight request pool (no per-request heap allocation).
+    /// Preallocated in-flight parent-request pool (no per-request heap alloc).
     pool: Mutex<ReqPool>,
+    /// Preallocated in-flight segment-op pool (one slot per concurrent segment).
+    seg_pool: Mutex<SegPool>,
     /// Reused across drain calls so submit allocates nothing (see `drain`).
     drain_chain: Mutex<ChainScratch>,
 
@@ -220,6 +272,7 @@ impl BlockDevice {
             readonly: backend.readonly(),
             driver_features: AtomicU64::new(0),
             pool: Mutex::new(ReqPool::new(queue_max as usize)),
+            seg_pool: Mutex::new(SegPool::new(queue_max as usize)),
             drain_chain: Mutex::new(ChainScratch::default()),
             ops_in: AtomicU64::new(0),
             ops_out: AtomicU64::new(0),
@@ -235,7 +288,7 @@ impl BlockDevice {
         let weak = Arc::downgrade(&dev);
         backend.set_completion_callback(Box::new(move |req: *mut Request| {
             if let Some(d) = weak.upgrade() {
-                d.on_complete(req);
+                d.on_seg_complete(req);
             }
         }));
         dev
@@ -298,38 +351,121 @@ impl BlockDevice {
         self.raise_irq_if_needed();
     }
 
-    /// Acquire a pool slot for an async request, copy its data segments into the
-    /// slot's reused Vec, and return the stable raw pointer (the IOCP completion
-    /// context). Returns None only if the pool is exhausted (in-flight == depth).
-    fn begin_request(
+    /// Acquire a parent slot and submit every data segment of a request
+    /// concurrently, each as its own `SegOp`. FLUSH is issued as one Flush
+    /// segment. A submission guard (`segs_outstanding` starts at 1) keeps the
+    /// request from finishing until all segments have been submitted, even if
+    /// some complete immediately; the decrement that drives the count to 0
+    /// finishes the request.
+    fn submit_request(
         &self,
         head: u16,
         rtype: u32,
-        cur_file_offset: u64,
+        base_offset: u64,
         status_ptr: *mut u8,
         data: &[ChainBuf],
-    ) -> Option<*mut BlkReq> {
-        let mut pool = self.pool.lock().unwrap();
-        let slot = pool.acquire()?;
-        let r = &mut *pool.slab[slot as usize];
-        r.req = Request::zeroed();
-        r.slot = slot;
-        r.head_idx = head;
-        r.rtype = rtype;
-        r.data_segs.clear();
-        r.data_segs.extend_from_slice(data);
-        r.cur_seg = 0;
-        r.cur_file_offset = cur_file_offset;
-        r.total_done = 0;
-        r.status_ptr = status_ptr;
-        r.failed = false;
-        Some(r as *mut BlkReq)
+    ) {
+        let parent: *mut BlkReq = {
+            let mut pool = self.pool.lock().unwrap();
+            let Some(slot) = pool.acquire() else {
+                self.reject(head, status_ptr, BLK_S_IOERR);
+                return;
+            };
+            let p = &mut *pool.slab[slot as usize];
+            p.slot = slot;
+            p.head_idx = head;
+            p.rtype = rtype;
+            p.status_ptr = status_ptr;
+            p.segs_outstanding.store(1, Ordering::Relaxed); // submission guard
+            p.total_done.store(0, Ordering::Relaxed);
+            p.failed.store(false, Ordering::Relaxed);
+            p as *mut BlkReq
+        };
+
+        if etw::enabled(etw::VERBOSE, etw::kw::BLOCK) {
+            let segs = if rtype == BLK_T_FLUSH {
+                1
+            } else {
+                data.len() as u32
+            };
+            etw::Event::new("BlkSubmit", etw::VERBOSE, etw::kw::BLOCK)
+                .u32("type", rtype)
+                .u64("sector", base_offset / SECTOR_SIZE as u64)
+                .u32("segs", segs)
+                .u32("head", head as u32)
+                .write();
+        }
+
+        if rtype == BLK_T_FLUSH {
+            self.submit_seg(parent, std::ptr::null_mut(), 0, 0, Op::Flush);
+        } else {
+            let op = if rtype == BLK_T_IN {
+                Op::Read
+            } else {
+                Op::Write
+            };
+            let backend_size = self.backend.size();
+            let mut file_off = base_offset;
+            for seg in data {
+                // Bounds-check each segment against the backing file (subtraction
+                // form so a 32-bit length + 64-bit offset can't wrap the check).
+                if file_off > backend_size || seg.len as u64 > backend_size - file_off {
+                    unsafe { (*parent).failed.store(true, Ordering::Relaxed) };
+                    break;
+                }
+                self.submit_seg(parent, seg.ptr, seg.len as u32, file_off, op);
+                file_off += seg.len as u64;
+            }
+        }
+
+        // Drop the submission guard; if every segment already completed (or none
+        // was submitted) this finishes the request now.
+        if unsafe { (*parent).segs_outstanding.fetch_sub(1, Ordering::AcqRel) } == 1 {
+            self.finish_request(parent);
+        }
+    }
+
+    /// Acquire a `SegOp`, fill its `Request`, count it on the parent, and submit
+    /// it. On synchronous submit failure it undoes the count and fails the
+    /// parent; the submission guard keeps the count from reaching 0 here, so the
+    /// request is finished exactly once -- by `submit_request`'s guard drop or by
+    /// the last real completion.
+    fn submit_seg(&self, parent: *mut BlkReq, buf: *mut u8, bytes: u32, file_offset: u64, op: Op) {
+        let seg: *mut SegOp = {
+            let mut sp = self.seg_pool.lock().unwrap();
+            let Some(slot) = sp.acquire() else {
+                // SegOp pool exhausted (not expected: in-flight segments are
+                // bounded by the descriptor-table size). Fail the request.
+                unsafe { (*parent).failed.store(true, Ordering::Relaxed) };
+                return;
+            };
+            let s = &mut *sp.slab[slot as usize];
+            s.req = Request::zeroed();
+            s.req.buf = buf;
+            s.req.bytes = bytes;
+            s.req.file_offset = file_offset;
+            s.req.op = op;
+            s.parent = parent;
+            s.slot = slot;
+            s as *mut SegOp
+        };
+        unsafe { (*parent).segs_outstanding.fetch_add(1, Ordering::AcqRel) };
+        if !unsafe { self.backend.submit(&mut (*seg).req) } {
+            unsafe { (*parent).failed.store(true, Ordering::Relaxed) };
+            unsafe { (*parent).segs_outstanding.fetch_sub(1, Ordering::AcqRel) };
+            self.release_seg(seg);
+        }
+    }
+
+    fn release_seg(&self, seg: *mut SegOp) {
+        let slot = unsafe { (*seg).slot };
+        self.seg_pool.lock().unwrap().release(slot);
     }
 
     fn drain(&self) {
         // One reused chain scratch across the whole drain AND across drain calls
         // so submit never allocates: each request's data segments are copied into
-        // the preallocated ReqPool slot (begin_request) before the next pop_into,
+        // preallocated SegOp slots (submit_request) before the next pop_into,
         // and holding `drain_chain` serialises the rare concurrent drain without
         // extending the contended queue-lock hold time.
         let mut scratch = self.drain_chain.lock().unwrap();
@@ -482,20 +618,7 @@ impl BlockDevice {
             // FLUSH: no data segments expected; ignore any present.
             if rtype == BLK_T_FLUSH {
                 self.ops_flush.fetch_add(1, Ordering::Relaxed);
-                let Some(raw) = self.begin_request(head, rtype, cur_file_offset, status_ptr, data)
-                else {
-                    self.reject(head, status_ptr, BLK_S_IOERR);
-                    continue;
-                };
-                unsafe {
-                    (*raw).req.op = Op::Flush;
-                }
-                if !unsafe { self.backend.submit(&mut (*raw).req) } {
-                    unsafe {
-                        (*raw).failed = true;
-                    }
-                    self.finish_request(raw);
-                }
+                self.submit_request(head, rtype, cur_file_offset, status_ptr, &[]);
                 continue;
             }
 
@@ -531,126 +654,67 @@ impl BlockDevice {
                 self.ops_out.fetch_add(1, Ordering::Relaxed);
             }
 
-            let Some(raw) = self.begin_request(head, rtype, cur_file_offset, status_ptr, data)
-            else {
-                self.reject(head, status_ptr, BLK_S_IOERR);
-                continue;
-            };
-
-            if etw::enabled(etw::VERBOSE, etw::kw::BLOCK) {
-                let r = unsafe { &*raw };
-                etw::Event::new("BlkSubmit", etw::VERBOSE, etw::kw::BLOCK)
-                    .u32("type", r.rtype)
-                    .u64("sector", r.cur_file_offset / SECTOR_SIZE as u64)
-                    .u32("segs", r.data_segs.len() as u32)
-                    .u32("head", r.head_idx as u32)
-                    .write();
-            }
-            self.submit_next(raw);
+            self.submit_request(head, rtype, cur_file_offset, status_ptr, data);
         }
     }
 
-    /// Submit the next pending data segment, or finish if all are done.
-    fn submit_next(&self, r: *mut BlkReq) {
-        enum Act {
-            Finish,
-            BoundsFail,
-            Submit,
-        }
-        let act = unsafe {
-            let rr = &mut *r;
-            if rr.cur_seg >= rr.data_segs.len() {
-                Act::Finish
-            } else {
-                let seg_ptr = rr.data_segs[rr.cur_seg].ptr;
-                let seg_len = rr.data_segs[rr.cur_seg].len;
-                // Bounds-check the segment against the backing file. Subtraction
-                // form so a 32-bit length + 64-bit offset can't wrap the check.
-                let backend_size = self.backend.size();
-                if rr.cur_file_offset > backend_size
-                    || seg_len as u64 > backend_size - rr.cur_file_offset
-                {
-                    Act::BoundsFail
-                } else {
-                    rr.req.buf = seg_ptr;
-                    rr.req.bytes = seg_len as u32;
-                    rr.req.file_offset = rr.cur_file_offset;
-                    rr.req.op = if rr.rtype == BLK_T_IN {
-                        Op::Read
-                    } else {
-                        Op::Write
-                    };
-                    Act::Submit
-                }
-            }
+    /// IOCP-worker completion for one segment. Records failure / bytes-read on
+    /// the parent, releases the SegOp slot, then decrements the parent's
+    /// outstanding count; the decrement that drives it to 0 finishes the request.
+    /// All completions for a disk run on its single IOCP worker thread, so the
+    /// per-segment updates to the parent are serialized; the AcqRel on
+    /// `segs_outstanding` publishes them to whoever observes the count reach 0.
+    fn on_seg_complete(&self, req: *mut Request) {
+        let seg = req as *mut SegOp;
+        let (parent, ok, op, bytes) = unsafe {
+            let s = &*seg;
+            (s.parent, s.req.ok, s.req.op, s.req.bytes)
         };
-        match act {
-            Act::Finish => self.finish_request(r),
-            Act::BoundsFail => {
-                unsafe {
-                    (*r).failed = true;
-                }
-                self.finish_request(r);
-            }
-            Act::Submit => {
-                if !unsafe { self.backend.submit(&mut (*r).req) } {
-                    unsafe {
-                        (*r).failed = true;
-                    }
-                    self.finish_request(r);
-                }
-            }
+        if !ok {
+            unsafe { (*parent).failed.store(true, Ordering::Relaxed) };
+        } else if op == Op::Read {
+            // used_len is u32, so saturate the running total of bytes read.
+            // Single-writer (this worker thread), so load+store is race-free.
+            let p = unsafe { &*parent };
+            let prev = p.total_done.load(Ordering::Relaxed);
+            p.total_done
+                .store(prev.saturating_add(bytes), Ordering::Relaxed);
+        }
+        self.release_seg(seg);
+        if unsafe { (*parent).segs_outstanding.fetch_sub(1, Ordering::AcqRel) } == 1 {
+            self.finish_request(parent);
         }
     }
 
-    /// IOCP-worker completion entry point. `req` is the embedded Request, which
-    /// is the first field of a `BlkReq`.
-    fn on_complete(&self, req: *mut Request) {
-        let r = req as *mut BlkReq;
-        let finish = unsafe {
-            let rr = &mut *r;
-            if !rr.req.ok {
-                rr.failed = true;
-                true
-            } else if rr.req.op == Op::Flush {
-                true
-            } else {
-                // used_len is u32, so saturate the running total.
-                let n = rr.req.bytes;
-                rr.total_done = rr.total_done.saturating_add(n);
-                rr.cur_file_offset += n as u64;
-                rr.cur_seg += 1;
-                false
-            }
+    /// Finish a request: write its status byte, retire it on the used ring,
+    /// release the parent slot, and signal the driver. Runs exactly once per
+    /// request -- driven by `segs_outstanding` reaching 0 -- on whichever thread
+    /// observes that (the guard drop in `submit_request`, or the last completion).
+    fn finish_request(&self, parent: *mut BlkReq) {
+        let (head, rtype, failed, total_done, status_ptr, slot) = unsafe {
+            let p = &*parent;
+            (
+                p.head_idx,
+                p.rtype,
+                p.failed.load(Ordering::Acquire),
+                p.total_done.load(Ordering::Relaxed),
+                p.status_ptr,
+                p.slot,
+            )
         };
-        if finish {
-            self.finish_request(r);
+        unsafe { *status_ptr = if failed { BLK_S_IOERR } else { BLK_S_OK } };
+        // used_len = data the device wrote (reads only) + the status byte.
+        let used_len = if failed {
+            1u32
+        } else if rtype == BLK_T_IN {
+            total_done.wrapping_add(1)
         } else {
-            self.submit_next(r);
-        }
-    }
-
-    fn finish_request(&self, r: *mut BlkReq) {
-        let (head, used_len) = unsafe {
-            *(*r).status_ptr = if (*r).failed { BLK_S_IOERR } else { BLK_S_OK };
-            // used_len = data the device wrote (reads only) + the status byte.
-            let used_len = if (*r).failed {
-                1u32
-            } else {
-                (if (*r).rtype == BLK_T_IN {
-                    (*r).total_done
-                } else {
-                    0
-                })
-                .wrapping_add(1)
-            };
-            ((*r).head_idx, used_len)
+            1
         };
         self.push_used(head, used_len);
         self.ops_done.fetch_add(1, Ordering::Relaxed);
 
         if etw::enabled(etw::VERBOSE, etw::kw::BLOCK) {
-            let (rtype, failed) = unsafe { ((*r).rtype, (*r).failed) };
             etw::Event::new("BlkComplete", etw::VERBOSE, etw::kw::BLOCK)
                 .u32("type", rtype)
                 .u32("used_len", used_len)
@@ -659,11 +723,8 @@ impl BlockDevice {
                 .write();
         }
 
-        // Return the slot to the pool (O(1)); its data_segs Vec stays allocated
-        // for reuse by a future request.
-        let slot = unsafe { (*r).slot };
+        // Return the parent slot to the pool (O(1)).
         self.pool.lock().unwrap().release(slot);
-
         self.raise_irq_if_needed();
     }
 }
@@ -733,9 +794,22 @@ impl VirtioDevice for BlockDevice {
     fn driver_ok(&self) {}
 
     fn reset(&self) {
-        // Best-effort. The caller is expected to have quiesced the backend
-        // (stopped the IOCP worker) before reset.
-        self.pool.lock().unwrap().reset();
+        // A guest-triggered reset (status write of 0) can race with reads/writes
+        // still outstanding on the IOCP worker — the worker is NOT stopped here.
+        // Two rules keep that memory-safe without draining (which would deadlock:
+        // reset runs under the transport `common` lock, and a completion's IRQ
+        // path re-takes `common`):
+        //  1. Reset the virtqueue. With `ready == false`, an in-flight completion
+        //     finds `push` / `should_interrupt_driver` early-returning, so it
+        //     retires through the normal path — releasing its parent + segment
+        //     slots — without touching the guest ring or raising an interrupt.
+        //  2. Do NOT rebuild the pool free-lists. A parent or segment slot whose
+        //     ReadFile/WriteFile is still outstanding must never be reissued to a
+        //     new request: that would alias a live BlkReq/SegOp across the pump
+        //     and worker threads (a data race + double free). The free-lists
+        //     self-heal as completions land — every acquired slot is released
+        //     exactly once.
+        self.queue.lock().unwrap().reset();
         self.driver_features.store(0, Ordering::Relaxed);
     }
 
