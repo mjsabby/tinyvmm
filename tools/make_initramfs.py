@@ -568,6 +568,135 @@ if grep -q 'tinyvmm.test=tsc' /proc/cmdline 2>/dev/null; then
     exec cat
 fi
 
+# --- optional SMP / multi-vCPU bring-up validation ----------------------
+# Enabled via kernel cmdline marker `tinyvmm.test=smp`. Driven by
+# tools/smp_test.py, which launches tinyvmm with `--vcpus N` (nested, where
+# the host uses the software-emulated LAPIC) and passes the expected count
+# as `tinyvmm.smp.expect=N`. This proves the secondary CPUs the BSP brings
+# up via INIT/SIPI actually come ONLINE (not merely "started"), that work
+# is scheduled onto every CPU, and that the software LAPIC routes
+# reschedule IPIs to the secondaries.
+#
+# Phases:
+#   count        nproc == /proc/cpuinfo processor count (>= 1)
+#   expect       nproc == tinyvmm.smp.expect=N (only if marker present)
+#   all-cpus-busy  under a 2*N spinner load every cpuN in /proc/stat
+#                  advances its user+nice+system jiffies (APs execute +
+#                  get scheduled, not just registered as present)
+#   ipi          /proc/interrupts RES (reschedule-IPI) total > 0 after the
+#                load -- proves the software LAPIC delivered IPIs to the
+#                secondary CPU(s)
+# Prints `SMP SUMMARY: X/Y phases passed` + the tinyvmm shutdown sentinel.
+if grep -q 'tinyvmm.test=smp' /proc/cmdline 2>/dev/null; then
+    log "--- SMP-TEST start ---"
+
+    SMP_PASS=0
+    SMP_FAIL=0
+    sp() { log "SMP $1: PASS${2:+ ($2)}"; SMP_PASS=$((SMP_PASS+1)); }
+    sf() { log "SMP $1: FAIL $2"; SMP_FAIL=$((SMP_FAIL+1)); }
+
+    WANT=$(cat /proc/cmdline | tr ' ' '\\n' | grep '^tinyvmm.smp.expect=' | cut -d= -f2)
+    NPROC=$(nproc 2>/dev/null || echo 1)
+    ONLINE=$(cat /sys/devices/system/cpu/online 2>/dev/null)
+    PRESENT=$(cat /sys/devices/system/cpu/present 2>/dev/null)
+    POSSIBLE=$(cat /sys/devices/system/cpu/possible 2>/dev/null)
+    CPUINFO_N=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null)
+    log "SMP nproc=$NPROC online=[$ONLINE] present=[$PRESENT] possible=[$POSSIBLE] cpuinfo=$CPUINFO_N want=[$WANT]"
+
+    log "SMP dmesg bring-up:"
+    dmesg 2>/dev/null \
+        | grep -iE 'smpboot|smp:|x2apic enabled|Brought up|APIC: |start_secondary' \
+        | grep -v 'SMP-TEST' \
+        | while IFS= read -r line; do log "  $line"; done
+
+    # Phase: count -- nproc agrees with /proc/cpuinfo.
+    if [ -n "$NPROC" ] && [ "$NPROC" = "$CPUINFO_N" ] && [ "$NPROC" -ge 1 ]; then
+        sp count "nproc=$NPROC == cpuinfo=$CPUINFO_N"
+    else
+        sf count "nproc=$NPROC cpuinfo=$CPUINFO_N"
+    fi
+
+    # Phase: expect -- online count matches what the host asked for.
+    if [ -n "$WANT" ]; then
+        if [ "$NPROC" = "$WANT" ]; then
+            sp expect "online $NPROC == expected $WANT"
+        else
+            sf expect "online $NPROC != expected $WANT"
+        fi
+    fi
+
+    if [ "$NPROC" -ge 2 ]; then
+        # Snapshot per-CPU busy jiffies (user+nice+system) before load.
+        BEFORE=$(grep '^cpu[0-9]' /proc/stat | awk '{print $1":"($2+$3+$4)}')
+        # 2*N tight spinners; more runnable tasks than CPUs forces the CFS load
+        # balancer to spread work to every CPU (driving reschedule + function-
+        # call IPIs to the secondaries). This also stress-tests timer delivery
+        # to a vCPU that NEVER halts -- the case a busy-poll workload hits.
+        NSPIN=$((NPROC * 2))
+        log "SMP load: spawning $NSPIN spinners"
+        PIDS=""
+        i=0
+        while [ "$i" -lt "$NSPIN" ]; do
+            ( while :; do : ; done ) &
+            PIDS="$PIDS $!"
+            i=$((i + 1))
+        done
+        # Watch the guest clock advance under full load. If the LVT timer IRQ is
+        # not delivered to a never-halting vCPU, jiffies freeze, `sleep` never
+        # returns, and these lines stop (-> the run times out). If they tick,
+        # scheduling under 100% load works.
+        s=0
+        while [ "$s" -lt 3 ]; do
+            sleep 1
+            s=$((s + 1))
+            log "SMP load: t=$(cut -d' ' -f1 /proc/uptime) tick $s/3"
+        done
+        log "SMP load: killing spinners"
+        for p in $PIDS; do kill "$p" 2>/dev/null; done
+        wait 2>/dev/null
+        log "SMP load: reaped"
+        AFTER=$(grep '^cpu[0-9]' /proc/stat | awk '{print $1":"($2+$3+$4)}')
+
+        # Phase: all-cpus-busy -- every cpuN advanced under load.
+        STALLED=""
+        for cpu in $(grep '^cpu[0-9]' /proc/stat | awk '{print $1}'); do
+            b=$(echo "$BEFORE" | grep "^$cpu:" | cut -d: -f2)
+            a=$(echo "$AFTER"  | grep "^$cpu:" | cut -d: -f2)
+            [ -z "$b" ] && b=0
+            [ -z "$a" ] && a=0
+            if [ "$a" -le "$b" ]; then STALLED="$STALLED $cpu"; fi
+        done
+        if [ -z "$STALLED" ]; then
+            sp all-cpus-busy "every CPU advanced under 2*${NPROC} spinner load"
+        else
+            sf all-cpus-busy "no progress on:$STALLED"
+        fi
+
+        # Phase: ipi -- reschedule IPIs reached the secondary CPU(s).
+        if [ -r /proc/interrupts ]; then
+            log "SMP /proc/interrupts IPI rows:"
+            grep -E 'RES:|CAL:|TLB:|LOC:' /proc/interrupts \
+                | while IFS= read -r line; do log "  $line"; done
+            RES_TOTAL=$(awk '/RES:/{s=0; for(i=2;i<=NF;i++){if($i ~ /^[0-9]+$/)s+=$i}; print s; exit}' /proc/interrupts)
+            [ -z "$RES_TOTAL" ] && RES_TOTAL=0
+            if [ "$RES_TOTAL" -gt 0 ]; then
+                sp ipi "reschedule IPIs delivered (RES total=$RES_TOTAL)"
+            else
+                sf ipi "no reschedule IPIs (RES total=0)"
+            fi
+        fi
+    fi
+
+    log "--- SMP-TEST end ---"
+    log "SMP SUMMARY: ${SMP_PASS}/$((SMP_PASS + SMP_FAIL)) phases passed"
+    sync
+    sleep 1
+    log "=== tinyvmm shutdown requested ==="
+    sleep 1
+    poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
+    exec cat
+fi
+
 # --- optional virtio-9p Phase-2 file-ops smoke ----------------------------
 # Enabled via kernel cmdline marker `tinyvmm.test=p9`. The host harness
 # attaches one --virtio-9p-share host=p9-test/ exposing a fixture with:

@@ -16,7 +16,7 @@ use windows_sys::Win32::System::Hypervisor::{
     WHvRunVpExitReasonX64InterruptWindow, WHvRunVpExitReasonX64IoPortAccess,
     WHvRunVpExitReasonX64MsrAccess, WHvSetVirtualProcessorInterruptControllerState2,
     WHvSetVirtualProcessorRegisters, WHvSetVirtualProcessorXsaveState, WHvX64RegisterCr8,
-    WHvX64RegisterRflags,
+    WHvX64RegisterDeliverabilityNotifications, WHvX64RegisterRflags,
 };
 
 /// `WHV_REGISTER_VALUE` carries `DECLSPEC_ALIGN(16)` in the WHP headers (WHP
@@ -207,6 +207,23 @@ impl Vcpu {
             WHV_REGISTER_VALUE { Reg64: inj },
         )?;
         Ok(true)
+    }
+
+    /// Ask WHP to exit this vCPU with an `X64InterruptWindow` exit as soon as the
+    /// guest can accept an external interrupt (IF set, no interrupt shadow, no
+    /// interruption already pending). Call when [`Self::try_inject_interrupt`]
+    /// returned `Ok(false)`: the queued vector would otherwise strand if the
+    /// guest is in a tight, never-halting loop and the one-shot APIC timer that
+    /// kicked us has already disarmed -- there would be no further exit to retry
+    /// delivery on. The notification is one-shot; WHP clears it on the exit.
+    pub fn request_interrupt_window(&self) -> Result<()> {
+        // WHV_X64_DELIVERABILITY_NOTIFICATIONS_REGISTER: bit0 NmiNotification,
+        // bit1 InterruptNotification, bits2..5 InterruptPriority (0 = notify for
+        // any deliverable interrupt). We want the interrupt notification.
+        self.set_register(
+            WHvX64RegisterDeliverabilityNotifications,
+            WHV_REGISTER_VALUE { Reg64: 1 << 1 },
+        )
     }
 
     pub fn get_register(&self, name: WHV_REGISTER_NAME) -> Result<WHV_REGISTER_VALUE> {

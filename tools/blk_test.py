@@ -148,8 +148,15 @@ def run_vmm(argv: list[str], timeout_sec: int) -> tuple[int, str]:
                 if not chunk:
                     break
                 out.append(chunk)
-                sys.stdout.write(chunk.decode("utf-8", errors="replace"))
-                sys.stdout.flush()
+                # Echo raw bytes: the guest log can contain bytes that decode to
+                # U+FFFD, which a cp1252 Windows console then cannot encode back
+                # (UnicodeEncodeError kills this reader thread). Writing bytes
+                # avoids the decode/encode round-trip.
+                try:
+                    sys.stdout.buffer.write(chunk)
+                    sys.stdout.buffer.flush()
+                except (ValueError, OSError):
+                    pass
                 blob = b"".join(out[-50:])
                 if SUMMARY_RE.search(blob):
                     summary_seen.set()

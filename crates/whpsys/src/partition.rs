@@ -8,7 +8,7 @@ use windows_sys::Win32::System::Hypervisor::{
     WHvPartitionPropertyCodeAllowDeviceAssignment, WHvPartitionPropertyCodeCpuidResultList,
     WHvPartitionPropertyCodeExceptionExitBitmap, WHvPartitionPropertyCodeExtendedVmExits,
     WHvPartitionPropertyCodeLocalApicEmulationMode, WHvPartitionPropertyCodeProcessorCount,
-    WHvSetPartitionProperty, WHvSetupPartition,
+    WHvPartitionPropertyCodeX64MsrExitBitmap, WHvSetPartitionProperty, WHvSetupPartition,
 };
 
 pub struct Partition {
@@ -69,6 +69,14 @@ impl Partition {
 
     pub fn set_local_apic_emulation(&self, mode: WHV_X64_LOCAL_APIC_EMULATION_MODE) -> Result<()> {
         self.set_property(WHvPartitionPropertyCodeLocalApicEmulationMode, &mode)
+    }
+
+    /// `WHV_X64_MSR_EXIT_BITMAP` (a u64 of intercept bits): bit0 UnhandledMsrs,
+    /// bit3 ApicBaseMsrWrite. With the software LAPIC we need APIC_BASE writes to
+    /// trap (so an AP can enable x2APIC without WHP faulting it) while keeping
+    /// unhandled MSRs trapping.
+    pub fn set_msr_exit_bitmap(&self, bits: u64) -> Result<()> {
+        self.set_property(WHvPartitionPropertyCodeX64MsrExitBitmap, &bits)
     }
 
     /// Permit Discrete Device Assignment (VPCI) in this partition. MUST be set

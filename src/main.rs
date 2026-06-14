@@ -1373,6 +1373,12 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         WHvX64LocalApicEmulationModeX2Apic
     };
     part.set_local_apic_emulation(apic_mode)?;
+    if emulate_lapic {
+        // Trap APIC_BASE writes (bit 3) so an AP enabling x2APIC reaches the
+        // software LAPIC instead of WHP faulting it; keep unhandled MSRs (bit 0)
+        // trapping for the Hyper-V + x2APIC MSRs.
+        part.set_msr_exit_bitmap(0x9)?;
+    }
     part.setup()?;
     let part_handle = part.handle();
     println!(
@@ -1384,7 +1390,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         }
     );
     if emulate_lapic {
-        whpsys::lapic::init(part_handle, 0, cached_tsc_hz());
+        whpsys::lapic::init(part_handle, cfg.vcpus, cached_tsc_hz());
     }
 
     // --- Guest RAM ---
@@ -2652,10 +2658,16 @@ fn run_restore(args: &[String]) -> Result<i32> {
         WHvX64LocalApicEmulationModeX2Apic
     };
     part.set_local_apic_emulation(apic_mode)?;
+    if emulate_lapic {
+        // Match the boot path: trap APIC_BASE writes (bit 3) so a restored AP
+        // re-enabling x2APIC reaches the software LAPIC, plus unhandled MSRs
+        // (bit 0) for the Hyper-V + x2APIC MSRs.
+        part.set_msr_exit_bitmap(0x9)?;
+    }
     part.setup()?;
     let part_handle = part.handle();
     if emulate_lapic {
-        whpsys::lapic::init(part_handle, 0, cached_tsc_hz());
+        whpsys::lapic::init(part_handle, vcpu_count, cached_tsc_hz());
     }
 
     let ram = Arc::new(GuestMemory::new_split(

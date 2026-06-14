@@ -417,3 +417,39 @@ pub fn setup_pvh_entry(vp: &Vcpu, res: &PvhLoadResult) -> Result<()> {
     ];
     vp.set_registers(&names, &values)
 }
+
+/// Place an application processor at its Startup-IPI entry: real mode, executing
+/// at physical `vector << 12` (`CS:IP = (vector << 8):0000`). Used by the
+/// software LAPIC's AP bring-up; the guest's trampoline at that address does the
+/// real -> protected -> long mode switch and joins the kernel's SMP boot.
+pub fn setup_ap_sipi(vp: &Vcpu, vector: u8) -> Result<()> {
+    // Real-mode segment access rights: present, code/data, accessed, 16-bit.
+    let code = seg((vector as u64) << 12, 0xFFFF, (vector as u16) << 8, 0x9B);
+    let data = seg(0, 0xFFFF, 0, 0x93);
+    const CR0_ET: u64 = 1 << 4; // PE = 0 -> real mode
+    let names = [
+        WHvX64RegisterCs,
+        WHvX64RegisterDs,
+        WHvX64RegisterEs,
+        WHvX64RegisterSs,
+        WHvX64RegisterFs,
+        WHvX64RegisterGs,
+        WHvX64RegisterCr0,
+        WHvX64RegisterCr4,
+        WHvX64RegisterRflags,
+        WHvX64RegisterRip,
+    ];
+    let values = [
+        code,
+        data,
+        data,
+        data,
+        data,
+        data,
+        reg64(CR0_ET),
+        reg64(0),
+        reg64(0x2),
+        reg64(0),
+    ];
+    vp.set_registers(&names, &values)
+}
