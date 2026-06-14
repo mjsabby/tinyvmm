@@ -13,6 +13,9 @@ pub const MSR_HYPERCALL: u32 = 0x4000_0001;
 pub const MSR_VP_INDEX: u32 = 0x4000_0002;
 pub const MSR_TIME_REF_COUNT: u32 = 0x4000_0020;
 pub const MSR_REFERENCE_TSC: u32 = 0x4000_0021;
+pub const MSR_TSC_FREQUENCY: u32 = 0x4000_0022;
+pub const MSR_APIC_FREQUENCY: u32 = 0x4000_0023;
+pub const MSR_VP_ASSIST_PAGE: u32 = 0x4000_0073;
 pub const MSR_TSC_INVARIANT_CTL: u32 = 0x4000_0118;
 
 const PAGE_SHIFT: u64 = 12;
@@ -39,6 +42,7 @@ struct MsrCache {
     hypercall_msr: u64,
     reference_tsc_msr: u64,
     tsc_invariant_ctl: u64,
+    vp_assist_page: u64,
 }
 
 pub struct HvEnlightenment {
@@ -59,6 +63,7 @@ impl HvEnlightenment {
                 hypercall_msr: 0,
                 reference_tsc_msr: 0,
                 tsc_invariant_ctl: 0,
+                vp_assist_page: 0,
             }),
         }
     }
@@ -75,34 +80,27 @@ impl HvEnlightenment {
         ((tsc as u128).wrapping_mul(self.tsc_scale as u128) >> 64) as u64
     }
 
-    fn page_for(&self, guest_pfn: u64) -> Option<&mut [u8]> {
-        let gpa = guest_pfn << PAGE_SHIFT;
-        // slice_mut bounds-checks against the (possibly split) RAM mapping, so a
-        // PFN in the MMIO hole or past the top of RAM is rejected here.
-        self.ram.slice_mut(gpa, PAGE_SIZE)
-    }
-
     fn write_reference_tsc_page(&self, guest_pfn: u64) -> bool {
-        let scale = self.tsc_scale;
-        let Some(page) = self.page_for(guest_pfn) else {
+        // Build the page in a host buffer and write it via the bounds-checked
+        // copy accessor — no `&mut [u8]` aliasing guest-shared memory (the old
+        // `slice_mut` path was unsound: aliasable `&mut` over RAM the guest CPU
+        // can concurrently touch).
+        let gpa = guest_pfn << PAGE_SHIFT;
+        let mut page = [0u8; PAGE_SIZE];
+        page[8..16].copy_from_slice(&self.tsc_scale.to_le_bytes());
+        if !self.ram.write_bytes(gpa, &page) {
             return false;
-        };
-        page.fill(0);
-        // Header: tsc_sequence(u32)=0, reserved1(u32)=0, tsc_scale(u64), tsc_offset(i64)=0
-        page[8..16].copy_from_slice(&scale.to_le_bytes());
-        // offset stays 0. Publish a stable non-zero sequence.
+        }
+        // Publish a stable non-zero sequence after the body is visible.
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-        page[0..4].copy_from_slice(&1u32.to_le_bytes());
-        true
+        self.ram.write_bytes(gpa, &1u32.to_le_bytes())
     }
 
     fn write_hypercall_page(&self, guest_pfn: u64) -> bool {
-        let Some(page) = self.page_for(guest_pfn) else {
-            return false;
-        };
-        page.fill(0);
+        let gpa = guest_pfn << PAGE_SHIFT;
+        let mut page = [0u8; PAGE_SIZE];
         page[..HYPERCALL_STUB.len()].copy_from_slice(&HYPERCALL_STUB);
-        true
+        self.ram.write_bytes(gpa, &page)
     }
 
     pub fn handle_wrmsr(&self, _vp_index: u32, msr: u32, value: u64) -> MsrHandled {
@@ -139,6 +137,14 @@ impl HvEnlightenment {
                 c.tsc_invariant_ctl = value;
                 MsrHandled::Yes
             }
+            MSR_VP_ASSIST_PAGE => {
+                // We don't implement the assist-page enlightenments (EOI assist,
+                // nested VMCS); the page is guest RAM that stays zeroed, which
+                // Linux reads as "no assist". Accepting the write avoids the
+                // benign-but-noisy `#GP` Linux logs from `hv_cpu_init`.
+                c.vp_assist_page = value;
+                MsrHandled::Yes
+            }
             _ => MsrHandled::NoInjectGp,
         }
     }
@@ -167,6 +173,20 @@ impl HvEnlightenment {
                 *out = c.reference_tsc_msr;
                 MsrHandled::Yes
             }
+            // The frequency MSRs are what let Linux's `ms_hyperv_init_platform`
+            // bypass PIT/HPET TSC calibration (it sets `x86_platform.calibrate_tsc
+            // = hv_get_tsc_khz`). Without them the guest falls back to PIT
+            // calibration → fails (no IRQ0/HPET) → `calibrate_delay()` spins
+            // forever. The software LAPIC's timer counts in host-TSC ticks, so
+            // its bus frequency *is* the TSC frequency.
+            MSR_TSC_FREQUENCY | MSR_APIC_FREQUENCY => {
+                *out = self.tsc_hz;
+                MsrHandled::Yes
+            }
+            MSR_VP_ASSIST_PAGE => {
+                *out = c.vp_assist_page;
+                MsrHandled::Yes
+            }
             MSR_TSC_INVARIANT_CTL => {
                 *out = c.tsc_invariant_ctl;
                 MsrHandled::Yes
@@ -178,15 +198,16 @@ impl HvEnlightenment {
         }
     }
 
-    /// Snapshot the Hyper-V MSR cache (4 u64 = 32 bytes). The hypercall +
+    /// Snapshot the Hyper-V MSR cache (5 u64 = 40 bytes). The hypercall +
     /// reference-TSC guest pages are part of RAM (restored separately).
     pub fn snapshot_capture(&self) -> Vec<u8> {
         let c = self.cache.lock().unwrap();
-        let mut b = Vec::with_capacity(32);
+        let mut b = Vec::with_capacity(40);
         b.extend_from_slice(&c.guest_os_id.to_le_bytes());
         b.extend_from_slice(&c.hypercall_msr.to_le_bytes());
         b.extend_from_slice(&c.reference_tsc_msr.to_le_bytes());
         b.extend_from_slice(&c.tsc_invariant_ctl.to_le_bytes());
+        b.extend_from_slice(&c.vp_assist_page.to_le_bytes());
         b
     }
 
@@ -202,12 +223,18 @@ impl HvEnlightenment {
         let hypercall_msr = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
         let reference_tsc_msr = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
         let tsc_invariant_ctl = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+        // vp_assist_page added later; tolerate older 32-byte snapshots.
+        let vp_assist_page = bytes
+            .get(32..40)
+            .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+            .unwrap_or(0);
         {
             let mut c = self.cache.lock().unwrap();
             c.guest_os_id = guest_os_id;
             c.hypercall_msr = hypercall_msr;
             c.reference_tsc_msr = reference_tsc_msr;
             c.tsc_invariant_ctl = tsc_invariant_ctl;
+            c.vp_assist_page = vp_assist_page;
         }
         if hypercall_msr & 1 != 0 {
             self.write_hypercall_page(hypercall_msr >> PAGE_SHIFT);

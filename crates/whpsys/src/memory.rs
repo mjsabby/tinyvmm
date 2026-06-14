@@ -333,15 +333,11 @@ impl GuestMemory {
         }
     }
 
-    /// A mutable byte view of `len` bytes starting at `guest_phys`. Used to
-    /// stage boot artifacts (ACPI) and Hyper-V pages where the writer is the
-    /// sole accessor at that moment.
-    #[allow(clippy::mut_from_ref)]
-    pub fn slice_mut(&self, guest_phys: u64, len: usize) -> Option<&mut [u8]> {
-        let off = self.region_off(guest_phys, len as u64)?;
-        let p = unsafe { self.base.get().add(off) };
-        Some(unsafe { std::slice::from_raw_parts_mut(p, len) })
-    }
+    // `slice_mut(&self) -> &mut [u8]` was removed: returning an aliasable `&mut`
+    // over memory the guest CPU concurrently mutates is unsound (Rust's `&mut`
+    // exclusivity is a lie there). All former call sites now go through the
+    // raw-pointer copy accessors below (`write_bytes` / `read_array`), which
+    // never materialize a Rust reference to guest RAM.
 
     // ---- Typed, bounds-checked accessors -------------------------------------
     //

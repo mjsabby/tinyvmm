@@ -205,7 +205,10 @@ impl Virtqueue {
 
     /// Restore queue programming + ring position from a snapshot.
     pub fn apply(&mut self, s: &QueueState) {
-        self.size = s.size;
+        // Clamp: a hostile/corrupt snapshot with size > u16::MAX would make
+        // `last_avail % size as u16` divide by zero (panic=abort). The transport
+        // already enforces size ≤ max_size on the live path; do the same here.
+        self.size = s.size.min(self.max_size);
         self.ready = s.ready;
         self.event_idx = s.event_idx;
         self.desc_gpa = s.desc_gpa;
@@ -289,8 +292,15 @@ impl Virtqueue {
 
         out.head_index = head;
 
+        // Spec §2.7.5.3.1: a chain (indirect or not) has at most queue-size
+        // descriptors total. Enforce it so a hostile size×size indirect chain
+        // can't quadratically inflate `out.bufs` (and downstream gather buffers).
+        let cap = self.size;
         let mut cur = head;
         for _ in 0..self.size {
+            if out.bufs.len() as u32 >= cap {
+                break;
+            }
             let Some(db) = self.mem.read_array::<16>(desc_base + cur as u64 * 16) else {
                 break;
             };
@@ -303,7 +313,7 @@ impl Virtqueue {
                 }
                 let mut i = 0u32;
                 let mut step = 0u32;
-                while step < inner_count && step < self.size {
+                while step < inner_count && step < self.size && (out.bufs.len() as u32) < cap {
                     let Some(ib) = self.mem.read_array::<16>(d.addr + i as u64 * 16) else {
                         break;
                     };

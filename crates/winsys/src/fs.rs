@@ -14,10 +14,11 @@
 use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, GetLastError, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, DeleteFileW,
-    FILE_ATTRIBUTE_DIRECTORY, FILE_BEGIN, FindClose, FindFirstFileW, FindNextFileW,
-    FlushFileBuffers, GetDiskFreeSpaceExW, GetFileAttributesW, GetFileInformationByHandle,
-    GetFinalPathNameByHandleW, MoveFileExW, ReadFile, RemoveDirectoryW, SetEndOfFile,
-    SetFilePointerEx, SetFileTime, WIN32_FIND_DATAW, WriteFile,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_BEGIN, FILE_ID_BOTH_DIR_INFO, FileIdBothDirectoryInfo,
+    FileIdBothDirectoryRestartInfo, FindClose, FindFirstFileW, FindNextFileW, FlushFileBuffers,
+    GetDiskFreeSpaceExW, GetFileAttributesW, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, GetFinalPathNameByHandleW, MoveFileExW, ReadFile,
+    RemoveDirectoryW, SetEndOfFile, SetFilePointerEx, SetFileTime, WIN32_FIND_DATAW, WriteFile,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
@@ -279,6 +280,104 @@ pub fn disk_free_space(path: &[u16]) -> Result<(u64, u64, u64), u32> {
 pub struct DirEntry {
     pub name: String,
     pub is_dir: bool,
+}
+
+/// One directory entry from [`ReadDirIds`] — like [`DirEntry`] but carries the
+/// 64-bit NTFS file-ID (`nFileIndex`) so the caller doesn't have to open each
+/// entry just to learn it.
+pub struct DirEntryId {
+    pub name: String,
+    pub is_dir: bool,
+    pub file_id: u64,
+}
+
+/// Handle-based directory iterator using `GetFileInformationByHandleEx` with
+/// `FileIdBothDirectoryInfo`: each refill returns a buffer-full of
+/// `FILE_ID_BOTH_DIR_INFO` entries (name + attributes + 64-bit FileId), so a
+/// large directory enumerates in O(entries / ~500) syscalls instead of
+/// `FindFirstFile` + a per-entry `CreateFile`/`GetFileInformationByHandle`
+/// (the 9p backend's previous `build_dir_cache` did the latter — ~4 syscalls
+/// per entry, the dominant cost of `Treaddir` on big directories).
+///
+/// `h` is a *borrowed* directory handle opened with `FILE_LIST_DIRECTORY`; the
+/// caller owns it (this iterator does not close it).
+pub struct ReadDirIds {
+    handle: HANDLE,
+    buf: Box<[u8]>,
+    /// Byte offset of the next entry in `buf`; `usize::MAX` means "refill".
+    pos: usize,
+    done: bool,
+    restart: bool,
+}
+
+pub fn read_dir_ids(h: HANDLE) -> ReadDirIds {
+    ReadDirIds {
+        handle: h,
+        buf: vec![0u8; 64 * 1024].into_boxed_slice(),
+        pos: usize::MAX,
+        done: false,
+        restart: true,
+    }
+}
+
+impl Iterator for ReadDirIds {
+    type Item = DirEntryId;
+
+    fn next(&mut self) -> Option<DirEntryId> {
+        if self.pos == usize::MAX {
+            if self.done {
+                return None;
+            }
+            let class = if self.restart {
+                FileIdBothDirectoryRestartInfo
+            } else {
+                FileIdBothDirectoryInfo
+            };
+            self.restart = false;
+            let ok = unsafe {
+                GetFileInformationByHandleEx(
+                    self.handle,
+                    class,
+                    self.buf.as_mut_ptr() as *mut core::ffi::c_void,
+                    self.buf.len() as u32,
+                )
+            };
+            if ok == 0 {
+                // ERROR_NO_MORE_FILES on a clean end; anything else is also end
+                // for our purposes (the caller treats a short listing as such).
+                self.done = true;
+                return None;
+            }
+            self.pos = 0;
+        }
+        // SAFETY: the kernel wrote a valid FILE_ID_BOTH_DIR_INFO at `pos`
+        // (NextEntryOffset chain, 8-byte aligned). We read fields by unaligned
+        // ptr to be defensive about the struct's declared alignment.
+        let base = unsafe { self.buf.as_ptr().add(self.pos) };
+        let rec = base as *const FILE_ID_BOTH_DIR_INFO;
+        let (next_off, attrs, name_len, file_id) = unsafe {
+            (
+                (*rec).NextEntryOffset,
+                (*rec).FileAttributes,
+                (*rec).FileNameLength as usize / 2,
+                (*rec).FileId as u64,
+            )
+        };
+        // FileName is the trailing variable-length array.
+        let name_ptr = unsafe { core::ptr::addr_of!((*rec).FileName) as *const u16 };
+        let name =
+            String::from_utf16_lossy(unsafe { core::slice::from_raw_parts(name_ptr, name_len) });
+        self.pos = if next_off == 0 {
+            usize::MAX
+        } else {
+            self.pos + next_off as usize
+        };
+        Some(DirEntryId {
+            name,
+            is_dir: attrs & FILE_ATTRIBUTE_DIRECTORY != 0,
+            file_id,
+        })
+    }
 }
 
 /// Lazy directory iterator over `FindFirstFileW`/`FindNextFileW`. `search` is a

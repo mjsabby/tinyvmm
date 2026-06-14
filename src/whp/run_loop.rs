@@ -350,6 +350,14 @@ impl RunLoop {
         if !whpsys::lapic::active() {
             return;
         }
+        // Skip the per-exit `WHvGetVirtualProcessorRegisters(CR8)` syscall when
+        // nothing is pending (the common case): a Mutex + 8-word OR is ~50 ns
+        // vs ~2 µs for the WHP register read under nested virt. At ~17 K exits/s
+        // (net RX flood) this is the difference between ~3.5 % and ~0 % CPU.
+        let lapic = whpsys::lapic::global();
+        if !lapic.irr_nonempty() {
+            return;
+        }
         // Live TPR class (CR8 = TPR[7:4]); the software LAPIC owns the priority
         // decision, we just feed it the current processor priority.
         let cr8 = self
@@ -357,7 +365,7 @@ impl RunLoop {
             .get_register(WHvX64RegisterCr8)
             .map(|v| (unsafe { v.Reg64 } & 0xF) as u32)
             .unwrap_or(0);
-        let Some(vector) = whpsys::lapic::global().next_vector(cr8) else {
+        let Some(vector) = lapic.next_vector(cr8) else {
             return;
         };
         match self.vcpu.try_inject_interrupt(vector) {

@@ -26,14 +26,12 @@ impl Doorbell {
     /// Register a doorbell matching a `length`-byte write of `value` at `gpa`.
     /// Returns None if the event can't be created or the registration fails.
     pub fn new(part: WHV_PARTITION_HANDLE, gpa: u64, value: u64, length: u32) -> Option<Doorbell> {
-        let event = unsafe {
-            CreateEventW(
-                std::ptr::null(),
-                1, /*manual reset*/
-                0,
-                std::ptr::null(),
-            )
-        };
+        // Auto-reset: WaitForMultipleObjects consumes the signal, so the pump
+        // doesn't need a per-wake ResetEvent syscall (≈1/3 of its cost under
+        // nested virt). A fire during `notify_queue` re-sets the event and the
+        // next WFMO picks it up — same semantics as manual-reset + ResetEvent-
+        // before-process.
+        let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
         if event.is_null() {
             return None;
         }

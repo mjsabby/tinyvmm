@@ -344,7 +344,7 @@ fn run_blk_selftest() -> Result<i32> {
             );
             put(avail_gpa + 2, &(avail_slot + 1).to_le_bytes());
             dev.notify_queue(0);
-            ram.slice_mut(stat, 1).expect("selftest status")[0]
+            ram.read_array::<1>(stat).expect("selftest status")[0]
         };
 
     // ---- READ/WRITE roundtrip through the parallel-submission path ----
@@ -391,7 +391,7 @@ fn run_blk_selftest() -> Result<i32> {
             put(avail_gpa + 2, &(avail_slot + 1).to_le_bytes());
             dev.notify_queue(0);
             for _ in 0..5000 {
-                let s = ram.slice_mut(stat, 1).expect("rw status")[0];
+                let s = ram.read_array::<1>(stat).expect("rw status")[0];
                 if s != 0xAA {
                     return s;
                 }
@@ -403,7 +403,7 @@ fn run_blk_selftest() -> Result<i32> {
     let st_r = issue_rw(1, 4, 0x5_0000, rdst, T_IN, 2);
     let mut rw_data_ok = true;
     for k in 0..(2 * SEG as u64) {
-        if ram.slice_mut(rdst + k, 1).expect("rw readback")[0] != 0x40 + (k % 64) as u8 {
+        if ram.read_array::<1>(rdst + k).expect("rw readback")[0] != 0x40 + (k % 64) as u8 {
             rw_data_ok = false;
             break;
         }
@@ -597,7 +597,7 @@ fn run_blk_stresstest() -> Result<i32> {
     let used_gpa: u64 = 0x3_0000;
 
     let put = |gpa: u64, b: &[u8]| ram.write_at(gpa, b).expect("stress write_at");
-    let getb = |gpa: u64| ram.slice_mut(gpa, 1).expect("stress read")[0];
+    let getb = |gpa: u64| ram.read_array::<1>(gpa).expect("stress read")[0];
     let write_desc = |table: u64, i: u64, addr: u64, len: u32, flags: u16, next: u16| {
         let base = table + i * 16;
         put(base, &addr.to_le_bytes());

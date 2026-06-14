@@ -97,7 +97,14 @@ struct Inner {
 impl Inner {
     fn new() -> Self {
         Inner {
-            apic_base: 0xFEE0_0000 | (1 << 8) /*BSP*/ | (1 << 11), /*global enable*/
+            // x2APIC is pre-enabled (bit 10): this LAPIC only services the
+            // x2APIC MSR range, so the guest MUST come up in x2APIC mode.
+            // Linux's `check_x2apic()` reads IA32_APIC_BASE early — without
+            // bit 10 set (and no interrupt-remapping unit) it stays in xAPIC,
+            // sends every LAPIC access to MMIO 0xFEE00000 (which we don't
+            // handle), and the timer is never armed → jiffies freeze → first
+            // `msleep()` parks the guest forever.
+            apic_base: 0xFEE0_0000 | (1 << 8) /*BSP*/ | (1 << 10) /*x2APIC*/ | (1 << 11), /*EN*/
             svr: 0xFF, // vector 0xFF, software-disabled until the guest sets bit 8
             isr: [0; 8],
             irr: [0; 8],
@@ -264,6 +271,13 @@ impl LocalApic {
     pub fn wake(&self) {
         let _g = self.inner.lock().unwrap();
         self.wake_cv.notify_all();
+    }
+
+    /// Fast IRR-non-empty check so the run loop can skip the per-exit
+    /// `WHvGetVirtualProcessorRegisters(CR8)` syscall when nothing is pending.
+    pub fn irr_nonempty(&self) -> bool {
+        let g = self.inner.lock().unwrap();
+        g.enabled() && g.irr.iter().any(|&w| w != 0)
     }
 
     /// Highest-priority deliverable vector given the live TPR class `cr8`

@@ -21,6 +21,7 @@ pub struct CpuidContext {
     pub vcpu_count: u32,
 }
 
+const ECX_X2APIC: u32 = 1 << 21;
 const ECX_TSC_DEADLINE: u32 = 1 << 24;
 const ECX_HYPERVISOR: u32 = 1 << 31;
 const EAX_ARAT: u32 = 1 << 2;
@@ -29,14 +30,26 @@ const EDX_INVARIANT_TSC: u32 = 1 << 8;
 const HV_MAX_LEAF: u32 = 0x4000_0006;
 
 // Hyper-V CPUID.40000003H:EAX feature bits we advertise.
+const HV_FEATURE_TIME_REF_COUNT: u32 = 1 << 1;
 const HV_FEATURE_HYPERCALL: u32 = 1 << 5;
 const HV_FEATURE_VP_INDEX: u32 = 1 << 6;
 const HV_FEATURE_REFERENCE_TSC: u32 = 1 << 9;
+const HV_FEATURE_FREQUENCY_MSRS: u32 = 1 << 11;
 const HV_FEATURE_TSC_INVARIANT: u32 = 1 << 15;
-pub const HV_FEATURES_ADVERTISED: u32 = HV_FEATURE_HYPERCALL
+pub const HV_FEATURES_ADVERTISED: u32 = HV_FEATURE_TIME_REF_COUNT
+    | HV_FEATURE_HYPERCALL
     | HV_FEATURE_VP_INDEX
     | HV_FEATURE_REFERENCE_TSC
+    | HV_FEATURE_FREQUENCY_MSRS
     | HV_FEATURE_TSC_INVARIANT;
+
+// CPUID.40000003H:EDX (`ms_hyperv.misc_features`). Linux gates the
+// HV_X64_MSR_{TSC,APIC}_FREQUENCY read on EAX[11] *and* EDX[8]; without both it
+// falls back to PIT calibration, which (with no IRQ0/HPET/PMTIMER) wedges
+// `calibrate_delay()`. Advertising these and serving the MSRs from `hv.rs`
+// makes Linux take `hv_get_tsc_khz` and skip the legacy calibration entirely.
+const HV_MISC_FREQUENCY_MSRS_AVAILABLE: u32 = 1 << 8;
+pub const HV_MISC_FEATURES_ADVERTISED: u32 = HV_MISC_FREQUENCY_MSRS_AVAILABLE;
 
 static HIDE_TSC_DEADLINE: AtomicBool = AtomicBool::new(false);
 
@@ -124,6 +137,9 @@ pub fn resolve_cpuid(
             }
         }
         0x0000_0001 => {
+            // The software LAPIC (nested path) only speaks x2APIC; force-on
+            // ECX[21] so the guest can switch even when the host masks it.
+            r.ecx |= ECX_X2APIC;
             if !HIDE_TSC_DEADLINE.load(Ordering::Relaxed) {
                 r.ecx |= ECX_TSC_DEADLINE;
             } else {
@@ -192,7 +208,7 @@ pub fn resolve_cpuid(
             r.eax = HV_FEATURES_ADVERTISED;
             r.ebx = 0;
             r.ecx = 0;
-            r.edx = 0;
+            r.edx = HV_MISC_FEATURES_ADVERTISED;
         }
         0x4000_0004..=0x4000_0006 => {
             r = CpuidResult::default();
@@ -246,7 +262,7 @@ pub fn build_static_cpuid_result_list(hide_tsc_deadline: bool) -> Vec<WHV_X64_CP
         } else {
             r1.ecx &= !ECX_TSC_DEADLINE;
         }
-        r1.ecx |= ECX_HYPERVISOR;
+        r1.ecx |= ECX_HYPERVISOR | ECX_X2APIC;
         r1.ebx = (r1.ebx & 0x0000_FFFF) | (1 << 16);
         list.push(entry(0x0000_0001, &r1));
     }
@@ -310,7 +326,7 @@ pub fn build_static_cpuid_result_list(hide_tsc_deadline: bool) -> Vec<WHV_X64_CP
             eax: HV_FEATURES_ADVERTISED,
             ebx: 0,
             ecx: 0,
-            edx: 0,
+            edx: HV_MISC_FEATURES_ADVERTISED,
         };
         list.push(entry(0x4000_0003, &r));
     }

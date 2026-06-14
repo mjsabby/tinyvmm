@@ -17,9 +17,7 @@ use std::thread::JoinHandle;
 use whpsys::doorbell::Doorbell;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Hypervisor::WHV_PARTITION_HANDLE;
-use windows_sys::Win32::System::Threading::{
-    CreateEventW, ResetEvent, SetEvent, WaitForMultipleObjects,
-};
+use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects};
 
 // BAR0 layout.
 const BAR_SIZE: u32 = 0x4000;
@@ -175,9 +173,8 @@ fn doorbell_pump(device: Arc<dyn VirtioDevice>, handles: SendHandles, qcount: u3
         } else {
             let i = r.wrapping_sub(WAIT_OBJECT_0) as usize;
             if i >= 1 && i < handles.len() {
-                unsafe {
-                    ResetEvent(handles[i]);
-                }
+                // Doorbell events are auto-reset (see whpsys::doorbell): WFMO
+                // already consumed the signal, no ResetEvent needed.
                 if crate::diag::etw::enabled(
                     crate::diag::etw::VERBOSE,
                     crate::diag::etw::kw::DOORBELL,
@@ -657,7 +654,12 @@ impl PciTransport {
                 if sel < c.queues.len() {
                     c.queues[sel].enable = en;
                     let q = c.queues[sel];
-                    if en != 0 && q.size != 0 {
+                    // Spec §2.7: desc 16-byte, avail 2-byte, used 4-byte aligned.
+                    // The queue's atomic ring-index accesses (`AtomicU16::from_ptr`)
+                    // require natural alignment; an odd guest GPA would be Rust UB
+                    // (and a fault on non-x86). Refuse the enable instead.
+                    let aligned = q.desc & 0xF == 0 && q.driver & 1 == 0 && q.device & 3 == 0;
+                    if en != 0 && q.size != 0 && aligned {
                         let event_idx = c.driver_features & FEATURE_RING_EVENT_IDX != 0;
                         self.device.enable_queue(
                             c.queue_select as u32,

@@ -17,6 +17,7 @@ boot.err.log
 boot.txt
 pvh.log
 trace.txt
+out/
 p9-test/
 dbg_*
 

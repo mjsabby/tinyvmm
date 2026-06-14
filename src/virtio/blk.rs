@@ -66,6 +66,28 @@ const BLK_MAX_DISCARD_SECTORS: u64 = 4 * 1024 * 1024;
 const BLK_MAX_WRITE_ZEROES_SECTORS: u64 = 4 * 1024 * 1024;
 const BLK_MAX_RANGE_SEG: usize = 1;
 
+// ---- Bounce-buffer coalescing -------------------------------------------------
+//
+// Guest page-cache I/O arrives as ~150 non-contiguous 4–8 KiB segments per
+// request (see the BlkSubmit.segs histogram in out\nested-blk-baseline.etl).
+// Issuing one ReadFile/WriteFile per segment is ~55 K syscalls/s and dominates
+// host CPU under nested virt. When a request has >1 data segment and totals
+// ≤ BOUNCE_CAP, we instead issue ONE I/O against a host bounce buffer and
+// scatter/gather to/from the guest segments. Single-segment requests (and
+// anything that overflows the cap or finds the pool empty) stay on the
+// existing zero-copy per-segment path.
+//
+// Cost: one extra memcpy of the request payload (≤ 2 MiB). Benefit: ~150×
+// fewer syscalls + IOCP completions per request. The bounce buffers are host-
+// allocated and fixed-size; the guest cannot influence their size or address.
+// Linux's observed max request on this device is 4 MiB exactly (max_sectors);
+// the cap must cover that or those requests fall back to per-segment. 8 slots
+// covers the in-flight depth (sequential readahead keeps ~1–2 in flight; the
+// 49 % miss at 8×2 MiB was size-gated, not pool-gated). 8 × 4 MiB = 32 MiB/disk.
+const BOUNCE_CAP: usize = 4 * 1024 * 1024;
+const BOUNCE_SLOTS: usize = 8;
+const NO_BOUNCE: u16 = u16::MAX;
+
 pub type IrqFn = Box<dyn Fn(u32) + Send + Sync>;
 
 /// Parent of one virtio-blk request. Its data segments are issued as independent
@@ -79,6 +101,9 @@ struct BlkReq {
     /// Index of this request's slot in the `ReqPool` (O(1) release).
     slot: u16,
     head_idx: u16,
+    /// `BouncePool` slot owning this request's coalesced buffer + scatter list,
+    /// or `NO_BOUNCE` if the request took the zero-copy per-segment path.
+    bounce_slot: u16,
     rtype: u32,
     status_ptr: *mut u8,
     /// Outstanding segment I/Os + 1 submission guard; reaching 0 finishes.
@@ -93,6 +118,7 @@ impl BlkReq {
         BlkReq {
             slot,
             head_idx: 0,
+            bounce_slot: NO_BOUNCE,
             rtype: 0,
             status_ptr: std::ptr::null_mut(),
             segs_outstanding: AtomicU32::new(0),
@@ -168,6 +194,53 @@ impl ReqPool {
 // cross-thread field is atomic, so it is Send.
 unsafe impl Send for BlkReq {}
 
+/// One reusable bounce buffer + the guest scatter list it serves. Ownership is
+/// linear (acquire on submit → release in `finish_request`), so the same slot
+/// is never touched by two threads at once; the IOCP post/completion is the
+/// synchronizing edge (mirroring `SegOp`).
+struct BounceSlot {
+    buf: Box<[u8]>,
+    /// (guest ptr, len) for each original segment, in request order. Pointers
+    /// are `host_range`-validated guest-RAM addresses captured at submit time.
+    segs: Vec<(*mut u8, u32)>,
+}
+
+// SAFETY: `segs` raw pointers are into guest RAM (kept alive by `GuestMemory`)
+// and are only dereferenced under the linear acquire→release ownership above.
+unsafe impl Send for BounceSlot {}
+
+struct BouncePool {
+    // Boxed for stable addresses (a `*mut BounceSlot` is held across the lock).
+    #[allow(clippy::vec_box)]
+    slab: Vec<Box<BounceSlot>>,
+    free: Vec<u16>,
+}
+
+impl BouncePool {
+    fn new(n: usize) -> BouncePool {
+        let n = n.clamp(1, u16::MAX as usize);
+        let mut slab = Vec::with_capacity(n);
+        for _ in 0..n {
+            slab.push(Box::new(BounceSlot {
+                buf: vec![0u8; BOUNCE_CAP].into_boxed_slice(),
+                segs: Vec::new(),
+            }));
+        }
+        let free: Vec<u16> = (0..n as u16).rev().collect();
+        BouncePool { slab, free }
+    }
+    fn acquire(&mut self) -> Option<u16> {
+        self.free.pop()
+    }
+    fn release(&mut self, slot: u16) {
+        self.free.push(slot);
+    }
+    /// Stable pointer to slot `i`; valid while the caller owns the slot.
+    fn slot_ptr(&mut self, i: u16) -> *mut BounceSlot {
+        &mut *self.slab[i as usize] as *mut BounceSlot
+    }
+}
+
 /// Preallocated pool of in-flight segment-op slots. Each is a heap-stable
 /// `Box<SegOp>` whose address is the IOCP completion context, reused via a
 /// free-list. Total in-flight segments are bounded by the descriptor-table size,
@@ -208,6 +281,8 @@ pub struct BlockDevice {
     pool: Mutex<ReqPool>,
     /// Preallocated in-flight segment-op pool (one slot per concurrent segment).
     seg_pool: Mutex<SegPool>,
+    /// Reusable bounce buffers for multi-segment coalescing (see BOUNCE_CAP).
+    bounce_pool: Mutex<BouncePool>,
     /// Reused across drain calls so submit allocates nothing (see `drain`).
     drain_chain: Mutex<ChainScratch>,
 
@@ -231,8 +306,14 @@ impl BlockDevice {
         let mut cfg = [0u8; 64];
         let capacity_sectors = backend.size() / SECTOR_SIZE as u64;
         put_le(&mut cfg[CFG_CAPACITY..CFG_CAPACITY + 8], capacity_sectors);
-        // SIZE_MAX: max bytes per data segment (generous 64 KiB).
-        put_le(&mut cfg[CFG_SIZE_MAX..CFG_SIZE_MAX + 4], 64 * 1024);
+        // SIZE_MAX: max bytes per data segment. 1 GiB ⇒ "don't split": the host
+        // side is zero-copy (ReadFile/WriteFile straight into guest RAM via
+        // host_range), so segment size has no allocation/security cost. NOTE:
+        // for page-cache-backed I/O the segment count is bound by guest *page
+        // fragmentation* (each non-contiguous 4 KiB page is its own descriptor),
+        // not by this cap — measured ~150 segs/request regardless. This value
+        // only helps the GPA-contiguous case (O_DIRECT, hugepage folios).
+        put_le(&mut cfg[CFG_SIZE_MAX..CFG_SIZE_MAX + 4], 0x4000_0000);
         // SEG_MAX: reserve 2 entries (header + status) from queue_max.
         let seg_max = queue_max.saturating_sub(2);
         put_le(&mut cfg[CFG_SEG_MAX..CFG_SEG_MAX + 4], seg_max as u64);
@@ -273,6 +354,7 @@ impl BlockDevice {
             driver_features: AtomicU64::new(0),
             pool: Mutex::new(ReqPool::new(queue_max as usize)),
             seg_pool: Mutex::new(SegPool::new(queue_max as usize)),
+            bounce_pool: Mutex::new(BouncePool::new(BOUNCE_SLOTS)),
             drain_chain: Mutex::new(ChainScratch::default()),
             ops_in: AtomicU64::new(0),
             ops_out: AtomicU64::new(0),
@@ -374,12 +456,36 @@ impl BlockDevice {
             let p = &mut *pool.slab[slot as usize];
             p.slot = slot;
             p.head_idx = head;
+            p.bounce_slot = NO_BOUNCE;
             p.rtype = rtype;
             p.status_ptr = status_ptr;
             p.segs_outstanding.store(1, Ordering::Relaxed); // submission guard
             p.total_done.store(0, Ordering::Relaxed);
             p.failed.store(false, Ordering::Relaxed);
             p as *mut BlkReq
+        };
+
+        // Total payload + file-bounds (subtraction form so it can't wrap).
+        let backend_size = self.backend.size();
+        let total_len: u64 = data.iter().map(|s| s.len as u64).sum();
+        let in_bounds = base_offset <= backend_size && total_len <= backend_size - base_offset;
+
+        // Coalesce: when a multi-segment request fits the bounce cap and a slot
+        // is free, issue ONE I/O against a host buffer instead of one per
+        // segment. Single-segment / oversize / pool-empty fall through to the
+        // zero-copy per-segment path unchanged.
+        let bounce: Option<*mut BounceSlot> = if rtype != BLK_T_FLUSH
+            && in_bounds
+            && data.len() > 1
+            && total_len <= BOUNCE_CAP as u64
+        {
+            let mut bp = self.bounce_pool.lock().unwrap();
+            bp.acquire().map(|idx| {
+                unsafe { (*parent).bounce_slot = idx };
+                bp.slot_ptr(idx)
+            })
+        } else {
+            None
         };
 
         if etw::enabled(etw::VERBOSE, etw::kw::BLOCK) {
@@ -392,19 +498,48 @@ impl BlockDevice {
                 .u32("type", rtype)
                 .u64("sector", base_offset / SECTOR_SIZE as u64)
                 .u32("segs", segs)
+                .u32("bytes", total_len.min(u32::MAX as u64) as u32)
+                .u32("bounced", bounce.is_some() as u32)
                 .u32("head", head as u32)
                 .write();
         }
 
         if rtype == BLK_T_FLUSH {
             self.submit_seg(parent, std::ptr::null_mut(), 0, 0, Op::Flush);
+        } else if let Some(bs) = bounce {
+            // SAFETY: we own this slot from acquire() until finish_request()
+            // releases it; no other thread touches it concurrently.
+            let bs = unsafe { &mut *bs };
+            bs.segs.clear();
+            let op = if rtype == BLK_T_IN {
+                Op::Read
+            } else {
+                Op::Write
+            };
+            let mut off = 0usize;
+            for seg in data {
+                bs.segs.push((seg.ptr, seg.len as u32));
+                if op == Op::Write {
+                    // Gather guest → bounce now (the guest pages are quiescent
+                    // until completion). `seg.ptr/len` were host_range-validated.
+                    let dst = &mut bs.buf[off..off + seg.len];
+                    dst.copy_from_slice(unsafe { std::slice::from_raw_parts(seg.ptr, seg.len) });
+                }
+                off += seg.len;
+            }
+            self.submit_seg(
+                parent,
+                bs.buf.as_mut_ptr(),
+                total_len as u32,
+                base_offset,
+                op,
+            );
         } else {
             let op = if rtype == BLK_T_IN {
                 Op::Read
             } else {
                 Op::Write
             };
-            let backend_size = self.backend.size();
             let mut file_off = base_offset;
             for seg in data {
                 // Bounds-check each segment against the backing file (subtraction
@@ -673,6 +808,30 @@ impl BlockDevice {
         if !ok {
             unsafe { (*parent).failed.store(true, Ordering::Relaxed) };
         } else if op == Op::Read {
+            // Bounced read: scatter the host buffer back to the guest segments
+            // before publishing completion. We own the bounce slot (acquired at
+            // submit) until finish_request releases it; the segment pointers
+            // were host_range-validated at pop time and the guest-RAM slab
+            // outlives the device.
+            let bidx = unsafe { (*parent).bounce_slot };
+            if bidx != NO_BOUNCE {
+                let bs = {
+                    let mut bp = self.bounce_pool.lock().unwrap();
+                    bp.slot_ptr(bidx)
+                };
+                let bs = unsafe { &*bs };
+                let mut off = 0usize;
+                for &(p, l) in &bs.segs {
+                    let n = (l as usize).min(bytes as usize - off);
+                    if n == 0 {
+                        break;
+                    }
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(bs.buf.as_ptr().add(off), p, n);
+                    }
+                    off += n;
+                }
+            }
             // used_len is u32, so saturate the running total of bytes read.
             // Single-writer (this worker thread), so load+store is race-free.
             let p = unsafe { &*parent };
@@ -723,7 +882,11 @@ impl BlockDevice {
                 .write();
         }
 
-        // Return the parent slot to the pool (O(1)).
+        // Return the bounce + parent slots to their pools (O(1)).
+        let bidx = unsafe { (*parent).bounce_slot };
+        if bidx != NO_BOUNCE {
+            self.bounce_pool.lock().unwrap().release(bidx);
+        }
         self.pool.lock().unwrap().release(slot);
         self.raise_irq_if_needed();
     }

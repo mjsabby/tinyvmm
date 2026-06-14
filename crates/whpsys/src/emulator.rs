@@ -11,10 +11,10 @@ use core::ffi::c_void;
 use windows_sys::Win32::System::Hypervisor::{
     WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_IO_ACCESS_INFO, WHV_EMULATOR_MEMORY_ACCESS_INFO,
     WHV_EMULATOR_STATUS, WHV_PARTITION_HANDLE, WHV_REGISTER_NAME, WHV_REGISTER_VALUE,
-    WHV_TRANSLATE_GVA_FLAGS, WHV_TRANSLATE_GVA_RESULT_CODE, WHvEmulatorCreateEmulator,
-    WHvEmulatorDestroyEmulator, WHvEmulatorTryIoEmulation, WHvEmulatorTryMmioEmulation,
-    WHvGetVirtualProcessorRegisters, WHvSetVirtualProcessorRegisters,
-    WHvTranslateGvaResultPrivilegeViolation,
+    WHV_TRANSLATE_GVA_FLAGS, WHV_TRANSLATE_GVA_RESULT, WHV_TRANSLATE_GVA_RESULT_CODE,
+    WHvEmulatorCreateEmulator, WHvEmulatorDestroyEmulator, WHvEmulatorTryIoEmulation,
+    WHvEmulatorTryMmioEmulation, WHvGetVirtualProcessorRegisters, WHvSetVirtualProcessorRegisters,
+    WHvTranslateGva,
 };
 use winsys::SharedPtr;
 
@@ -232,15 +232,22 @@ unsafe extern "system" fn on_set_registers(
 }
 
 unsafe extern "system" fn on_translate_gva(
-    _context: *const c_void,
-    _gva: u64,
-    _flags: WHV_TRANSLATE_GVA_FLAGS,
+    context: *const c_void,
+    gva: u64,
+    flags: WHV_TRANSLATE_GVA_FLAGS,
     result_code: *mut WHV_TRANSLATE_GVA_RESULT_CODE,
-    _gpa: *mut u64,
+    gpa: *mut u64,
 ) -> i32 {
     unsafe {
-        // Fail closed -- our minimal device model never exercises GVA translation.
-        *result_code = WHvTranslateGvaResultPrivilegeViolation;
-        -2147467263 // E_NOTIMPL
+        // String port-IO (`rep insb`/`outsb`) and the rare MMIO instruction whose
+        // memory operand is in guest RAM make the emulator ask for GVA→GPA. The
+        // previous fail-closed E_NOTIMPL turned that into EmulationFailure → VMM
+        // termination, i.e. a guest-triggerable DoS. Forward to WHP's page-table
+        // walker instead; cold path (only string IO / RMW MMIO hit it).
+        let c = &*(context as *const EmuCtx);
+        let mut result = WHV_TRANSLATE_GVA_RESULT::default();
+        let hr = WHvTranslateGva(c.part, c.vp, gva, flags, &mut result, gpa);
+        *result_code = result.ResultCode;
+        hr
     }
 }
