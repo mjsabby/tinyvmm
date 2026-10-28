@@ -387,13 +387,30 @@ impl Virtqueue {
     }
 
     pub fn push(&mut self, head_index: u16, used_len: u32) {
+        self.add_used(head_index, used_len);
+        self.publish_used();
+    }
+
+    /// Write a used-ring element without making it visible to the driver.
+    /// Call [`Self::publish_used`] once every element of a multi-buffer
+    /// (MRG_RXBUF) packet is written: the driver reads `num_buffers` from the
+    /// first buffer and drops the packet if the rest aren't already in the
+    /// used ring.
+    pub fn add_used(&mut self, head_index: u16, used_len: u32) {
         if !self.ready || self.size == 0 {
             return;
         }
         let slot = self.last_used_idx % self.size as u16;
         self.store_used_ring(slot, head_index as u32, used_len);
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
-        // Publish used.idx after writing the element.
+    }
+
+    /// Publish `used.idx` for every element written by [`Self::add_used`].
+    pub fn publish_used(&mut self) {
+        if !self.ready || self.size == 0 {
+            return;
+        }
+        // Publish used.idx after writing the elements.
         fence(Ordering::Release);
         self.store_used_idx(self.last_used_idx);
     }
