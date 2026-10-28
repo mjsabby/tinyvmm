@@ -15,7 +15,10 @@
 use crate::diag::etw;
 use crate::net::sys::{self, Iocp};
 use crate::net::wire::*;
-use crate::virtio::net::{HDR_F_NEEDS_CSUM, HDR_GSO_TCPV4, NetBackend, NetDevice, RxHeader};
+use crate::virtio::net::{
+    HDR_F_NEEDS_CSUM, HDR_GSO_TCPV4, NetBackend, NetDevice, RxHeader, TX_FRAME_CAP, TxHeader,
+    tx_offload_software,
+};
 use std::cell::UnsafeCell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -35,6 +38,10 @@ const KEY_ACCEPT: usize = 5;
 /// worker. A remote accept-flood is dropped past this rather than piling up host
 /// sockets/memory unboundedly.
 const MAX_ACCEPT_INFLIGHT: usize = 64;
+/// Guest TX frame with offload metadata (partial L4 checksum and/or a TCPv4
+/// super-segment): small-pool slot / big-pool slot respectively.
+const KEY_FRAME_OFFLOAD: usize = 6;
+const KEY_FRAME_OFFLOAD_BIG: usize = 7;
 const KEY_STOP: usize = 9;
 
 const FRAME_CAP: usize = 2048;
@@ -51,6 +58,10 @@ const MAX_UDP_FLOWS: usize = 256;
 const MAX_TCP_FLOWS: usize = 256;
 /// Number of preallocated guest-TX frame slots shared across all shards.
 const POOL_SLOTS: usize = 1024;
+/// Slots for >`FRAME_CAP` TSO super-segments (each [`TX_FRAME_CAP`] bytes,
+/// ~4 MiB total). When exhausted the frame is segmented in software into the
+/// small pool instead of being dropped.
+const BIG_POOL_SLOTS: usize = 64;
 /// Free-list end marker for the frame pool.
 const POOL_SENTINEL: u32 = u32::MAX;
 /// Cap on the per-flow guest->host queue. When reached we stop draining the
@@ -178,6 +189,7 @@ trait TcbDyn {
     fn listen(&mut self) -> Result<(), TcpError>;
     fn connect(&mut self) -> Result<(), TcpError>;
     fn inject_packet(&mut self, pkt: &[u8]) -> Result<(), TcpError>;
+    fn inject_packet_l4_csum_trusted(&mut self, pkt: &[u8]) -> Result<(), TcpError>;
     fn extract_packet(&mut self, out: &mut [u8]) -> Result<usize, TcpError>;
     fn poll(&self) -> u32;
     fn recv(&mut self, dst: &mut [u8]) -> Result<usize, TcpError>;
@@ -202,6 +214,9 @@ impl<const BUF: usize> TcbDyn for Tcb<BUF> {
     }
     fn inject_packet(&mut self, pkt: &[u8]) -> Result<(), TcpError> {
         self.inject_packet(pkt)
+    }
+    fn inject_packet_l4_csum_trusted(&mut self, pkt: &[u8]) -> Result<(), TcpError> {
+        self.inject_packet_l4_csum_trusted(pkt)
     }
     fn extract_packet(&mut self, out: &mut [u8]) -> Result<usize, TcpError> {
         self.extract_packet(out)
@@ -320,32 +335,32 @@ fn make_icmp_reply() -> Box<IcmpReplyMsg> {
 /// between acquire and release, so the `UnsafeCell` access is race-free; the
 /// data handoff itself is synchronized by the IOCP post/completion.
 #[repr(C)]
-struct FrameSlot {
+struct FrameSlot<const CAP: usize> {
     idx: u32,
-    data: UnsafeCell<[u8; FRAME_CAP]>,
+    data: UnsafeCell<[u8; CAP]>,
 }
 
 /// Fixed pool of frame slots with a lock-free Treiber free-list (ABA-guarded
 /// by a tag in the high 32 bits of `head`). Multi-producer acquire (vCPUs) and
 /// multi-producer release (shard workers) — fully MPMC. No per-frame heap
 /// allocation on the hot path.
-struct FramePool {
-    slots: Box<[FrameSlot]>,
+struct FramePool<const CAP: usize> {
+    slots: Box<[FrameSlot<CAP>]>,
     next: Box<[AtomicU32]>,
     head: AtomicU64, // (tag << 32) | free-list head index
 }
 
 // The slots are accessed through raw pointers handed off via the IOCP; the
 // free-list guarantees a slot is owned by at most one party at a time.
-unsafe impl Send for FramePool {}
-unsafe impl Sync for FramePool {}
+unsafe impl<const CAP: usize> Send for FramePool<CAP> {}
+unsafe impl<const CAP: usize> Sync for FramePool<CAP> {}
 
-impl FramePool {
+impl<const CAP: usize> FramePool<CAP> {
     fn new(n: usize) -> Self {
-        let slots: Vec<FrameSlot> = (0..n)
+        let slots: Vec<FrameSlot<CAP>> = (0..n)
             .map(|i| FrameSlot {
                 idx: i as u32,
-                data: UnsafeCell::new([0u8; FRAME_CAP]),
+                data: UnsafeCell::new([0u8; CAP]),
             })
             .collect();
         let next: Vec<AtomicU32> = (0..n)
@@ -403,18 +418,34 @@ impl FramePool {
         }
     }
 
-    fn slot_ptr(&self, idx: u32) -> *mut FrameSlot {
-        &self.slots[idx as usize] as *const FrameSlot as *mut FrameSlot
+    fn slot_ptr(&self, idx: u32) -> *mut FrameSlot<CAP> {
+        &self.slots[idx as usize] as *const FrameSlot<CAP> as *mut FrameSlot<CAP>
     }
 
     /// Copy a frame into slot `idx`. Caller must own the slot (just acquired).
     fn fill(&self, idx: u32, frame: &[u8]) -> usize {
-        let n = frame.len().min(FRAME_CAP);
+        let n = frame.len().min(CAP);
         unsafe {
             let data = &mut *self.slots[idx as usize].data.get();
             data[..n].copy_from_slice(&frame[..n]);
         }
         n
+    }
+
+    /// Worker side of the handoff: the (slot index, frame bytes) behind a
+    /// `KEY_FRAME*` completion.
+    ///
+    /// # Safety
+    /// `ov` must be a slot pointer of this pool posted by the producer, and the
+    /// returned slice must not be used after `release(idx)`.
+    unsafe fn received<'a>(ov: *mut OVERLAPPED, bytes: u32) -> (u32, &'a [u8]) {
+        let slot = ov as *mut FrameSlot<CAP>;
+        let n = (bytes as usize).min(CAP);
+        unsafe {
+            let idx = (*slot).idx;
+            let arr = &*UnsafeCell::raw_get(core::ptr::addr_of!((*slot).data));
+            (idx, &arr[..n])
+        }
     }
 }
 
@@ -821,7 +852,11 @@ struct NatState {
     udp: HashMap<FlowKey, UdpFlow>,
     tcp: HashMap<FlowKey, TcpFlow>,
     icmp: Arc<IcmpPool>,
-    pool: Arc<FramePool>,
+    pool: Arc<FramePool<FRAME_CAP>>,
+    big_pool: Arc<FramePool<TX_FRAME_CAP>>,
+    /// Set while handling a frame whose TCP checksum the guest left to us
+    /// (offload): the flow's TCB skips verifying it.
+    l4_csum_trusted: bool,
     // Preallocated control-plane object pools (no steady-state allocation).
     tcb_pools: Vec<BoxPool<dyn TcbDyn>>, // one free-list per compile-time tier
     tcp_op_pool: BoxPool<TcpOp>,
@@ -893,15 +928,20 @@ impl NatState {
                 // timeout: fall through to the timer sweep below.
             } else {
                 match key {
-                    KEY_FRAME => {
-                        let slot = ov as *mut FrameSlot;
-                        let n = (bytes as usize).min(FRAME_CAP);
-                        let idx = unsafe { (*slot).idx };
-                        let data_ptr =
-                            UnsafeCell::raw_get(unsafe { core::ptr::addr_of!((*slot).data) });
-                        let arr = unsafe { &*data_ptr };
-                        self.handle_frame(&arr[..n]);
+                    KEY_FRAME | KEY_FRAME_OFFLOAD => {
+                        let (idx, frame) = unsafe { FramePool::<FRAME_CAP>::received(ov, bytes) };
+                        self.l4_csum_trusted = key == KEY_FRAME_OFFLOAD;
+                        self.handle_frame(frame);
+                        self.l4_csum_trusted = false;
                         self.pool.release(idx);
+                    }
+                    KEY_FRAME_OFFLOAD_BIG => {
+                        let (idx, frame) =
+                            unsafe { FramePool::<TX_FRAME_CAP>::received(ov, bytes) };
+                        self.l4_csum_trusted = true;
+                        self.handle_frame(frame);
+                        self.l4_csum_trusted = false;
+                        self.big_pool.release(idx);
                     }
                     KEY_UDP => self.on_udp_recv(ov as *mut UdpOp, ok, bytes),
                     KEY_ICMP => {
@@ -1211,7 +1251,12 @@ impl NatState {
         let now = self.now();
         if let Some(flow) = self.tcp.get_mut(&key) {
             flow.tcb.as_mut().unwrap().set_now(now);
-            let _ = flow.tcb.as_mut().unwrap().inject_packet(ip.datagram);
+            let tcb = flow.tcb.as_mut().unwrap();
+            let _ = if self.l4_csum_trusted {
+                tcb.inject_packet_l4_csum_trusted(ip.datagram)
+            } else {
+                tcb.inject_packet(ip.datagram)
+            };
             flow.last_activity = now;
         }
         self.tcp_drive(key);
@@ -1553,6 +1598,22 @@ impl NatState {
                     }
                 };
             }
+            // Drain the tcb receive ring into the guest->host queue before
+            // pumping egress, so the window update `recv` queues once space
+            // frees leaves in this same drive (the guest sender may be stalled
+            // on our window). Stop at the cap so a slow host send keeps the
+            // guest window closed (backpressure) instead of buffering without
+            // bound.
+            if flow.tcb.as_ref().unwrap().poll() & EV_READABLE != 0 {
+                let mut rb = [0u8; 16384];
+                while flow.pending_to_host.len() < TO_HOST_CAP {
+                    match flow.tcb.as_mut().unwrap().recv(&mut rb) {
+                        Ok(0) => break,
+                        Ok(n) => flow.pending_to_host.extend_from_slice(&rb[..n]),
+                        Err(_) => break,
+                    }
+                }
+            }
             'pump: loop {
                 // Top up the send ring from any spillover before each tick so a
                 // recv larger than one egress-ring pass still drains in one drive.
@@ -1603,19 +1664,6 @@ impl NatState {
             } // 'pump
             flush_gso!();
             let ev = flow.tcb.as_ref().unwrap().poll();
-            if ev & EV_READABLE != 0 {
-                // Drain the tcb receive ring into the guest->host queue, but
-                // stop at the cap so a slow host send keeps the guest window
-                // closed (backpressure) instead of buffering without bound.
-                let mut rb = [0u8; 4096];
-                while flow.pending_to_host.len() < TO_HOST_CAP {
-                    match flow.tcb.as_mut().unwrap().recv(&mut rb) {
-                        Ok(0) => break,
-                        Ok(n) => flow.pending_to_host.extend_from_slice(&rb[..n]),
-                        Err(_) => break,
-                    }
-                }
-            }
             if ev & EV_PEER_CLOSED != 0 && !flow.shutdown_done {
                 flow.want_shutdown = true;
             }
@@ -1774,13 +1822,15 @@ pub struct NatBackend {
     icmp_workers: Mutex<Vec<JoinHandle<()>>>,
     listeners: Mutex<Vec<SOCKET>>,
     listener_threads: Mutex<Vec<JoinHandle<()>>>,
-    pool: Arc<FramePool>,
+    pool: Arc<FramePool<FRAME_CAP>>,
+    big_pool: Arc<FramePool<TX_FRAME_CAP>>,
 }
 
 impl NatBackend {
     pub fn new(net: &Arc<NetDevice>, opts: NatOptions) -> Arc<Self> {
         sys::wsa_startup();
         let pool = Arc::new(FramePool::new(POOL_SLOTS));
+        let big_pool = Arc::new(FramePool::new(BIG_POOL_SLOTS));
         let iocp = match sys::create_iocp() {
             Some(i) => i,
             None => {
@@ -1793,6 +1843,7 @@ impl NatBackend {
                     listeners: Mutex::new(Vec::new()),
                     listener_threads: Mutex::new(Vec::new()),
                     pool,
+                    big_pool,
                 });
             }
         };
@@ -1866,6 +1917,8 @@ impl NatBackend {
             tcp: HashMap::new(),
             icmp: icmp.clone(),
             pool: pool.clone(),
+            big_pool: big_pool.clone(),
+            l4_csum_trusted: false,
             tcb_pools,
             tcp_op_pool: BoxPool::new(MAX_TCP_FLOWS, make_tcp_op),
             tcp_send_op_pool: BoxPool::new(MAX_TCP_FLOWS, make_tcp_send_op),
@@ -1901,6 +1954,7 @@ impl NatBackend {
             listeners: Mutex::new(listeners),
             listener_threads: Mutex::new(listener_threads),
             pool,
+            big_pool,
         })
     }
 }
@@ -1939,25 +1993,64 @@ fn listener_loop(
     }
 }
 
+impl NatBackend {
+    /// Copy `frame` into a slot of `pool` and post it to the worker under
+    /// `key`. Returns false only if the pool is exhausted.
+    fn post_frame<const CAP: usize>(
+        &self,
+        pool: &FramePool<CAP>,
+        frame: &[u8],
+        key: usize,
+    ) -> bool {
+        // Acquire a preallocated slot (no heap alloc on the hot path).
+        let Some(idx) = pool.acquire() else {
+            return false;
+        };
+        let n = pool.fill(idx, frame);
+        let ptr = pool.slot_ptr(idx);
+        if !sys::post(self.iocp, n as u32, key, ptr as *mut OVERLAPPED) {
+            pool.release(idx);
+        }
+        true
+    }
+
+    fn tx_drop(frame: &[u8]) {
+        if etw::enabled(etw::VERBOSE, etw::kw::NET) {
+            etw::Event::new("NetTxDrop", etw::VERBOSE, etw::kw::NET)
+                .u32("len", frame.len() as u32)
+                .write();
+        }
+    }
+}
+
 impl NetBackend for NatBackend {
     fn on_guest_frame(&self, frame: &[u8]) {
         if self.iocp.0.is_null() || frame.is_empty() || frame.len() > FRAME_CAP {
             return;
         }
-        // Acquire a preallocated slot (no heap alloc on the hot path); if the
-        // pool is exhausted, drop the frame (the guest will retransmit).
-        let Some(idx) = self.pool.acquire() else {
-            if etw::enabled(etw::VERBOSE, etw::kw::NET) {
-                etw::Event::new("NetTxDrop", etw::VERBOSE, etw::kw::NET)
-                    .u32("len", frame.len() as u32)
-                    .write();
-            }
+        // If the pool is exhausted, drop the frame (the guest will retransmit).
+        if !self.post_frame(&self.pool, frame, KEY_FRAME) {
+            Self::tx_drop(frame);
+        }
+    }
+
+    /// The worker terminates guest TCP in a tcp-sans-io TCB, which accepts
+    /// multi-MSS super-segments and (via the trusted inject) the unfinished
+    /// checksum; guest UDP checksums are never verified (only the payload is
+    /// forwarded). So offloaded frames are handed over as-is — no per-MSS
+    /// segmentation and no 64 KiB checksum pass on the vCPU thread.
+    fn on_guest_frame_offload(&self, frame: &mut [u8], hdr: &TxHeader) {
+        if self.iocp.0.is_null() || frame.is_empty() {
             return;
+        }
+        let posted = if frame.len() <= FRAME_CAP {
+            self.post_frame(&self.pool, frame, KEY_FRAME_OFFLOAD)
+        } else {
+            self.post_frame(&self.big_pool, frame, KEY_FRAME_OFFLOAD_BIG)
         };
-        let n = self.pool.fill(idx, frame);
-        let ptr = self.pool.slot_ptr(idx);
-        if !sys::post(self.iocp, n as u32, KEY_FRAME, ptr as *mut OVERLAPPED) {
-            self.pool.release(idx);
+        if !posted {
+            // Big pool busy: segment in software into the small pool.
+            tx_offload_software(frame, hdr, &mut |f| self.on_guest_frame(f));
         }
     }
 
