@@ -5,9 +5,11 @@ use crate::error::{Error, Result, check_hr};
 use crate::host;
 use core::ffi::c_void;
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::thread::JoinHandle;
 use windows_sys::Win32::System::Hypervisor::{
-    WHV_PARTITION_HANDLE, WHvMapGpaRange, WHvMapGpaRangeFlagExecute, WHvMapGpaRangeFlagRead,
-    WHvMapGpaRangeFlagWrite, WHvUnmapGpaRange,
+    WHV_ADVISE_GPA_RANGE_POPULATE, WHV_MEMORY_RANGE_ENTRY, WHV_PARTITION_HANDLE, WHvAdviseGpaRange,
+    WHvAdviseGpaRangeCodePopulate, WHvMapGpaRange, WHvMapGpaRangeFlagExecute,
+    WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite, WHvMemoryAccessWrite, WHvUnmapGpaRange,
 };
 use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEM_LARGE_PAGES, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
@@ -33,6 +35,48 @@ struct Split {
     high_gpa: u64,
 }
 
+/// Pre-build the hypervisor's SLAT entries for freshly mapped guest RAM.
+/// Without this every first guest touch of a 4 KiB page takes a GPA fault
+/// that WHP resolves in the root partition (~40 µs each), which made guest
+/// page-zeroing ~25x slower than steady state. Populating 1 GiB takes ~90 ms,
+/// so it runs on a background thread that overlaps guest boot (lazy faults
+/// still resolve normally meanwhile). Best effort: hosts that lack the advice
+/// code simply keep the lazy behaviour.
+fn populate_async(part: WHV_PARTITION_HANDLE, ranges: &[(u64, u64)]) -> Option<JoinHandle<()>> {
+    let ranges = ranges.to_vec();
+    std::thread::Builder::new()
+        .name("ram-populate".into())
+        .spawn(move || populate(part, &ranges))
+        .ok()
+}
+
+fn populate(part: WHV_PARTITION_HANDLE, ranges: &[(u64, u64)]) {
+    let entries: Vec<WHV_MEMORY_RANGE_ENTRY> = ranges
+        .iter()
+        .map(|&(gpa, size)| WHV_MEMORY_RANGE_ENTRY {
+            GuestAddress: gpa,
+            SizeInBytes: size,
+        })
+        .collect();
+    let advice = WHV_ADVISE_GPA_RANGE_POPULATE {
+        AccessType: WHvMemoryAccessWrite,
+        ..Default::default()
+    };
+    let hr = unsafe {
+        WHvAdviseGpaRange(
+            part,
+            entries.as_ptr(),
+            entries.len() as u32,
+            WHvAdviseGpaRangeCodePopulate,
+            (&raw const advice).cast(),
+            size_of_val(&advice) as u32,
+        )
+    };
+    if hr < 0 {
+        eprintln!("[mem] WARN: WHvAdviseGpaRange(Populate) failed: 0x{hr:08x}");
+    }
+}
+
 pub struct GuestMemory {
     part: WHV_PARTITION_HANDLE,
     base: SharedPtr<u8>,
@@ -40,6 +84,8 @@ pub struct GuestMemory {
     size: usize,
     large_pages: bool,
     split: Option<Split>,
+    /// Background SLAT pre-population; joined before the GPA range is unmapped.
+    populate: Option<JoinHandle<()>>,
 }
 
 // `GuestMemory` now AUTO-derives Send + Sync: every field is Send+Sync
@@ -82,6 +128,7 @@ impl GuestMemory {
             }
             return Err(e);
         }
+        let populate = populate_async(part, &[(gpa, alloc_size as u64)]);
 
         Ok(GuestMemory {
             part,
@@ -90,6 +137,7 @@ impl GuestMemory {
             size: alloc_size,
             large_pages: large,
             split: None,
+            populate: populate,
         })
     }
 
@@ -161,6 +209,7 @@ impl GuestMemory {
             }
             return Err(e);
         }
+        let populate = populate_async(part, &[(0, low_limit as u64), (high_gpa, high_size as u64)]);
 
         Ok(GuestMemory {
             part,
@@ -172,6 +221,7 @@ impl GuestMemory {
                 low_size: low_limit,
                 high_gpa,
             }),
+            populate: populate,
         })
     }
 
@@ -247,6 +297,7 @@ impl GuestMemory {
             size: alloc_size,
             large_pages: false,
             split: None,
+            populate: None,
         })
     }
 
@@ -418,6 +469,9 @@ impl GuestMemory {
 
 impl Drop for GuestMemory {
     fn drop(&mut self) {
+        if let Some(h) = self.populate.take() {
+            let _ = h.join();
+        }
         if !self.base.is_null() {
             unsafe {
                 // part == 0 => host-only slab (new_host_only): no GPA mapping to undo.
@@ -530,6 +584,7 @@ mod tests {
                 low_size: low_limit,
                 high_gpa,
             }),
+            populate: None,
         };
 
         // The "saved RAM image": the contiguous low||high host bytes.

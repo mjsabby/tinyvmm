@@ -47,7 +47,7 @@
 //! true lowest-priority arbitration (mode 1 is treated like fixed). Extend here
 //! if a guest ever needs them.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
 use windows_sys::Win32::System::Hypervisor::{WHV_PARTITION_HANDLE, WHvCancelRunVirtualProcessor};
@@ -203,6 +203,9 @@ pub struct LocalApic {
     /// runs picks the vector up on its next delivery pass -- so cancelling would
     /// just cost a spurious `Canceled` exit.
     in_run: AtomicBool,
+    /// Bumped on every queued vector / wake; lets the halt-poll spin detect a
+    /// new interrupt without taking `inner`.
+    kicks: AtomicU64,
     tsc_hz: u64,
 }
 
@@ -242,6 +245,7 @@ pub fn init(part: WHV_PARTITION_HANDLE, vcpu_count: u32, tsc_hz: u64) {
             part,
             vp: i,
             in_run: AtomicBool::new(false),
+            kicks: AtomicU64::new(0),
             tsc_hz,
         })
         .collect();
@@ -260,6 +264,24 @@ pub fn init(part: WHV_PARTITION_HANDLE, vcpu_count: u32, tsc_hz: u64) {
 fn rdtsc() -> u64 {
     // SAFETY: RDTSC is always available on x86-64 and has no preconditions.
     unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+/// Default halt-poll window (same as KVM's `halt_poll_ns` default).
+const DEFAULT_HALT_POLL_US: u64 = 200;
+
+/// How long a halted vCPU spins for a new interrupt before parking on
+/// `wake_cv`. Under nesting a condvar park/wake plus re-entering the guest
+/// costs hundreds of microseconds, which dominates request/response latency
+/// (e.g. TCP ACK -> next TX). Override with `TINYVMM_HALT_POLL_US` (0 = off).
+fn halt_poll() -> Duration {
+    static P: OnceLock<Duration> = OnceLock::new();
+    *P.get_or_init(|| {
+        let us = std::env::var("TINYVMM_HALT_POLL_US")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_HALT_POLL_US);
+        Duration::from_micros(us)
+    })
 }
 
 impl LocalApic {
@@ -292,6 +314,7 @@ impl LocalApic {
             let mut g = self.inner.lock().unwrap();
             g.set_irr(vector);
         }
+        self.kicks.fetch_add(1, Ordering::Release);
         // Wake a parked run loop. Safe against lost wakeups: `set_irr` ran under
         // `inner`, and `park_while_idle` re-checks the IRR under `inner` after a
         // notify, so a parker either already saw the bit or will be notified.
@@ -305,6 +328,23 @@ impl LocalApic {
     /// counterpart to WHP's hardware HLT wait. `timeout` bounds any missed
     /// wakeup (the timer/device path normally wakes us in microseconds).
     pub fn park_while_idle(&self, stop: &AtomicBool, timeout: Duration) {
+        let poll = halt_poll();
+        if !poll.is_zero() {
+            if self.irr_nonempty() {
+                return;
+            }
+            // Spin on the lock-free kick counter; any change means a vector was
+            // queued (or a wake requested), so return and let the run loop
+            // deliver it. A miss just falls through to the condvar wait below.
+            let seen = self.kicks.load(Ordering::Acquire);
+            let t0 = std::time::Instant::now();
+            while t0.elapsed() < poll {
+                if self.kicks.load(Ordering::Acquire) != seen || stop.load(Ordering::Acquire) {
+                    return;
+                }
+                std::hint::spin_loop();
+            }
+        }
         let g = self.inner.lock().unwrap();
         let _ = self.wake_cv.wait_timeout_while(g, timeout, |inner| {
             inner.irr.iter().all(|&w| w == 0) && !stop.load(Ordering::Acquire)
@@ -313,6 +353,7 @@ impl LocalApic {
 
     /// Wake a parked run loop without queuing an interrupt (used on shutdown).
     pub fn wake(&self) {
+        self.kicks.fetch_add(1, Ordering::Release);
         let _g = self.inner.lock().unwrap();
         self.wake_cv.notify_all();
     }

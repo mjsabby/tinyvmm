@@ -47,7 +47,7 @@ windows-sys = { version = "0.61", features = [
 # that temporary overflows even the 16 MiB nat-worker stack (STATUS_STACK_OVERFLOW
 # at TCP connect). Ring SIZE is unchanged (still 1 MiB/direction), so throughput
 # and the per-Tcb window are unaffected.
-tcp-sans-io = { git = "https://github.com/mjsabby/tcp-sans-io", features = ["std", "heap-buffers"] }
+tcp-sans-io = { git = "https://github.com/mjsabby/tcp-sans-io", rev = "10af9c3ba58b503d38acec7c6c59f0c48f7a15d4", features = ["std", "heap-buffers"] }
 
 [profile.release]
 opt-level = 3

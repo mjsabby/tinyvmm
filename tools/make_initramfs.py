@@ -321,6 +321,16 @@ if grep -q 'tinyvmm.test=netcmp' /proc/cmdline 2>/dev/null; then
     base="http://${host}:${port}"
     us() { awk '{print int($1 * 1000000)}' /proc/uptime; }
     log "NETCMP start host=${host} port=${port} size=${size} runs=${runs} rr=${rr} par=${par} ping=${pingn}"
+    # Guest environment (differences here skew per-byte guest CPU cost).
+    log "NETCMP ENV clocksource=$(cat /sys/devices/system/clocksource/clocksource0/current_clocksource 2>/dev/null) avail=$(cat /sys/devices/system/clocksource/clocksource0/available_clocksource 2>/dev/null)"
+    log "NETCMP ENV flags=$(grep -m1 '^flags' /proc/cpuinfo | cut -d: -f2)"
+    for v in /sys/devices/system/cpu/vulnerabilities/*; do log "NETCMP ENV vuln $(basename $v)=$(cat $v)"; done
+    log "NETCMP ENV offload=$(cat /sys/class/net/eth0/features 2>/dev/null) tso_max=$(cat /sys/class/net/eth0/gso_max_size 2>/dev/null)"
+    for i in 1 2 3; do
+        t0=$(us); dd if=/dev/zero of=/tmp/memb bs=1M count=256 2>/dev/null; t1=$(us); rm -f /tmp/memb
+        log "NETCMP MEMBENCH pass=$i fault+zero 256MiB tmpfs: $(( (t1-t0)/1000 )) ms"
+    done
+    log "NETCMP ENV mtrr=$(cat /proc/mtrr 2>/dev/null | tr '\\n' ';') pat=$(dmesg | grep -m1 -i 'x86/PAT' | cut -c16-)"
     # Settle: let the NIC finish coming up before timing anything.
     wget -q -O /dev/null -T 10 -t 3 "${base}/bytes/1/warm" 2>/dev/null
 
@@ -357,6 +367,7 @@ if grep -q 'tinyvmm.test=netcmp' /proc/cmdline 2>/dev/null; then
     done
     rm -f /tmp/up.bin
     log "NETCMP PHASE ul end"
+    log "NETCMP TCPSTAT $(grep '^Tcp:' /proc/net/snmp | tr '\n' ' ')"
 
     log "NETCMP PHASE par begin"
     for r in $(seq 1 "${runs}"); do
