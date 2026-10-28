@@ -565,6 +565,12 @@ impl NetDevice {
         self.acked_features.load(Ordering::Relaxed) & NEED == NEED
     }
 
+    /// Whether the guest accepts partial checksums: a backend may then
+    /// deliver frames with `HDR_F_NEEDS_CSUM` instead of summing payloads.
+    pub fn rx_csum_ok(&self) -> bool {
+        self.acked_features.load(Ordering::Relaxed) & NET_F_GUEST_CSUM != 0
+    }
+
     /// Move queued frames into the guest's RX buffers (the RxPool fallback path
     /// — the steady-state direct delivery happens inline in `inject_rx_gso`).
     fn deliver_rx(&self) {
