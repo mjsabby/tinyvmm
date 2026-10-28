@@ -42,6 +42,9 @@ const MAX_ACCEPT_INFLIGHT: usize = 64;
 /// super-segment): small-pool slot / big-pool slot respectively.
 const KEY_FRAME_OFFLOAD: usize = 6;
 const KEY_FRAME_OFFLOAD_BIG: usize = 7;
+/// The NIC's RX backlog drained after the worker paused on it
+/// (`NetDevice::rx_congested`): resume the paused flows.
+const KEY_RX_SPACE: usize = 8;
 const KEY_STOP: usize = 9;
 
 const FRAME_CAP: usize = 2048;
@@ -673,6 +676,7 @@ struct TcpFlow {
     last_activity: u64,       // ms of last real TX/RX (idle/half-close watchdogs)
     diag: FlowDiag,           // net-diag stall tracking
     published: Losses,        // TCB loss counters already added to NatStats
+    rx_blocked: bool,         // paused on the NIC's RX backlog (in rx_blocked list)
 }
 
 impl Drop for TcpFlow {
@@ -871,6 +875,7 @@ enum Wake {
     HostRecv,
     HostSend,
     Timer,
+    RxSpace,
     Other,
 }
 
@@ -881,6 +886,7 @@ impl Wake {
             Wake::HostRecv => "host recv",
             Wake::HostSend => "host send",
             Wake::Timer => "timer",
+            Wake::RxSpace => "guest rx space",
             Wake::Other => "other",
         }
     }
@@ -937,6 +943,8 @@ struct NatStats {
     tx_drops: AtomicU64,
     host_stalls: AtomicU64,
     host_stall_ms: AtomicU64,
+    rx_stalls: AtomicU64,
+    rx_stall_ms: AtomicU64,
     other_stalls: AtomicU64,
     other_stall_ms: AtomicU64,
 }
@@ -984,9 +992,11 @@ impl NatStats {
         );
         if crate::diag::net_enabled() {
             s.push_str(&format!(
-                " stalls: host={} ({} ms) other={} ({} ms)",
+                " stalls: host={} ({} ms) guest_rx={} ({} ms) other={} ({} ms)",
                 ld(&self.host_stalls),
                 ld(&self.host_stall_ms),
+                ld(&self.rx_stalls),
+                ld(&self.rx_stall_ms),
                 ld(&self.other_stalls),
                 ld(&self.other_stall_ms),
             ));
@@ -1030,7 +1040,9 @@ fn fmt_flow(k: FlowKey) -> String {
 /// count it by what ended it, and log it if it reached 10 ms (shorter stalls
 /// ended by a guest frame are routine ACK clocking under load). A stall a host
 /// recv ended, with that recv outstanding about as long, is the host sender
-/// stalling; one a guest frame ended is the guest's window or ACK clock.
+/// stalling; one ended by guest RX space is the guest slow to take frames
+/// (the NIC backlog was full); one a guest frame ended is the guest's window
+/// or ACK clock.
 fn note_data_out(d: &mut FlowDiag, key: FlowKey, wake: Wake, stats: &NatStats) {
     let now = Instant::now();
     if let Some(prev) = d.last_data_out {
@@ -1038,6 +1050,7 @@ fn note_data_out(d: &mut FlowDiag, key: FlowKey, wake: Wake, stats: &NatStats) {
         if (3..1000).contains(&gap) {
             let (n, ms) = match wake {
                 Wake::HostRecv => (&stats.host_stalls, &stats.host_stall_ms),
+                Wake::RxSpace => (&stats.rx_stalls, &stats.rx_stall_ms),
                 _ => (&stats.other_stalls, &stats.other_stall_ms),
             };
             n.fetch_add(1, Ordering::Relaxed);
@@ -1086,6 +1099,10 @@ struct NatState {
     last_tick: u64,
     last_expire: u64,
     tick_keys: Vec<FlowKey>,
+    /// Flows paused because the NIC's RX backlog was deep, in pause order;
+    /// `rx_spare` recycles the list's allocation across resumes.
+    rx_blocked: Vec<FlowKey>,
+    rx_spare: Vec<FlowKey>,
     // Reusable scratch buffers for building guest-bound frames without a
     // per-packet heap allocation (the worker is single-threaded).
     tx_scratch: Vec<u8>,
@@ -1139,7 +1156,11 @@ impl NatState {
                 if key == KEY_STOP {
                     break;
                 }
-                // timeout: fall through to the timer sweep below.
+                if key == KEY_RX_SPACE {
+                    self.wake = Wake::RxSpace;
+                    self.resume_rx_blocked();
+                }
+                // Otherwise a timeout: fall through to the timer sweep below.
             } else {
                 self.wake = Wake::Other;
                 match key {
@@ -1573,6 +1594,7 @@ impl NatState {
                 last_activity: now,
                 diag: FlowDiag::default(),
                 published: Losses::default(),
+                rx_blocked: false,
             },
         );
         Some(())
@@ -1670,6 +1692,7 @@ impl NatState {
                 last_activity: now,
                 diag: FlowDiag::default(),
                 published: Losses::default(),
+                rx_blocked: false,
             },
         );
         // Emit the SYN toward the guest and arm the host receive.
@@ -1795,6 +1818,27 @@ impl NatState {
         self.tcp_drive(key);
     }
 
+    /// The NIC drained its RX backlog: drive every flow that paused on it, in
+    /// pause order. Each drive runs until the backlog fills again, so rotate
+    /// the re-paused list to let a different flow go first next time.
+    fn resume_rx_blocked(&mut self) {
+        let spare = std::mem::take(&mut self.rx_spare);
+        let mut keys = std::mem::replace(&mut self.rx_blocked, spare);
+        for key in &keys {
+            if let Some(f) = self.tcp.get_mut(key) {
+                f.rx_blocked = false;
+            }
+        }
+        for &key in &keys {
+            self.tcp_drive(key);
+        }
+        if self.rx_blocked.len() > 1 {
+            self.rx_blocked.rotate_left(1);
+        }
+        keys.clear();
+        self.rx_spare = keys;
+    }
+
     fn tcp_drive(&mut self, key: FlowKey) {
         let gw = self.gw_mac;
         let gm = self.guest_mac;
@@ -1855,6 +1899,7 @@ impl NatState {
             }
             let diag = crate::diag::net_enabled();
             let mut data_out = false;
+            let mut rx_paused = false;
             'pump: loop {
                 // Top up the send ring from any spillover before each tick so a
                 // recv larger than one egress-ring pass still drains in one drive.
@@ -1862,6 +1907,14 @@ impl NatState {
                 let _ = flow.tcb.as_mut().unwrap().tick();
                 let mut any = false;
                 loop {
+                    // Backpressure: while the guest's RX backlog is deep, leave
+                    // segments in the TCB. Its rings fill, which closes the
+                    // host-recv side too (`maybe_post_recv`); the NIC wakes us
+                    // via KEY_RX_SPACE once the guest has taken the backlog.
+                    if dev.as_ref().is_some_and(|d| d.rx_congested()) {
+                        rx_paused = true;
+                        break 'pump;
+                    }
                     let n = match flow.tcb.as_mut().unwrap().extract_packet(&mut pbuf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => n,
@@ -1907,6 +1960,10 @@ impl NatState {
                 }
             } // 'pump
             flush_gso!();
+            if rx_paused && !flow.rx_blocked {
+                flow.rx_blocked = true;
+                self.rx_blocked.push(key);
+            }
             if data_out {
                 note_data_out(&mut flow.diag, key, self.wake, &self.stats);
             }
@@ -2193,6 +2250,8 @@ impl NatBackend {
             last_tick: 0,
             last_expire: 0,
             tick_keys: Vec::new(),
+            rx_blocked: Vec::new(),
+            rx_spare: Vec::new(),
             tx_scratch: Vec::with_capacity(GSO_FRAME_CAP),
             l3_scratch: Vec::with_capacity(FRAME_CAP),
             gso_hdr: Vec::with_capacity(64),
@@ -2320,6 +2379,12 @@ impl NetBackend for NatBackend {
 
     fn diag_summary(&self) -> Option<String> {
         Some(self.stats.summary())
+    }
+
+    fn on_rx_space(&self) {
+        if !self.iocp.0.is_null() {
+            sys::post(self.iocp, 0, KEY_RX_SPACE, std::ptr::null_mut());
+        }
     }
 
     fn stop(&self) {

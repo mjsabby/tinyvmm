@@ -575,7 +575,7 @@ malloc-free hot path never stalls.
 | Pool | Where | Backing | Free-list | Sizing |
 |------|-------|---------|-----------|--------|
 | **FramePool** (guest-TX frames) | `src/net/nat.rs` | `Box<[FrameSlot]>`, each `#[repr(C)]` with a `UnsafeCell<[u8; 2048]>` body | **lock-free Treiber stack**, ABA-guarded by a tag in the high 32 bits of an `AtomicU64`, `compare_exchange_weak` | `POOL_SLOTS = 1024` |
-| **RxPool** (inbound frames) | `src/virtio/net.rs` | `Vec<[u8; 2048]>` | `Vec<u32>` index free-list, under the device mutex | `RX_POOL_SLOTS = 512` |
+| **RxPool** (inbound frames waiting for guest RX buffers) | `src/virtio/net.rs` | `Vec<Box<[u8; 65600]>>` (one GSO super-frame each) | `Vec<u32>` index free-list, under the device mutex | `RX_POOL_SLOTS = 64`; the NAT pauses at 32 queued (§9) |
 | **ReqPool** (in-flight blk requests) | `src/virtio/blk.rs` | `Vec<Box<BlkReq>>` | `Vec<u16>` | virtqueue depth |
 | **SlotPool** (in-flight 9p requests) | `src/virtio/p9.rs` | `Vec<UnsafeCell<P9Slot>>` | `Mutex<Vec<u16>>` + precreated workers | `P9_QUEUE_MAX = 128` |
 
@@ -640,9 +640,10 @@ The tax the safety model adds versus a C VMM that derefs guest pointers directly
   scratch `frame` (a NIC backend wants one `&[u8]`) — a protocol requirement, not
   a per-guest-touch safety tax.
 * **Per inbound RX frame (net):** RX is the mirror — bytes are *placed into* the
-  guest's RX descriptors (inherent to any NIC), plus one **ownership-boundary**
-  staging copy into a pooled 2 KiB slot (under `Mutex<RxPool>`) so the network
-  thread is decoupled from the vCPU/pump.
+  guest's RX descriptors (inherent to any NIC). Only when the guest's RX ring has
+  no room is there an extra **ownership-boundary** staging copy into a pooled
+  slot (under `Mutex<RxPool>`), so the network thread is decoupled from the
+  vCPU/pump.
 * **Per host input event (gpu+input):** the window's `InputSink` runs on the
   message-pump thread and reuses the device's `event_scratch`, so a steady input
   stream allocates nothing after warm-up; one IRQ per `submit_frame`.
@@ -853,9 +854,14 @@ the locking story above.
   check is the backstop; all Win32 calls go through `\\?\` long paths. Read-only
   shares reject writes with `EROFS`.
 * **Backpressure, not unbounded buffering:** the NAT's per-flow guest→host queue
-  caps at `TO_HOST_CAP = 64 KiB` (closing the guest TCP window); the net RX pool
-  **drops** inbound frames when the guest is not draining; the ICMP handoff queue
-  is bounded.
+  caps at `TO_HOST_CAP = 64 KiB` (closing the guest TCP window). Toward the
+  guest, the NAT stops pulling segments out of its TCBs while the NIC's RX
+  backlog (frames waiting for guest RX buffers, 64 slots) holds 32 frames, and
+  resumes when the NIC reports it drained to 8 (`NetDevice::rx_congested` /
+  `NetBackend::on_rx_space`); the held data fills the TCB rings, which stops
+  host recvs in turn. Sources that don't throttle (ARP, ICMP, UDP, the WinTun
+  and loopback backends) still **drop** at a full backlog. The ICMP handoff
+  queue is bounded.
 
 ---
 
@@ -953,14 +959,15 @@ path, so the steady state pays nothing):
 
 ```text
 [net] nic0 rx_frames=107808 tx_frames=72177 rx_backlogged=108 rx_rewinds=109 rx_truncated=0
-  rx_backlog_drops=0 rx_backlog_max=23 | nat: tcp_flows=28 retransmits=0 (0 B) rto=0 tlp=0
-  recoveries=0 dsacks=0 dup_bytes_from_guest=0 ooo_drops=0 tx_drops=0
+  rx_backlog_drops=0 rx_backlog_max=23 rx_throttles=0 | nat: tcp_flows=28 retransmits=0 (0 B)
+  rto=0 tlp=0 recoveries=0 dsacks=0 dup_bytes_from_guest=0 ooo_drops=0 tx_drops=0
 ```
 
 * **virtio-net RX:** `rx_backlogged` frames waited for guest RX buffers;
   `rx_rewinds` counts a ring running dry mid-frame (buffers given back, frame
-  retried later); `rx_truncated` / `rx_backlog_drops` are frames the guest lost
-  and should be 0.
+  retried later); `rx_throttles` counts times the backlog got deep enough to
+  pause the NAT (see §9); `rx_truncated` / `rx_backlog_drops` are frames the
+  guest lost and should be 0.
 * **NAT** (tcp-sans-io's per-connection `TcbStats` for the guest-facing TCBs,
   summed over flows): retransmits and their causes (`rto`, `tlp`, fast
   `recoveries`), `dsacks` (the guest received a duplicate, so a retransmit was
@@ -970,10 +977,11 @@ path, so the steady state pays nothing):
 
 `TINYVMM_NET_DIAG=1` adds live stderr lines: guest-bound data stalls of 10 ms or
 more with what resumed them (a host recv outstanding about as long as the stall
-means the host sender stalled; a guest frame means the guest's window or ACK
-clock), per-flow loss counters when a flow with losses closes, and RX backlog
-drops / truncations. The summary then also totals stalls of 3 ms or more:
-`stalls: host=… other=…`.
+means the host sender stalled; guest RX space means the guest was slow to take
+frames; a guest frame means the guest's window or ACK clock), per-flow loss
+counters when a flow with losses closes, and RX backlog drops / truncations.
+The summary then also totals stalls of 3 ms or more:
+`stalls: host=… guest_rx=… other=…`.
 
 `tools/net_compare.py` reports the guest's side for every VMM: deltas of its
 `/proc/net/{snmp,netstat,dev}` counters over the download and upload phases
