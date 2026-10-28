@@ -262,6 +262,8 @@ def vmm_argv(name: str, a: argparse.Namespace, host: str, port: int) -> list[str
 
 
 PHASE_RE = re.compile(r"NETCMP PHASE (\w+) (begin|end)")
+# Guest network counter deltas over a phase: "NETCMP <kind> <phase> k=v k=v ...".
+GUEST_RE = re.compile(r"NETCMP (TCPEXT|SNMP|NETDEV) (\w+)(.*)$")
 
 
 @dataclass
@@ -272,6 +274,7 @@ class RunResult:
     xfers: dict = field(default_factory=dict)    # phase -> [Xfer]
     ping: str = ""
     rr: tuple | None = None                     # (n, ok, us)
+    guest: dict = field(default_factory=dict)   # phase -> {counter: delta}
     log: str = ""
 
 
@@ -293,8 +296,13 @@ def run_one(name: str, a: argparse.Namespace, srv: Server, host: str) -> RunResu
         for raw in iter(proc.stdout.readline, b""):
             line = raw.decode("utf-8", "replace").rstrip()
             lines.append(line)
-            if a.verbose or "NETCMP" in line:
+            if a.verbose or "NETCMP" in line or line.startswith("[net]"):
                 print(f"  | {line}", flush=True)
+            mg = GUEST_RE.search(line)
+            if mg:
+                d = res.guest.setdefault(mg.group(2), {})
+                for k, v in re.findall(r"(\S+)=(-?\d+)", mg.group(3)):
+                    d[k] = int(v)
             m = PHASE_RE.search(line)
             if m:
                 now, cpu = time.perf_counter(), proc_cpu_seconds(proc)
@@ -314,7 +322,8 @@ def run_one(name: str, a: argparse.Namespace, srv: Server, host: str) -> RunResu
                 done.set()
         done.set()
 
-    threading.Thread(target=reader, daemon=True).start()
+    rt = threading.Thread(target=reader, daemon=True)
+    rt.start()
     if not done.wait(a.timeout_sec):
         print(f"[net-compare] {name}: timeout after {a.timeout_sec}s", flush=True)
     # Give the guest a moment to power off cleanly, then make sure it's gone.
@@ -324,6 +333,8 @@ def run_one(name: str, a: argparse.Namespace, srv: Server, host: str) -> RunResu
         subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
                        capture_output=True)
         proc.wait(timeout=10)
+    # Let the reader drain the VMM's last output (tinyvmm's teardown counters).
+    rt.join(timeout=5)
     res.log = "\n".join(lines)
     if not res.ok and not a.verbose:
         print("\n".join(lines[-40:]))
@@ -371,6 +382,15 @@ def summarize(rs: list[RunResult]) -> dict:
     s["ping_max_ms"] = max(t[2] for t in rtts) if rtts else None
     s["ping_loss_pct"] = max(losses) if losses else None
     s["rr_tps"] = statistics.mean(rr_tps) if rr_tps else None
+
+    def total(phase: str, *keys: str):
+        got = [r.guest[phase] for r in rs if phase in r.guest]
+        return sum(g.get(k, 0) for g in got for k in keys) if got else None
+
+    s["dl_holes"] = total("dl", "TCPOFOQueue")
+    s["dl_dups"] = total("dl", "TCPDSACKOldSent", "TCPDSACKOfoSent")
+    s["dl_rx_drops"] = total("dl", "rx_drop", "rx_frame")
+    s["ul_retrans"] = total("ul", "Tcp:RetransSegs")
     for k, v in (("dl", dl), ("ul", ul), ("par", par)):
         s[f"{k}_gbps"] = statistics.mean(v) if v else None
         s[f"{k}_gbps_min"] = min(v) if v else None
@@ -399,6 +419,10 @@ def report(results: dict[str, list[RunResult]], a: argparse.Namespace) -> dict:
         ("VMM CPU s/GiB download   lower=better", "dl_cpu_s_per_gib", ".3f"),
         ("VMM CPU s/GiB upload", "ul_cpu_s_per_gib", ".3f"),
         (f"VMM CPU s/GiB x{a.par} download", "par_cpu_s_per_gib", ".3f"),
+        ("guest TCP holes in download (OFO)", "dl_holes", "d"),
+        ("guest dup segments in download (D-SACK)", "dl_dups", "d"),
+        ("guest NIC rx drops in download", "dl_rx_drops", "d"),
+        ("guest retransmits in upload", "ul_retrans", "d"),
     ]
     w = 42
     print("\n" + "=" * (w + 18 * len(names)))
@@ -420,6 +444,8 @@ def report(results: dict[str, list[RunResult]], a: argparse.Namespace) -> dict:
                 cells.append(cell)
         print(f"{label:<{w}}" + "".join(f"{c:>18}" for c in cells))
     print("  (Gbps cells: mean (min-max) over all runs; CPU = VMM process user+kernel)")
+    print("  (guest rows: totals over all runs; non-zero means data was lost, dropped or "
+          "duplicated between the host and the guest)")
     return sums
 
 

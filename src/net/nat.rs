@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::Instant;
-use tcp_sans_io::{Endpoint, State, Tcb, TcbConfig, TcpError};
+use tcp_sans_io::{Endpoint, State, Tcb, TcbConfig, TcbStats, TcpError};
 use windows_sys::Win32::Networking::WinSock::{INVALID_SOCKET, SOCKET, WSABUF};
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
@@ -211,6 +211,7 @@ trait TcbDyn {
     fn close(&mut self) -> Result<(), TcpError>;
     /// Recycle this Tcb onto a new connection in place (reuses its rings).
     fn reinit(&mut self, cfg: TcbConfig);
+    fn stats(&self) -> TcbStats;
 }
 
 impl<const BUF: usize> TcbDyn for Tcb<BUF> {
@@ -255,6 +256,9 @@ impl<const BUF: usize> TcbDyn for Tcb<BUF> {
     }
     fn reinit(&mut self, cfg: TcbConfig) {
         self.reinit(cfg)
+    }
+    fn stats(&self) -> TcbStats {
+        self.stats()
     }
 }
 
@@ -667,6 +671,8 @@ struct TcpFlow {
     dead: bool,               // tearing down; socket closed, awaiting op drain
     created_at: u64,          // ms at flow creation (connect-deadline watchdog)
     last_activity: u64,       // ms of last real TX/RX (idle/half-close watchdogs)
+    diag: FlowDiag,           // net-diag stall tracking
+    published: Losses,        // TCB loss counters already added to NatStats
 }
 
 impl Drop for TcpFlow {
@@ -815,6 +821,9 @@ fn maybe_post_recv(flow: &mut TcpFlow) -> bool {
     let posted = unsafe { sys::wsa_recv(sock, buf, ovl) };
     if posted {
         flow.recv_pending = true;
+        if crate::diag::net_enabled() {
+            flow.diag.recv_posted = Some(Instant::now());
+        }
     }
     posted
 }
@@ -852,6 +861,198 @@ fn pump_send(flow: &mut TcpFlow) -> bool {
     } else {
         false
     }
+}
+
+/// What woke the NAT worker for the current dispatch. Net-diag mode uses it to
+/// attribute a guest-bound data stall to whatever ended it.
+#[derive(Clone, Copy)]
+enum Wake {
+    Guest,
+    HostRecv,
+    HostSend,
+    Timer,
+    Other,
+}
+
+impl Wake {
+    fn as_str(self) -> &'static str {
+        match self {
+            Wake::Guest => "guest frame",
+            Wake::HostRecv => "host recv",
+            Wake::HostSend => "host send",
+            Wake::Timer => "timer",
+            Wake::Other => "other",
+        }
+    }
+}
+
+/// The cumulative loss counters of a tcp-sans-io [`TcbStats`], which also
+/// carries gauges (srtt, cwnd, ...) that aren't summed across flows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Losses {
+    segs_retrans: u64,
+    bytes_retrans: u64,
+    rto: u64,
+    tlp: u64,
+    fast_recoveries: u64,
+    /// D-SACKs from the guest: it got a duplicate, so we retransmitted
+    /// spuriously.
+    dsacks: u64,
+    /// Payload the guest sent us again that we already had.
+    dup_bytes_received: u64,
+    /// Guest segments dropped because the out-of-order tracker was full.
+    ooo_drops: u64,
+}
+
+impl From<&TcbStats> for Losses {
+    fn from(s: &TcbStats) -> Self {
+        Losses {
+            segs_retrans: s.segs_retrans,
+            bytes_retrans: s.bytes_retrans,
+            rto: s.rto_count.into(),
+            tlp: s.tlp_count.into(),
+            fast_recoveries: s.fast_recoveries.into(),
+            dsacks: s.dsacks_received,
+            dup_bytes_received: s.dup_bytes_received,
+            ooo_drops: s.ooo_drops.into(),
+        }
+    }
+}
+
+/// NAT counters, shared by the worker with [`NatBackend`] for the exit
+/// summary. Each flow's [`Losses`] are published on every timer sweep and
+/// at reap; the stall counters are only kept in net-diag mode.
+#[derive(Default)]
+struct NatStats {
+    tcp_flows: AtomicU64,
+    segs_retrans: AtomicU64,
+    bytes_retrans: AtomicU64,
+    rto: AtomicU64,
+    tlp: AtomicU64,
+    fast_recoveries: AtomicU64,
+    dsacks: AtomicU64,
+    dup_bytes_received: AtomicU64,
+    ooo_drops: AtomicU64,
+    /// Guest frames dropped because the frame pool was exhausted.
+    tx_drops: AtomicU64,
+    host_stalls: AtomicU64,
+    host_stall_ms: AtomicU64,
+    other_stalls: AtomicU64,
+    other_stall_ms: AtomicU64,
+}
+
+impl NatStats {
+    /// Add what a flow's loss counters gained since `old` (they only grow
+    /// within one connection).
+    fn add_delta(&self, new: &Losses, old: &Losses) {
+        let add = |a: &AtomicU64, n: u64, o: u64| {
+            a.fetch_add(n.saturating_sub(o), Ordering::Relaxed);
+        };
+        add(&self.segs_retrans, new.segs_retrans, old.segs_retrans);
+        add(&self.bytes_retrans, new.bytes_retrans, old.bytes_retrans);
+        add(&self.rto, new.rto, old.rto);
+        add(&self.tlp, new.tlp, old.tlp);
+        add(
+            &self.fast_recoveries,
+            new.fast_recoveries,
+            old.fast_recoveries,
+        );
+        add(&self.dsacks, new.dsacks, old.dsacks);
+        add(
+            &self.dup_bytes_received,
+            new.dup_bytes_received,
+            old.dup_bytes_received,
+        );
+        add(&self.ooo_drops, new.ooo_drops, old.ooo_drops);
+    }
+
+    fn summary(&self) -> String {
+        let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let mut s = format!(
+            "nat: tcp_flows={} retransmits={} ({} B) rto={} tlp={} recoveries={} dsacks={} \
+             dup_bytes_from_guest={} ooo_drops={} tx_drops={}",
+            ld(&self.tcp_flows),
+            ld(&self.segs_retrans),
+            ld(&self.bytes_retrans),
+            ld(&self.rto),
+            ld(&self.tlp),
+            ld(&self.fast_recoveries),
+            ld(&self.dsacks),
+            ld(&self.dup_bytes_received),
+            ld(&self.ooo_drops),
+            ld(&self.tx_drops),
+        );
+        if crate::diag::net_enabled() {
+            s.push_str(&format!(
+                " stalls: host={} ({} ms) other={} ({} ms)",
+                ld(&self.host_stalls),
+                ld(&self.host_stall_ms),
+                ld(&self.other_stalls),
+                ld(&self.other_stall_ms),
+            ));
+        }
+        s
+    }
+}
+
+/// Net-diag stall tracking for one TCP flow (untouched unless net-diag is on).
+#[derive(Default)]
+struct FlowDiag {
+    /// When guest-bound data last left this flow.
+    last_data_out: Option<Instant>,
+    /// When the outstanding host recv was posted.
+    recv_posted: Option<Instant>,
+    /// How long the most recently completed host recv was outstanding.
+    last_recv_wait_ms: u64,
+}
+
+/// Publish what `flow`'s loss counters gained since the last call.
+fn publish_tcb_stats(flow: &mut TcpFlow, stats: &NatStats) {
+    if let Some(tcb) = flow.tcb.as_ref() {
+        let now = Losses::from(&tcb.stats());
+        if now != flow.published {
+            stats.add_delta(&now, &flow.published);
+            flow.published = now;
+        }
+    }
+}
+
+fn fmt_flow(k: FlowKey) -> String {
+    let (gi, gp, ri, rp) = k;
+    format!(
+        "{}.{}.{}.{}:{gp} <-> {}.{}.{}.{}:{rp}",
+        gi[0], gi[1], gi[2], gi[3], ri[0], ri[1], ri[2], ri[3]
+    )
+}
+
+/// Net-diag: guest-bound data just left `key`. A gap of 3 ms to 1 s since the
+/// previous data is a stall (shorter is normal pacing, longer an idle flow):
+/// count it by what ended it, and log it if it reached 10 ms (shorter stalls
+/// ended by a guest frame are routine ACK clocking under load). A stall a host
+/// recv ended, with that recv outstanding about as long, is the host sender
+/// stalling; one a guest frame ended is the guest's window or ACK clock.
+fn note_data_out(d: &mut FlowDiag, key: FlowKey, wake: Wake, stats: &NatStats) {
+    let now = Instant::now();
+    if let Some(prev) = d.last_data_out {
+        let gap = now.duration_since(prev).as_millis() as u64;
+        if (3..1000).contains(&gap) {
+            let (n, ms) = match wake {
+                Wake::HostRecv => (&stats.host_stalls, &stats.host_stall_ms),
+                _ => (&stats.other_stalls, &stats.other_stall_ms),
+            };
+            n.fetch_add(1, Ordering::Relaxed);
+            ms.fetch_add(gap, Ordering::Relaxed);
+            if gap >= 10 {
+                eprintln!(
+                    "[nat] {} stalled {gap} ms, resumed by {} (host recv outstanding {} ms)",
+                    fmt_flow(key),
+                    wake.as_str(),
+                    d.last_recv_wait_ms
+                );
+            }
+        }
+    }
+    d.last_data_out = Some(now);
 }
 
 struct NatState {
@@ -893,6 +1094,8 @@ struct NatState {
     // across `tcp_drive` calls so the hot path stays allocation-free.
     gso_hdr: Vec<u8>,
     gso_payload: Vec<u8>,
+    wake: Wake,
+    stats: Arc<NatStats>,
 }
 
 // After construction the state is moved into and owned solely by the worker
@@ -938,8 +1141,10 @@ impl NatState {
                 }
                 // timeout: fall through to the timer sweep below.
             } else {
+                self.wake = Wake::Other;
                 match key {
                     KEY_FRAME | KEY_FRAME_OFFLOAD => {
+                        self.wake = Wake::Guest;
                         let (idx, frame) = unsafe { FramePool::<FRAME_CAP>::received(ov, bytes) };
                         self.l4_csum_trusted = key == KEY_FRAME_OFFLOAD;
                         self.handle_frame(frame);
@@ -947,6 +1152,7 @@ impl NatState {
                         self.pool.release(idx);
                     }
                     KEY_FRAME_OFFLOAD_BIG => {
+                        self.wake = Wake::Guest;
                         let (idx, frame) =
                             unsafe { FramePool::<TX_FRAME_CAP>::received(ov, bytes) };
                         self.l4_csum_trusted = true;
@@ -972,6 +1178,11 @@ impl NatState {
                         // association, so connect/recv/send all arrive as
                         // KEY_TCP; the op kind disambiguates them.
                         let kind = unsafe { (*(ov as *const TcpOvHeader)).kind };
+                        self.wake = match kind {
+                            1 => Wake::HostRecv,
+                            2 => Wake::HostSend,
+                            _ => Wake::Other,
+                        };
                         match kind {
                             0 => self.on_tcp_connect(ov as *mut TcpOp, ok),
                             1 => self.on_tcp_recv(ov as *mut TcpOp, ok, bytes),
@@ -990,6 +1201,7 @@ impl NatState {
             let now = self.now();
             if now.wrapping_sub(self.last_tick) >= TICK_GATE_MS {
                 self.last_tick = now;
+                self.wake = Wake::Timer;
                 self.tcp_tick();
             }
             if now.wrapping_sub(self.last_expire) >= EXPIRE_GATE_MS {
@@ -1002,6 +1214,7 @@ impl NatState {
         // intentional drops as reaped. TcpFlow::drop then closes the host
         // socket; for UDP the socket lives in the op, so close it here.
         for (_, mut f) in self.tcp.drain() {
+            publish_tcb_stats(&mut f, &self.stats);
             f.tcb.take();
             f.op.take();
             f.send_op.take();
@@ -1337,6 +1550,7 @@ impl NatState {
             self.tcp_send_op_pool.release(send_op);
             return None;
         }
+        self.stats.tcp_flows.fetch_add(1, Ordering::Relaxed);
         self.tcp.insert(
             key,
             TcpFlow {
@@ -1357,6 +1571,8 @@ impl NatState {
                 dead: false,
                 created_at: now,
                 last_activity: now,
+                diag: FlowDiag::default(),
+                published: Losses::default(),
             },
         );
         Some(())
@@ -1431,6 +1647,7 @@ impl NatState {
         send_op.overlapped = unsafe { core::mem::zeroed() };
         send_op.kind = 2;
         send_op.key = key;
+        self.stats.tcp_flows.fetch_add(1, Ordering::Relaxed);
         self.tcp.insert(
             key,
             TcpFlow {
@@ -1451,6 +1668,8 @@ impl NatState {
                 dead: false,
                 created_at: now,
                 last_activity: now,
+                diag: FlowDiag::default(),
+                published: Losses::default(),
             },
         );
         // Emit the SYN toward the guest and arm the host receive.
@@ -1496,6 +1715,9 @@ impl NatState {
         let mut dead = false;
         if let Some(flow) = self.tcp.get_mut(&key) {
             flow.recv_pending = false;
+            if let Some(t) = flow.diag.recv_posted.take() {
+                flow.diag.last_recv_wait_ms = t.elapsed().as_millis() as u64;
+            }
             if flow.dead {
                 dead = true;
             } else {
@@ -1631,6 +1853,8 @@ impl NatState {
                     }
                 }
             }
+            let diag = crate::diag::net_enabled();
+            let mut data_out = false;
             'pump: loop {
                 // Top up the send ring from any spillover before each tick so a
                 // recv larger than one egress-ring pass still drains in one drive.
@@ -1644,6 +1868,9 @@ impl NatState {
                     };
                     any = true;
                     let dgram = &pbuf[..n];
+                    if diag && !data_out {
+                        data_out = split_tcp_dgram(dgram).is_some_and(|(_, p, _, _)| !p.is_empty());
+                    }
                     let coalesce = gso_ok
                         && match split_tcp_dgram(dgram) {
                             Some((hdr, pay, seq, flags))
@@ -1680,6 +1907,9 @@ impl NatState {
                 }
             } // 'pump
             flush_gso!();
+            if data_out {
+                note_data_out(&mut flow.diag, key, self.wake, &self.stats);
+            }
             let ev = flow.tcb.as_ref().unwrap().poll();
             if ev & EV_PEER_CLOSED != 0 && !flow.shutdown_done {
                 flow.want_shutdown = true;
@@ -1733,6 +1963,15 @@ impl NatState {
                 // closes the socket (a no-op — already INVALID) and the Drop-bomb
                 // confirms every box was reclaimed.
                 let tier = f.tier;
+                publish_tcb_stats(&mut f, &self.stats);
+                if crate::diag::net_enabled() && f.published != Losses::default() {
+                    let rtt = f.tcb.as_ref().map_or(0, |t| t.stats().min_rtt_ms);
+                    eprintln!(
+                        "[nat] {} closed (min rtt {rtt} ms): {:?}",
+                        fmt_flow(key),
+                        f.published
+                    );
+                }
                 if let Some(tcb) = f.tcb.take() {
                     self.tcb_pools[tier].release(tcb);
                 }
@@ -1820,6 +2059,7 @@ impl NatState {
                 if !flow.dead {
                     flow.tcb.as_mut().unwrap().set_now(now);
                     let _ = flow.tcb.as_mut().unwrap().tick();
+                    publish_tcb_stats(flow, &self.stats);
                     tick = true;
                 }
             }
@@ -1841,6 +2081,7 @@ pub struct NatBackend {
     listener_threads: Mutex<Vec<JoinHandle<()>>>,
     pool: Arc<FramePool<FRAME_CAP>>,
     big_pool: Arc<FramePool<TX_FRAME_CAP>>,
+    stats: Arc<NatStats>,
 }
 
 impl NatBackend {
@@ -1848,6 +2089,7 @@ impl NatBackend {
         sys::wsa_startup();
         let pool = Arc::new(FramePool::new(POOL_SLOTS));
         let big_pool = Arc::new(FramePool::new(BIG_POOL_SLOTS));
+        let stats = Arc::new(NatStats::default());
         let iocp = match sys::create_iocp() {
             Some(i) => i,
             None => {
@@ -1861,6 +2103,7 @@ impl NatBackend {
                     listener_threads: Mutex::new(Vec::new()),
                     pool,
                     big_pool,
+                    stats,
                 });
             }
         };
@@ -1954,6 +2197,8 @@ impl NatBackend {
             l3_scratch: Vec::with_capacity(FRAME_CAP),
             gso_hdr: Vec::with_capacity(64),
             gso_payload: Vec::with_capacity(GSO_PAYLOAD_CAP),
+            wake: Wake::Other,
+            stats: stats.clone(),
         };
         // With `heap-buffers` the Tcb rings are boxed, so a Tcb is no longer a
         // multi-MiB stack temporary; pooled construction above is cheap. The
@@ -1972,6 +2217,7 @@ impl NatBackend {
             listener_threads: Mutex::new(listener_threads),
             pool,
             big_pool,
+            stats,
         })
     }
 }
@@ -2047,6 +2293,7 @@ impl NetBackend for NatBackend {
         }
         // If the pool is exhausted, drop the frame (the guest will retransmit).
         if !self.post_frame(&self.pool, frame, KEY_FRAME) {
+            self.stats.tx_drops.fetch_add(1, Ordering::Relaxed);
             Self::tx_drop(frame);
         }
     }
@@ -2069,6 +2316,10 @@ impl NetBackend for NatBackend {
             // Big pool busy: segment in software into the small pool.
             tx_offload_software(frame, hdr, &mut |f| self.on_guest_frame(f));
         }
+    }
+
+    fn diag_summary(&self) -> Option<String> {
+        Some(self.stats.summary())
     }
 
     fn stop(&self) {

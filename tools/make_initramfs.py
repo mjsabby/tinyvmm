@@ -309,7 +309,8 @@ fi
 # tinyvmm and OpenVMM (consomme) and times throughput host-side (the guest's
 # /proc/uptime only has 10 ms resolution). VMM-agnostic: only needs eth0 at
 # 10.0.0.2/24 via gateway 10.0.0.1, which both user-mode NATs use. Prints a
-# `NETCMP DONE` marker and halts; the driver kills the VMM on that marker.
+# `NETCMP DONE` marker, then the tinyvmm shutdown sentinel, and halts; the
+# driver kills any VMM still running 5 s after the marker.
 # Cmdline vars: NETCMP_HOST, NETCMP_PORT, NETCMP_SIZE (bytes per stream),
 # NETCMP_RUNS, NETCMP_RR (sequential tiny requests), NETCMP_PAR (streams),
 # NETCMP_PING (count).
@@ -320,6 +321,17 @@ if grep -q 'tinyvmm.test=netcmp' /proc/cmdline 2>/dev/null; then
     pingn=$(arg NETCMP_PING)
     base="http://${host}:${port}"
     us() { awk '{print int($1 * 1000000)}' /proc/uptime; }
+    # Guest network counters over a phase, as non-zero deltas. TCPEXT: DSACK /
+    # OFO mean loss or spurious retransmits, ZeroWindow is flow control. SNMP:
+    # the IP/TCP/UDP MIBs (RetransSegs, InErrs, InTruncatedPkts, ...). NETDEV:
+    # eth0 driver counters; rx drop/frame are frames the driver discarded.
+    snap() { cat /proc/net/snmp /proc/net/netstat > /tmp/ns$1; grep eth0 /proc/net/dev > /tmp/nd$1; }
+    netdelta() {
+        snap 1
+        log "NETCMP TCPEXT $1 $(awk 'NR==FNR{if($1 in h){for(i=2;i<=NF;i++)a[$1,i]=$i}else{h[$1]=1;for(i=2;i<=NF;i++)n[$1,i]=$i};next} $1=="TcpExt:"{if(g++)for(i=2;i<=NF;i++)if($i!=a[$1,i])printf "%s=%d ",n[$1,i],$i-a[$1,i]}' /tmp/ns0 /tmp/ns1)"
+        log "NETCMP SNMP $1 $(awk 'NR==FNR{if($1 in h){for(i=2;i<=NF;i++)a[$1,i]=$i}else{h[$1]=1;for(i=2;i<=NF;i++)n[$1,i]=$i};next} $1!="TcpExt:"&&$1!="IcmpMsg:"{if($1 in g){for(i=2;i<=NF;i++)if($i!=a[$1,i])printf "%s%s=%d ",$1,n[$1,i],$i-a[$1,i]}else g[$1]=1}' /tmp/ns0 /tmp/ns1)"
+        log "NETCMP NETDEV $1 $(awk '{sub(":"," ")} NR==FNR{for(i=2;i<=NF;i++)a[i]=$i;next} {printf "rx_pkts=%d rx_errs=%d rx_drop=%d rx_frame=%d tx_pkts=%d tx_errs=%d tx_drop=%d",$3-a[3],$4-a[4],$5-a[5],$7-a[7],$11-a[11],$12-a[12],$13-a[13]}' /tmp/nd0 /tmp/nd1)"
+    }
     log "NETCMP start host=${host} port=${port} size=${size} runs=${runs} rr=${rr} par=${par} ping=${pingn}"
     # Guest environment (differences here skew per-byte guest CPU cost).
     log "NETCMP ENV clocksource=$(cat /sys/devices/system/clocksource/clocksource0/current_clocksource 2>/dev/null) avail=$(cat /sys/devices/system/clocksource/clocksource0/available_clocksource 2>/dev/null)"
@@ -348,9 +360,7 @@ if grep -q 'tinyvmm.test=netcmp' /proc/cmdline 2>/dev/null; then
     log "NETCMP RR n=${rr} ok=${ok} us=$((t1 - t0))"
     log "NETCMP PHASE rr end"
 
-    # Guest TCP receiver counters over the download (non-zero TcpExt deltas):
-    # DSACK/OFO mean loss or spurious retransmits; ZeroWindow is flow control.
-    grep '^TcpExt:' /proc/net/netstat > /tmp/te0
+    snap 0
     log "NETCMP PHASE dl begin"
     wget -q -O /dev/null -T 60 -t 1 "${base}/bytes/${size}/dlwarm" 2>/dev/null
     for i in $(seq 1 "${runs}"); do
@@ -358,13 +368,13 @@ if grep -q 'tinyvmm.test=netcmp' /proc/cmdline 2>/dev/null; then
         log "NETCMP DL run=${i} rc=$?"
     done
     log "NETCMP PHASE dl end"
-    grep '^TcpExt:' /proc/net/netstat > /tmp/te1
-    log "NETCMP TCPEXT dl $(awk 'NR==FNR{if(FNR==1)for(i=2;i<=NF;i++)n[i]=$i;else for(i=2;i<=NF;i++)a[i]=$i;next} FNR==2{for(i=2;i<=NF;i++)if($i!=a[i])printf "%s=%d ",n[i],$i-a[i]}' /tmp/te0 /tmp/te1)"
+    netdelta dl
 
     # tmpfs-backed file so the upload reads from RAM, not a disk. busybox wget
     # sizes --post-file with strlen(), so the payload must contain no NULs.
     # Built before the phase marker so its cost isn't charged to the upload.
     yes 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde | head -c "${size}" > /tmp/up.bin
+    snap 0
     log "NETCMP PHASE ul begin"
     for i in $(seq 1 "${runs}"); do
         wget -q -O /dev/null -T 120 -t 1 --post-file=/tmp/up.bin "${base}/upload/ul${i}" 2>/dev/null
@@ -372,7 +382,7 @@ if grep -q 'tinyvmm.test=netcmp' /proc/cmdline 2>/dev/null; then
     done
     rm -f /tmp/up.bin
     log "NETCMP PHASE ul end"
-    log "NETCMP TCPSTAT $(grep '^Tcp:' /proc/net/snmp | tr '\n' ' ')"
+    netdelta ul
 
     log "NETCMP PHASE par begin"
     for r in $(seq 1 "${runs}"); do
@@ -385,6 +395,9 @@ if grep -q 'tinyvmm.test=netcmp' /proc/cmdline 2>/dev/null; then
     log "NETCMP PHASE par end"
 
     log "NETCMP DONE"
+    # Stop tinyvmm cleanly so it prints its teardown counters (see
+    # src/main.rs); other VMMs are killed by the driver on `NETCMP DONE`.
+    log "=== tinyvmm shutdown requested ==="
     sync
     poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
     exec cat
