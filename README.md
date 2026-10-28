@@ -367,7 +367,12 @@ axes).
   socket per 4-tuple), and **TCP** terminate-and-proxy (the guest-facing TCB is
   the `tcp-sans-io` crate; the host side dials out with `ConnectEx`). `--portfwd`
   adds inbound forwarding — the VMM originates a SYN toward the guest. A **single
-  precreated worker thread** owns all flow state and a single IOCP.
+  precreated worker thread** owns all flow state and a single IOCP. Host→guest
+  TCP bytes go from a 256 KiB overlapped `WSARecv` per flow into the TCB's send
+  ring, become segments built in place in the TCB's TX ring (TCP checksum left
+  partial when the guest negotiated `VIRTIO_NET_F_GUEST_CSUM`), are appended to
+  a GSO super-frame of up to 64 KiB built in place (`NEEDS_CSUM`), and are
+  copied once into the guest's RX buffers.
 * **`wintun`** — bridges onto a real WinTun L3 adapter (`wintun.dll` loaded at
   runtime via `GetProcAddress`; requires elevation to create the adapter).
 
@@ -668,6 +673,8 @@ NIC/display protocol, not to the guest-memory-access layer.
 | virtio-9p single-stream read | ~16 MB/s (request-response latency-bound) |
 | virtio-9p concurrent (32 readers) | ~190 MB/s (ceiling = one submit pump + the per-queue `Mutex<Virtqueue>`) |
 | virtio-net guest→host | 20 MB transfer at line rate with the pump's periodic sweep disabled |
+| NAT TCP host→guest (`tools\net_compare.py`, server on the same host, 1 vCPU) | ~13.6 Gbit/s one stream, ~10.4 Gbit/s across 16 streams |
+| NAT TCP guest→host (same setup) | ~8.6 Gbit/s one stream |
 
 ---
 

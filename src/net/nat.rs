@@ -54,10 +54,17 @@ const FRAME_CAP: usize = 2048;
 const GSO_PAYLOAD_CAP: usize = 65000;
 const GSO_FRAME_CAP: usize = ETH_HDR + 60 + GSO_PAYLOAD_CAP;
 const UDP_BUF: usize = 2048;
-// Host-socket recv buffer per overlapped op. Each WSARecv completion drives one
-// `tcp_drive` pass; the GSO coalescer can only merge what that pass sees, so
-// this is also the effective super-frame size. 64 KiB ⇒ ~45 MSS per frame.
+// Host-socket send buffer per overlapped op (one host send in flight per flow).
 const TCP_BUF: usize = 65536;
+// Host-socket recv buffer per overlapped op. Each WSARecv completion drives one
+// `tcp_drive` pass, so bigger recvs mean fewer syscalls, kernel wakeups, guest
+// interrupts and drives per byte: 256 KiB carried ~11% more single-stream
+// download than 64 KiB at ~11% less VMM CPU per byte. A pass still delivers
+// at most GSO_PAYLOAD_CAP per super-frame.
+const TCP_RECV_BUF: usize = 256 * 1024;
+/// Recv ops built up front; the pool grows on demand to the flow cap (and
+/// recycles), so idle VMs don't commit MAX_TCP_FLOWS of 256 KiB buffers.
+const TCP_RECV_OP_WARM: usize = 32;
 const MAX_UDP_FLOWS: usize = 256;
 const MAX_TCP_FLOWS: usize = 256;
 /// Number of preallocated guest-TX frame slots shared across all shards.
@@ -71,6 +78,9 @@ const POOL_SENTINEL: u32 = u32::MAX;
 /// Cap on the per-flow guest->host queue. When reached we stop draining the
 /// tcb receive ring, which closes the guest-facing window (backpressure).
 const TO_HOST_CAP: usize = 64 * 1024;
+/// Host->guest bytes spilled past a full tcb send ring above which no further
+/// host recv is posted, so a flow's spill stays under this plus one recv.
+const TO_GUEST_SPILL_CAP: usize = 64 * 1024;
 /// Fixed receive buffer for host sockets whose peer is this host. Windows'
 /// receive-window autotuning keeps such sub-millisecond connections at a small
 /// window, and the sender then stalls in ~15 ms steps: about 5.7 Gbps with ~40
@@ -205,7 +215,10 @@ trait TcbDyn {
     fn connect(&mut self) -> Result<(), TcpError>;
     fn inject_packet(&mut self, pkt: &[u8]) -> Result<(), TcpError>;
     fn inject_packet_l4_csum_trusted(&mut self, pkt: &[u8]) -> Result<(), TcpError>;
-    fn extract_packet(&mut self, out: &mut [u8]) -> Result<usize, TcpError>;
+    /// Pop one staged datagram and lend it to `f`; false when none is staged.
+    fn extract_packet_with(&mut self, f: &mut dyn FnMut(&[u8])) -> bool;
+    /// Leave TCP checksums of staged segments partial (CHECKSUM_PARTIAL).
+    fn set_tx_csum_offload(&mut self, on: bool);
     fn poll(&self) -> u32;
     fn recv(&mut self, dst: &mut [u8]) -> Result<usize, TcpError>;
     fn send(&mut self, data: &[u8]) -> Result<usize, TcpError>;
@@ -239,8 +252,11 @@ impl<const BUF: usize> TcbDyn for Tcb<BUF> {
     fn inject_packet_l4_csum_trusted(&mut self, pkt: &[u8]) -> Result<(), TcpError> {
         self.inject_packet_l4_csum_trusted(pkt)
     }
-    fn extract_packet(&mut self, out: &mut [u8]) -> Result<usize, TcpError> {
-        self.extract_packet(out)
+    fn extract_packet_with(&mut self, f: &mut dyn FnMut(&[u8])) -> bool {
+        self.extract_packet_with(|p| f(p)).is_some()
+    }
+    fn set_tx_csum_offload(&mut self, on: bool) {
+        self.set_tx_csum_offload(on)
     }
     fn poll(&self) -> u32 {
         self.poll()
@@ -339,7 +355,8 @@ impl<T> SyncBoxPool<T> {
 fn make_tcp_op() -> Box<TcpOp> {
     // All fields are POD (integers, byte arrays, OVERLAPPED/WSABUF), so a fully
     // zeroed value is valid; the acquire site sets key/kind and arms the op.
-    Box::new(unsafe { core::mem::zeroed() })
+    // Zeroed on the heap: the op is too big for a stack temporary.
+    unsafe { Box::<TcpOp>::new_zeroed().assume_init() }
 }
 fn make_tcp_send_op() -> Box<TcpSendOp> {
     Box::new(unsafe { core::mem::zeroed() })
@@ -648,7 +665,7 @@ struct TcpOp {
     overlapped: OVERLAPPED,
     kind: u8, // 0 = connect, 1 = recv
     key: FlowKey,
-    buf: [u8; TCP_BUF],
+    buf: [u8; TCP_RECV_BUF],
     wsabuf: WSABUF,
 }
 
@@ -690,6 +707,7 @@ struct TcpFlow {
     diag: FlowDiag,           // net-diag stall tracking
     published: Losses,        // TCB loss counters already added to NatStats
     rx_blocked: bool,         // paused on the NIC's RX backlog (in rx_blocked list)
+    csum_offload: bool,       // the TCB leaves TCP checksums partial (guest GUEST_CSUM)
 }
 
 impl Drop for TcpFlow {
@@ -723,17 +741,87 @@ fn split_tcp_dgram(ip: &[u8]) -> Option<(&[u8], &[u8], u32, u8)> {
     Some((&ip[..ihl + thl], &ip[ihl + thl..], seq, flags))
 }
 
-/// Emit one coalesced TCP super-segment toward the guest. `hdr_tmpl` is the
-/// IP+TCP header of the *last* contributing segment (so ack/window/flags are
-/// fresh); `seq` is the *first* segment's sequence number; `mss` is the
-/// original segment size (`gso_size`). Builds Eth+IP+TCP+payload with correct
-/// checksums into `eth` and delivers via `inject_rx_gso` with a TCPv4 GSO
-/// header so the guest's GRO path sees one skb.
+/// Bytes reserved in front of a coalesced payload for its Ethernet, IPv4 and
+/// TCP headers (an IPv4 or TCP header is at most 60 bytes).
+const GSO_HDR_ROOM: usize = ETH_HDR + 60 + 60;
+
+/// One coalesced TCP super-frame toward the guest, built in place: payloads
+/// are appended behind `GSO_HDR_ROOM` reserved bytes, and the headers are
+/// written in front of them once, at flush, so each payload byte is copied
+/// exactly once on its way to the NIC.
+struct GsoFrame {
+    buf: Vec<u8>,
+    /// IP+TCP header of the latest segment (its ack/window/flags are fresh).
+    hdr: [u8; 120],
+    hdr_len: usize,
+    /// Sequence number of the first segment, and its payload size (gso_size).
+    seq: u32,
+    mss: u16,
+}
+
+impl GsoFrame {
+    fn new() -> Self {
+        let mut buf = Vec::with_capacity(GSO_HDR_ROOM + GSO_PAYLOAD_CAP);
+        buf.resize(GSO_HDR_ROOM, 0);
+        GsoFrame {
+            buf,
+            hdr: [0; 120],
+            hdr_len: 0,
+            seq: 0,
+            mss: 0,
+        }
+    }
+
+    fn payload_len(&self) -> usize {
+        self.buf.len() - GSO_HDR_ROOM
+    }
+
+    /// Whether a data segment `(seq, len)` extends the frame contiguously.
+    fn extends(&self, seq: u32, len: usize) -> bool {
+        seq == self.seq.wrapping_add(self.payload_len() as u32)
+            && self.payload_len() + len <= GSO_PAYLOAD_CAP
+    }
+
+    fn push(&mut self, hdr: &[u8], pay: &[u8], seq: u32) {
+        if self.payload_len() == 0 {
+            self.seq = seq;
+            self.mss = pay.len() as u16;
+        }
+        self.buf.extend_from_slice(pay);
+        self.hdr[..hdr.len()].copy_from_slice(hdr);
+        self.hdr_len = hdr.len();
+    }
+
+    fn flush(&mut self, dev: Option<&NetDevice>, dst_mac: [u8; 6], src_mac: [u8; 6]) {
+        if self.payload_len() == 0 {
+            return;
+        }
+        if let Some(d) = dev {
+            emit_gso_tcp(
+                d,
+                &mut self.buf,
+                &self.hdr[..self.hdr_len],
+                self.seq,
+                self.mss,
+                dst_mac,
+                src_mac,
+            );
+        }
+        self.buf.truncate(GSO_HDR_ROOM);
+    }
+}
+
+/// Emit one coalesced TCP super-segment toward the guest. `frame` holds the
+/// payload after `GSO_HDR_ROOM` bytes; `hdr_tmpl` is the IP+TCP header of the
+/// *last* contributing segment (so ack/window/flags are fresh); `seq` is the
+/// *first* segment's sequence number; `mss` is the original segment size
+/// (`gso_size`). Writes Eth+IP+TCP in front of the payload with correct
+/// checksums and delivers via `inject_rx_gso` with a TCPv4 GSO header so the
+/// guest's GRO path sees one skb.
 fn emit_gso_tcp(
     dev: &NetDevice,
-    eth: &mut Vec<u8>,
+    frame: &mut [u8],
     hdr_tmpl: &[u8],
-    pay: &[u8],
     seq: u32,
     mss: u16,
     dst_mac: [u8; 6],
@@ -741,18 +829,17 @@ fn emit_gso_tcp(
 ) {
     let ihl = (hdr_tmpl[0] & 0x0F) as usize * 4;
     let thl = ((hdr_tmpl[ihl + 12] >> 4) as usize) * 4;
-    let l3_len = ihl + thl + pay.len();
+    let pay_len = frame.len() - GSO_HDR_ROOM;
+    let l3_len = ihl + thl + pay_len;
 
-    eth.clear();
-    eth.extend_from_slice(&dst_mac);
-    eth.extend_from_slice(&src_mac);
-    eth.extend_from_slice(&(ETHERTYPE_IPV4 as u16).to_be_bytes());
-    let ip0 = eth.len();
-    eth.extend_from_slice(hdr_tmpl);
-    eth.extend_from_slice(pay);
+    let eth = &mut frame[GSO_HDR_ROOM - ETH_HDR - ihl - thl..];
+    eth[..6].copy_from_slice(&dst_mac);
+    eth[6..12].copy_from_slice(&src_mac);
+    eth[12..ETH_HDR].copy_from_slice(&(ETHERTYPE_IPV4 as u16).to_be_bytes());
+    eth[ETH_HDR..ETH_HDR + ihl + thl].copy_from_slice(hdr_tmpl);
 
     // Patch IP: total_len + recompute header checksum.
-    let b = &mut eth[ip0..];
+    let b = &mut eth[ETH_HDR..];
     b[2] = (l3_len >> 8) as u8;
     b[3] = l3_len as u8;
     b[10] = 0;
@@ -767,7 +854,7 @@ fn emit_gso_tcp(
     // Linux trusts CHECKSUM_PARTIAL for local delivery, so we skip summing the
     // ~64 KiB payload — the dominant remaining NAT-worker cost at 625 MB/s.
     b[ihl + 4..ihl + 8].copy_from_slice(&seq.to_be_bytes());
-    let tcp_len = (thl + pay.len()) as u16;
+    let tcp_len = (thl + pay_len) as u16;
     let mut pseudo = [0u8; 12];
     pseudo[0..4].copy_from_slice(&b[12..16]); // src ip
     pseudo[4..8].copy_from_slice(&b[16..20]); // dst ip
@@ -781,7 +868,7 @@ fn emit_gso_tcp(
     b[ihl + 17] = partial as u8;
 
     let csum_start = (ETH_HDR + ihl) as u16;
-    let vhdr = if pay.len() > mss as usize {
+    let vhdr = if pay_len > mss as usize {
         RxHeader {
             flags: HDR_F_NEEDS_CSUM,
             gso_type: HDR_GSO_TCPV4,
@@ -836,7 +923,7 @@ fn maybe_post_recv(flow: &mut TcpFlow) -> bool {
     if !flow.connected || flow.recv_pending || flow.closing || flow.dead {
         return true;
     }
-    if flow.pending_to_guest.len() > TCP_BUF {
+    if flow.pending_to_guest.len() > TO_GUEST_SPILL_CAP {
         return true;
     }
     let op = flow.op.as_mut().unwrap();
@@ -1140,10 +1227,10 @@ struct NatState {
     // per-packet heap allocation (the worker is single-threaded).
     tx_scratch: Vec<u8>,
     l3_scratch: Vec<u8>,
-    // GSO coalescing scratch (header template + accumulated payload), reused
-    // across `tcp_drive` calls so the hot path stays allocation-free.
-    gso_hdr: Vec<u8>,
-    gso_payload: Vec<u8>,
+    // GSO coalescing frame and the TCB receive-drain buffer, reused across
+    // `tcp_drive` calls so the hot path neither allocates nor zeroes.
+    gso: GsoFrame,
+    drain_scratch: Vec<u8>,
     wake: Wake,
     stats: Arc<NatStats>,
 }
@@ -1332,6 +1419,12 @@ impl NatState {
 
     fn now(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
+    }
+
+    /// Whether the guest accepts partial checksums (`HDR_F_NEEDS_CSUM`), so
+    /// a TCB can leave its TCP checksums to the guest.
+    fn rx_csum_ok(&self) -> bool {
+        self.net.upgrade().is_some_and(|d| d.rx_csum_ok())
     }
 
     /// Pick the Tcb size-tier for a flow from its service port, falling back to
@@ -1616,10 +1709,12 @@ impl NatState {
         // Acquire a Tcb of the chosen size-tier plus the overlapped ops, all
         // from preallocated pools, and arm them for this connection.
         let tier = self.choose_tier(dport);
+        let csum_offload = self.rx_csum_ok();
         let mut tcb = self.tcb_pools[tier].acquire();
         tcb.reinit(cfg);
         tcb.set_secret(&self.tcb_secret);
         tcb.set_now(now);
+        tcb.set_tx_csum_offload(csum_offload);
         if tcb.listen().is_err() {
             self.tcb_pools[tier].release(tcb);
             sys::close_sock(sock);
@@ -1677,6 +1772,7 @@ impl NatState {
                 diag: FlowDiag::default(),
                 published: Losses::default(),
                 rx_blocked: false,
+                csum_offload,
             },
         );
         Some(())
@@ -1726,10 +1822,12 @@ impl NatState {
         };
         // Acquire a Tcb of the chosen tier and actively open it toward the guest.
         let tier = self.choose_tier(guest_port);
+        let csum_offload = self.rx_csum_ok();
         let mut tcb = self.tcb_pools[tier].acquire();
         tcb.reinit(cfg);
         tcb.set_secret(&self.tcb_secret);
         tcb.set_now(now);
+        tcb.set_tx_csum_offload(csum_offload);
         if tcb.connect().is_err() {
             // active open: emits a SYN toward the guest
             self.tcb_pools[tier].release(tcb);
@@ -1777,6 +1875,7 @@ impl NatState {
                 diag: FlowDiag::default(),
                 published: Losses::default(),
                 rx_blocked: false,
+                csum_offload,
             },
         );
         // Emit the SYN toward the guest and arm the host receive.
@@ -1837,7 +1936,7 @@ impl NatState {
                     // send ring (skipping the `pending_to_guest` staging copy —
                     // ~735 MB/s of memcpy at the current ceiling). Only the
                     // remainder (send-ring full) spills to `pending_to_guest`;
-                    // with the default 1 MiB ring and a 64 KiB recv that's rare.
+                    // with the default 1 MiB ring and a 256 KiB recv that's rare.
                     // SAFETY: `op.buf` and `tcb` are disjoint Box fields of
                     // `flow`; `send` only reads from the slice.
                     let buf_ptr = flow.op.as_ref().unwrap().buf.as_ptr();
@@ -1928,21 +2027,24 @@ impl NatState {
         let now = self.now();
         let dev = self.net.upgrade();
         let gso_ok = dev.as_ref().is_some_and(|d| d.rx_gso_ok());
+        let csum_ok = dev.as_ref().is_some_and(|d| d.rx_csum_ok());
         let mut scratch = std::mem::take(&mut self.tx_scratch);
-        let mut ghdr = std::mem::take(&mut self.gso_hdr);
-        let mut gpay = std::mem::take(&mut self.gso_payload);
         let mut teardown = false;
         if let Some(flow) = self.tcp.get_mut(&key) {
             if flow.dead {
                 self.tx_scratch = scratch;
-                self.gso_hdr = ghdr;
-                self.gso_payload = gpay;
                 return;
             }
             // Segments built here carry this time (timestamps, RTT samples,
             // loss timers); some callers (host send completion, RX-space
             // resume) arrive without having set it.
             flow.tcb.as_mut().unwrap().set_now(now);
+            // Follow the guest if it renegotiated checksum offload.
+            if flow.csum_offload != csum_ok {
+                flow.csum_offload = csum_ok;
+                flow.tcb.as_mut().unwrap().set_tx_csum_offload(csum_ok);
+            }
+            let offload = flow.csum_offload;
             // Drain the tcb's egress queue, coalescing consecutive data segments
             // into one GSO super-frame so the guest's TCP stack processes 1 skb
             // per ~64 KiB instead of ~45 per-MSS skbs (the ~207 MB/s ceiling was
@@ -1954,21 +2056,7 @@ impl NatState {
             // egress ring happens in `maybe_send_data`, which `tick()` drives.
             // The outer loop pumps extract→tick until a tick stages nothing,
             // so one `tcp_drive` drains the whole send ring (not just 32 segs).
-            let mut pbuf = [0u8; tcp_sans_io::MAX_PACKET];
-            ghdr.clear();
-            gpay.clear();
-            let mut acc_seq: u32 = 0;
-            let mut acc_mss: u16 = 0;
-            macro_rules! flush_gso {
-                () => {
-                    if !gpay.is_empty() {
-                        if let Some(d) = &dev {
-                            emit_gso_tcp(d, &mut scratch, &ghdr, &gpay, acc_seq, acc_mss, gm, gw);
-                        }
-                        gpay.clear();
-                    }
-                };
-            }
+            let gso = &mut self.gso;
             // Drain the tcb receive ring into the guest->host queue before
             // pumping egress, so the window update `recv` queues once space
             // frees leaves in this same drive (the guest sender may be stalled
@@ -1976,9 +2064,9 @@ impl NatState {
             // guest window closed (backpressure) instead of buffering without
             // bound.
             if flow.tcb.as_ref().unwrap().poll() & EV_READABLE != 0 {
-                let mut rb = [0u8; 16384];
+                let rb = &mut self.drain_scratch;
                 while flow.pending_to_host.len() < TO_HOST_CAP {
-                    match flow.tcb.as_mut().unwrap().recv(&mut rb) {
+                    match flow.tcb.as_mut().unwrap().recv(rb) {
                         Ok(0) => break,
                         Ok(n) => flow.pending_to_host.extend_from_slice(&rb[..n]),
                         Err(_) => break,
@@ -1995,47 +2083,47 @@ impl NatState {
                 // and held in the egress ring it would go stale — the tail
                 // draws a spurious tail-loss probe after one PTO, a hold past
                 // the RTO collapses cwnd, and the hold inflates the RTT sample.
+                // Each datagram is lent straight out of the TCB's egress ring.
                 let mut any = false;
-                loop {
-                    let n = match flow.tcb.as_mut().unwrap().extract_packet(&mut pbuf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => n,
-                    };
-                    any = true;
-                    let dgram = &pbuf[..n];
-                    if diag && !data_out {
-                        data_out = split_tcp_dgram(dgram).is_some_and(|(_, p, _, _)| !p.is_empty());
-                    }
-                    let coalesce = gso_ok
-                        && match split_tcp_dgram(dgram) {
-                            Some((hdr, pay, seq, flags))
-                                if !pay.is_empty()
-                                    && flags & (TCP_SYN | TCP_FIN | TCP_RST) == 0 =>
-                            {
-                                let expected = acc_seq.wrapping_add(gpay.len() as u32);
-                                if !gpay.is_empty()
-                                    && (seq != expected || gpay.len() + pay.len() > GSO_PAYLOAD_CAP)
-                                {
-                                    flush_gso!();
-                                }
-                                if gpay.is_empty() {
-                                    acc_seq = seq;
-                                    acc_mss = pay.len() as u16;
-                                }
-                                gpay.extend_from_slice(pay);
-                                ghdr.clear();
-                                ghdr.extend_from_slice(hdr);
-                                true
+                while flow
+                    .tcb
+                    .as_mut()
+                    .unwrap()
+                    .extract_packet_with(&mut |dgram| {
+                        if diag && !data_out {
+                            data_out =
+                                split_tcp_dgram(dgram).is_some_and(|(_, p, _, _)| !p.is_empty());
+                        }
+                        let seg = split_tcp_dgram(dgram).filter(|&(_, pay, _, flags)| {
+                            gso_ok && !pay.is_empty() && flags & (TCP_SYN | TCP_FIN | TCP_RST) == 0
+                        });
+                        if let Some((hdr, pay, seq, _)) = seg {
+                            if gso.payload_len() > 0 && !gso.extends(seq, pay.len()) {
+                                gso.flush(dev.as_deref(), gm, gw);
                             }
-                            _ => false,
-                        };
-                    if !coalesce {
-                        flush_gso!();
+                            gso.push(hdr, pay, seq);
+                            return;
+                        }
+                        gso.flush(dev.as_deref(), gm, gw);
                         if let Some(d) = &dev {
                             build_eth_into(&mut scratch, gm, gw, ETHERTYPE_IPV4, dgram);
-                            d.inject_rx(&scratch);
+                            if offload {
+                                // The TCB left the TCP checksum for the guest.
+                                let ihl = (dgram[0] & 0x0F) as usize * 4;
+                                let vhdr = RxHeader {
+                                    flags: HDR_F_NEEDS_CSUM,
+                                    csum_start: (ETH_HDR + ihl) as u16,
+                                    csum_offset: 16,
+                                    ..Default::default()
+                                };
+                                d.inject_rx_gso(&scratch, vhdr);
+                            } else {
+                                d.inject_rx(&scratch);
+                            }
                         }
-                    }
+                    })
+                {
+                    any = true;
                 }
                 if ticked && !any {
                     break 'pump;
@@ -2057,7 +2145,7 @@ impl NatState {
                 let _ = flow.tcb.as_mut().unwrap().tick();
                 ticked = true;
             } // 'pump
-            flush_gso!();
+            gso.flush(dev.as_deref(), gm, gw);
             if rx_paused && !flow.rx_blocked {
                 flow.rx_blocked = true;
                 self.rx_blocked.push(key);
@@ -2080,8 +2168,6 @@ impl NatState {
             }
         }
         self.tx_scratch = scratch;
-        self.gso_hdr = ghdr;
-        self.gso_payload = gpay;
         if teardown {
             self.begin_teardown(key);
         }
@@ -2339,7 +2425,7 @@ impl NatBackend {
             big_pool: big_pool.clone(),
             l4_csum_trusted: false,
             tcb_pools,
-            tcp_op_pool: BoxPool::new(MAX_TCP_FLOWS, make_tcp_op),
+            tcp_op_pool: BoxPool::new(TCP_RECV_OP_WARM, make_tcp_op),
             tcp_send_op_pool: BoxPool::new(MAX_TCP_FLOWS, make_tcp_send_op),
             udp_op_pool: BoxPool::new(MAX_UDP_FLOWS, make_udp_op),
             accept_pool,
@@ -2357,8 +2443,8 @@ impl NatBackend {
             rx_spare: Vec::new(),
             tx_scratch: Vec::with_capacity(GSO_FRAME_CAP),
             l3_scratch: Vec::with_capacity(FRAME_CAP),
-            gso_hdr: Vec::with_capacity(64),
-            gso_payload: Vec::with_capacity(GSO_PAYLOAD_CAP),
+            gso: GsoFrame::new(),
+            drain_scratch: vec![0; 16384],
             wake: Wake::Other,
             stats: stats.clone(),
         };
@@ -2522,13 +2608,9 @@ mod tests {
 
     /// Move every datagram `from` has staged into `to`.
     fn shuttle(from: &mut dyn TcbDyn, to: &mut dyn TcbDyn) {
-        let mut pkt = [0u8; tcp_sans_io::MAX_PACKET];
-        while let Ok(n) = from.extract_packet(&mut pkt) {
-            if n == 0 {
-                break;
-            }
-            let _ = to.inject_packet(&pkt[..n]);
-        }
+        while from.extract_packet_with(&mut |pkt| {
+            let _ = to.inject_packet(pkt);
+        }) {}
     }
 
     /// The host closes while bytes it sent are still spilled in
@@ -2595,6 +2677,7 @@ mod tests {
             diag: FlowDiag::default(),
             published: Losses::default(),
             rx_blocked: false,
+            csum_offload: false,
         };
         on_host_eof(&mut flow);
 
