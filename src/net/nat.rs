@@ -210,6 +210,8 @@ trait TcbDyn {
     fn send(&mut self, data: &[u8]) -> Result<usize, TcpError>;
     fn state(&self) -> State;
     fn tick(&mut self) -> Result<(), TcpError>;
+    /// Host back-pressure: build no more segments until resumed.
+    fn set_egress_paused(&mut self, paused: bool);
     fn abort(&mut self) -> Result<(), TcpError>;
     fn close(&mut self) -> Result<(), TcpError>;
     /// Recycle this Tcb onto a new connection in place (reuses its rings).
@@ -250,6 +252,9 @@ impl<const BUF: usize> TcbDyn for Tcb<BUF> {
     }
     fn tick(&mut self) -> Result<(), TcpError> {
         self.tick()
+    }
+    fn set_egress_paused(&mut self, paused: bool) {
+        self.set_egress_paused(paused)
     }
     fn abort(&mut self) -> Result<(), TcpError> {
         self.abort()
@@ -941,6 +946,9 @@ struct NatStats {
     ooo_drops: AtomicU64,
     /// Guest frames dropped because the frame pool was exhausted.
     tx_drops: AtomicU64,
+    /// Most completions a due timer sweep found already queued and handled
+    /// first (within its catch-up budget): how far the worker fell behind.
+    iocp_backlog_max: AtomicU64,
     host_stalls: AtomicU64,
     host_stall_ms: AtomicU64,
     rx_stalls: AtomicU64,
@@ -978,7 +986,7 @@ impl NatStats {
         let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
         let mut s = format!(
             "nat: tcp_flows={} retransmits={} ({} B) rto={} tlp={} recoveries={} dsacks={} \
-             dup_bytes_from_guest={} ooo_drops={} tx_drops={}",
+             dup_bytes_from_guest={} ooo_drops={} tx_drops={} iocp_backlog_max={}",
             ld(&self.tcp_flows),
             ld(&self.segs_retrans),
             ld(&self.bytes_retrans),
@@ -989,6 +997,7 @@ impl NatStats {
             ld(&self.dup_bytes_received),
             ld(&self.ooo_drops),
             ld(&self.tx_drops),
+            ld(&self.iocp_backlog_max),
         );
         if crate::diag::net_enabled() {
             s.push_str(&format!(
@@ -1150,69 +1159,14 @@ impl NatState {
     fn run(mut self) {
         const IDLE_MS: u32 = 25;
         const TICK_GATE_MS: u64 = 20;
-        loop {
+        // Time a due timer sweep spends first on completions already queued:
+        // enough to catch up after a hiccup, bounded so a completion flood
+        // cannot starve the timers.
+        const SWEEP_CATCHUP_MS: u64 = 10;
+        'run: loop {
             let (ok, bytes, key, ov) = sys::get_ms(self.iocp, IDLE_MS);
-            if ov.is_null() {
-                if key == KEY_STOP {
-                    break;
-                }
-                if key == KEY_RX_SPACE {
-                    self.wake = Wake::RxSpace;
-                    self.resume_rx_blocked();
-                }
-                // Otherwise a timeout: fall through to the timer sweep below.
-            } else {
-                self.wake = Wake::Other;
-                match key {
-                    KEY_FRAME | KEY_FRAME_OFFLOAD => {
-                        self.wake = Wake::Guest;
-                        let (idx, frame) = unsafe { FramePool::<FRAME_CAP>::received(ov, bytes) };
-                        self.l4_csum_trusted = key == KEY_FRAME_OFFLOAD;
-                        self.handle_frame(frame);
-                        self.l4_csum_trusted = false;
-                        self.pool.release(idx);
-                    }
-                    KEY_FRAME_OFFLOAD_BIG => {
-                        self.wake = Wake::Guest;
-                        let (idx, frame) =
-                            unsafe { FramePool::<TX_FRAME_CAP>::received(ov, bytes) };
-                        self.l4_csum_trusted = true;
-                        self.handle_frame(frame);
-                        self.l4_csum_trusted = false;
-                        self.big_pool.release(idx);
-                    }
-                    KEY_UDP => self.on_udp_recv(ov as *mut UdpOp, ok, bytes),
-                    KEY_ICMP => {
-                        let msg = unsafe { Box::from_raw(ov as *mut IcmpReplyMsg) };
-                        self.on_icmp_reply(&msg);
-                        self.icmp_reply_pool.release(msg);
-                    }
-                    KEY_ACCEPT => {
-                        let msg = unsafe { Box::from_raw(ov as *mut AcceptMsg) };
-                        let (sock, guest_ip, guest_port) = (msg.sock, msg.guest_ip, msg.guest_port);
-                        self.accept_pool.release(msg);
-                        self.accept_inflight.fetch_sub(1, Ordering::AcqRel);
-                        self.new_inbound_flow(sock, guest_ip, guest_port);
-                    }
-                    KEY_TCP => {
-                        // The completion key comes from the socket's IOCP
-                        // association, so connect/recv/send all arrive as
-                        // KEY_TCP; the op kind disambiguates them.
-                        let kind = unsafe { (*(ov as *const TcpOvHeader)).kind };
-                        self.wake = match kind {
-                            1 => Wake::HostRecv,
-                            2 => Wake::HostSend,
-                            _ => Wake::Other,
-                        };
-                        match kind {
-                            0 => self.on_tcp_connect(ov as *mut TcpOp, ok),
-                            1 => self.on_tcp_recv(ov as *mut TcpOp, ok, bytes),
-                            2 => self.on_tcp_send(ov as *mut TcpSendOp, ok, bytes),
-                            _ => {}
-                        }
-                    }
-                    _ => {}
-                }
+            if !self.dispatch(ok, bytes, key, ov) {
+                break;
             }
             // Drive per-flow TCP timers (retransmit / delayed-ACK) on a coarse
             // cadence rather than on every completion: those timers are coarse
@@ -1221,19 +1175,121 @@ impl NatState {
             // packet).
             let now = self.now();
             if now.wrapping_sub(self.last_tick) >= TICK_GATE_MS {
-                self.last_tick = now;
+                // Catch up first. When this worker falls behind, the guest's
+                // ACKs wait in the queue; a sweep that ran ahead of them would
+                // read that silence as a lost tail and probe every busy flow.
+                let mut queued = 0u64;
+                loop {
+                    let (ok, bytes, key, ov) = sys::get_ms(self.iocp, 0);
+                    if ov.is_null() && key == 0 {
+                        break;
+                    }
+                    queued += 1;
+                    if !self.dispatch(ok, bytes, key, ov) {
+                        break 'run;
+                    }
+                    if self.now().wrapping_sub(now) >= SWEEP_CATCHUP_MS {
+                        break;
+                    }
+                }
+                self.stats
+                    .iocp_backlog_max
+                    .fetch_max(queued, Ordering::Relaxed);
+                self.last_tick = self.now();
                 self.wake = Wake::Timer;
+                let tlp0 = self.stats.tlp.load(Ordering::Relaxed);
                 self.tcp_tick();
+                if crate::diag::net_enabled() {
+                    let fired = self.stats.tlp.load(Ordering::Relaxed) - tlp0;
+                    if fired > 0 {
+                        eprintln!(
+                            "[nat] timer sweep fired {fired} tail-loss probes \
+                             ({queued} queued completions handled first)"
+                        );
+                    }
+                }
             }
+            // Re-read the clock: the catch-up above may have created flows or
+            // stamped activity after `now`, and those must not look ancient.
+            let now = self.now();
             if now.wrapping_sub(self.last_expire) >= EXPIRE_GATE_MS {
                 self.last_expire = now;
                 self.expire_idle(now);
             }
         }
-        // Shutdown: drop all live flows. take() the pooled boxes first (the
-        // pools are dying, so just discard them) so the Drop-bomb treats these
-        // intentional drops as reaped. TcpFlow::drop then closes the host
-        // socket; for UDP the socket lives in the op, so close it here.
+        self.shutdown();
+    }
+
+    /// Handle one IOCP dequeue (a timeout is a no-op). Returns false on stop.
+    fn dispatch(&mut self, ok: bool, bytes: u32, key: usize, ov: *mut OVERLAPPED) -> bool {
+        if ov.is_null() {
+            if key == KEY_STOP {
+                return false;
+            }
+            if key == KEY_RX_SPACE {
+                self.wake = Wake::RxSpace;
+                self.resume_rx_blocked();
+            }
+            return true;
+        }
+        self.wake = Wake::Other;
+        match key {
+            KEY_FRAME | KEY_FRAME_OFFLOAD => {
+                self.wake = Wake::Guest;
+                let (idx, frame) = unsafe { FramePool::<FRAME_CAP>::received(ov, bytes) };
+                self.l4_csum_trusted = key == KEY_FRAME_OFFLOAD;
+                self.handle_frame(frame);
+                self.l4_csum_trusted = false;
+                self.pool.release(idx);
+            }
+            KEY_FRAME_OFFLOAD_BIG => {
+                self.wake = Wake::Guest;
+                let (idx, frame) = unsafe { FramePool::<TX_FRAME_CAP>::received(ov, bytes) };
+                self.l4_csum_trusted = true;
+                self.handle_frame(frame);
+                self.l4_csum_trusted = false;
+                self.big_pool.release(idx);
+            }
+            KEY_UDP => self.on_udp_recv(ov as *mut UdpOp, ok, bytes),
+            KEY_ICMP => {
+                let msg = unsafe { Box::from_raw(ov as *mut IcmpReplyMsg) };
+                self.on_icmp_reply(&msg);
+                self.icmp_reply_pool.release(msg);
+            }
+            KEY_ACCEPT => {
+                let msg = unsafe { Box::from_raw(ov as *mut AcceptMsg) };
+                let (sock, guest_ip, guest_port) = (msg.sock, msg.guest_ip, msg.guest_port);
+                self.accept_pool.release(msg);
+                self.accept_inflight.fetch_sub(1, Ordering::AcqRel);
+                self.new_inbound_flow(sock, guest_ip, guest_port);
+            }
+            KEY_TCP => {
+                // The completion key comes from the socket's IOCP
+                // association, so connect/recv/send all arrive as
+                // KEY_TCP; the op kind disambiguates them.
+                let kind = unsafe { (*(ov as *const TcpOvHeader)).kind };
+                self.wake = match kind {
+                    1 => Wake::HostRecv,
+                    2 => Wake::HostSend,
+                    _ => Wake::Other,
+                };
+                match kind {
+                    0 => self.on_tcp_connect(ov as *mut TcpOp, ok),
+                    1 => self.on_tcp_recv(ov as *mut TcpOp, ok, bytes),
+                    2 => self.on_tcp_send(ov as *mut TcpSendOp, ok, bytes),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Shutdown: drop all live flows. take() the pooled boxes first (the pools
+    /// are dying, so just discard them) so the Drop-bomb treats these
+    /// intentional drops as reaped. TcpFlow::drop then closes the host socket;
+    /// for UDP the socket lives in the op, so close it here.
+    fn shutdown(&mut self) {
         for (_, mut f) in self.tcp.drain() {
             publish_tcb_stats(&mut f, &self.stats);
             f.tcb.take();
@@ -1842,6 +1898,7 @@ impl NatState {
     fn tcp_drive(&mut self, key: FlowKey) {
         let gw = self.gw_mac;
         let gm = self.guest_mac;
+        let now = self.now();
         let dev = self.net.upgrade();
         let gso_ok = dev.as_ref().is_some_and(|d| d.rx_gso_ok());
         let mut scratch = std::mem::take(&mut self.tx_scratch);
@@ -1855,6 +1912,10 @@ impl NatState {
                 self.gso_payload = gpay;
                 return;
             }
+            // Segments built here carry this time (timestamps, RTT samples,
+            // loss timers); some callers (host send completion, RX-space
+            // resume) arrive without having set it.
+            flow.tcb.as_mut().unwrap().set_now(now);
             // Drain the tcb's egress queue, coalescing consecutive data segments
             // into one GSO super-frame so the guest's TCP stack processes 1 skb
             // per ~64 KiB instead of ~45 per-MSS skbs (the ~207 MB/s ceiling was
@@ -1864,7 +1925,7 @@ impl NatState {
             //
             // `Tcb::send` only fills the send ring; staging into the 32-slot
             // egress ring happens in `maybe_send_data`, which `tick()` drives.
-            // The outer loop pumps tick→extract until no more segments stage,
+            // The outer loop pumps extract→tick until a tick stages nothing,
             // so one `tcp_drive` drains the whole send ring (not just 32 segs).
             let mut pbuf = [0u8; tcp_sans_io::MAX_PACKET];
             ghdr.clear();
@@ -1900,21 +1961,15 @@ impl NatState {
             let diag = crate::diag::net_enabled();
             let mut data_out = false;
             let mut rx_paused = false;
+            let mut ticked = false;
             'pump: loop {
-                // Top up the send ring from any spillover before each tick so a
-                // recv larger than one egress-ring pass still drains in one drive.
-                flush_to_tcb(flow);
-                let _ = flow.tcb.as_mut().unwrap().tick();
+                // Deliver everything already staged, even into a deep backlog:
+                // it was built for now (ACK, window, timestamp, loss timers),
+                // and held in the egress ring it would go stale — the tail
+                // draws a spurious tail-loss probe after one PTO, a hold past
+                // the RTO collapses cwnd, and the hold inflates the RTT sample.
                 let mut any = false;
                 loop {
-                    // Backpressure: while the guest's RX backlog is deep, leave
-                    // segments in the TCB. Its rings fill, which closes the
-                    // host-recv side too (`maybe_post_recv`); the NIC wakes us
-                    // via KEY_RX_SPACE once the guest has taken the backlog.
-                    if dev.as_ref().is_some_and(|d| d.rx_congested()) {
-                        rx_paused = true;
-                        break 'pump;
-                    }
                     let n = match flow.tcb.as_mut().unwrap().extract_packet(&mut pbuf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => n,
@@ -1955,9 +2010,25 @@ impl NatState {
                         }
                     }
                 }
-                if !any {
+                if ticked && !any {
                     break 'pump;
                 }
+                // Backpressure (like TCP Small Queues): while the guest's RX
+                // backlog is deep, the TCB builds nothing more, so nothing
+                // ages in its egress ring. Its rings fill, which closes the
+                // host-recv side too (`maybe_post_recv`); the NIC wakes us via
+                // KEY_RX_SPACE once the guest has taken the backlog.
+                let congested = dev.as_ref().is_some_and(|d| d.rx_congested());
+                flow.tcb.as_mut().unwrap().set_egress_paused(congested);
+                if congested {
+                    rx_paused = true;
+                    break 'pump;
+                }
+                // Top up the send ring from any spillover before each tick so a
+                // recv larger than one egress-ring pass still drains in one drive.
+                flush_to_tcb(flow);
+                let _ = flow.tcb.as_mut().unwrap().tick();
+                ticked = true;
             } // 'pump
             flush_gso!();
             if rx_paused && !flow.rx_blocked {
@@ -2052,7 +2123,7 @@ impl NatState {
         let udp_dead: Vec<FlowKey> = self
             .udp
             .iter()
-            .filter(|(_, f)| !f.dead && now.wrapping_sub(f.last_use) > UDP_IDLE_MS)
+            .filter(|(_, f)| !f.dead && now.saturating_sub(f.last_use) > UDP_IDLE_MS)
             .map(|(k, _)| *k)
             .collect();
         for k in udp_dead {
@@ -2074,7 +2145,7 @@ impl NatState {
                 if f.dead {
                     return false;
                 }
-                let idle = now.wrapping_sub(f.last_activity);
+                let idle = now.saturating_sub(f.last_activity);
                 let st = f.tcb.as_ref().unwrap().state();
                 let half = matches!(
                     st,
@@ -2088,7 +2159,7 @@ impl NatState {
                 // completed (outbound) or the TCB hasn't reached a synchronized
                 // state (covers an inbound flow whose guest never accepts).
                 let establishing = !f.connected || !st.is_synchronized();
-                (establishing && now.wrapping_sub(f.created_at) > TCP_CONNECT_MS)
+                (establishing && now.saturating_sub(f.created_at) > TCP_CONNECT_MS)
                     || (half && idle > TCP_HALF_CLOSE_MS)
                     || (idle > TCP_IDLE_MS)
             })

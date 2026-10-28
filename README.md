@@ -855,11 +855,15 @@ the locking story above.
   shares reject writes with `EROFS`.
 * **Backpressure, not unbounded buffering:** the NAT's per-flow guest→host queue
   caps at `TO_HOST_CAP = 64 KiB` (closing the guest TCP window). Toward the
-  guest, the NAT stops pulling segments out of its TCBs while the NIC's RX
-  backlog (frames waiting for guest RX buffers, 64 slots) holds 32 frames, and
-  resumes when the NIC reports it drained to 8 (`NetDevice::rx_congested` /
-  `NetBackend::on_rx_space`); the held data fills the TCB rings, which stops
-  host recvs in turn. Sources that don't throttle (ARP, ICMP, UDP, the WinTun
+  guest, while the NIC's RX backlog (frames waiting for guest RX buffers, 64
+  slots) holds 32 frames, the NAT pauses its TCBs' egress (tcp-sans-io
+  `Tcb::set_egress_paused`, like Linux TCP Small Queues): segments a TCB already
+  built are delivered, no new ones are built, and it resumes when the NIC
+  reports the backlog drained to 8 (`NetDevice::rx_congested` /
+  `NetBackend::on_rx_space`). Building segments only when they can leave keeps
+  their ACK, window, timestamp and loss timers current, so a pause is not
+  mistaken for loss. The held data fills the TCB rings, which stops host recvs
+  in turn. Sources that don't throttle (ARP, ICMP, UDP, the WinTun
   and loopback backends) still **drop** at a full backlog. The ICMP handoff
   queue is bounded.
 
@@ -958,9 +962,10 @@ Teardown also prints one line per NIC (always on: every counter sits on a slow
 path, so the steady state pays nothing):
 
 ```text
-[net] nic0 rx_frames=107808 tx_frames=72177 rx_backlogged=108 rx_rewinds=109 rx_truncated=0
-  rx_backlog_drops=0 rx_backlog_max=23 rx_throttles=0 | nat: tcp_flows=28 retransmits=0 (0 B)
-  rto=0 tlp=0 recoveries=0 dsacks=0 dup_bytes_from_guest=0 ooo_drops=0 tx_drops=0
+[net] nic0 rx_frames=74851 tx_frames=41014 rx_backlogged=72 rx_rewinds=74 rx_truncated=0
+  rx_backlog_drops=0 rx_backlog_max=31 rx_throttles=0 | nat: tcp_flows=8 retransmits=0 (0 B)
+  rto=0 tlp=0 recoveries=0 dsacks=0 dup_bytes_from_guest=1144 ooo_drops=0 tx_drops=0
+  iocp_backlog_max=401
 ```
 
 * **virtio-net RX:** `rx_backlogged` frames waited for guest RX buffers;
@@ -972,14 +977,19 @@ path, so the steady state pays nothing):
   summed over flows): retransmits and their causes (`rto`, `tlp`, fast
   `recoveries`), `dsacks` (the guest received a duplicate, so a retransmit was
   spurious), `dup_bytes_from_guest` / `ooo_drops` (guest data received twice, or
-  dropped because the out-of-order tracker was full), and `tx_drops` (guest
-  frames dropped because the frame pool was full).
+  dropped because the out-of-order tracker was full), `tx_drops` (guest
+  frames dropped because the frame pool was full), and `iocp_backlog_max`: the
+  most completions the NAT worker found already queued when its 20 ms timer
+  sweep came due. The sweep spends up to 10 ms handling them first, so a worker
+  that fell behind does not read the guest ACKs still in its queue as a lost
+  tail.
 
 `TINYVMM_NET_DIAG=1` adds live stderr lines: guest-bound data stalls of 10 ms or
 more with what resumed them (a host recv outstanding about as long as the stall
 means the host sender stalled; guest RX space means the guest was slow to take
-frames; a guest frame means the guest's window or ACK clock), per-flow loss
-counters when a flow with losses closes, and RX backlog drops / truncations.
+frames; a guest frame means the guest's window or ACK clock), timer sweeps that
+fired tail-loss probes, per-flow loss counters when a flow with losses closes,
+and RX backlog drops / truncations.
 The summary then also totals stalls of 3 ms or more:
 `stalls: host=… guest_rx=… other=…`.
 
