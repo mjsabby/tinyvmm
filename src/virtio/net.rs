@@ -10,7 +10,7 @@ use crate::virtio::device::{
 use crate::virtio::queue::{PoppedChain, Virtqueue};
 use crate::whp::GuestMemory;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 const NET_F_CSUM: u64 = 1 << 0;
@@ -72,6 +72,13 @@ impl RxHeader {
 /// ~64 KiB of TCP payload, so the slot must hold a full GSO super-frame.
 const RX_FRAME_CAP: usize = 65600;
 const RX_POOL_SLOTS: usize = 64;
+/// Backlog depth at which [`NetDevice::rx_congested`] tells a backend to stop
+/// sending, and the depth it must drain back to before the backend is woken
+/// ([`NetBackend::on_rx_space`]). The gap below [`RX_POOL_SLOTS`] absorbs
+/// frames already being built and traffic that isn't throttled (ARP, ICMP,
+/// UDP); the hysteresis batches the wakes.
+const RX_BACKLOG_HIGH: usize = 32;
+const RX_BACKLOG_LOW: usize = 8;
 
 pub const NET_RX_QUEUE: u32 = 0;
 pub const NET_TX_QUEUE: u32 = 1;
@@ -93,6 +100,10 @@ pub trait NetBackend: Send + Sync {
         tx_offload_software(frame, hdr, &mut |f| self.on_guest_frame(f));
     }
     fn stop(&self) {}
+    /// The RX backlog drained after [`NetDevice::rx_congested`] reported it
+    /// full: resume sending. Runs on whichever thread drained it (doorbell,
+    /// vCPU, or the backend's own via `inject_rx`), so it must not block.
+    fn on_rx_space(&self) {}
     /// Backend counters to append to the NIC's exit summary, if any.
     fn diag_summary(&self) -> Option<String> {
         None
@@ -270,6 +281,8 @@ pub struct RxCounters {
     backlog_drops: AtomicU64,
     /// Deepest the backlog got.
     backlog_max: AtomicU64,
+    /// Times a backend was told to stop sending because the backlog was deep.
+    throttles: AtomicU64,
 }
 
 pub struct NetDevice {
@@ -290,6 +303,10 @@ pub struct NetDevice {
     tx_packets: AtomicU64,
     rx_packets: AtomicU64,
     rx_ctr: RxCounters,
+    /// `rx.pending.len()`, readable without the lock.
+    rx_backlog: AtomicUsize,
+    /// A backend was told the backlog is congested and wants a wake-up.
+    rx_wake: AtomicBool,
 }
 
 impl NetDevice {
@@ -312,6 +329,8 @@ impl NetDevice {
             tx_packets: AtomicU64::new(0),
             rx_packets: AtomicU64::new(0),
             rx_ctr: RxCounters::default(),
+            rx_backlog: AtomicUsize::new(0),
+            rx_wake: AtomicBool::new(false),
         })
     }
 
@@ -354,7 +373,7 @@ impl NetDevice {
         let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
         let mut s = format!(
             "rx_frames={} tx_frames={} rx_backlogged={} rx_rewinds={} rx_truncated={} \
-             rx_backlog_drops={} rx_backlog_max={}",
+             rx_backlog_drops={} rx_backlog_max={} rx_throttles={}",
             self.rx_packets(),
             self.tx_packets(),
             ld(&c.backlogged),
@@ -362,12 +381,47 @@ impl NetDevice {
             ld(&c.truncated),
             ld(&c.backlog_drops),
             ld(&c.backlog_max),
+            ld(&c.throttles),
         );
         if let Some(extra) = self.backend.get().and_then(|b| b.diag_summary()) {
             s.push_str(" | ");
             s.push_str(&extra);
         }
         s
+    }
+
+    /// Whether the RX backlog is too deep for a backend to keep sending. When
+    /// true, stop producing guest-bound frames until [`NetBackend::on_rx_space`]
+    /// is called, which happens once the guest has taken most of the backlog.
+    /// One atomic load while uncongested.
+    pub fn rx_congested(&self) -> bool {
+        if self.rx_backlog.load(Ordering::Relaxed) < RX_BACKLOG_HIGH {
+            return false;
+        }
+        let armed = !self.rx_wake.swap(true, Ordering::SeqCst);
+        // Re-check after arming: a drain racing the arm either sees the flag
+        // (and wakes us) or has already stored the lower depth read here.
+        let congested = self.rx_backlog.load(Ordering::SeqCst) >= RX_BACKLOG_HIGH;
+        if congested && armed {
+            self.rx_ctr.throttles.fetch_add(1, Ordering::Relaxed);
+        }
+        congested
+    }
+
+    /// Wake a backend that [`Self::rx_congested`] paused, once the backlog has
+    /// drained to `left` frames (or was discarded). Read-only unless armed.
+    fn maybe_wake_backend(&self, left: usize) {
+        if left > RX_BACKLOG_LOW
+            || !self.rx_wake.load(Ordering::SeqCst)
+            || !self.rx_wake.swap(false, Ordering::SeqCst)
+        {
+            return;
+        }
+        if !self.backend_detached.load(Ordering::Acquire) {
+            if let Some(b) = self.backend.get() {
+                b.on_rx_space();
+            }
+        }
     }
 
     fn raise(&self, qidx: u32) {
@@ -490,6 +544,7 @@ impl NetDevice {
             };
             rx.slots[idx as usize][..n].copy_from_slice(frame);
             rx.pending.push_back((idx, n as u32, hdr));
+            self.rx_backlog.store(rx.pending.len(), Ordering::SeqCst);
             self.rx_ctr.backlogged.fetch_add(1, Ordering::Relaxed);
             self.rx_ctr
                 .backlog_max
@@ -515,6 +570,7 @@ impl NetDevice {
     fn deliver_rx(&self) {
         let mut rx_interrupt = false;
         let mrg = self.mrg_rxbuf();
+        let left;
         {
             let mut rx = self.rx.lock().unwrap();
             let mut rxq = self.rxq.lock().unwrap();
@@ -537,10 +593,13 @@ impl NetDevice {
                     rx_interrupt = rxq.should_interrupt_driver();
                 }
             }
+            left = rx.pending.len();
+            self.rx_backlog.store(left, Ordering::SeqCst);
         }
         if rx_interrupt {
             self.raise(NET_RX_QUEUE);
         }
+        self.maybe_wake_backend(left);
     }
 }
 
@@ -838,6 +897,8 @@ impl VirtioDevice for NetDevice {
         self.driver_ok.store(false, Ordering::Relaxed);
         self.acked_features.store(0, Ordering::Relaxed);
         self.rx.lock().unwrap().clear();
+        self.rx_backlog.store(0, Ordering::SeqCst);
+        self.maybe_wake_backend(0);
         self.rxq.lock().unwrap().reset();
         self.txq.lock().unwrap().reset();
     }
@@ -1058,5 +1119,67 @@ mod tests {
         assert_eq!(r, Some(3));
         assert_eq!(used_idx(), 3);
         assert_eq!(mem.read_u16(BUF + 10), Some(3), "num_buffers");
+    }
+
+    /// With no guest RX buffers, frames back up in the backlog: a backend that
+    /// honours `rx_congested` is told to stop at the high mark, and is woken
+    /// exactly once when the guest posts buffers and the backlog drains.
+    #[test]
+    fn rx_backlog_throttles_and_wakes_backend() {
+        use crate::virtio::queue::VRING_DESC_F_WRITE;
+        struct Wakes(AtomicUsize);
+        impl NetBackend for Wakes {
+            fn on_guest_frame(&self, _: &[u8]) {}
+            fn on_rx_space(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        const DESC: u64 = 0x1000;
+        const AVAIL: u64 = 0x2000;
+        const USED: u64 = 0x3000;
+        const BUF: u64 = 0x10000;
+        const BUF_LEN: u32 = 2048;
+        const QSIZE: u16 = 64;
+        let mem = Arc::new(GuestMemory::new_host_only(512 * 1024).unwrap());
+        let dev = NetDevice::new(mem.clone(), [2, 0, 0, 0, 0, 1]);
+        let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+        dev.set_backend(wakes.clone());
+        {
+            let mut q = dev.rxq.lock().unwrap();
+            q.set_size(QSIZE.into());
+            q.set_desc_gpa(DESC);
+            q.set_avail_gpa(AVAIL);
+            q.set_used_gpa(USED);
+            q.set_event_idx_enabled(true);
+            q.set_ready(true);
+        }
+        let frame = [0xab_u8; 100];
+        for i in 0..RX_BACKLOG_HIGH {
+            assert!(!dev.rx_congested(), "frame {i}: below the high mark");
+            dev.inject_rx(&frame);
+        }
+        assert!(dev.rx_congested(), "backlog at the high mark");
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+
+        // The guest posts a buffer per ring slot and kicks the RX queue.
+        for i in 0..QSIZE {
+            let mut d = [0u8; 16];
+            d[0..8].copy_from_slice(&(BUF + u64::from(i) * u64::from(BUF_LEN)).to_le_bytes());
+            d[8..12].copy_from_slice(&BUF_LEN.to_le_bytes());
+            d[12..14].copy_from_slice(&VRING_DESC_F_WRITE.to_le_bytes());
+            mem.write_at(DESC + 16 * u64::from(i), &d).unwrap();
+            mem.write_at(AVAIL + 4 + 2 * u64::from(i), &i.to_le_bytes())
+                .unwrap();
+        }
+        mem.write_at(AVAIL + 2, &QSIZE.to_le_bytes()).unwrap();
+        dev.notify_queue(NET_RX_QUEUE);
+
+        assert_eq!(
+            dev.rx_packets(),
+            RX_BACKLOG_HIGH as u64,
+            "backlog delivered"
+        );
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1, "woken once");
+        assert!(!dev.rx_congested());
     }
 }
