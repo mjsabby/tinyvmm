@@ -946,6 +946,42 @@ Measured (`--rng`, 4 vCPUs, 1 GiB; see §12): the watchdog reported `io=1107` (a
 four vCPUs) while teardown reported the BSP's `io=775 mmio=16 cpuid=486 msr=15
 halt=0 other=0`. With a single vCPU the two agree by definition.
 
+### Network counters
+
+Teardown also prints one line per NIC (always on: every counter sits on a slow
+path, so the steady state pays nothing):
+
+```text
+[net] nic0 rx_frames=107808 tx_frames=72177 rx_backlogged=108 rx_rewinds=109 rx_truncated=0
+  rx_backlog_drops=0 rx_backlog_max=23 | nat: tcp_flows=28 retransmits=0 (0 B) rto=0 tlp=0
+  recoveries=0 dsacks=0 dup_bytes_from_guest=0 ooo_drops=0 tx_drops=0
+```
+
+* **virtio-net RX:** `rx_backlogged` frames waited for guest RX buffers;
+  `rx_rewinds` counts a ring running dry mid-frame (buffers given back, frame
+  retried later); `rx_truncated` / `rx_backlog_drops` are frames the guest lost
+  and should be 0.
+* **NAT** (tcp-sans-io's per-connection `TcbStats` for the guest-facing TCBs,
+  summed over flows): retransmits and their causes (`rto`, `tlp`, fast
+  `recoveries`), `dsacks` (the guest received a duplicate, so a retransmit was
+  spurious), `dup_bytes_from_guest` / `ooo_drops` (guest data received twice, or
+  dropped because the out-of-order tracker was full), and `tx_drops` (guest
+  frames dropped because the frame pool was full).
+
+`TINYVMM_NET_DIAG=1` adds live stderr lines: guest-bound data stalls of 10 ms or
+more with what resumed them (a host recv outstanding about as long as the stall
+means the host sender stalled; a guest frame means the guest's window or ACK
+clock), per-flow loss counters when a flow with losses closes, and RX backlog
+drops / truncations. The summary then also totals stalls of 3 ms or more:
+`stalls: host=… other=…`.
+
+`tools/net_compare.py` reports the guest's side for every VMM: deltas of its
+`/proc/net/{snmp,netstat,dev}` counters over the download and upload phases
+(`NETCMP TCPEXT|SNMP|NETDEV` lines) and, in the table, TCP holes, duplicate
+segments and NIC RX drops during the download and retransmits during the
+upload. Non-zero means data was lost, dropped or duplicated between host and
+guest.
+
 ---
 
 ## 12. Boot trace (measured)

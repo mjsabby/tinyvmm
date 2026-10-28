@@ -93,6 +93,10 @@ pub trait NetBackend: Send + Sync {
         tx_offload_software(frame, hdr, &mut |f| self.on_guest_frame(f));
     }
     fn stop(&self) {}
+    /// Backend counters to append to the NIC's exit summary, if any.
+    fn diag_summary(&self) -> Option<String> {
+        None
+    }
 }
 
 const ETH_HDR_LEN: usize = 14;
@@ -252,6 +256,22 @@ struct TxScratch {
 unsafe impl Send for RxPool {}
 unsafe impl Send for TxScratch {}
 
+/// RX slow-path counters. Bumped only when the guest's RX ring can't take a
+/// frame right away, so they cost nothing while the ring stays stocked.
+#[derive(Default)]
+pub struct RxCounters {
+    /// Frames that had to wait in the backlog for guest RX buffers.
+    backlogged: AtomicU64,
+    /// Times the ring ran dry mid-frame and the popped buffers were given back.
+    rewinds: AtomicU64,
+    /// Frames published truncated because even a whole ring couldn't hold them.
+    truncated: AtomicU64,
+    /// Frames dropped because the backlog was full.
+    backlog_drops: AtomicU64,
+    /// Deepest the backlog got.
+    backlog_max: AtomicU64,
+}
+
 pub struct NetDevice {
     rxq: Mutex<Virtqueue>,
     txq: Mutex<Virtqueue>,
@@ -269,6 +289,7 @@ pub struct NetDevice {
     backend_detached: AtomicBool,
     tx_packets: AtomicU64,
     rx_packets: AtomicU64,
+    rx_ctr: RxCounters,
 }
 
 impl NetDevice {
@@ -290,6 +311,7 @@ impl NetDevice {
             backend_detached: AtomicBool::new(false),
             tx_packets: AtomicU64::new(0),
             rx_packets: AtomicU64::new(0),
+            rx_ctr: RxCounters::default(),
         })
     }
 
@@ -323,6 +345,29 @@ impl NetDevice {
     }
     pub fn rx_packets(&self) -> u64 {
         self.rx_packets.load(Ordering::Relaxed)
+    }
+
+    /// One-line data-path summary for the exit report: frame counts, the RX
+    /// slow-path counters, and whatever the backend adds.
+    pub fn diag_summary(&self) -> String {
+        let c = &self.rx_ctr;
+        let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let mut s = format!(
+            "rx_frames={} tx_frames={} rx_backlogged={} rx_rewinds={} rx_truncated={} \
+             rx_backlog_drops={} rx_backlog_max={}",
+            self.rx_packets(),
+            self.tx_packets(),
+            ld(&c.backlogged),
+            ld(&c.rewinds),
+            ld(&c.truncated),
+            ld(&c.backlog_drops),
+            ld(&c.backlog_max),
+        );
+        if let Some(extra) = self.backend.get().and_then(|b| b.diag_summary()) {
+            s.push_str(" | ");
+            s.push_str(&extra);
+        }
+        s
     }
 
     fn raise(&self, qidx: u32) {
@@ -418,7 +463,8 @@ impl NetDevice {
             let mut rxq = self.rxq.lock().unwrap();
             if rxq.ready() && rx.pending.is_empty() {
                 let rxp = &mut *rx;
-                if deliver_frame(&mut rxq, &mut rxp.chain, frame, &hdr, mrg).is_some() {
+                if deliver_frame(&mut rxq, &mut rxp.chain, frame, &hdr, mrg, &self.rx_ctr).is_some()
+                {
                     self.rx_packets.fetch_add(1, Ordering::Relaxed);
                     let irq = rxq.should_interrupt_driver();
                     drop(rxq);
@@ -431,6 +477,10 @@ impl NetDevice {
             }
             drop(rxq);
             let Some(idx) = rx.free.pop() else {
+                self.rx_ctr.backlog_drops.fetch_add(1, Ordering::Relaxed);
+                if crate::diag::net_enabled() {
+                    eprintln!("[net] rx backlog full: dropped a {n}-byte frame");
+                }
                 if etw::enabled(etw::VERBOSE, etw::kw::NET) {
                     etw::Event::new("NetRxDrop", etw::VERBOSE, etw::kw::NET)
                         .u32("len", n as u32)
@@ -440,6 +490,10 @@ impl NetDevice {
             };
             rx.slots[idx as usize][..n].copy_from_slice(frame);
             rx.pending.push_back((idx, n as u32, hdr));
+            self.rx_ctr.backlogged.fetch_add(1, Ordering::Relaxed);
+            self.rx_ctr
+                .backlog_max
+                .fetch_max(rx.pending.len() as u64, Ordering::Relaxed);
         }
         self.deliver_rx();
     }
@@ -469,7 +523,9 @@ impl NetDevice {
                 let rxp = &mut *rx;
                 while let Some(&(idx, len, hdr)) = rxp.pending.front() {
                     let frame = &rxp.slots[idx as usize][..len as usize];
-                    if deliver_frame(&mut rxq, &mut rxp.chain, frame, &hdr, mrg).is_none() {
+                    if deliver_frame(&mut rxq, &mut rxp.chain, frame, &hdr, mrg, &self.rx_ctr)
+                        .is_none()
+                    {
                         break;
                     }
                     rxp.pending.pop_front();
@@ -499,6 +555,7 @@ fn deliver_frame(
     frame: &[u8],
     hdr: &RxHeader,
     mrg: bool,
+    ctr: &RxCounters,
 ) -> Option<u16> {
     // Bounded: a refill racing `rewind_avail` may not kick, so retry rather
     // than wait for it, but never spin on a ring a guest keeps poking.
@@ -535,10 +592,20 @@ fn deliver_frame(
         // even a whole ring can't hold it, publish what fits rather than wedge
         // every later frame behind it.
         if ran_dry && u32::from(nbufs) < rxq.size() {
+            ctr.rewinds.fetch_add(1, Ordering::Relaxed);
             if rxq.rewind_avail(cursor) {
                 continue;
             }
             return None;
+        }
+        if (written as usize) < frame.len() {
+            ctr.truncated.fetch_add(1, Ordering::Relaxed);
+            if crate::diag::net_enabled() {
+                eprintln!(
+                    "[net] rx frame truncated: {written} of {} bytes in {nbufs} buffers",
+                    frame.len()
+                );
+            }
         }
         if let Some(p) = hdr_ptr {
             unsafe {
@@ -974,15 +1041,17 @@ mod tests {
         // The 12-byte header plus 6000 bytes needs three 2 KiB buffers.
         let frame: Vec<u8> = (0..6000u32).map(|i| i as u8).collect();
         let mut chain = PoppedChain::default();
+        let ctr = RxCounters::default();
 
         post(2);
-        let r = deliver_frame(&mut q, &mut chain, &frame, &RxHeader::default(), true);
+        let r = deliver_frame(&mut q, &mut chain, &frame, &RxHeader::default(), true, &ctr);
         assert_eq!(r, None);
+        assert_eq!(ctr.rewinds.load(Ordering::Relaxed), 1);
         assert_eq!(used_idx(), 0, "no truncated frame published");
         assert_eq!(q.avail_cursor(), 0, "popped buffers given back");
 
         post(3);
-        let r = deliver_frame(&mut q, &mut chain, &frame, &RxHeader::default(), true);
+        let r = deliver_frame(&mut q, &mut chain, &frame, &RxHeader::default(), true, &ctr);
         assert_eq!(r, Some(3));
         assert_eq!(used_idx(), 3);
         assert_eq!(mem.read_u16(BUF + 10), Some(3), "num_buffers");

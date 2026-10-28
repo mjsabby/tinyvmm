@@ -2121,6 +2121,11 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
          exits[io={io} mmio={mmio} cpuid={cpuid} msr={msr} halt={halt} other={other}]",
         com1.tx_bytes(),
     );
+    // Network data-path counters (always on; they cost nothing on the hot
+    // path). TINYVMM_NET_DIAG adds live stall/loss lines during the run.
+    for (i, nd) in net_devices.iter().enumerate() {
+        println!("[net] nic{i} {}", nd.diag_summary());
+    }
 
     // TINYVMM_DIAG: per-vCPU exit breakdown + a guest-RAM dump for post-mortem.
     if diag_enabled() {
@@ -3318,6 +3323,9 @@ fn run_restore(args: &[String]) -> Result<i32> {
         reason,
         com1.tx_bytes()
     );
+    for (i, nd) in net_devices.iter().enumerate() {
+        println!("[net] nic{i} {}", nd.diag_summary());
+    }
     Ok(match reason {
         StopReason::GuestHalted | StopReason::Cancelled => 0,
         _ => 1,
