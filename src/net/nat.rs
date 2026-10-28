@@ -674,6 +674,7 @@ struct TcpFlow {
     pending_to_host: Vec<u8>, // guest->host queue (drained by overlapped sends)
     pending_to_guest: Vec<u8>, // host->guest bytes the tcb hasn't accepted yet
     closing: bool,            // host sent FIN: our recv side is closing
+    fin_queued: bool,         // the host FIN was handed to the tcb (after its bytes)
     want_shutdown: bool,      // guest sent FIN: SD_SEND the host once the queue drains
     shutdown_done: bool,      // SD_SEND already issued
     dead: bool,               // tearing down; socket closed, awaiting op drain
@@ -793,7 +794,8 @@ fn emit_gso_tcp(
     dev.inject_rx_gso(eth, vhdr);
 }
 
-/// Push buffered host->guest bytes into the tcb send ring (as much as fits).
+/// Push buffered host->guest bytes into the tcb send ring (as much as fits),
+/// then, once the host has closed and every byte is in, queue the FIN.
 fn flush_to_tcb(flow: &mut TcpFlow) {
     while !flow.pending_to_guest.is_empty() {
         match flow.tcb.as_mut().unwrap().send(&flow.pending_to_guest) {
@@ -804,6 +806,17 @@ fn flush_to_tcb(flow: &mut TcpFlow) {
             Err(_) => break,
         }
     }
+    if flow.closing && !flow.fin_queued && flow.pending_to_guest.is_empty() {
+        flow.fin_queued = true;
+        let _ = flow.tcb.as_mut().unwrap().close();
+    }
+}
+
+/// The host side reached EOF (or failed): stop receiving. The FIN toward the
+/// guest waits in [`flush_to_tcb`] for the bytes the tcb has not taken yet:
+/// closing the tcb now would make them unsendable and cut the stream short.
+fn on_host_eof(flow: &mut TcpFlow) {
+    flow.closing = true;
 }
 
 /// Re-arm a host receive if the flow is connected, idle, and the send ring
@@ -1643,6 +1656,7 @@ impl NatState {
                 pending_to_host: Vec::new(),
                 pending_to_guest: Vec::new(),
                 closing: false,
+                fin_queued: false,
                 want_shutdown: false,
                 shutdown_done: false,
                 dead: false,
@@ -1741,6 +1755,7 @@ impl NatState {
                 pending_to_host: Vec::new(),
                 pending_to_guest: Vec::new(),
                 closing: false,
+                fin_queued: false,
                 want_shutdown: false,
                 shutdown_done: false,
                 dead: false,
@@ -1802,8 +1817,7 @@ impl NatState {
             } else {
                 flow.tcb.as_mut().unwrap().set_now(now);
                 if !ok || bytes == 0 {
-                    let _ = flow.tcb.as_mut().unwrap().close();
-                    flow.closing = true;
+                    on_host_eof(flow);
                 } else {
                     let n = (bytes as usize).min(flow.op.as_ref().unwrap().buf.len());
                     // Fast path: feed the WSARecv buffer straight into the tcb
@@ -2481,5 +2495,115 @@ impl NetBackend for NatBackend {
         if let Some(h) = self.worker.lock().unwrap().take() {
             let _ = h.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Move every datagram `from` has staged into `to`.
+    fn shuttle(from: &mut dyn TcbDyn, to: &mut dyn TcbDyn) {
+        let mut pkt = [0u8; tcp_sans_io::MAX_PACKET];
+        while let Ok(n) = from.extract_packet(&mut pkt) {
+            if n == 0 {
+                break;
+            }
+            let _ = to.inject_packet(&pkt[..n]);
+        }
+    }
+
+    /// The host closes while bytes it sent are still spilled in
+    /// `pending_to_guest` (the tcb's send ring was full): the guest must get
+    /// every byte, then the FIN.
+    #[test]
+    fn host_eof_delivers_spilled_bytes_before_fin() {
+        let nat_end = Endpoint {
+            ip: [10, 0, 0, 1],
+            port: 80,
+        };
+        let guest_end = Endpoint {
+            ip: [10, 0, 0, 2],
+            port: 40000,
+        };
+        let mut nat = TIER_MAKE[0]();
+        nat.reinit(TcbConfig {
+            local: nat_end,
+            remote: guest_end,
+            iss: 1000,
+            initial_rto_ms: 1000,
+        });
+        nat.listen().unwrap();
+        let mut guest = TIER_MAKE[0]();
+        guest.reinit(TcbConfig {
+            local: guest_end,
+            remote: nat_end,
+            iss: 2000,
+            initial_rto_ms: 1000,
+        });
+        guest.connect().unwrap();
+        for _ in 0..4 {
+            guest.tick().unwrap();
+            shuttle(&mut *guest, &mut *nat);
+            nat.tick().unwrap();
+            shuttle(&mut *nat, &mut *guest);
+        }
+        assert_eq!(nat.state(), State::Established);
+
+        // The host sends more than the send ring holds, then closes.
+        let data: Vec<u8> = (0..3 * TIER_BUF[0] as u32).map(|i| (i * 7) as u8).collect();
+        let sent = nat.send(&data).unwrap();
+        assert!(sent < data.len());
+        let mut flow = TcpFlow {
+            tcb: Some(nat),
+            tier: 0,
+            sock: INVALID_SOCKET,
+            op: None,
+            send_op: None,
+            connected: true,
+            connect_pending: false,
+            recv_pending: false,
+            send_inflight: false,
+            pending_to_host: Vec::new(),
+            pending_to_guest: data[sent..].to_vec(),
+            closing: false,
+            fin_queued: false,
+            want_shutdown: false,
+            shutdown_done: false,
+            dead: false,
+            created_at: 0,
+            last_activity: 0,
+            diag: FlowDiag::default(),
+            published: Losses::default(),
+            rx_blocked: false,
+        };
+        on_host_eof(&mut flow);
+
+        // Pump both ends, as `tcp_drive` and the guest would.
+        let mut got = Vec::new();
+        let mut rb = [0u8; 16384];
+        for now in (0..10_000).step_by(10) {
+            flush_to_tcb(&mut flow);
+            let nat = flow.tcb.as_mut().unwrap();
+            nat.set_now(now);
+            nat.tick().unwrap();
+            shuttle(&mut **nat, &mut *guest);
+            guest.set_now(now);
+            while let Ok(n) = guest.recv(&mut rb) {
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&rb[..n]);
+            }
+            guest.tick().unwrap();
+            shuttle(&mut *guest, &mut **nat);
+            if guest.poll() & EV_PEER_CLOSED != 0 {
+                break;
+            }
+        }
+        assert_eq!(got.len(), data.len());
+        assert!(got == data);
+        assert_ne!(guest.poll() & EV_PEER_CLOSED, 0, "the FIN follows the data");
+        flow.tcb.take();
     }
 }
