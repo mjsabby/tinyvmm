@@ -13,6 +13,7 @@
 //! `tcp-sans-io`, host socket via `ConnectEx`), plus inbound `--portfwd`.
 
 use crate::diag::etw;
+use crate::host;
 use crate::net::sys::{self, Iocp};
 use crate::net::wire::*;
 use crate::virtio::net::{
@@ -216,6 +217,9 @@ trait TcbDyn {
     fn close(&mut self) -> Result<(), TcpError>;
     /// Recycle this Tcb onto a new connection in place (reuses its rings).
     fn reinit(&mut self, cfg: TcbConfig);
+    /// Key ISNs, TSval offsets and SYN cookies; `listen` requires it and
+    /// `reinit` clears it.
+    fn set_secret(&mut self, secret: &[u8; 16]);
     fn stats(&self) -> TcbStats;
 }
 
@@ -264,6 +268,9 @@ impl<const BUF: usize> TcbDyn for Tcb<BUF> {
     }
     fn reinit(&mut self, cfg: TcbConfig) {
         self.reinit(cfg)
+    }
+    fn set_secret(&mut self, secret: &[u8; 16]) {
+        self.set_secret(secret)
     }
     fn stats(&self) -> TcbStats {
         self.stats()
@@ -1118,6 +1125,10 @@ struct NatState {
     port_tier: HashMap<u16, usize>,
     start: Instant,
     rng: u32,
+    /// Per-NAT 128-bit secret from the OS CSPRNG, installed into every Tcb
+    /// after `reinit`: tcp-sans-io keys listener ISNs, TSval offsets and SYN
+    /// cookies with it, and `listen` fails without one.
+    tcb_secret: [u8; 16],
     last_tick: u64,
     last_expire: u64,
     tick_keys: Vec<FlowKey>,
@@ -1607,6 +1618,7 @@ impl NatState {
         let tier = self.choose_tier(dport);
         let mut tcb = self.tcb_pools[tier].acquire();
         tcb.reinit(cfg);
+        tcb.set_secret(&self.tcb_secret);
         tcb.set_now(now);
         if tcb.listen().is_err() {
             self.tcb_pools[tier].release(tcb);
@@ -1716,6 +1728,7 @@ impl NatState {
         let tier = self.choose_tier(guest_port);
         let mut tcb = self.tcb_pools[tier].acquire();
         tcb.reinit(cfg);
+        tcb.set_secret(&self.tcb_secret);
         tcb.set_now(now);
         if tcb.connect().is_err() {
             // active open: emits a SYN toward the guest
@@ -2309,6 +2322,10 @@ impl NatBackend {
                 port_tier.insert(port, tier);
             }
         }
+        let mut tcb_secret = [0u8; 16];
+        if !host::random_fill(&mut tcb_secret) {
+            panic!("nat: BCryptGenRandom failed (Tcb secret)");
+        }
         let state = NatState {
             net: Arc::downgrade(net),
             iocp,
@@ -2332,6 +2349,7 @@ impl NatBackend {
             port_tier,
             start: Instant::now(),
             rng: 0x2545_F491,
+            tcb_secret,
             last_tick: 0,
             last_expire: 0,
             tick_keys: Vec::new(),
@@ -2533,6 +2551,7 @@ mod tests {
             iss: 1000,
             initial_rto_ms: 1000,
         });
+        nat.set_secret(&[0x5a; 16]);
         nat.listen().unwrap();
         let mut guest = TIER_MAKE[0]();
         guest.reinit(TcbConfig {
