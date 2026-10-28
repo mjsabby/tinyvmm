@@ -546,10 +546,13 @@ fn deliver_frame(
                 *p.add(11) = (nbufs >> 8) as u8;
             }
         }
-        rxq.push(head0, used0);
+        // All of the frame's buffers become visible together (one used.idx
+        // update): see `Virtqueue::add_used`.
+        rxq.add_used(head0, used0);
         for &(h, u) in &extra[..nbufs as usize - 1] {
-            rxq.push(h, u);
+            rxq.add_used(h, u);
         }
+        rxq.publish_used();
         return Some(nbufs);
     }
     None
