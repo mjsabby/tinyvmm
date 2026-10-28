@@ -7,9 +7,10 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
 };
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, FIONBIO, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IPPROTO_TCP, IPPROTO_UDP, SD_SEND,
-    SOCK_DGRAM, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKET, SOL_SOCKET, WSA_IO_PENDING, WSABUF,
-    WSADATA, WSAGetLastError, WSAIoctl, WSARecv, WSASend, WSAStartup, accept, bind, closesocket,
-    connect, ioctlsocket, listen, setsockopt, shutdown, socket,
+    SO_RCVBUF, SOCK_DGRAM, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKET, SOL_SOCKET, WSA_IO_PENDING,
+    WSABUF, WSADATA, WSAGetLastError, WSAIoctl, WSARecv, WSASend, WSAStartup, accept, bind,
+    closesocket, connect, getpeername, getsockname, ioctlsocket, listen, setsockopt, shutdown,
+    socket,
 };
 use windows_sys::Win32::System::IO::{
     CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED, PostQueuedCompletionStatus,
@@ -224,6 +225,49 @@ pub fn update_connect_ctx(s: SOCKET) {
             std::ptr::null(),
             0,
         );
+    }
+}
+
+/// True if a connected IPv4 socket's peer is this host: a loopback address,
+/// or the very address the socket is bound to (a connection to one of the
+/// host's own interface addresses). ConnectEx sockets need
+/// [`update_connect_ctx`] first.
+pub fn peer_is_local(s: SOCKET) -> bool {
+    let mut local: SOCKADDR_IN = unsafe { core::mem::zeroed() };
+    let mut peer: SOCKADDR_IN = unsafe { core::mem::zeroed() };
+    let mut local_len = core::mem::size_of::<SOCKADDR_IN>() as i32;
+    let mut peer_len = local_len;
+    let ok = unsafe {
+        getsockname(
+            s,
+            &mut local as *mut SOCKADDR_IN as *mut SOCKADDR,
+            &mut local_len,
+        ) == 0
+            && getpeername(
+                s,
+                &mut peer as *mut SOCKADDR_IN as *mut SOCKADDR,
+                &mut peer_len,
+            ) == 0
+    };
+    if !ok || local.sin_family != AF_INET || peer.sin_family != AF_INET {
+        return false;
+    }
+    // SAFETY: every bit pattern is a valid `S_addr`; octets are in network order.
+    let (l, p) = unsafe { (local.sin_addr.S_un.S_addr, peer.sin_addr.S_un.S_addr) };
+    p.to_ne_bytes()[0] == 127 || p == l
+}
+
+/// Fix the socket's receive buffer, and so its advertised TCP window, at
+/// `bytes`. This replaces Windows' receive-window autotuning for the socket.
+pub fn set_rcvbuf(s: SOCKET, bytes: i32) -> bool {
+    unsafe {
+        setsockopt(
+            s,
+            SOL_SOCKET,
+            SO_RCVBUF,
+            &bytes as *const i32 as *const u8,
+            core::mem::size_of::<i32>() as i32,
+        ) == 0
     }
 }
 

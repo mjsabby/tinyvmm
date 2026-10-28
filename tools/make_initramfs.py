@@ -348,6 +348,9 @@ if grep -q 'tinyvmm.test=netcmp' /proc/cmdline 2>/dev/null; then
     log "NETCMP RR n=${rr} ok=${ok} us=$((t1 - t0))"
     log "NETCMP PHASE rr end"
 
+    # Guest TCP receiver counters over the download (non-zero TcpExt deltas):
+    # DSACK/OFO mean loss or spurious retransmits; ZeroWindow is flow control.
+    grep '^TcpExt:' /proc/net/netstat > /tmp/te0
     log "NETCMP PHASE dl begin"
     wget -q -O /dev/null -T 60 -t 1 "${base}/bytes/${size}/dlwarm" 2>/dev/null
     for i in $(seq 1 "${runs}"); do
@@ -355,6 +358,8 @@ if grep -q 'tinyvmm.test=netcmp' /proc/cmdline 2>/dev/null; then
         log "NETCMP DL run=${i} rc=$?"
     done
     log "NETCMP PHASE dl end"
+    grep '^TcpExt:' /proc/net/netstat > /tmp/te1
+    log "NETCMP TCPEXT dl $(awk 'NR==FNR{if(FNR==1)for(i=2;i<=NF;i++)n[i]=$i;else for(i=2;i<=NF;i++)a[i]=$i;next} FNR==2{for(i=2;i<=NF;i++)if($i!=a[i])printf "%s=%d ",n[i],$i-a[i]}' /tmp/te0 /tmp/te1)"
 
     # tmpfs-backed file so the upload reads from RAM, not a disk. busybox wget
     # sizes --post-file with strlen(), so the payload must contain no NULs.

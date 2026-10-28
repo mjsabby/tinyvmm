@@ -500,39 +500,59 @@ fn deliver_frame(
     hdr: &RxHeader,
     mrg: bool,
 ) -> Option<u16> {
-    if !rxq.pop_into(chain) {
-        return None;
-    }
-    let (mut written, hdr_ptr) = write_first_rx(chain, hdr, frame);
-    let head0 = chain.head_index;
-    let used0 = written + VIRTIO_NET_HDR_SIZE as u32;
-    let mut nbufs: u16 = 1;
-    // 64 spill chains covers a 64 KiB frame across the driver's initial
-    // ~1.5 KiB mergeable buffers (which adapt upward toward PAGE_SIZE).
-    let mut extra: [(u16, u32); 64] = [(0, 0); 64];
-    while mrg && (written as usize) < frame.len() && (nbufs as usize) <= extra.len() {
+    // Bounded: a refill racing `rewind_avail` may not kick, so retry rather
+    // than wait for it, but never spin on a ring a guest keeps poking.
+    for _ in 0..4 {
+        let cursor = rxq.avail_cursor();
         if !rxq.pop_into(chain) {
-            break;
+            return None;
         }
-        let w = write_more_rx(chain, &frame[written as usize..]);
-        extra[nbufs as usize - 1] = (chain.head_index, w);
-        written += w;
-        nbufs += 1;
-        if w == 0 {
-            break;
+        let (mut written, hdr_ptr) = write_first_rx(chain, hdr, frame);
+        let head0 = chain.head_index;
+        let used0 = written + VIRTIO_NET_HDR_SIZE as u32;
+        let mut nbufs: u16 = 1;
+        // 64 spill chains covers a 64 KiB frame across the driver's initial
+        // ~1.5 KiB mergeable buffers (which adapt upward toward PAGE_SIZE).
+        let mut extra: [(u16, u32); 64] = [(0, 0); 64];
+        let mut ran_dry = false;
+        while mrg && (written as usize) < frame.len() && (nbufs as usize) <= extra.len() {
+            if !rxq.pop_into(chain) {
+                ran_dry = true;
+                break;
+            }
+            let w = write_more_rx(chain, &frame[written as usize..]);
+            extra[nbufs as usize - 1] = (chain.head_index, w);
+            written += w;
+            nbufs += 1;
+            if w == 0 {
+                break;
+            }
         }
-    }
-    if let Some(p) = hdr_ptr {
-        unsafe {
-            *p.add(10) = nbufs as u8;
-            *p.add(11) = (nbufs >> 8) as u8;
+        // Out of guest RX buffers mid-frame. Publishing the prefix would hand
+        // the guest a truncated packet that it drops: for a coalesced TCP
+        // super-frame that is ~64 KB of loss. Give the chains back so the
+        // caller queues the frame until the driver refills the ring. Only if
+        // even a whole ring can't hold it, publish what fits rather than wedge
+        // every later frame behind it.
+        if ran_dry && u32::from(nbufs) < rxq.size() {
+            if rxq.rewind_avail(cursor) {
+                continue;
+            }
+            return None;
         }
+        if let Some(p) = hdr_ptr {
+            unsafe {
+                *p.add(10) = nbufs as u8;
+                *p.add(11) = (nbufs >> 8) as u8;
+            }
+        }
+        rxq.push(head0, used0);
+        for &(h, u) in &extra[..nbufs as usize - 1] {
+            rxq.push(h, u);
+        }
+        return Some(nbufs);
     }
-    rxq.push(head0, used0);
-    for &(h, u) in &extra[..nbufs as usize - 1] {
-        rxq.push(h, u);
-    }
-    Some(nbufs)
+    None
 }
 
 /// Hard cap on an assembled guest TX frame: a `HOST_TSO4` super-segment is at
@@ -916,5 +936,55 @@ mod tests {
             got.extend_from_slice(&tcp[20..]);
         }
         assert_eq!(got, payload);
+    }
+
+    /// A frame needing more RX buffers than the guest has posted must not be
+    /// published truncated: nothing reaches the used ring until the driver adds
+    /// enough buffers, and then the whole frame arrives.
+    #[test]
+    fn rx_frame_waits_for_buffers_instead_of_truncating() {
+        use crate::virtio::queue::VRING_DESC_F_WRITE;
+        const DESC: u64 = 0x1000;
+        const AVAIL: u64 = 0x2000;
+        const USED: u64 = 0x3000;
+        const BUF: u64 = 0x10000;
+        const BUF_LEN: u32 = 2048;
+        let mem = Arc::new(GuestMemory::new_host_only(256 * 1024).unwrap());
+        let mut q = Virtqueue::new(mem.clone(), 8);
+        q.set_size(8);
+        q.set_desc_gpa(DESC);
+        q.set_avail_gpa(AVAIL);
+        q.set_used_gpa(USED);
+        q.set_event_idx_enabled(true);
+        q.set_ready(true);
+        // Post `n` single-descriptor writable buffers (descriptor i in slot i).
+        let post = |n: u16| {
+            for i in 0..n {
+                let mut d = [0u8; 16];
+                d[0..8].copy_from_slice(&(BUF + u64::from(i) * u64::from(BUF_LEN)).to_le_bytes());
+                d[8..12].copy_from_slice(&BUF_LEN.to_le_bytes());
+                d[12..14].copy_from_slice(&VRING_DESC_F_WRITE.to_le_bytes());
+                mem.write_at(DESC + 16 * u64::from(i), &d).unwrap();
+                mem.write_at(AVAIL + 4 + 2 * u64::from(i), &i.to_le_bytes())
+                    .unwrap();
+            }
+            mem.write_at(AVAIL + 2, &n.to_le_bytes()).unwrap();
+        };
+        let used_idx = || mem.read_u16(USED + 2).unwrap();
+        // The 12-byte header plus 6000 bytes needs three 2 KiB buffers.
+        let frame: Vec<u8> = (0..6000u32).map(|i| i as u8).collect();
+        let mut chain = PoppedChain::default();
+
+        post(2);
+        let r = deliver_frame(&mut q, &mut chain, &frame, &RxHeader::default(), true);
+        assert_eq!(r, None);
+        assert_eq!(used_idx(), 0, "no truncated frame published");
+        assert_eq!(q.avail_cursor(), 0, "popped buffers given back");
+
+        post(3);
+        let r = deliver_frame(&mut q, &mut chain, &frame, &RxHeader::default(), true);
+        assert_eq!(r, Some(3));
+        assert_eq!(used_idx(), 3);
+        assert_eq!(mem.read_u16(BUF + 10), Some(3), "num_buffers");
     }
 }
