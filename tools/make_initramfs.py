@@ -155,7 +155,7 @@ log "=== init complete; dropping to shell on hvc0 ==="
 # UDP DNS, and HTTP/TCP fetches against well-known endpoints, then halts
 # so a watchdog-less host run can verify the usernet/wintun datapath
 # without an interactive shell.
-if grep -q 'tinyvmm.test=net' /proc/cmdline 2>/dev/null; then
+if grep -qE 'tinyvmm.test=net( |$)' /proc/cmdline 2>/dev/null; then
     log "--- NETTEST start ---"
 
     log "+ ping -c 2 -W 2 10.0.0.1 (gateway)"
@@ -299,6 +299,88 @@ if grep -q 'tinyvmm.test=usernet-tsi' /proc/cmdline 2>/dev/null; then
     sleep 65
     log "=== tinyvmm shutdown requested ==="
     sleep 1
+    poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
+    exec cat
+fi
+
+# --- optional cross-VMM NAT networking comparison -----------------------
+# Enabled via kernel cmdline marker `tinyvmm.test=netcmp`. Driven by
+# tools/net_compare.py, which boots this same kernel + initramfs under
+# tinyvmm and OpenVMM (consomme) and times throughput host-side (the guest's
+# /proc/uptime only has 10 ms resolution). VMM-agnostic: only needs eth0 at
+# 10.0.0.2/24 via gateway 10.0.0.1, which both user-mode NATs use. Prints a
+# `NETCMP DONE` marker and halts; the driver kills the VMM on that marker.
+# Cmdline vars: NETCMP_HOST, NETCMP_PORT, NETCMP_SIZE (bytes per stream),
+# NETCMP_RUNS, NETCMP_RR (sequential tiny requests), NETCMP_PAR (streams),
+# NETCMP_PING (count).
+if grep -q 'tinyvmm.test=netcmp' /proc/cmdline 2>/dev/null; then
+    arg() { tr ' ' '\\n' < /proc/cmdline | grep "^$1=" | cut -d= -f2; }
+    host=$(arg NETCMP_HOST); port=$(arg NETCMP_PORT); size=$(arg NETCMP_SIZE)
+    runs=$(arg NETCMP_RUNS); rr=$(arg NETCMP_RR); par=$(arg NETCMP_PAR)
+    pingn=$(arg NETCMP_PING)
+    base="http://${host}:${port}"
+    us() { awk '{print int($1 * 1000000)}' /proc/uptime; }
+    log "NETCMP start host=${host} port=${port} size=${size} runs=${runs} rr=${rr} par=${par} ping=${pingn}"
+    # Guest environment (differences here skew per-byte guest CPU cost).
+    log "NETCMP ENV clocksource=$(cat /sys/devices/system/clocksource/clocksource0/current_clocksource 2>/dev/null) avail=$(cat /sys/devices/system/clocksource/clocksource0/available_clocksource 2>/dev/null)"
+    log "NETCMP ENV flags=$(grep -m1 '^flags' /proc/cpuinfo | cut -d: -f2)"
+    for v in /sys/devices/system/cpu/vulnerabilities/*; do log "NETCMP ENV vuln $(basename $v)=$(cat $v)"; done
+    log "NETCMP ENV offload=$(cat /sys/class/net/eth0/features 2>/dev/null) tso_max=$(cat /sys/class/net/eth0/gso_max_size 2>/dev/null)"
+    for i in 1 2 3; do
+        t0=$(us); dd if=/dev/zero of=/tmp/memb bs=1M count=256 2>/dev/null; t1=$(us); rm -f /tmp/memb
+        log "NETCMP MEMBENCH pass=$i fault+zero 256MiB tmpfs: $(( (t1-t0)/1000 )) ms"
+    done
+    log "NETCMP ENV mtrr=$(cat /proc/mtrr 2>/dev/null | tr '\\n' ';') pat=$(dmesg | grep -m1 -i 'x86/PAT' | cut -c16-)"
+    # Settle: let the NIC finish coming up before timing anything.
+    wget -q -O /dev/null -T 10 -t 3 "${base}/bytes/1/warm" 2>/dev/null
+
+    log "NETCMP PHASE ping begin"
+    ping -c "${pingn}" -i 0.01 -W 1 "${host}" > /tmp/ping.log 2>&1
+    log "NETCMP PING $(grep -E 'packets|min/avg/max' /tmp/ping.log | tr '\\n' ' ')"
+    log "NETCMP PHASE ping end"
+
+    log "NETCMP PHASE rr begin"
+    t0=$(us); ok=0
+    for i in $(seq 1 "${rr}"); do
+        wget -q -O /dev/null -T 5 -t 1 "${base}/bytes/1/rr" 2>/dev/null && ok=$((ok + 1))
+    done
+    t1=$(us)
+    log "NETCMP RR n=${rr} ok=${ok} us=$((t1 - t0))"
+    log "NETCMP PHASE rr end"
+
+    log "NETCMP PHASE dl begin"
+    wget -q -O /dev/null -T 60 -t 1 "${base}/bytes/${size}/dlwarm" 2>/dev/null
+    for i in $(seq 1 "${runs}"); do
+        wget -q -O /dev/null -T 120 -t 1 "${base}/bytes/${size}/dl${i}" 2>/dev/null
+        log "NETCMP DL run=${i} rc=$?"
+    done
+    log "NETCMP PHASE dl end"
+
+    # tmpfs-backed file so the upload reads from RAM, not a disk. busybox wget
+    # sizes --post-file with strlen(), so the payload must contain no NULs.
+    # Built before the phase marker so its cost isn't charged to the upload.
+    yes 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde | head -c "${size}" > /tmp/up.bin
+    log "NETCMP PHASE ul begin"
+    for i in $(seq 1 "${runs}"); do
+        wget -q -O /dev/null -T 120 -t 1 --post-file=/tmp/up.bin "${base}/upload/ul${i}" 2>/dev/null
+        log "NETCMP UL run=${i} rc=$?"
+    done
+    rm -f /tmp/up.bin
+    log "NETCMP PHASE ul end"
+    log "NETCMP TCPSTAT $(grep '^Tcp:' /proc/net/snmp | tr '\n' ' ')"
+
+    log "NETCMP PHASE par begin"
+    for r in $(seq 1 "${runs}"); do
+        for i in $(seq 1 "${par}"); do
+            wget -q -O /dev/null -T 120 -t 1 "${base}/bytes/${size}/par${r}_${i}" 2>/dev/null &
+        done
+        wait
+        log "NETCMP PAR run=${r} done"
+    done
+    log "NETCMP PHASE par end"
+
+    log "NETCMP DONE"
+    sync
     poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
     exec cat
 fi
@@ -564,6 +646,135 @@ if grep -q 'tinyvmm.test=tsc' /proc/cmdline 2>/dev/null; then
     log "available=$(cat /sys/devices/system/clocksource/clocksource0/available_clocksource 2>/dev/null)"
     log "--- TSC-WATCHDOG-TEST end ---"
     sync
+    poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
+    exec cat
+fi
+
+# --- optional SMP / multi-vCPU bring-up validation ----------------------
+# Enabled via kernel cmdline marker `tinyvmm.test=smp`. Driven by
+# tools/smp_test.py, which launches tinyvmm with `--vcpus N` (nested, where
+# the host uses the software-emulated LAPIC) and passes the expected count
+# as `tinyvmm.smp.expect=N`. This proves the secondary CPUs the BSP brings
+# up via INIT/SIPI actually come ONLINE (not merely "started"), that work
+# is scheduled onto every CPU, and that the software LAPIC routes
+# reschedule IPIs to the secondaries.
+#
+# Phases:
+#   count        nproc == /proc/cpuinfo processor count (>= 1)
+#   expect       nproc == tinyvmm.smp.expect=N (only if marker present)
+#   all-cpus-busy  under a 2*N spinner load every cpuN in /proc/stat
+#                  advances its user+nice+system jiffies (APs execute +
+#                  get scheduled, not just registered as present)
+#   ipi          /proc/interrupts RES (reschedule-IPI) total > 0 after the
+#                load -- proves the software LAPIC delivered IPIs to the
+#                secondary CPU(s)
+# Prints `SMP SUMMARY: X/Y phases passed` + the tinyvmm shutdown sentinel.
+if grep -q 'tinyvmm.test=smp' /proc/cmdline 2>/dev/null; then
+    log "--- SMP-TEST start ---"
+
+    SMP_PASS=0
+    SMP_FAIL=0
+    sp() { log "SMP $1: PASS${2:+ ($2)}"; SMP_PASS=$((SMP_PASS+1)); }
+    sf() { log "SMP $1: FAIL $2"; SMP_FAIL=$((SMP_FAIL+1)); }
+
+    WANT=$(cat /proc/cmdline | tr ' ' '\\n' | grep '^tinyvmm.smp.expect=' | cut -d= -f2)
+    NPROC=$(nproc 2>/dev/null || echo 1)
+    ONLINE=$(cat /sys/devices/system/cpu/online 2>/dev/null)
+    PRESENT=$(cat /sys/devices/system/cpu/present 2>/dev/null)
+    POSSIBLE=$(cat /sys/devices/system/cpu/possible 2>/dev/null)
+    CPUINFO_N=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null)
+    log "SMP nproc=$NPROC online=[$ONLINE] present=[$PRESENT] possible=[$POSSIBLE] cpuinfo=$CPUINFO_N want=[$WANT]"
+
+    log "SMP dmesg bring-up:"
+    dmesg 2>/dev/null \
+        | grep -iE 'smpboot|smp:|x2apic enabled|Brought up|APIC: |start_secondary' \
+        | grep -v 'SMP-TEST' \
+        | while IFS= read -r line; do log "  $line"; done
+
+    # Phase: count -- nproc agrees with /proc/cpuinfo.
+    if [ -n "$NPROC" ] && [ "$NPROC" = "$CPUINFO_N" ] && [ "$NPROC" -ge 1 ]; then
+        sp count "nproc=$NPROC == cpuinfo=$CPUINFO_N"
+    else
+        sf count "nproc=$NPROC cpuinfo=$CPUINFO_N"
+    fi
+
+    # Phase: expect -- online count matches what the host asked for.
+    if [ -n "$WANT" ]; then
+        if [ "$NPROC" = "$WANT" ]; then
+            sp expect "online $NPROC == expected $WANT"
+        else
+            sf expect "online $NPROC != expected $WANT"
+        fi
+    fi
+
+    if [ "$NPROC" -ge 2 ]; then
+        # Snapshot per-CPU busy jiffies (user+nice+system) before load.
+        BEFORE=$(grep '^cpu[0-9]' /proc/stat | awk '{print $1":"($2+$3+$4)}')
+        # 2*N tight spinners; more runnable tasks than CPUs forces the CFS load
+        # balancer to spread work to every CPU (driving reschedule + function-
+        # call IPIs to the secondaries). This also stress-tests timer delivery
+        # to a vCPU that NEVER halts -- the case a busy-poll workload hits.
+        NSPIN=$((NPROC * 2))
+        log "SMP load: spawning $NSPIN spinners"
+        PIDS=""
+        i=0
+        while [ "$i" -lt "$NSPIN" ]; do
+            ( while :; do : ; done ) &
+            PIDS="$PIDS $!"
+            i=$((i + 1))
+        done
+        # Watch the guest clock advance under full load. If the LVT timer IRQ is
+        # not delivered to a never-halting vCPU, jiffies freeze, `sleep` never
+        # returns, and these lines stop (-> the run times out). If they tick,
+        # scheduling under 100% load works.
+        s=0
+        while [ "$s" -lt 3 ]; do
+            sleep 1
+            s=$((s + 1))
+            log "SMP load: t=$(cut -d' ' -f1 /proc/uptime) tick $s/3"
+        done
+        log "SMP load: killing spinners"
+        for p in $PIDS; do kill "$p" 2>/dev/null; done
+        wait 2>/dev/null
+        log "SMP load: reaped"
+        AFTER=$(grep '^cpu[0-9]' /proc/stat | awk '{print $1":"($2+$3+$4)}')
+
+        # Phase: all-cpus-busy -- every cpuN advanced under load.
+        STALLED=""
+        for cpu in $(grep '^cpu[0-9]' /proc/stat | awk '{print $1}'); do
+            b=$(echo "$BEFORE" | grep "^$cpu:" | cut -d: -f2)
+            a=$(echo "$AFTER"  | grep "^$cpu:" | cut -d: -f2)
+            [ -z "$b" ] && b=0
+            [ -z "$a" ] && a=0
+            if [ "$a" -le "$b" ]; then STALLED="$STALLED $cpu"; fi
+        done
+        if [ -z "$STALLED" ]; then
+            sp all-cpus-busy "every CPU advanced under 2*${NPROC} spinner load"
+        else
+            sf all-cpus-busy "no progress on:$STALLED"
+        fi
+
+        # Phase: ipi -- reschedule IPIs reached the secondary CPU(s).
+        if [ -r /proc/interrupts ]; then
+            log "SMP /proc/interrupts IPI rows:"
+            grep -E 'RES:|CAL:|TLB:|LOC:' /proc/interrupts \
+                | while IFS= read -r line; do log "  $line"; done
+            RES_TOTAL=$(awk '/RES:/{s=0; for(i=2;i<=NF;i++){if($i ~ /^[0-9]+$/)s+=$i}; print s; exit}' /proc/interrupts)
+            [ -z "$RES_TOTAL" ] && RES_TOTAL=0
+            if [ "$RES_TOTAL" -gt 0 ]; then
+                sp ipi "reschedule IPIs delivered (RES total=$RES_TOTAL)"
+            else
+                sf ipi "no reschedule IPIs (RES total=0)"
+            fi
+        fi
+    fi
+
+    log "--- SMP-TEST end ---"
+    log "SMP SUMMARY: ${SMP_PASS}/$((SMP_PASS + SMP_FAIL)) phases passed"
+    sync
+    sleep 1
+    log "=== tinyvmm shutdown requested ==="
+    sleep 1
     poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
     exec cat
 fi

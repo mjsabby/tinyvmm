@@ -13,9 +13,11 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+const NET_F_CSUM: u64 = 1 << 0;
 const NET_F_GUEST_CSUM: u64 = 1 << 1;
 const NET_FEATURE_MAC: u64 = 1 << 5;
 const NET_F_GUEST_TSO4: u64 = 1 << 7;
+const NET_F_HOST_TSO4: u64 = 1 << 11;
 const NET_F_MRG_RXBUF: u64 = 1 << 15;
 const NET_FEATURE_STATUS: u64 = 1 << 16;
 
@@ -41,6 +43,29 @@ pub struct RxHeader {
     pub csum_offset: u16,
 }
 
+/// The same 10 bytes on a guest TX frame. `csum_start` is relative to the
+/// start of the Ethernet frame (header already stripped).
+pub type TxHeader = RxHeader;
+
+impl RxHeader {
+    fn parse(h: &[u8; VIRTIO_NET_HDR_SIZE]) -> Self {
+        let le = |i: usize| u16::from_le_bytes([h[i], h[i + 1]]);
+        RxHeader {
+            flags: h[0],
+            gso_type: h[1],
+            hdr_len: le(2),
+            gso_size: le(4),
+            csum_start: le(6),
+            csum_offset: le(8),
+        }
+    }
+
+    /// True when the frame carries offload work (partial checksum or GSO).
+    pub fn has_offload(&self) -> bool {
+        self.flags & HDR_F_NEEDS_CSUM != 0 || self.gso_type != HDR_GSO_NONE
+    }
+}
+
 /// Per-slot capacity + slot count of the preallocated RX delivery pool, so
 /// `inject_rx` copies into a pooled buffer instead of allocating a `Vec` per
 /// inbound frame. With `GUEST_TSO4` a single delivered frame may carry up to
@@ -58,8 +83,129 @@ pub type IrqFn = Box<dyn Fn(u32) + Send + Sync>;
 /// for each transmitted Ethernet frame (virtio_net_hdr already stripped); it
 /// must not block. Backends inject inbound frames via `NetDevice::inject_rx`.
 pub trait NetBackend: Send + Sync {
+    /// A complete, MTU-sized frame with valid checksums.
     fn on_guest_frame(&self, frame: &[u8]);
+    /// A frame with TX offload work pending (`CSUM` / `HOST_TSO4`): a partial
+    /// L4 checksum and/or a TCPv4 super-segment of up to ~64 KiB. `frame` is
+    /// scratch and may be modified. The default finishes the work in software
+    /// (checksum completion + segmentation) and feeds `on_guest_frame`.
+    fn on_guest_frame_offload(&self, frame: &mut [u8], hdr: &TxHeader) {
+        tx_offload_software(frame, hdr, &mut |f| self.on_guest_frame(f));
+    }
     fn stop(&self) {}
+}
+
+const ETH_HDR_LEN: usize = 14;
+const TCP_FIN: u8 = 0x01;
+const TCP_PSH: u8 = 0x08;
+const TCP_CWR: u8 = 0x80;
+
+thread_local! {
+    static TSO_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Software fallback for TX offloads: emits finished, MTU-sized frames.
+/// Malformed or unsupported requests are dropped.
+pub fn tx_offload_software(frame: &mut [u8], hdr: &TxHeader, emit: &mut dyn FnMut(&[u8])) {
+    match hdr.gso_type {
+        HDR_GSO_NONE => {
+            if hdr.flags & HDR_F_NEEDS_CSUM == 0
+                || complete_csum(frame, hdr.csum_start, hdr.csum_offset)
+            {
+                emit(frame);
+            }
+        }
+        HDR_GSO_TCPV4 => {
+            TSO_SCRATCH.with(|s| tso4_segment(frame, hdr.gso_size, &mut s.borrow_mut(), emit))
+        }
+        _ => {}
+    }
+}
+
+/// Finish a partial checksum (spec §5.1.6.2): the field at
+/// `csum_start + csum_offset` holds the pseudo-header sum; fold everything from
+/// `csum_start` to the end and store the complement there.
+fn complete_csum(frame: &mut [u8], csum_start: u16, csum_offset: u16) -> bool {
+    let s = csum_start as usize;
+    let o = s + csum_offset as usize;
+    if s >= frame.len() || o + 2 > frame.len() {
+        return false;
+    }
+    let c = crate::net::wire::checksum16(&[&frame[s..]]);
+    frame[o..o + 2].copy_from_slice(&c.to_be_bytes());
+    true
+}
+
+/// Split a TCPv4 super-segment into `mss`-payload frames with fresh IPv4
+/// lengths/IDs/checksums, per-segment sequence numbers, FIN/PSH only on the
+/// last segment, CWR only on the first, and full TCP checksums.
+fn tso4_segment(frame: &[u8], mss: u16, seg: &mut Vec<u8>, emit: &mut dyn FnMut(&[u8])) {
+    let be16 = |b: &[u8], i: usize| u16::from_be_bytes([b[i], b[i + 1]]);
+    let ip = ETH_HDR_LEN;
+    if frame.len() < ip + 40
+        || be16(frame, 12) != 0x0800
+        || frame[ip] >> 4 != 4
+        || frame[ip + 9] != 6
+    {
+        return;
+    }
+    let ihl = (frame[ip] & 0x0F) as usize * 4;
+    let tcp = ip + ihl;
+    if ihl < 20 || frame.len() < tcp + 20 {
+        return;
+    }
+    let thl = (frame[tcp + 12] >> 4) as usize * 4;
+    let hl = tcp + thl;
+    let mss = mss as usize;
+    if thl < 20 || frame.len() < hl || mss == 0 {
+        return;
+    }
+    let tot = be16(frame, ip + 2) as usize;
+    let end = if tot >= ihl + thl && ip + tot <= frame.len() {
+        ip + tot
+    } else {
+        frame.len()
+    };
+    let seq0 = u32::from_be_bytes(frame[tcp + 4..tcp + 8].try_into().unwrap());
+    let id0 = be16(frame, ip + 4);
+    let mut off = hl;
+    let mut i: u16 = 0;
+    loop {
+        let n = mss.min(end - off);
+        let last = off + n >= end;
+        seg.clear();
+        seg.extend_from_slice(&frame[..hl]);
+        seg.extend_from_slice(&frame[off..off + n]);
+        let s = &mut seg[..];
+        s[ip + 2..ip + 4].copy_from_slice(&((ihl + thl + n) as u16).to_be_bytes());
+        s[ip + 4..ip + 6].copy_from_slice(&id0.wrapping_add(i).to_be_bytes());
+        s[ip + 10] = 0;
+        s[ip + 11] = 0;
+        let c = crate::net::wire::checksum16(&[&s[ip..tcp]]);
+        s[ip + 10..ip + 12].copy_from_slice(&c.to_be_bytes());
+        let seq = seq0.wrapping_add((off - hl) as u32);
+        s[tcp + 4..tcp + 8].copy_from_slice(&seq.to_be_bytes());
+        if !last {
+            s[tcp + 13] &= !(TCP_FIN | TCP_PSH);
+        }
+        if i > 0 {
+            s[tcp + 13] &= !TCP_CWR;
+        }
+        s[tcp + 16] = 0;
+        s[tcp + 17] = 0;
+        let mut pseudo = [0u8; 12];
+        pseudo[..8].copy_from_slice(&s[ip + 12..ip + 20]);
+        pseudo[9] = 6;
+        pseudo[10..12].copy_from_slice(&((thl + n) as u16).to_be_bytes());
+        let c = crate::net::wire::checksum16(&[&pseudo, &s[tcp..]]);
+        s[tcp + 16..tcp + 18].copy_from_slice(&c.to_be_bytes());
+        emit(s);
+        if last {
+            break;
+        }
+        off += n;
+        i = i.wrapping_add(1);
+    }
 }
 
 /// Preallocated RX delivery pool: fixed slot storage + a free list + the queue
@@ -204,6 +350,7 @@ impl NetDevice {
             let mut tx = self.txq.lock().unwrap();
             if tx.ready() {
                 while tx.pop_into(chain) {
+                    let hdr = read_tx_hdr(chain);
                     frame_into(frame, chain, VIRTIO_NET_HDR_SIZE);
                     tx.push(chain.head_index, 0);
                     if !frame.is_empty() {
@@ -216,7 +363,11 @@ impl NetDevice {
                             // on_guest_frame only posts to the NAT IOCP (or
                             // loopback inject) — it never re-enters the device's
                             // TX path, so holding txq here is safe.
-                            b.on_guest_frame(frame);
+                            if hdr.has_offload() {
+                                b.on_guest_frame_offload(frame, &hdr);
+                            } else {
+                                b.on_guest_frame(frame);
+                            }
                         }
                         count += 1;
                     }
@@ -384,10 +535,31 @@ fn deliver_frame(
     Some(nbufs)
 }
 
-/// Hard cap on an assembled guest TX frame. We advertise no GSO/TSO, so a
-/// well-behaved driver never exceeds MTU; a hostile chain (overlapping indirect
-/// descriptors summing to ~guest-RAM-size) must not balloon `out` to OOM/abort.
-const TX_FRAME_CAP: usize = 65536;
+/// Hard cap on an assembled guest TX frame: a `HOST_TSO4` super-segment is at
+/// most a 64 KiB IPv4 datagram plus the Ethernet (and a VLAN) header. A hostile
+/// chain (overlapping indirect descriptors summing to ~guest-RAM-size) must not
+/// balloon `out` to OOM/abort.
+pub const TX_FRAME_CAP: usize = ETH_HDR_LEN + 4 + 65535;
+
+/// Copy the leading virtio_net_hdr out of a TX chain (it may span buffers).
+/// A chain too short to hold it yields an all-zero (no-offload) header.
+fn read_tx_hdr(chain: &PoppedChain) -> TxHeader {
+    let mut h = [0u8; VIRTIO_NET_HDR_SIZE];
+    let mut n = 0;
+    for b in &chain.bufs {
+        if b.write {
+            continue;
+        }
+        let s = b.as_slice();
+        let take = s.len().min(VIRTIO_NET_HDR_SIZE - n);
+        h[n..n + take].copy_from_slice(&s[..take]);
+        n += take;
+        if n == VIRTIO_NET_HDR_SIZE {
+            return TxHeader::parse(&h);
+        }
+    }
+    TxHeader::default()
+}
 
 /// Concatenate a chain's device-readable buffers, skipping `skip` leading
 /// (virtio_net_hdr) bytes, into `out` (cleared first). No allocation when `out`
@@ -504,6 +676,13 @@ impl VirtioDevice for NetDevice {
             | NET_F_GUEST_CSUM
             | NET_F_GUEST_TSO4
             | NET_F_MRG_RXBUF
+            // TX-side offloads: the guest hands us partially-checksummed TCP
+            // super-segments (up to 64 KiB) instead of checksumming and
+            // segmenting every MSS itself. Backends consume them natively (NAT
+            // terminates TCP) or finish them in software; HOST_TSO4 requires
+            // CSUM (spec §5.1.3.1).
+            | NET_F_CSUM
+            | NET_F_HOST_TSO4
     }
 
     fn set_driver_features(&self, acked: u64) -> bool {
@@ -647,5 +826,95 @@ impl NetBackend for LoopbackBackend {
         if let Some(net) = self.net.upgrade() {
             net.inject_rx(frame);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::wire::{build_eth, build_ipv4, build_tcp, checksum16};
+
+    const SRC: [u8; 4] = [10, 0, 0, 2];
+    const DST: [u8; 4] = [1, 2, 3, 4];
+
+    /// A guest-style offloaded TCP frame: the TCP checksum field holds only
+    /// the (un-complemented) pseudo-header sum, as Linux leaves it for
+    /// CHECKSUM_PARTIAL.
+    fn offloaded_frame(payload: &[u8], flags: u8) -> Vec<u8> {
+        let mut tcp = build_tcp(SRC, DST, 40000, 80, 1000, 7, flags, 512);
+        tcp.extend_from_slice(payload);
+        let mut pseudo = [0u8; 12];
+        pseudo[..4].copy_from_slice(&SRC);
+        pseudo[4..8].copy_from_slice(&DST);
+        pseudo[9] = 6;
+        pseudo[10..12].copy_from_slice(&(tcp.len() as u16).to_be_bytes());
+        tcp[16..18].copy_from_slice(&(!checksum16(&[&pseudo])).to_be_bytes());
+        build_eth([2; 6], [4; 6], 0x0800, &build_ipv4(SRC, DST, 6, &tcp))
+    }
+
+    fn tcp_csum_ok(f: &[u8]) -> bool {
+        let ip = &f[ETH_HDR_LEN..];
+        let tcp = &ip[20..];
+        let mut pseudo = [0u8; 12];
+        pseudo[..8].copy_from_slice(&ip[12..20]);
+        pseudo[9] = 6;
+        pseudo[10..12].copy_from_slice(&(tcp.len() as u16).to_be_bytes());
+        checksum16(&[&ip[..20]]) == 0 && checksum16(&[&pseudo, tcp]) == 0
+    }
+
+    fn csum_hdr() -> TxHeader {
+        TxHeader {
+            flags: HDR_F_NEEDS_CSUM,
+            csum_start: (ETH_HDR_LEN + 20) as u16,
+            csum_offset: 16,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn software_csum_completion() {
+        let mut f = offloaded_frame(b"hello, offload", 0x18);
+        assert!(!tcp_csum_ok(&f));
+        let mut out = Vec::new();
+        tx_offload_software(&mut f, &csum_hdr(), &mut |s| out.push(s.to_vec()));
+        assert_eq!(out.len(), 1);
+        assert!(tcp_csum_ok(&out[0]));
+
+        // csum_start/offset past the end of the frame: dropped, not panicking.
+        let hdr = TxHeader {
+            csum_offset: 0xFFF0,
+            ..csum_hdr()
+        };
+        out.clear();
+        tx_offload_software(&mut f, &hdr, &mut |s| out.push(s.to_vec()));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn software_tso4_segmentation() {
+        let payload: Vec<u8> = (0..10_000u32).map(|i| i as u8).collect();
+        let mut f = offloaded_frame(&payload, 0x18 | TCP_FIN | TCP_CWR); // ACK|PSH|FIN|CWR
+        let hdr = TxHeader {
+            gso_type: HDR_GSO_TCPV4,
+            gso_size: 1448,
+            hdr_len: (ETH_HDR_LEN + 40) as u16,
+            ..csum_hdr()
+        };
+        let mut segs = Vec::new();
+        tx_offload_software(&mut f, &hdr, &mut |s| segs.push(s.to_vec()));
+        assert_eq!(segs.len(), 10_000usize.div_ceil(1448));
+        let mut got = Vec::new();
+        for (i, s) in segs.iter().enumerate() {
+            assert!(tcp_csum_ok(s), "segment {i} checksum");
+            let tcp = &s[ETH_HDR_LEN + 20..];
+            let seq = u32::from_be_bytes(tcp[4..8].try_into().unwrap());
+            assert_eq!(seq, 1000 + got.len() as u32);
+            let last = i == segs.len() - 1;
+            assert_eq!(tcp[13] & (TCP_FIN | TCP_PSH) != 0, last);
+            assert_eq!(tcp[13] & TCP_CWR != 0, i == 0);
+            assert!(tcp.len() - 20 <= 1448);
+            got.extend_from_slice(&tcp[20..]);
+        }
+        assert_eq!(got, payload);
     }
 }

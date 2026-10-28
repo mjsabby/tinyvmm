@@ -28,15 +28,19 @@ pub fn inject_msi(partition: WHV_PARTITION_HANDLE, address: u64, data: u32) -> b
 
     // --- Software-LAPIC path (nested guest) ---
     if lapic::active() {
-        // Fixed (0) / LowestPriority (1) are the only modes virtio MSI-X devices
-        // emit. Queue the vector in the software LAPIC IRR and kick the vCPU.
+        // Destination APIC id from the MSI address (xAPIC: bits [19:12]). Fixed
+        // (0) / LowestPriority (1) are the only modes virtio MSI-X devices emit;
+        // route the vector to that vCPU's LAPIC and kick it. Lowest-priority is
+        // approximated by the addressed vCPU (single target for our devices).
+        let dest = ((address >> 12) & 0xFF) as u32;
         return match delivery {
-            0 | 1 => {
-                lapic::global().request_interrupt(vector as u8);
+            0 | 1 if dest < lapic::count() => {
+                lapic::for_vp(dest).request_interrupt(vector as u8);
                 MSI_INJECT_COUNT.fetch_add(1, Ordering::Relaxed);
                 true
             }
-            // NMI / INIT / SMI via MSI are not used by any emulated device here.
+            // NMI / INIT / SMI via MSI, or an out-of-range destination, are not
+            // produced by any emulated device here.
             _ => false,
         };
     }

@@ -148,7 +148,14 @@ impl RunLoop {
         self.stop.store(true, Ordering::Release);
         let _ = self.vcpu.cancel();
         // Also wake the loop if it's parked on a halted guest (not in `run`).
-        whpsys::lapic::global().wake();
+        if whpsys::lapic::active() {
+            self.lapic().wake();
+        }
+    }
+
+    /// This vCPU's software LAPIC. Only valid when `lapic::active()`.
+    fn lapic(&self) -> &'static whpsys::lapic::LocalApic {
+        whpsys::lapic::for_vp(self.vcpu.index())
     }
 
     pub fn run(&self) -> StopReason {
@@ -160,18 +167,59 @@ impl RunLoop {
         let part = self.vcpu.part();
         let vp = self.vcpu.index();
 
+        // APs (vp != 0) under the software LAPIC begin halted in the
+        // wait-for-SIPI state: hold here until the BSP sends a Startup-IPI, then
+        // place this vCPU in real mode at the SIPI vector and start running. (The
+        // hardware-LAPIC path lets WHP manage AP startup itself.)
+        if whpsys::lapic::active() && vp != 0 {
+            match self.lapic().wait_for_sipi(&self.stop) {
+                Some(vector) => {
+                    if let Err(e) = crate::boot::loader::setup_ap_sipi(&self.vcpu, vector) {
+                        eprintln!("[loop] vp{vp} SIPI setup failed: {e}");
+                        return StopReason::EmulationFailure;
+                    }
+                    println!("[pvh-run] vCPU {vp} started (SIPI vector 0x{vector:02x})");
+                }
+                None => return StopReason::Cancelled, // stopped before any SIPI
+            }
+        }
+
         loop {
             if self.stop.load(Ordering::Acquire) {
                 return StopReason::Cancelled;
             }
 
+            // Arm the kick BEFORE reading the IRR -- the ordering is load-bearing.
+            // A device/timer thread queues a vector under the LAPIC lock and then
+            // kicks (cancels the run) only if `in_run` is set. If we read the IRR
+            // first and set `in_run` after, a vector queued in that gap is seen by
+            // neither -- the read missed it and the kick is a no-op -- so it sits
+            // in the IRR with nothing to break the guest out of its run. At idle
+            // that is harmless (a halted guest is parked and woken via `wake_cv`),
+            // but a guest that never halts (a busy-poll vCPU) is only reachable via
+            // the kick, and in Linux's one-shot timer mode the timer disarms on
+            // fire: a single lost kick then freezes the guest clock forever,
+            // because the guest never gets the IRQ that would re-arm it. Setting
+            // `in_run = true` (Release) before `deliver_interrupts` reads the IRR
+            // under the LAPIC lock means any later `set_irr` observes `in_run`
+            // (its kick's Acquire load pairs with our store through the lock) and
+            // cancels the upcoming run. (Software LAPIC only; the hardware path
+            // has no per-vCPU LAPIC to gate.)
+            let sw = whpsys::lapic::active();
+            if sw {
+                self.lapic().set_in_run(true);
+            }
             // Deliver any interrupt the software LAPIC has queued before
             // re-entering the guest. Done on every iteration -- including those
             // reached via `continue` (e.g. the HLT path) and after an
             // interrupt-window exit -- so a queued vector is never stranded.
             self.deliver_interrupts();
 
-            let exit = match self.vcpu.run_exit() {
+            let run_result = self.vcpu.run_exit();
+            if sw {
+                self.lapic().set_in_run(false);
+            }
+            let exit = match run_result {
                 Ok(e) => e,
                 Err(e) => {
                     eprintln!("[loop] WHvRunVirtualProcessor failed: {e}");
@@ -203,7 +251,7 @@ impl RunLoop {
                         // loop so `deliver_interrupts` injects it. With WHP's
                         // hardware LAPIC, WHP itself waits on HLT, so just re-run.
                         if whpsys::lapic::active() {
-                            whpsys::lapic::global().park_while_idle(&self.stop, HALT_PARK);
+                            self.lapic().park_while_idle(&self.stop, HALT_PARK);
                         }
                         continue;
                     }
@@ -350,32 +398,43 @@ impl RunLoop {
         if !whpsys::lapic::active() {
             return;
         }
-        // Skip the per-exit `WHvGetVirtualProcessorRegisters(CR8)` syscall when
-        // nothing is pending (the common case): a Mutex + 8-word OR is ~50 ns
-        // vs ~2 µs for the WHP register read under nested virt. At ~17 K exits/s
-        // (net RX flood) this is the difference between ~3.5 % and ~0 % CPU.
-        let lapic = whpsys::lapic::global();
+        // Skip the WHP register read entirely when nothing is pending (the common
+        // case): a Mutex + 8-word OR is ~50 ns vs ~2 µs for a WHP register read
+        // under nested virt.
+        let lapic = self.lapic();
         if !lapic.irr_nonempty() {
             return;
         }
-        // Live TPR class (CR8 = TPR[7:4]); the software LAPIC owns the priority
-        // decision, we just feed it the current processor priority.
-        let cr8 = self
-            .vcpu
-            .get_register(WHvX64RegisterCr8)
-            .map(|v| (unsafe { v.Reg64 } & 0xF) as u32)
-            .unwrap_or(0);
-        let Some(vector) = lapic.next_vector(cr8) else {
+        // One batched WHP read of every register the decision needs (cr8 for the
+        // TPR class plus the four injectability inputs), rather than five calls.
+        let (cr8, rflags, istate, pint, pevent) = match self.vcpu.injectability_regs() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[loop] injectability read failed: {e}");
+                return;
+            }
+        };
+        // The software LAPIC owns the priority decision; feed it the live TPR.
+        let Some(vector) = lapic.next_vector((cr8 & 0xF) as u32) else {
             return;
         };
-        match self.vcpu.try_inject_interrupt(vector) {
+        match self
+            .vcpu
+            .try_inject_interrupt(vector, rflags, istate, pint, pevent)
+        {
             // Accepted into service; clear it from the IRR.
-            Ok(true) => whpsys::lapic::global().take_vector(vector),
-            // Guest not interruptible right now (IF=0 / shadow / pending). Leave
-            // the vector in the IRR; we retry on the next exit. The periodic
-            // timer, EOI MSR writes, and the cancel issued on every new MSI all
-            // force frequent exits, so the wait is short.
-            Ok(false) => {}
+            Ok(true) => self.lapic().take_vector(vector),
+            // Guest not injectable this instant (IF=0 / interrupt shadow / an
+            // interruption already pending). The vector stays in the IRR. Ask WHP
+            // to exit as soon as the guest can take an interrupt so we retry then,
+            // rather than relying on a future natural exit -- under a busy-poll
+            // load the kicking timer is one-shot and has already disarmed, so no
+            // such exit may come and the vector would strand (guest clock freeze).
+            Ok(false) => {
+                if let Err(e) = self.vcpu.request_interrupt_window() {
+                    eprintln!("[loop] request interrupt window failed: {e}");
+                }
+            }
             Err(e) => eprintln!("[loop] interrupt injection failed: {e}"),
         }
     }
@@ -394,7 +453,7 @@ impl RunLoop {
             false
         } else if is_write {
             let mut set_cr8 = None;
-            let h = whpsys::lapic::global().write_msr(msr, wr_val, &mut set_cr8);
+            let h = self.lapic().write_msr(msr, wr_val, &mut set_cr8);
             if let Some(tpr_class) = set_cr8 {
                 // Guest set TPR via the APIC MSR; keep CR8 in sync.
                 let _ = self
@@ -408,7 +467,7 @@ impl RunLoop {
                 .get_register(WHvX64RegisterCr8)
                 .map(|v| (unsafe { v.Reg64 } & 0xF) as u32)
                 .unwrap_or(0);
-            whpsys::lapic::global().read_msr(msr, cr8, &mut rd_val)
+            self.lapic().read_msr(msr, cr8, &mut rd_val)
         };
 
         if !handled {

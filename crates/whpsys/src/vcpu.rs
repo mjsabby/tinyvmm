@@ -15,7 +15,8 @@ use windows_sys::Win32::System::Hypervisor::{
     WHvRunVpExitReasonX64ApicEoi, WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt,
     WHvRunVpExitReasonX64InterruptWindow, WHvRunVpExitReasonX64IoPortAccess,
     WHvRunVpExitReasonX64MsrAccess, WHvSetVirtualProcessorInterruptControllerState2,
-    WHvSetVirtualProcessorRegisters, WHvSetVirtualProcessorXsaveState, WHvX64RegisterRflags,
+    WHvSetVirtualProcessorRegisters, WHvSetVirtualProcessorXsaveState, WHvX64RegisterCr8,
+    WHvX64RegisterDeliverabilityNotifications, WHvX64RegisterRflags,
 };
 
 /// `WHV_REGISTER_VALUE` carries `DECLSPEC_ALIGN(16)` in the WHP headers (WHP
@@ -144,43 +145,58 @@ impl Vcpu {
         self.set_registers(&[name], &[value])
     }
 
-    /// Try to deliver external-interrupt `vector` via VM-entry event injection
-    /// (`WHvRegisterPendingInterruption`). This is the nested-VM interrupt path:
-    /// `WHvRequestInterrupt`'s LAPIC delivery relies on hardware APIC
-    /// virtualization that Hyper-V doesn't expose to a nested guest, so we inject
-    /// the event directly instead. Mirrors OpenVMM's `virt_whp` `inject_interrupt`.
-    ///
-    /// Only injects when the guest is actually injectable (a blind injection
-    /// causes an invalid VM entry and crashes WHP); priority vs. the TPR is the
-    /// caller's job (the software LAPIC already filtered on PPR). MUST be called
-    /// while the vCPU is not running (between `run` calls). Returns `Ok(true)` if
-    /// injected, `Ok(false)` if the guest wasn't ready -- the vector stays queued
-    /// in the software LAPIC IRR and the run loop retries on the next exit.
-    pub fn try_inject_interrupt(&self, vector: u8) -> Result<bool> {
-        const RFLAGS_IF: u64 = 1 << 9;
-        // One batched WHP call for the four interruptibility gates instead of
-        // four (each is a kernel transition; under nested virt that's ~2 µs ×4
-        // per inject — measured ~7 % of a core at ~7 K injects/s).
-        const NAMES: [WHV_REGISTER_NAME; 4] = [
+    /// Read, in a single WHP call, the registers the interrupt-delivery pass
+    /// needs: returns `(cr8, rflags, interrupt_state, pending_interruption,
+    /// pending_event)` as their low-64-bit images. Batching matters because this
+    /// runs on every delivery pass; OpenVMM's `inject_interrupt` reads the same
+    /// set in one `get_registers!` call rather than five.
+    pub fn injectability_regs(&self) -> Result<(u64, u64, u64, u64, u64)> {
+        let names = [
+            WHvX64RegisterCr8,
             WHvX64RegisterRflags,
             WHvRegisterInterruptState,
             WHvRegisterPendingInterruption,
             WHvRegisterPendingEvent,
         ];
-        let mut vals = [WHV_REGISTER_VALUE { Reg64: 0 }; 4];
-        self.get_registers(&NAMES, &mut vals)?;
-        // SAFETY: Reg64 reads the low 64 bits of the value union; for the
-        // 128-bit PendingEvent that's the half holding `EventPending`.
-        let rflags = unsafe { vals[0].Reg64 };
-        let istate = unsafe { vals[1].Reg64 };
-        let pint = unsafe { vals[2].Reg64 };
-        let pevent = unsafe { vals[3].Reg64 };
+        let mut v = [WHV_REGISTER_VALUE { Reg64: 0 }; 5];
+        self.get_registers(&names, &mut v)?;
+        // SAFETY: each value's `Reg64` arm holds the low 64 bits we need; for the
+        // 128-bit PendingEvent that's the half with the `EventPending` bit.
+        Ok(unsafe { (v[0].Reg64, v[1].Reg64, v[2].Reg64, v[3].Reg64, v[4].Reg64) })
+    }
+
+    /// Deliver external-interrupt `vector` via VM-entry event injection
+    /// (`WHvRegisterPendingInterruption`), given injectability registers already
+    /// read via [`Self::injectability_regs`]. This is the nested-VM interrupt
+    /// path: `WHvRequestInterrupt`'s LAPIC delivery relies on hardware APIC
+    /// virtualization Hyper-V doesn't expose to a nested guest, so we inject the
+    /// event directly. Mirrors OpenVMM's `virt_whp` `inject_interrupt`.
+    ///
+    /// Only injects when the guest is actually injectable (a blind injection
+    /// causes an invalid VM entry and crashes WHP); priority vs. the TPR is the
+    /// caller's job (the software LAPIC already filtered on PPR). MUST be called
+    /// while the vCPU is not running. Returns `Ok(true)` if injected, `Ok(false)`
+    /// if the guest wasn't ready -- the vector stays queued in the IRR and the
+    /// run loop retries on the next exit.
+    pub fn try_inject_interrupt(
+        &self,
+        vector: u8,
+        rflags: u64,
+        interrupt_state: u64,
+        pending_interruption: u64,
+        pending_event: u64,
+    ) -> Result<bool> {
+        const RFLAGS_IF: u64 = 1 << 9;
         // Not injectable if IF is clear, an interruption is already pending
         // (PendingInterruption bit 0), an interrupt shadow is active
         // (InterruptState bit 0), or an event is already pending (PendingEvent
         // bit 0). Injecting over any of these is an invalid VM entry and faults
         // WHP. (Priority vs. TPR is the caller's responsibility.)
-        if rflags & RFLAGS_IF == 0 || (pint & 1) != 0 || (istate & 1) != 0 || (pevent & 1) != 0 {
+        if rflags & RFLAGS_IF == 0
+            || (pending_interruption & 1) != 0
+            || (interrupt_state & 1) != 0
+            || (pending_event & 1) != 0
+        {
             return Ok(false);
         }
         // WHV_X64_PENDING_INTERRUPTION_REGISTER: pending=bit0, type=bits1..3
@@ -191,6 +207,23 @@ impl Vcpu {
             WHV_REGISTER_VALUE { Reg64: inj },
         )?;
         Ok(true)
+    }
+
+    /// Ask WHP to exit this vCPU with an `X64InterruptWindow` exit as soon as the
+    /// guest can accept an external interrupt (IF set, no interrupt shadow, no
+    /// interruption already pending). Call when [`Self::try_inject_interrupt`]
+    /// returned `Ok(false)`: the queued vector would otherwise strand if the
+    /// guest is in a tight, never-halting loop and the one-shot APIC timer that
+    /// kicked us has already disarmed -- there would be no further exit to retry
+    /// delivery on. The notification is one-shot; WHP clears it on the exit.
+    pub fn request_interrupt_window(&self) -> Result<()> {
+        // WHV_X64_DELIVERABILITY_NOTIFICATIONS_REGISTER: bit0 NmiNotification,
+        // bit1 InterruptNotification, bits2..5 InterruptPriority (0 = notify for
+        // any deliverable interrupt). We want the interrupt notification.
+        self.set_register(
+            WHvX64RegisterDeliverabilityNotifications,
+            WHV_REGISTER_VALUE { Reg64: 1 << 1 },
+        )
     }
 
     pub fn get_register(&self, name: WHV_REGISTER_NAME) -> Result<WHV_REGISTER_VALUE> {
