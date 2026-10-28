@@ -6,7 +6,11 @@
 
 use crate::whp::GuestMemory;
 use core::arch::x86_64::_rdtsc;
-use std::sync::{Arc, Mutex};
+use core::ffi::c_void;
+use std::sync::{Arc, Mutex, OnceLock};
+use windows_sys::Win32::System::Hypervisor::{
+    WHvCapabilityCodeInterruptClockFrequency, WHvGetCapability,
+};
 
 pub const MSR_GUEST_OS_ID: u32 = 0x4000_0000;
 pub const MSR_HYPERCALL: u32 = 0x4000_0001;
@@ -37,6 +41,38 @@ pub fn compute_tsc_scale(tsc_hz: u64) -> u64 {
     ((10_000_000u128 << 64) / tsc_hz as u128) as u64
 }
 
+/// Rate WHP's LAPIC timer counts at (its "interrupt clock"), which is what the
+/// guest must be told in `HV_X64_MSR_APIC_FREQUENCY`. It is *not* the TSC
+/// frequency (200 MHz vs ~3 GHz on current hosts): a guest told the TSC rate
+/// programs every LAPIC timer ~16x too long. Falls back to 200 MHz, the value
+/// current Hyper-V builds report, if the capability can't be read.
+pub fn interrupt_clock_hz() -> u64 {
+    static HZ: OnceLock<u64> = OnceLock::new();
+    *HZ.get_or_init(|| {
+        let mut hz: u64 = 0;
+        let mut written: u32 = 0;
+        // SAFETY: WHvGetCapability writes at most 8 bytes into `hz`.
+        let hr = unsafe {
+            WHvGetCapability(
+                WHvCapabilityCodeInterruptClockFrequency,
+                &mut hz as *mut u64 as *mut c_void,
+                std::mem::size_of::<u64>() as u32,
+                &mut written,
+            )
+        };
+        if hr >= 0 && hz != 0 {
+            hz
+        } else {
+            eprintln!(
+                "[hv] WARN: WHvGetCapability(InterruptClockFrequency) failed \
+                 (HRESULT 0x{:08x}); assuming a 200 MHz LAPIC timer",
+                hr as u32
+            );
+            200_000_000
+        }
+    })
+}
+
 struct MsrCache {
     guest_os_id: u64,
     hypercall_msr: u64,
@@ -49,15 +85,19 @@ pub struct HvEnlightenment {
     ram: Arc<GuestMemory>,
     tsc_hz: u64,
     tsc_scale: u64,
+    apic_hz: u64,
     cache: Mutex<MsrCache>,
 }
 
 impl HvEnlightenment {
-    pub fn new(ram: Arc<GuestMemory>, tsc_hz: u64) -> Self {
+    /// `apic_hz` is the LAPIC timer rate the guest calibrates against; pass
+    /// [`interrupt_clock_hz`].
+    pub fn new(ram: Arc<GuestMemory>, tsc_hz: u64, apic_hz: u64) -> Self {
         HvEnlightenment {
             ram,
             tsc_hz,
             tsc_scale: compute_tsc_scale(tsc_hz),
+            apic_hz,
             cache: Mutex::new(MsrCache {
                 guest_os_id: 0,
                 hypercall_msr: 0,
@@ -70,6 +110,9 @@ impl HvEnlightenment {
 
     pub fn tsc_hz(&self) -> u64 {
         self.tsc_hz
+    }
+    pub fn apic_hz(&self) -> u64 {
+        self.apic_hz
     }
     pub fn tsc_scale(&self) -> u64 {
         self.tsc_scale
@@ -174,13 +217,17 @@ impl HvEnlightenment {
                 MsrHandled::Yes
             }
             // The frequency MSRs are what let Linux's `ms_hyperv_init_platform`
-            // bypass PIT/HPET TSC calibration (it sets `x86_platform.calibrate_tsc
-            // = hv_get_tsc_khz`). Without them the guest falls back to PIT
-            // calibration → fails (no IRQ0/HPET) → `calibrate_delay()` spins
-            // forever. The software LAPIC's timer counts in host-TSC ticks, so
-            // its bus frequency *is* the TSC frequency.
-            MSR_TSC_FREQUENCY | MSR_APIC_FREQUENCY => {
+            // bypass PIT/HPET calibration (it sets `x86_platform.calibrate_tsc
+            // = hv_get_tsc_khz` and takes the LAPIC timer period from the APIC
+            // frequency). Without them the guest falls back to PIT calibration →
+            // fails (no IRQ0/HPET) → `calibrate_delay()` spins forever.
+            MSR_TSC_FREQUENCY => {
                 *out = self.tsc_hz;
+                MsrHandled::Yes
+            }
+            // WHP's LAPIC timer counts at the interrupt clock, not the TSC.
+            MSR_APIC_FREQUENCY => {
+                *out = self.apic_hz;
                 MsrHandled::Yes
             }
             MSR_VP_ASSIST_PAGE => {

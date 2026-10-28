@@ -44,7 +44,7 @@ use crate::virtio::snd::SndDevice;
 use crate::virtio::transport::{self, PciTransport};
 use crate::whp::cpu_affinity::{self, AffinityMode};
 use crate::whp::cpuid::{build_static_cpuid_result_list, cached_tsc_hz, set_hide_tsc_deadline};
-use crate::whp::hv::HvEnlightenment;
+use crate::whp::hv::{HvEnlightenment, interrupt_clock_hz};
 use crate::whp::run_loop::{RunLoop, StopReason};
 use crate::whp::{GuestMemory, Partition, Vcpu};
 
@@ -63,10 +63,9 @@ use windows_sys::Win32::System::Console::{
     STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
 };
 use windows_sys::Win32::System::Hypervisor::{
-    WHV_INTERRUPT_CONTROL, WHV_PARTITION_HANDLE, WHvCapabilityCodeFeatures,
-    WHvCapabilityCodeHypervisorPresent, WHvGetCapability, WHvMapGpaRange, WHvMapGpaRange2,
-    WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite, WHvRequestInterrupt, WHvUnmapGpaRange,
-    WHvX64LocalApicEmulationModeNone, WHvX64LocalApicEmulationModeX2Apic,
+    WHV_PARTITION_HANDLE, WHvCapabilityCodeFeatures, WHvCapabilityCodeHypervisorPresent,
+    WHvGetCapability, WHvMapGpaRange, WHvMapGpaRange2, WHvMapGpaRangeFlagRead,
+    WHvMapGpaRangeFlagWrite, WHvUnmapGpaRange, WHvX64LocalApicEmulationModeX2Apic,
 };
 use windows_sys::Win32::System::SystemInformation::GetSystemFirmwareTable;
 
@@ -908,8 +907,6 @@ struct PvhArgs {
     unsafe_save_mutable_drive: bool,
     with_input: bool,
     with_sound: bool,
-    /// Force the software LAPIC on/off; `None` auto-detects (nested => on).
-    emulate_lapic: Option<bool>,
 }
 
 /// Parse a `--portfwd HOSTPORT:GUESTPORT` rule. The host side binds 127.0.0.1
@@ -963,8 +960,6 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
     let mut unsafe_save_mutable_drive = false;
     let mut with_input = false;
     let mut with_sound = false;
-    // None = auto-detect (software LAPIC only when running nested).
-    let mut emulate_lapic: Option<bool> = None;
 
     let mut i = 2;
     while i < args.len() && args[i].starts_with("--") && args[i] != "--" {
@@ -976,15 +971,6 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
                         .ok_or_else(|| Error::msg("--initrd wants a path"))?
                         .clone(),
                 );
-            }
-            "--emulate-lapic" => {
-                i += 1;
-                emulate_lapic = match args.get(i).map(|s| s.as_str()) {
-                    Some("auto") => None,
-                    Some("on") => Some(true),
-                    Some("off") => Some(false),
-                    _ => return Err(Error::msg("--emulate-lapic wants auto|on|off")),
-                };
             }
             "--ram-mb" => {
                 i += 1;
@@ -1239,47 +1225,47 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
         unsafe_save_mutable_drive,
         with_input,
         with_sound,
-        emulate_lapic,
     })
 }
 
-/// Decide whether to drive interrupts through the software LAPIC. The hardware
-/// LAPIC (WHP) is faster but only delivers interrupts when APIC virtualization
-/// is available, which it isn't to a *nested* guest -- so emulate when running
-/// inside a VM. `forced` overrides the auto-detection (`--emulate-lapic on|off`).
-fn decide_emulate_lapic(forced: Option<bool>) -> bool {
-    forced.unwrap_or_else(host_is_vm)
+/// The 8259 pair, whose INT output is the BSP's LINT0. A request kicks the BSP
+/// out of `WHvRunVirtualProcessor` so its run loop injects the vector as an
+/// ExtINT event right away -- even if the guest is halted (see `devices::pic`).
+fn new_pic(bsp: &Arc<Vcpu>) -> Arc<Pic8259> {
+    let bsp = bsp.clone();
+    Pic8259::new(Box::new(move || {
+        let _ = bsp.cancel();
+    }))
 }
 
-/// True if this host is itself a virtual machine (so WHP runs nested). Reads the
-/// SMBIOS system product name from the registry; Hyper-V guests report
-/// "Virtual Machine" while bare-metal (even a Hyper-V root) reports real
-/// hardware. On any read failure we assume nested -- the software LAPIC works
-/// everywhere, it's just slower, so that's the safe default.
-fn host_is_vm() -> bool {
-    use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
-    let subkey: Vec<u16> = "HARDWARE\\DESCRIPTION\\System\\BIOS\0"
-        .encode_utf16()
-        .collect();
-    let value: Vec<u16> = "SystemProductName\0".encode_utf16().collect();
-    let mut buf = [0u16; 128];
-    let mut cb = std::mem::size_of_val(&buf) as u32;
-    let rc = unsafe {
-        RegGetValueW(
-            HKEY_LOCAL_MACHINE,
-            subkey.as_ptr(),
-            value.as_ptr(),
-            RRF_RT_REG_SZ,
-            std::ptr::null_mut(),
-            buf.as_mut_ptr() as *mut core::ffi::c_void,
-            &mut cb,
-        )
-    };
-    if rc != 0 {
-        return true; // can't tell -> assume nested (always-correct, just slower)
+/// TINYVMM_DIAG post-mortem view of each vCPU's WHP LAPIC: TPR/PPR plus the
+/// in-service and pending vectors. An ISR bit that never clears pins PPR at its
+/// class and blocks every vector at or below it -- the signature of an
+/// interrupt the guest never EOIs.
+fn dump_apic_state(vcpus: &[Arc<Vcpu>]) {
+    for v in vcpus {
+        let page = v.get_interrupt_controller();
+        let reg = |off: usize| {
+            page.get(off..off + 4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        };
+        let vectors = |base: usize| {
+            let set: Vec<String> = (0..256usize)
+                .filter(|&vec| reg(base + (vec / 32) * 0x10).unwrap_or(0) & (1 << (vec % 32)) != 0)
+                .map(|vec| format!("0x{vec:02x}"))
+                .collect();
+            set.join(",")
+        };
+        match (reg(0x80), reg(0xA0)) {
+            (Some(tpr), Some(ppr)) => eprintln!(
+                "[pvh-run] vCPU {} LAPIC: tpr=0x{tpr:02x} ppr=0x{ppr:02x} isr=[{}] irr=[{}]",
+                v.index(),
+                vectors(0x100),
+                vectors(0x200)
+            ),
+            _ => eprintln!("[pvh-run] vCPU {} LAPIC: state unavailable", v.index()),
+        }
     }
-    let n = (cb as usize / 2).saturating_sub(1).min(buf.len()); // drop trailing NUL
-    String::from_utf16_lossy(&buf[..n]).eq_ignore_ascii_case("Virtual Machine")
 }
 
 /// Heavy post-mortem diagnostics (per-vCPU exit breakdown + a guest-RAM dump)
@@ -1361,37 +1347,11 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     set_hide_tsc_deadline(true);
     let static_cpuid = build_static_cpuid_result_list(true);
     part.set_cpuid_result_list(&static_cpuid)?;
-    // LAPIC emulation: nested guests need the software LAPIC (see whpsys::lapic)
-    // because WHP's own LAPIC delivery relies on APIC virtualization the L1
-    // hypervisor doesn't expose to an L2 guest, so device/timer interrupts would
-    // never reach an idle guest. On bare metal that virtualization is present, so
-    // keep WHP's faster hardware LAPIC. Auto-detected unless --emulate-lapic says.
-    let emulate_lapic = decide_emulate_lapic(cfg.emulate_lapic);
-    let apic_mode = if emulate_lapic {
-        WHvX64LocalApicEmulationModeNone
-    } else {
-        WHvX64LocalApicEmulationModeX2Apic
-    };
-    part.set_local_apic_emulation(apic_mode)?;
-    if emulate_lapic {
-        // Trap APIC_BASE writes (bit 3) so an AP enabling x2APIC reaches the
-        // software LAPIC instead of WHP faulting it; keep unhandled MSRs (bit 0)
-        // trapping for the Hyper-V + x2APIC MSRs.
-        part.set_msr_exit_bitmap(0x9)?;
-    }
+    // WHP's in-hypervisor LAPIC delivers MSIs, IPIs and the LAPIC timer on bare
+    // metal and nested alike; only the PIC's ExtINT is injected by us.
+    part.set_local_apic_emulation(WHvX64LocalApicEmulationModeX2Apic)?;
     part.setup()?;
     let part_handle = part.handle();
-    println!(
-        "[pvh-run] LAPIC: {}",
-        if emulate_lapic {
-            "software-emulated (nested)"
-        } else {
-            "hardware (WHP x2APIC)"
-        }
-    );
-    if emulate_lapic {
-        whpsys::lapic::init(part_handle, cfg.vcpus, cached_tsc_hz());
-    }
 
     // --- Guest RAM ---
     // RAM up to the 3584 MiB PCI MMIO window stays at GPA 0; any remainder is
@@ -1427,11 +1387,16 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     }
 
     // --- Hyper-V enlightenment (Reference TSC page + MSRs) ---
-    let hv = Arc::new(HvEnlightenment::new(ram.clone(), cached_tsc_hz()));
+    let hv = Arc::new(HvEnlightenment::new(
+        ram.clone(),
+        cached_tsc_hz(),
+        interrupt_clock_hz(),
+    ));
     println!(
-        "[pvh-run] Hyper-V enlightenment ready (tsc_hz={}, scale=0x{:016x})",
+        "[pvh-run] Hyper-V enlightenment ready (tsc_hz={}, scale=0x{:016x}, apic_hz={})",
         hv.tsc_hz(),
-        hv.tsc_scale()
+        hv.tsc_scale(),
+        hv.apic_hz()
     );
     btimer.mark("guest RAM mapped");
 
@@ -1487,21 +1452,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     legacy.attach(&mut io_bus);
 
     // Legacy PIC: the only ISA-IRQ -> guest-IDT path in virtual-wire mode.
-    let pic = Pic8259::new(Box::new(move |vector: u8, dest: u32| -> bool {
-        let ctrl = WHV_INTERRUPT_CONTROL {
-            _bitfield: 0, // Type=Fixed, DestMode=Physical, Trigger=Edge
-            Destination: dest,
-            Vector: vector as u32,
-        };
-        let hr = unsafe {
-            WHvRequestInterrupt(
-                part_handle,
-                &ctrl,
-                std::mem::size_of::<WHV_INTERRUPT_CONTROL>() as u32,
-            )
-        };
-        hr >= 0
-    }));
+    let pic = new_pic(&vcpus[0]);
     pic.attach(&mut io_bus);
     {
         let pic = pic.clone();
@@ -1866,6 +1817,9 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     for vp in &vcpus {
         let mut rl = RunLoop::new(vp.clone(), io_bus.clone(), mmio_bus.clone(), cfg.vcpus)?;
         rl.set_hv(hv.clone());
+        if vp.index() == 0 {
+            rl.set_ext_int_source(pic.clone());
+        }
         loops.push(rl);
     }
 
@@ -2181,6 +2135,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
                 cc.other.load(Ordering::Relaxed),
             );
         }
+        dump_apic_state(&vcpus);
         dump_guest_ram(&ram, "tinyvmm-guest-ram.bin");
     }
 
@@ -2649,26 +2604,9 @@ fn run_restore(args: &[String]) -> Result<i32> {
     set_hide_tsc_deadline(true);
     let static_cpuid = build_static_cpuid_result_list(true);
     part.set_cpuid_result_list(&static_cpuid)?;
-    // Match the boot path's LAPIC choice (nested => software-emulated). Auto by
-    // default; restore on a different host than the save honours this host's env.
-    let emulate_lapic = decide_emulate_lapic(None);
-    let apic_mode = if emulate_lapic {
-        WHvX64LocalApicEmulationModeNone
-    } else {
-        WHvX64LocalApicEmulationModeX2Apic
-    };
-    part.set_local_apic_emulation(apic_mode)?;
-    if emulate_lapic {
-        // Match the boot path: trap APIC_BASE writes (bit 3) so a restored AP
-        // re-enabling x2APIC reaches the software LAPIC, plus unhandled MSRs
-        // (bit 0) for the Hyper-V + x2APIC MSRs.
-        part.set_msr_exit_bitmap(0x9)?;
-    }
+    part.set_local_apic_emulation(WHvX64LocalApicEmulationModeX2Apic)?;
     part.setup()?;
     let part_handle = part.handle();
-    if emulate_lapic {
-        whpsys::lapic::init(part_handle, vcpu_count, cached_tsc_hz());
-    }
 
     let ram = Arc::new(GuestMemory::new_split(
         part_handle,
@@ -2678,7 +2616,11 @@ fn run_restore(args: &[String]) -> Result<i32> {
         true,
         large_pages,
     )?);
-    let hv = Arc::new(HvEnlightenment::new(ram.clone(), cached_tsc_hz()));
+    let hv = Arc::new(HvEnlightenment::new(
+        ram.clone(),
+        cached_tsc_hz(),
+        interrupt_clock_hz(),
+    ));
 
     let mut vcpus: Vec<Arc<Vcpu>> = Vec::with_capacity(vcpu_count as usize);
     for i in 0..vcpu_count {
@@ -2697,21 +2639,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
     pit.attach(&mut io_bus);
     let legacy = LegacyIsaStubs::new();
     legacy.attach(&mut io_bus);
-    let pic = Pic8259::new(Box::new(move |vector: u8, dest: u32| -> bool {
-        let ctrl = WHV_INTERRUPT_CONTROL {
-            _bitfield: 0,
-            Destination: dest,
-            Vector: vector as u32,
-        };
-        let hr = unsafe {
-            WHvRequestInterrupt(
-                part_handle,
-                &ctrl,
-                std::mem::size_of::<WHV_INTERRUPT_CONTROL>() as u32,
-            )
-        };
-        hr >= 0
-    }));
+    let pic = new_pic(&vcpus[0]);
     pic.attach(&mut io_bus);
     {
         let pic = pic.clone();
@@ -3218,6 +3146,9 @@ fn run_restore(args: &[String]) -> Result<i32> {
     for vp in &vcpus {
         let mut rl = RunLoop::new(vp.clone(), io_bus.clone(), mmio_bus.clone(), vcpu_count)?;
         rl.set_hv(hv.clone());
+        if vp.index() == 0 {
+            rl.set_ext_int_source(pic.clone());
+        }
         loops.push(rl);
     }
 

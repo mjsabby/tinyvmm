@@ -103,6 +103,21 @@ Boot a kernel:
 .\target\release\tinyvmm.exe --pvh-run --initrd initramfs.cpio vmlinux
 ```
 
+### Tests & benchmarks
+
+`cargo test --workspace --release` runs the unit tests (no WHP needed; CI runs
+it). The `tools\*.py` harnesses boot `vmlinux` with an initramfs built from a
+static `busybox-x86_64` (`tools/make_initramfs.py`; both live, gitignored, in the
+repo root) and need WHP — bare metal or nested Hyper-V:
+
+| Harness | Covers |
+|---------|--------|
+| `python tools\blk_test.py` | virtio-blk integrity, queue depth, flush/barrier, read-only |
+| `python tools\smp_test.py` | AP bring-up, scheduling on every vCPU, IPIs, blk under SMP |
+| `python tools\irq_test.py` | interrupt delivery at 1 and 2 vCPUs: COM1 IRQs reach the guest as ExtINT (also waking an idle BSP), MSIs keep flowing afterwards, the LAPIC timer is calibrated to WHP's interrupt clock, and `sleep 2` takes 2 s of host time |
+| `python tools\irq_bench.py --tinyvmm base=<exe> --tinyvmm new=<exe>` | A/B interrupt-path latency: timer wake-up, virtio-blk QD1 round trip, cross-CPU wake-up, idle host CPU, VM exits |
+| `python tools\net_compare.py` | NAT networking vs OpenVMM |
+
 ### Large pages (recommended)
 
 Guest RAM is allocated with `MEM_LARGE_PAGES` (2 MiB pages) when the process can
@@ -309,14 +324,22 @@ order they are created — that order is fixed (it is also the snapshot
 * **8250/16550 UART** at `0x3F8` — TX → host stdout; raises ISA IRQ4 through the
   PIC when the guest enables transmit interrupts (ETBEI). Used for `earlyprintk`.
 * **i8259 PIC pair** at `0x20/0x21`, `0xA0/0xA1` — the only ISA-IRQ → guest-IDT
-  path; injects vectors with `WHvRequestInterrupt`. Holds its mapping behind a
-  `Mutex<Inner>` and a `Box<dyn Fn(u8,u32)->bool>` injection closure.
+  path. An IRQ latches in the IRR and kicks the BSP; the BSP's run loop runs the
+  INTA cycle (`Pic8259::acknowledge`) and injects the vector as an **ExtINT**
+  event (`WHvRegisterPendingEvent`), or requests an interrupt-window exit while
+  the guest can't take it. Never as a Fixed LAPIC interrupt: Linux EOIs 8259
+  IRQs only at the PIC, so a Fixed delivery would leave its LAPIC ISR bit set
+  and block every MSI at or below its priority class.
 * **8254 PIT** at `0x40–0x43`, `0x61` — counters only; **IRQ0 intentionally not
   wired** (Linux uses the in-hypervisor LAPIC timer).
 * **CMOS/RTC** at `0x70/0x71` returns a fixed `2024-01-01` wall clock; POST port
   `0x80` and port-A `0x92` are stubs (`src/devices/legacy.rs`).
 
-The vCPU local APIC is emulated by WHP in **x2APIC mode**, and a minimal ACPI
+The vCPU local APIC is emulated by WHP in **x2APIC mode** — on bare metal and
+nested alike — and delivers MSIs (`WHvRequestInterrupt`), IPIs, the LAPIC timer
+and HLT wake-ups without VM exits; the guest is told its timer rate through
+`HV_X64_MSR_APIC_FREQUENCY`, which reports WHP's interrupt clock
+(`WHvCapabilityCodeInterruptClockFrequency`, 200 MHz), not the TSC. A minimal ACPI
 surface (RSDP / XSDT / MADT with one x2APIC entry per vCPU, LAPIC at
 `0xFEE0_0000`) is staged into guest RAM by `src/boot/acpi.rs` (`MAX_VCPUS = 32`).
 
@@ -897,9 +920,15 @@ six `AtomicU64` — `io`, `mmio`, `halt`, `cpuid`, `msr`, `other`):
   otherwise `resolve_cpuid` applies the static result list (including the Hyper-V
   leaves `0x4000_0000..0x4000_0006`).
 * **Msr** → handled by the Hyper-V enlightenment (`src/whp/hv.rs`): the hypercall
-  page, Reference-TSC page, `GUEST_OS_ID`, `VP_INDEX`, the TSC-invariant control,
-  etc. An unhandled MSR injects `#GP(0)` rather than crashing.
-* **Halt** with interrupts enabled just resumes; HLT with `IF=0` is terminal.
+  page, Reference-TSC page, `GUEST_OS_ID`, `VP_INDEX`, the TSC/APIC frequency
+  MSRs, the TSC-invariant control, etc. An unhandled MSR injects `#GP(0)` rather
+  than crashing. The x2APIC MSRs never exit: WHP's LAPIC owns them.
+* **Halt** with interrupts enabled just resumes (WHP's LAPIC normally waits out
+  HLT in the hypervisor, so this is rare); HLT with `IF=0` is terminal.
+* **InterruptWindow / Canceled** → re-run the BSP's ExtINT delivery pass: a PIC
+  request kicks the BSP with `WHvCancelRunVirtualProcessor`, and if the guest
+  can't take it yet (`IF=0`, interrupt shadow, event pending) the loop asks for
+  an interrupt-window exit and injects then.
 
 **Why doorbells matter to the counters:** a queue notify that hits a doorbell
 ([§3](#3-devices-in-detail)) signals an OS event and takes **0 VM exits**. The

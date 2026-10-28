@@ -72,9 +72,7 @@ impl Partition {
     }
 
     /// `WHV_X64_MSR_EXIT_BITMAP` (a u64 of intercept bits): bit0 UnhandledMsrs,
-    /// bit3 ApicBaseMsrWrite. With the software LAPIC we need APIC_BASE writes to
-    /// trap (so an AP can enable x2APIC without WHP faulting it) while keeping
-    /// unhandled MSRs trapping.
+    /// bit3 ApicBaseMsrWrite.
     pub fn set_msr_exit_bitmap(&self, bits: u64) -> Result<()> {
         self.set_property(WHvPartitionPropertyCodeX64MsrExitBitmap, &bits)
     }

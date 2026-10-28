@@ -137,8 +137,8 @@ pub fn resolve_cpuid(
             }
         }
         0x0000_0001 => {
-            // The software LAPIC (nested path) only speaks x2APIC; force-on
-            // ECX[21] so the guest can switch even when the host masks it.
+            // Advertise x2APIC even if the host masks it: WHP's LAPIC runs in
+            // x2APIC mode, and the MADT describes the vCPUs as x2APIC entries.
             r.ecx |= ECX_X2APIC;
             if !HIDE_TSC_DEADLINE.load(Ordering::Relaxed) {
                 r.ecx |= ECX_TSC_DEADLINE;
