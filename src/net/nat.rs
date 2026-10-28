@@ -107,9 +107,9 @@ pub struct NatOptions {
     pub tcb_warm: [usize; N_TCB_TIERS],
     /// Tier index assigned to a flow when no port override matches.
     pub default_tier: usize,
-    /// Optional service-port → tier overrides (e.g. route known-bulk ports to
-    /// the big-ring tier). Keyed by the destination port (outbound) / guest
-    /// service port (inbound).
+    /// Optional service-port → tier overrides (e.g. route known small-transfer
+    /// ports to a smaller tier to save memory). Keyed by the destination port
+    /// (outbound) / guest service port (inbound).
     pub tcb_port_tier: Vec<(u16, usize)>,
 }
 
@@ -137,10 +137,13 @@ impl Default for NatOptions {
 // reused scratch buffers); this extends the same discipline to flow setup.
 //
 // Tcb ring sizes are COMPILE-TIME tiers (const-generic `Tcb<BUF>`); the WAN
-// bandwidth-delay product is absorbed by the host kernel socket, so for the
-// NAT these rings only bridge the sub-millisecond in-VMM guest leg — the
-// default tier is ample. Counts are RUNTIME pool config (see `NatOptions`).
-// Sizes MUST be powers of two.
+// bandwidth-delay product is absorbed by the host kernel socket, so these
+// rings only bridge the in-VMM guest leg. That leg is still window-bound: a
+// guest upload can have at most one ring of unacknowledged data in flight,
+// and under nested virtualization each round trip is ~0.4 ms (mostly the
+// guest's ACK -> next-TX reaction), so 256 KiB rings cap uploads near 4 Gbps
+// while 1 MiB reaches ~9 Gbps. Counts are RUNTIME pool config (see
+// `NatOptions`). Sizes MUST be powers of two.
 
 /// Number of compile-time Tcb ring-size tiers.
 pub const N_TCB_TIERS: usize = 3;
@@ -153,11 +156,13 @@ const TIER_MAKE: [fn() -> Box<dyn TcbDyn>; N_TCB_TIERS] = [
     make_tcb::<{ TIER_BUF[1] }>,
     make_tcb::<{ TIER_BUF[2] }>,
 ];
-/// Default warm counts: most flows ride the mid tier; the small/big tiers are
-/// lightly warmed (big is opt-in via `tcb_port_tier`).
-const DEFAULT_TCB_WARM: [usize; N_TCB_TIERS] = [192, 56, 8];
-/// Default tier index (256 KiB) when no port override matches.
-const DEFAULT_TIER: usize = 1;
+/// Default warm counts (cold-start preallocation; pools still grow on demand).
+/// Most flows ride the default 1 MiB tier; the small/mid tiers are opt-in via
+/// `tcb_port_tier`. Preallocated ring memory (two rings per Tcb):
+/// 192 x 128 KiB + 8 x 512 KiB + 16 x 2 MiB = 60 MiB.
+const DEFAULT_TCB_WARM: [usize; N_TCB_TIERS] = [192, 8, 16];
+/// Default tier index (1 MiB) when no port override matches.
+const DEFAULT_TIER: usize = 2;
 
 /// Placeholder config a pooled Tcb is built with; `reinit` on acquire fully
 /// overwrites it, so these values never reach the wire.
@@ -1492,7 +1497,7 @@ impl NatState {
                     // send ring (skipping the `pending_to_guest` staging copy —
                     // ~735 MB/s of memcpy at the current ceiling). Only the
                     // remainder (send-ring full) spills to `pending_to_guest`;
-                    // with a 256 KiB ring and a 64 KiB recv that's rare.
+                    // with the default 1 MiB ring and a 64 KiB recv that's rare.
                     // SAFETY: `op.buf` and `tcb` are disjoint Box fields of
                     // `flow`; `send` only reads from the slice.
                     let buf_ptr = flow.op.as_ref().unwrap().buf.as_ptr();
