@@ -155,7 +155,7 @@ log "=== init complete; dropping to shell on hvc0 ==="
 # UDP DNS, and HTTP/TCP fetches against well-known endpoints, then halts
 # so a watchdog-less host run can verify the usernet/wintun datapath
 # without an interactive shell.
-if grep -q 'tinyvmm.test=net' /proc/cmdline 2>/dev/null; then
+if grep -qE 'tinyvmm.test=net( |$)' /proc/cmdline 2>/dev/null; then
     log "--- NETTEST start ---"
 
     log "+ ping -c 2 -W 2 10.0.0.1 (gateway)"
@@ -299,6 +299,77 @@ if grep -q 'tinyvmm.test=usernet-tsi' /proc/cmdline 2>/dev/null; then
     sleep 65
     log "=== tinyvmm shutdown requested ==="
     sleep 1
+    poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
+    exec cat
+fi
+
+# --- optional cross-VMM NAT networking comparison -----------------------
+# Enabled via kernel cmdline marker `tinyvmm.test=netcmp`. Driven by
+# tools/net_compare.py, which boots this same kernel + initramfs under
+# tinyvmm and OpenVMM (consomme) and times throughput host-side (the guest's
+# /proc/uptime only has 10 ms resolution). VMM-agnostic: only needs eth0 at
+# 10.0.0.2/24 via gateway 10.0.0.1, which both user-mode NATs use. Prints a
+# `NETCMP DONE` marker and halts; the driver kills the VMM on that marker.
+# Cmdline vars: NETCMP_HOST, NETCMP_PORT, NETCMP_SIZE (bytes per stream),
+# NETCMP_RUNS, NETCMP_RR (sequential tiny requests), NETCMP_PAR (streams),
+# NETCMP_PING (count).
+if grep -q 'tinyvmm.test=netcmp' /proc/cmdline 2>/dev/null; then
+    arg() { tr ' ' '\\n' < /proc/cmdline | grep "^$1=" | cut -d= -f2; }
+    host=$(arg NETCMP_HOST); port=$(arg NETCMP_PORT); size=$(arg NETCMP_SIZE)
+    runs=$(arg NETCMP_RUNS); rr=$(arg NETCMP_RR); par=$(arg NETCMP_PAR)
+    pingn=$(arg NETCMP_PING)
+    base="http://${host}:${port}"
+    us() { awk '{print int($1 * 1000000)}' /proc/uptime; }
+    log "NETCMP start host=${host} port=${port} size=${size} runs=${runs} rr=${rr} par=${par} ping=${pingn}"
+    # Settle: let the NIC finish coming up before timing anything.
+    wget -q -O /dev/null -T 10 -t 3 "${base}/bytes/1/warm" 2>/dev/null
+
+    log "NETCMP PHASE ping begin"
+    ping -c "${pingn}" -i 0.01 -W 1 "${host}" > /tmp/ping.log 2>&1
+    log "NETCMP PING $(grep -E 'packets|min/avg/max' /tmp/ping.log | tr '\\n' ' ')"
+    log "NETCMP PHASE ping end"
+
+    log "NETCMP PHASE rr begin"
+    t0=$(us); ok=0
+    for i in $(seq 1 "${rr}"); do
+        wget -q -O /dev/null -T 5 -t 1 "${base}/bytes/1/rr" 2>/dev/null && ok=$((ok + 1))
+    done
+    t1=$(us)
+    log "NETCMP RR n=${rr} ok=${ok} us=$((t1 - t0))"
+    log "NETCMP PHASE rr end"
+
+    log "NETCMP PHASE dl begin"
+    wget -q -O /dev/null -T 60 -t 1 "${base}/bytes/${size}/dlwarm" 2>/dev/null
+    for i in $(seq 1 "${runs}"); do
+        wget -q -O /dev/null -T 120 -t 1 "${base}/bytes/${size}/dl${i}" 2>/dev/null
+        log "NETCMP DL run=${i} rc=$?"
+    done
+    log "NETCMP PHASE dl end"
+
+    # tmpfs-backed file so the upload reads from RAM, not a disk. busybox wget
+    # sizes --post-file with strlen(), so the payload must contain no NULs.
+    # Built before the phase marker so its cost isn't charged to the upload.
+    yes 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde | head -c "${size}" > /tmp/up.bin
+    log "NETCMP PHASE ul begin"
+    for i in $(seq 1 "${runs}"); do
+        wget -q -O /dev/null -T 120 -t 1 --post-file=/tmp/up.bin "${base}/upload/ul${i}" 2>/dev/null
+        log "NETCMP UL run=${i} rc=$?"
+    done
+    rm -f /tmp/up.bin
+    log "NETCMP PHASE ul end"
+
+    log "NETCMP PHASE par begin"
+    for r in $(seq 1 "${runs}"); do
+        for i in $(seq 1 "${par}"); do
+            wget -q -O /dev/null -T 120 -t 1 "${base}/bytes/${size}/par${r}_${i}" 2>/dev/null &
+        done
+        wait
+        log "NETCMP PAR run=${r} done"
+    done
+    log "NETCMP PHASE par end"
+
+    log "NETCMP DONE"
+    sync
     poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
     exec cat
 fi
