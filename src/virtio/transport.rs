@@ -138,19 +138,16 @@ struct SendHandles(Vec<HANDLE>);
 // WaitForMultipleObjects only; OS handle waits are thread-safe.
 unsafe impl Send for SendHandles {}
 
-/// Pump thread: wait on {stop, per-queue doorbells} and drive the existing
-/// `notify_queue` path off the event instead of a VM exit. A short timeout
-/// sweeps all queues as a safety net for any notification that the doorbell
-/// didn't catch (e.g. EVENT_IDX corner cases) — mirrors the C++ 5 ms sweep.
 /// Pump thread: block until a per-queue doorbell (or stop) fires and drive the
 /// existing `notify_queue` path — no VM exit, and no periodic wakeup. The
-/// doorbell is sufficient on its own: the virtqueue re-reads avail.idx
-/// (Acquire) every drain and publishes avail_event (Release) requesting the
-/// next kick, so the EVENT_IDX notification race is closed (verified: a 20 MB
-/// transfer ran at line rate with the periodic sweep disabled). Any write that
-/// somehow doesn't match the doorbell still falls through to the MMIO handler,
-/// so no periodic safety sweep is needed (unlike the C++, whose 5 ms timeout is
-/// really its WSAPoll socket-poll cadence — we use IOCP for sockets instead).
+/// doorbell is sufficient on its own: when a drain finds the ring empty, the
+/// virtqueue publishes `avail_event` requesting the next kick, issues a full
+/// fence, and re-reads `avail.idx` (`Virtqueue::arm_kick_and_recheck`, pairing
+/// with the barrier in the driver's `virtqueue_kick_prepare`), so the EVENT_IDX
+/// notification race is closed. Any write that somehow doesn't match the
+/// doorbell still falls through to the MMIO handler, so no periodic safety
+/// sweep is needed (unlike the C++, whose 5 ms timeout is really its WSAPoll
+/// socket-poll cadence — we use IOCP for sockets instead).
 /// The pump holds a strong `Arc<dyn VirtioDevice>` (not `Weak<PciTransport>`):
 /// it only needs `notify_queue`, the device merely *weak*-refs the transport
 /// back (via the irq closure) so there's no strong cycle, and teardown drives

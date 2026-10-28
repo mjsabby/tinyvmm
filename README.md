@@ -381,9 +381,11 @@ a VM exit**; a per-device **pump thread** wakes and drives the normal
 hot notify path with a downstream worker) and left **off for rng, input, and gpu**
 (low-rate; serviced inline on the vCPU thread). The pump waits `INFINITE` with
 **no periodic sweep** (`SWEEP_MS = u32::MAX`): the virtqueue itself closes the
-`EVENT_IDX` notification race (an Acquire re-read of `avail.idx` + a Release of
-`avail_event` per drain), and any non-matching write still falls through to the
-MMIO handler as a backstop.
+`EVENT_IDX` notification races the way vhost does, with a full fence between
+its store and the load that pairs with the driver's barrier (publish
+`avail_event`, fence, re-read `avail.idx` before treating the ring as empty;
+publish `used.idx`, fence, read `used_event` before deciding to interrupt), and
+any non-matching write still falls through to the MMIO handler as a backstop.
 
 ---
 

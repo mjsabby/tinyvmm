@@ -274,8 +274,11 @@ impl Virtqueue {
         if !self.ready || self.size == 0 {
             return false;
         }
-        let avail_idx = self.avail_idx();
-        if avail_idx == self.last_avail {
+        // Without EVENT_IDX the driver kicks for every publish (we never set
+        // VRING_USED_F_NO_NOTIFY), so an empty ring needs no re-check.
+        if self.avail_idx() == self.last_avail
+            && (!self.event_idx || self.arm_kick_and_recheck() == self.last_avail)
+        {
             return false;
         }
         let slot = self.last_avail % self.size as u16;
@@ -367,6 +370,23 @@ impl Virtqueue {
         if self.pop_into(&mut c) { Some(c) } else { None }
     }
 
+    /// The ring looked empty: ask the driver to kick when it publishes the
+    /// next entry, then look again (`vhost_enable_notify`). Returns the fresh
+    /// `avail.idx`.
+    ///
+    /// The fence pairs with the full barrier the driver executes between
+    /// publishing `avail.idx` and reading `avail_event`
+    /// (`virtqueue_kick_prepare`). Release/Acquire do not order a store before
+    /// a later load: without the fence this CPU can complete the `avail.idx`
+    /// load while the `avail_event` store still sits in its store buffer, a
+    /// driver publishing in that window reads the old event and skips the
+    /// kick, and the entry waits for a kick that never comes.
+    fn arm_kick_and_recheck(&self) -> u16 {
+        self.store_avail_event(self.last_avail);
+        fence(Ordering::SeqCst);
+        self.avail_idx()
+    }
+
     /// Position of the next available-ring entry [`Self::pop_into`] will take;
     /// pass it to [`Self::rewind_avail`] to give back the chains popped since.
     pub fn avail_cursor(&self) -> u16 {
@@ -377,8 +397,8 @@ impl Virtqueue {
     /// empty. None of them may have been pushed to the used ring. With
     /// EVENT_IDX, `pop_into` already left `avail_event` at the index where the
     /// ring ran dry, so the driver's next refill kicks the device. Returns true
-    /// if the driver published more buffers before that request was visible;
-    /// such a refill may not kick, so the caller should retry now.
+    /// if the driver published more buffers since that empty check; the caller
+    /// should retry now rather than wait for the kick.
     pub fn rewind_avail(&mut self, cursor: u16) -> bool {
         let dry_at = self.last_avail;
         self.last_avail = cursor;
@@ -423,6 +443,14 @@ impl Virtqueue {
         if !self.ready {
             return false;
         }
+        // Pairs with the full barrier the driver executes between re-enabling
+        // interrupts (writing `used_event`, or clearing NO_INTERRUPT) and
+        // re-reading `used.idx` (`virtqueue_enable_cb_prepare` +
+        // `virtqueue_poll`; vhost_notify). Without it this CPU can read the
+        // old `used_event` while the `used.idx` it just published still sits
+        // in its store buffer: a driver re-arming in that window sees nothing
+        // new and waits for an interrupt that never comes.
+        fence(Ordering::SeqCst);
         let new_used = self.last_used_idx;
         let old_used = self.last_used_signaled;
         self.last_used_signaled = new_used;
@@ -509,5 +537,142 @@ mod tests {
                 }
             }
         }
+    }
+
+    // EVENT_IDX notification races, run as store-buffer litmus tests on real
+    // CPUs: the device and a model of the Linux driver each store their side
+    // of the handshake and then load the other's. Without a full fence on the
+    // device side both loads can miss, and the notification is lost.
+    const SIZE: u32 = 256;
+    const DESC: u64 = 0x1000;
+    const AVAIL: u64 = 0x2000;
+    const USED: u64 = 0x3000;
+    const USED_EVENT: u64 = AVAIL + 4 + 2 * SIZE as u64;
+    const AVAIL_EVENT: u64 = USED + 4 + 8 * SIZE as u64;
+    const ROUNDS: u32 = 200_000;
+
+    fn litmus_queue() -> (Arc<GuestMemory>, Virtqueue) {
+        let mem = Arc::new(GuestMemory::new_host_only(64 * 1024).unwrap());
+        // Every avail entry names descriptor 0: one 64-byte readable buffer.
+        let mut d = [0u8; 16];
+        d[..8].copy_from_slice(&0x8000u64.to_le_bytes());
+        d[8..12].copy_from_slice(&64u32.to_le_bytes());
+        mem.write_at(DESC, &d).unwrap();
+        let mut q = Virtqueue::new(mem.clone(), SIZE);
+        q.set_size(SIZE);
+        q.set_desc_gpa(DESC);
+        q.set_avail_gpa(AVAIL);
+        q.set_used_gpa(USED);
+        q.set_event_idx_enabled(true);
+        q.set_ready(true);
+        (mem, q)
+    }
+
+    /// Both threads arrive, then go on together.
+    fn rendezvous(gate: &std::sync::atomic::AtomicU32, phase: u32) {
+        gate.fetch_add(1, Ordering::SeqCst);
+        let mut spins = 0u32;
+        while gate.load(Ordering::SeqCst) < 2 * (phase + 1) {
+            spins += 1;
+            if spins % 1024 == 0 {
+                std::thread::yield_now();
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    /// Run `ROUNDS` rounds of `device` and `driver` on two threads, starting
+    /// each round on both at once, and count the rounds in which neither saw
+    /// the other's store: notifications lost. Each side calls the `decided`
+    /// callback it is given once per round, after its race and before it
+    /// readies the next round, so neither reads the other's clean-up.
+    fn lost_notifications(
+        mut device: impl FnMut(u32, &dyn Fn()) -> bool + Send,
+        mut driver: impl FnMut(u32, &dyn Fn()) -> bool + Send,
+    ) -> usize {
+        let gate = std::sync::atomic::AtomicU32::new(0);
+        let gate = &gate;
+        let (dev, drv) = std::thread::scope(|s| {
+            let d = s.spawn(move || {
+                (0..ROUNDS)
+                    .map(|r| {
+                        rendezvous(gate, 2 * r);
+                        device(r, &|| rendezvous(gate, 2 * r + 1))
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let r = s.spawn(move || {
+                (0..ROUNDS)
+                    .map(|r| {
+                        rendezvous(gate, 2 * r);
+                        driver(r, &|| rendezvous(gate, 2 * r + 1))
+                    })
+                    .collect::<Vec<_>>()
+            });
+            (d.join().unwrap(), r.join().unwrap())
+        });
+        dev.iter().zip(&drv).filter(|&(&d, &r)| !d && !r).count()
+    }
+
+    /// Round r: the device publishes used entry r and decides whether to
+    /// interrupt, while the driver, having consumed entries < r, re-enables
+    /// interrupts at r and re-checks `used.idx` (`virtqueue_enable_cb_prepare`
+    /// + `virtqueue_poll`).
+    #[test]
+    fn used_buffer_interrupt_is_never_lost() {
+        let (mem, mut q) = litmus_queue();
+        // The driver last re-enabled at "round -1".
+        assert!(mem.store_release_u16(USED_EVENT, u16::MAX));
+        let lost = lost_notifications(
+            |_, decided| {
+                q.push(0, 0);
+                let irq = q.should_interrupt_driver();
+                decided();
+                irq
+            },
+            |r, decided| {
+                let r = r as u16;
+                assert!(mem.store_release_u16(USED_EVENT, r));
+                fence(Ordering::SeqCst);
+                let more = mem.load_acquire_u16(USED + 2) != Some(r);
+                decided();
+                more
+            },
+        );
+        assert_eq!(lost, 0, "{lost} of {ROUNDS} used-buffer interrupts lost");
+    }
+
+    /// Round r: entry 2r is already available. The device pops it, then finds
+    /// the ring empty unless it sees entry 2r+1, which the driver publishes
+    /// meanwhile before deciding whether to kick (`virtqueue_kick_prepare`).
+    #[test]
+    fn available_buffer_kick_is_never_lost() {
+        let (mem, mut q) = litmus_queue();
+        let mut chain = ChainScratch::default();
+        assert!(mem.store_release_u16(AVAIL + 2, 1)); // entry 0
+        let lost = lost_notifications(
+            |_, decided| {
+                assert!(q.pop_into(&mut chain), "entry 2r was published");
+                let got = q.pop_into(&mut chain);
+                decided();
+                // Take a missed entry 2r+1 now, so the next round starts alike.
+                if !got {
+                    assert!(q.pop_into(&mut chain));
+                }
+                got
+            },
+            |r, decided| {
+                let new = (2 * r + 2) as u16;
+                assert!(mem.store_release_u16(AVAIL + 2, new));
+                fence(Ordering::SeqCst);
+                let event = mem.load_acquire_u16(AVAIL_EVENT).unwrap();
+                decided();
+                // Entry 2r+2, which the device pops next round.
+                assert!(mem.store_release_u16(AVAIL + 2, new.wrapping_add(1)));
+                Virtqueue::vring_need_event(event, new, new.wrapping_sub(1))
+            },
+        );
+        assert_eq!(lost, 0, "{lost} of {ROUNDS} available-buffer kicks lost");
     }
 }
