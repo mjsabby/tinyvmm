@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 """Validate tinyvmm multi-vCPU (SMP) bring-up end-to-end.
 
-tinyvmm runs a software-emulated per-vCPU LAPIC when the host is itself a
-VM (nested), because WHP's in-hypervisor APIC virtualization is not
-available to a nested partition. This driver proves that path actually
-works: the BSP brings up the secondary CPUs via INIT/SIPI, they come
-ONLINE (not merely "started"), work is scheduled onto every CPU, and the
-software LAPIC routes reschedule IPIs to the secondaries.
+WHP's in-hypervisor LAPIC (x2APIC mode) handles AP startup (INIT/SIPI), IPIs
+and per-vCPU timers, on bare metal and nested alike. This driver proves that
+path works: the BSP brings up the secondary CPUs, they come ONLINE (not merely
+"started"), work is scheduled onto every CPU, and reschedule IPIs reach the
+secondaries.
 
-It launches tinyvmm with `--emulate-lapic on` (forces the software LAPIC
-regardless of whether THIS box is detected as nested, so the test is
-deterministic on bare metal and nested alike) for several vCPU counts,
-running the `tinyvmm.test=smp` initramfs self-test, and asserts every
-phase passes with `SMP SUMMARY: N/N`. It then runs the virtio-blk
-self-test under 2 vCPUs to prove device interrupts still reach the guest
-correctly with SMP enabled (MSI/LAPIC destination routing).
+It launches tinyvmm for several vCPU counts, running the `tinyvmm.test=smp`
+initramfs self-test, and asserts every phase passes with `SMP SUMMARY: N/N`.
+It then runs the virtio-blk self-test under 2 vCPUs to prove device
+interrupts still reach the guest correctly with SMP enabled (MSI destination
+routing).
 
 Usage:
   python tools\\smp_test.py
@@ -237,7 +234,6 @@ def main() -> int:
         print(f"\n========== SMP self-test: --vcpus {n} ==========")
         argv = [
             str(args.tinyvmm), "--pvh-run",
-            "--emulate-lapic", "on",
             "--vcpus", str(n),
             "--ram-mb", "256",
             "--initrd", str(args.initrd),
@@ -264,7 +260,6 @@ def main() -> int:
         try:
             argv = [
                 str(args.tinyvmm), "--pvh-run",
-                "--emulate-lapic", "on",
                 "--vcpus", "2",
                 "--ram-mb", "256",
                 "--drive", str(vdb),

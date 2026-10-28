@@ -657,12 +657,11 @@ fi
 
 # --- optional SMP / multi-vCPU bring-up validation ----------------------
 # Enabled via kernel cmdline marker `tinyvmm.test=smp`. Driven by
-# tools/smp_test.py, which launches tinyvmm with `--vcpus N` (nested, where
-# the host uses the software-emulated LAPIC) and passes the expected count
-# as `tinyvmm.smp.expect=N`. This proves the secondary CPUs the BSP brings
-# up via INIT/SIPI actually come ONLINE (not merely "started"), that work
-# is scheduled onto every CPU, and that the software LAPIC routes
-# reschedule IPIs to the secondaries.
+# tools/smp_test.py, which launches tinyvmm with `--vcpus N` and passes the
+# expected count as `tinyvmm.smp.expect=N`. This proves the secondary CPUs
+# the BSP brings up via INIT/SIPI actually come ONLINE (not merely
+# "started"), that work is scheduled onto every CPU, and that reschedule
+# IPIs reach the secondaries.
 #
 # Phases:
 #   count        nproc == /proc/cpuinfo processor count (>= 1)
@@ -671,8 +670,7 @@ fi
 #                  advances its user+nice+system jiffies (APs execute +
 #                  get scheduled, not just registered as present)
 #   ipi          /proc/interrupts RES (reschedule-IPI) total > 0 after the
-#                load -- proves the software LAPIC delivered IPIs to the
-#                secondary CPU(s)
+#                load -- proves IPIs were delivered to the secondary CPU(s)
 # Prints `SMP SUMMARY: X/Y phases passed` + the tinyvmm shutdown sentinel.
 if grep -q 'tinyvmm.test=smp' /proc/cmdline 2>/dev/null; then
     log "--- SMP-TEST start ---"
@@ -776,6 +774,222 @@ if grep -q 'tinyvmm.test=smp' /proc/cmdline 2>/dev/null; then
 
     log "--- SMP-TEST end ---"
     log "SMP SUMMARY: ${SMP_PASS}/$((SMP_PASS + SMP_FAIL)) phases passed"
+    sync
+    sleep 1
+    log "=== tinyvmm shutdown requested ==="
+    sleep 1
+    poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
+    exec cat
+fi
+
+# --- optional interrupt-delivery regression test ------------------------
+# Enabled via kernel cmdline marker `tinyvmm.test=irq`. Driven by
+# tools/irq_test.py, which attaches a scratch disk (/dev/vda) and boots this
+# at several --vcpus counts. It guards the two ways interrupt delivery has
+# broken before:
+#   * an 8259 IRQ delivered as a Fixed LAPIC interrupt instead of ExtINT:
+#     Linux EOIs it only at the PIC, so its LAPIC ISR bit never clears and
+#     every MSI at or below its priority class is blocked -- the next virtio
+#     request never completes;
+#   * a LAPIC timer calibrated against the wrong clock (the TSC instead of
+#     WHP's interrupt clock): every timer fires ~16x late.
+# Phases:
+#   pic       COM1 sends 64 bursts interrupt-driven: every byte drains and
+#             the XT-PIC IRQ 4 count rises once per burst (ExtINT delivery)
+#   msi       a virtio-blk read completes afterwards (MSIs aren't blocked)
+#   timer     `sleep 2` lasts ~2 s by the guest clock (the host also times
+#             the `IRQ TIMER begin/end` markers against its own clock)
+#   pic-ap    (>= 2 vCPUs) pic with the writer pinned to CPU1, so each IRQ
+#             has to wake an idle BSP
+#   msi-ap    (>= 2 vCPUs) msi again, after the AP-driven PIC traffic
+#   timer-ap  (>= 2 vCPUs) timer pinned to CPU1 (an AP's own LAPIC timer)
+# Prints `IRQ SUMMARY: X/Y phases passed` + the tinyvmm shutdown sentinel.
+if grep -qE 'tinyvmm.test=irq( |$)' /proc/cmdline 2>/dev/null; then
+    log "--- IRQ-TEST start ---"
+
+    IRQ_PASS=0
+    IRQ_FAIL=0
+    ipass() { log "IRQ $1: PASS${2:+ ($2)}"; IRQ_PASS=$((IRQ_PASS+1)); }
+    ifail() { log "IRQ $1: FAIL $2"; IRQ_FAIL=$((IRQ_FAIL+1)); }
+    # Total IRQ 4 count across CPUs from /proc/interrupts (0 if absent).
+    irq4() {
+        n=$(awk '$1=="4:"{s=0; for(i=2;i<=NF;i++){if($i ~ /^[0-9]+$/) s+=$i; else break}; print s; exit}' /proc/interrupts)
+        echo "${n:-0}"
+    }
+    ms_now() { echo $(( $(date +%s%N) / 1000000 )); }
+    NPROC=$(nproc 2>/dev/null || echo 1)
+
+    log "IRQ dmesg:"
+    dmesg 2>/dev/null \\
+        | grep -E 'LAPIC Timer Frequency|ttyS0 at|x2apic|Switched APIC' \\
+        | grep -v 'IRQ-TEST' \\
+        | while IFS= read -r line; do log "  $line"; done
+
+    # COM1 has to be interrupt-driven for the PIC phases; if the boot-time
+    # IRQ autoprobe came up empty, point the port at the ISA default.
+    if ! grep -q '^0:.* irq:4' /proc/tty/driver/serial 2>/dev/null; then
+        setserial /dev/ttyS0 irq 4 2>/dev/kmsg
+    fi
+    log "IRQ serial: $(grep '^0:' /proc/tty/driver/serial 2>/dev/null)"
+    stty -F /dev/ttyS0 raw -echo 2>/dev/kmsg
+
+    # Driver-side transmit counter for ttyS0.
+    serial_tx() {
+        n=$(sed -n 's/^0:.* tx:\\([0-9]*\\).*/\\1/p' /proc/tty/driver/serial)
+        echo "${n:-0}"
+    }
+    # 64 bursts of 8 bytes, 2 ms apart. The UART reasserts THRE as soon as a
+    # byte is written, so Linux drains a burst inside one interrupt -- each
+    # burst therefore costs one fresh IRQ 4, usually landing on an idle BSP.
+    # fd 7 holds the port open so IRQ 4 stays requested (and listed in
+    # /proc/interrupts) until the driver's tx counter shows everything left.
+    WRITER='i=0; while [ $i -lt 64 ]; do printf pppppppp > /dev/ttyS0; usleep 2000; i=$((i+1)); done'
+    pic_phase() {   # $1 phase name, $2 optional CPU list for the writer
+        exec 7>/dev/ttyS0
+        before=$(irq4)
+        tx0=$(serial_tx)
+        if [ -n "$2" ]; then
+            timeout 20 taskset -c "$2" sh -c "$WRITER"
+        else
+            timeout 20 sh -c "$WRITER"
+        fi
+        rc=$?
+        waited=0
+        while [ $(( $(serial_tx) - tx0 )) -lt 512 ] && [ "$waited" -lt 200 ]; do
+            usleep 50000
+            waited=$((waited + 1))
+        done
+        sent=$(( $(serial_tx) - tx0 ))
+        n=$(( $(irq4) - before ))
+        exec 7>&-
+        if [ "$rc" = 0 ] && [ "$sent" -ge 512 ] && [ "$n" -ge 32 ]; then
+            ipass "$1" "IRQ 4 x$n while $sent bytes drained"
+        else
+            ifail "$1" "writer rc=$rc, $sent/512 bytes sent, IRQ 4 x$n (want all sent, >= 32 IRQs)"
+        fi
+    }
+    msi_phase() {   # $1 phase name
+        if [ ! -b /dev/vda ]; then
+            ifail "$1" "no /dev/vda"
+            return
+        fi
+        echo 3 > /proc/sys/vm/drop_caches
+        t0=$(ms_now)
+        if timeout 20 dd if=/dev/vda of=/dev/null bs=64k count=256 2>/dev/null; then
+            ipass "$1" "16 MiB virtio-blk read in $(( $(ms_now) - t0 )) ms"
+        else
+            ifail "$1" "virtio-blk read failed or hung"
+        fi
+    }
+    timer_phase() {   # $1 phase name, $2 optional CPU list
+        log "IRQ TIMER begin $1"
+        t0=$(ms_now)
+        if [ -n "$2" ]; then taskset -c "$2" sleep 2; else sleep 2; fi
+        d=$(( $(ms_now) - t0 ))
+        log "IRQ TIMER end $1"
+        if [ "$d" -ge 1990 ] && [ "$d" -le 2600 ]; then
+            ipass "$1" "sleep 2 took $d ms"
+        else
+            ifail "$1" "sleep 2 took $d ms (want ~2000)"
+        fi
+    }
+
+    pic_phase pic
+    msi_phase msi
+    timer_phase timer
+    if [ "$NPROC" -ge 2 ]; then
+        pic_phase pic-ap 1
+        msi_phase msi-ap
+        timer_phase timer-ap 1
+    fi
+
+    log "IRQ /proc/interrupts:"
+    grep -E '^ *[0-9]+:|LOC:|RES:|CAL:' /proc/interrupts \\
+        | while IFS= read -r line; do log "  $line"; done
+    log "--- IRQ-TEST end ---"
+    log "IRQ SUMMARY: ${IRQ_PASS}/$((IRQ_PASS + IRQ_FAIL)) phases passed"
+    sync
+    sleep 1
+    log "=== tinyvmm shutdown requested ==="
+    sleep 1
+    poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
+    exec cat
+fi
+
+# --- optional interrupt-path micro-benchmark -----------------------------
+# Enabled via kernel cmdline marker `tinyvmm.test=bench-irq` (not a match for
+# the `tinyvmm.test=irq` marker above). Driven by tools/irq_bench.py: scratch
+# disk at /dev/vda, >= 2 vCPUs for the cross-CPU phase. Each result is one
+# `IRQBENCH <metric> <value>` line:
+#   timer_wake_ns   SCHED_FIFO 1 ms `read -t` timeout loop on an idle CPU:
+#                   mean time per iteration beyond the requested 1 ms
+#   blk_qd1_ns      4 KiB virtio-blk reads, one in flight (readahead off):
+#                   mean time per request -- one MSI round trip each
+#   pipe_rtt_ns     fifo ping-pong between two tasks on CPU0: mean round trip
+#   ipi_rtt_ns      the same with the peer on CPU1 (two cross-CPU wake-ups)
+#   idle            `IRQBENCH idle begin` .. `end` brackets a 10 s idle period
+#                   (the host samples tinyvmm's CPU time across it)
+if grep -q 'tinyvmm.test=bench-irq' /proc/cmdline 2>/dev/null; then
+    log "--- IRQBENCH start ---"
+    NPROC=$(nproc 2>/dev/null || echo 1)
+    bench_n() { echo "$1" | tr ' ' '\\n' | grep "^$2=" | cut -d= -f2; }
+    N_TIMER=$(bench_n "$(cat /proc/cmdline)" tinyvmm.bench.timer); N_TIMER=${N_TIMER:-2000}
+    N_BLK=$(bench_n "$(cat /proc/cmdline)" tinyvmm.bench.blk); N_BLK=${N_BLK:-8192}
+    N_IPI=$(bench_n "$(cat /proc/cmdline)" tinyvmm.bench.ipi); N_IPI=${N_IPI:-4000}
+
+    # timer_wake: a 1 ms `read -t` timeout on a fifo nobody writes -- a pure
+    # timer wake-up, with no fork and an otherwise idle CPU. RT priority
+    # makes the hrtimer slack 0.
+    mkfifo /tmp/tfifo
+    chrt -f 50 sh -c '
+        N=$1
+        exec 3<>/tmp/tfifo
+        t0=$(date +%s%N); i=0
+        while [ $i -lt $N ]; do read -t 0.001 x <&3; i=$((i+1)); done
+        t1=$(date +%s%N)
+        echo $(( (t1 - t0) / N - 1000000 ))
+    ' sh "$N_TIMER" > /tmp/timer.ns
+    rm -f /tmp/tfifo
+    log "IRQBENCH timer_wake_ns $(cat /tmp/timer.ns)"
+
+    # blk_qd1: buffered 4 KiB reads with readahead off are one request each.
+    if [ -b /dev/vda ]; then
+        blockdev --setra 0 /dev/vda
+        echo 3 > /proc/sys/vm/drop_caches
+        t0=$(date +%s%N)
+        dd if=/dev/vda of=/dev/null bs=4k count="$N_BLK" 2>/dev/null
+        t1=$(date +%s%N)
+        log "IRQBENCH blk_qd1_ns $(( (t1 - t0) / N_BLK ))"
+    fi
+
+    # ipi_rtt: fifo ping-pong with the peer on CPU1 -- each round trip wakes
+    # a task on the other CPU twice. pipe_rtt is the same with the peer on
+    # CPU0 (no cross-CPU wake-ups), so the difference is the IPI/wake cost.
+    pingpong() {   # $1 = CPU for the peer; the caller is pinned to CPU0
+        mkfifo /tmp/ping /tmp/pong
+        taskset -c "$1" sh -c 'exec 3</tmp/ping 4>/tmp/pong; while read -r x <&3; do echo "$x" >&4; done' &
+        peer=$!
+        exec 5>/tmp/ping 6</tmp/pong
+        t0=$(date +%s%N); i=0
+        while [ $i -lt "$N_IPI" ]; do echo $i >&5; read -r y <&6; i=$((i+1)); done
+        t1=$(date +%s%N)
+        exec 5>&- 6<&-
+        wait $peer 2>/dev/null
+        rm -f /tmp/ping /tmp/pong
+        echo $(( (t1 - t0) / N_IPI ))
+    }
+    if [ "$NPROC" -ge 2 ]; then
+        taskset -p -c 0 $$ >/dev/null
+        log "IRQBENCH pipe_rtt_ns $(pingpong 0)"
+        log "IRQBENCH ipi_rtt_ns $(pingpong 1)"
+        taskset -p -c 0-$((NPROC - 1)) $$ >/dev/null
+    fi
+
+    log "IRQBENCH idle begin"
+    sleep 10
+    log "IRQBENCH idle end"
+
+    log "--- IRQBENCH end ---"
     sync
     sleep 1
     log "=== tinyvmm shutdown requested ==="

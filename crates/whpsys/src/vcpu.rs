@@ -4,18 +4,19 @@ use crate::error::{Error, Result, check_hr};
 use core::ffi::c_void;
 use windows_sys::Win32::System::Hypervisor::{
     WHV_MEMORY_ACCESS_CONTEXT, WHV_PARTITION_HANDLE, WHV_REGISTER_NAME, WHV_REGISTER_VALUE,
-    WHV_RUN_VP_EXIT_CONTEXT, WHV_VP_EXIT_CONTEXT, WHV_X64_IO_PORT_ACCESS_CONTEXT,
-    WHvCancelRunVirtualProcessor, WHvCreateVirtualProcessor, WHvDeleteVirtualProcessor,
-    WHvGetVirtualProcessorInterruptControllerState2, WHvGetVirtualProcessorRegisters,
-    WHvGetVirtualProcessorXsaveState, WHvRegisterInterruptState, WHvRegisterPendingEvent,
-    WHvRegisterPendingInterruption, WHvRunVirtualProcessor, WHvRunVpExitReasonCanceled,
-    WHvRunVpExitReasonException, WHvRunVpExitReasonInvalidVpRegisterValue,
-    WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonNone,
-    WHvRunVpExitReasonUnrecoverableException, WHvRunVpExitReasonUnsupportedFeature,
-    WHvRunVpExitReasonX64ApicEoi, WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt,
-    WHvRunVpExitReasonX64InterruptWindow, WHvRunVpExitReasonX64IoPortAccess,
-    WHvRunVpExitReasonX64MsrAccess, WHvSetVirtualProcessorInterruptControllerState2,
-    WHvSetVirtualProcessorRegisters, WHvSetVirtualProcessorXsaveState, WHvX64RegisterCr8,
+    WHV_RUN_VP_EXIT_CONTEXT, WHV_UINT128, WHV_UINT128_0, WHV_VP_EXIT_CONTEXT,
+    WHV_X64_IO_PORT_ACCESS_CONTEXT, WHvCancelRunVirtualProcessor, WHvCreateVirtualProcessor,
+    WHvDeleteVirtualProcessor, WHvGetVirtualProcessorInterruptControllerState2,
+    WHvGetVirtualProcessorRegisters, WHvGetVirtualProcessorXsaveState, WHvRegisterInterruptState,
+    WHvRegisterPendingEvent, WHvRegisterPendingInterruption, WHvRunVirtualProcessor,
+    WHvRunVpExitReasonCanceled, WHvRunVpExitReasonException,
+    WHvRunVpExitReasonInvalidVpRegisterValue, WHvRunVpExitReasonMemoryAccess,
+    WHvRunVpExitReasonNone, WHvRunVpExitReasonUnrecoverableException,
+    WHvRunVpExitReasonUnsupportedFeature, WHvRunVpExitReasonX64ApicEoi, WHvRunVpExitReasonX64Cpuid,
+    WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64InterruptWindow,
+    WHvRunVpExitReasonX64IoPortAccess, WHvRunVpExitReasonX64MsrAccess,
+    WHvSetVirtualProcessorInterruptControllerState2, WHvSetVirtualProcessorRegisters,
+    WHvSetVirtualProcessorXsaveState, WHvX64PendingEventExtInt,
     WHvX64RegisterDeliverabilityNotifications, WHvX64RegisterRflags,
 };
 
@@ -45,6 +46,40 @@ fn val_to_bytes(v: &WHV_REGISTER_VALUE) -> [u8; 16] {
     let mut b = [0u8; 16];
     unsafe { core::ptr::copy_nonoverlapping(v as *const _ as *const u8, b.as_mut_ptr(), 16) };
     b
+}
+
+/// The registers that decide whether an external interrupt can be injected at
+/// the next VM entry, read in one WHP call by [`Vcpu::interruptibility`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Interruptibility {
+    pub rflags: u64,
+    /// `WHvRegisterInterruptState`; bit 0 is the STI / MOV-SS interrupt shadow.
+    pub interrupt_state: u64,
+    /// `WHvRegisterPendingInterruption`; bit 0 means an interruption is queued.
+    pub pending_interruption: u64,
+    /// Low half of `WHvRegisterPendingEvent`; bit 0 means an event is queued.
+    pub pending_event: u64,
+}
+
+impl Interruptibility {
+    /// True when IF is set and nothing (an interrupt shadow, a queued
+    /// interruption or event) is in the way. Injecting otherwise makes the VM
+    /// entry invalid.
+    pub fn can_inject(&self) -> bool {
+        const RFLAGS_IF: u64 = 1 << 9;
+        self.rflags & RFLAGS_IF != 0
+            && self.interrupt_state & 1 == 0
+            && self.pending_interruption & 1 == 0
+            && self.pending_event & 1 == 0
+    }
+}
+
+/// `WHV_X64_PENDING_EXT_INT_EVENT` image `(low, high)` for `vector`:
+/// EventPending (bit 0), EventType = `WHvX64PendingEventExtInt` (bits 1..=3),
+/// Vector (bits 8..=15).
+pub fn ext_int_event(vector: u8) -> (u64, u64) {
+    let low = 1 | ((WHvX64PendingEventExtInt as u64) << 1) | ((vector as u64) << 8);
+    (low, 0)
 }
 
 pub struct Vcpu {
@@ -145,77 +180,56 @@ impl Vcpu {
         self.set_registers(&[name], &[value])
     }
 
-    /// Read, in a single WHP call, the registers the interrupt-delivery pass
-    /// needs: returns `(cr8, rflags, interrupt_state, pending_interruption,
-    /// pending_event)` as their low-64-bit images. Batching matters because this
-    /// runs on every delivery pass; OpenVMM's `inject_interrupt` reads the same
-    /// set in one `get_registers!` call rather than five.
-    pub fn injectability_regs(&self) -> Result<(u64, u64, u64, u64, u64)> {
+    /// Read, in a single WHP call, what decides whether an external interrupt
+    /// can be injected right now (see [`Interruptibility::can_inject`]).
+    pub fn interruptibility(&self) -> Result<Interruptibility> {
         let names = [
-            WHvX64RegisterCr8,
             WHvX64RegisterRflags,
             WHvRegisterInterruptState,
             WHvRegisterPendingInterruption,
             WHvRegisterPendingEvent,
         ];
-        let mut v = [WHV_REGISTER_VALUE { Reg64: 0 }; 5];
+        let mut v = [WHV_REGISTER_VALUE { Reg64: 0 }; 4];
         self.get_registers(&names, &mut v)?;
         // SAFETY: each value's `Reg64` arm holds the low 64 bits we need; for the
         // 128-bit PendingEvent that's the half with the `EventPending` bit.
-        Ok(unsafe { (v[0].Reg64, v[1].Reg64, v[2].Reg64, v[3].Reg64, v[4].Reg64) })
+        Ok(unsafe {
+            Interruptibility {
+                rflags: v[0].Reg64,
+                interrupt_state: v[1].Reg64,
+                pending_interruption: v[2].Reg64,
+                pending_event: v[3].Reg64,
+            }
+        })
     }
 
-    /// Deliver external-interrupt `vector` via VM-entry event injection
-    /// (`WHvRegisterPendingInterruption`), given injectability registers already
-    /// read via [`Self::injectability_regs`]. This is the nested-VM interrupt
-    /// path: `WHvRequestInterrupt`'s LAPIC delivery relies on hardware APIC
-    /// virtualization Hyper-V doesn't expose to a nested guest, so we inject the
-    /// event directly. Mirrors OpenVMM's `virt_whp` `inject_interrupt`.
-    ///
-    /// Only injects when the guest is actually injectable (a blind injection
-    /// causes an invalid VM entry and crashes WHP); priority vs. the TPR is the
-    /// caller's job (the software LAPIC already filtered on PPR). MUST be called
-    /// while the vCPU is not running. Returns `Ok(true)` if injected, `Ok(false)`
-    /// if the guest wasn't ready -- the vector stays queued in the IRR and the
-    /// run loop retries on the next exit.
-    pub fn try_inject_interrupt(
-        &self,
-        vector: u8,
-        rflags: u64,
-        interrupt_state: u64,
-        pending_interruption: u64,
-        pending_event: u64,
-    ) -> Result<bool> {
-        const RFLAGS_IF: u64 = 1 << 9;
-        // Not injectable if IF is clear, an interruption is already pending
-        // (PendingInterruption bit 0), an interrupt shadow is active
-        // (InterruptState bit 0), or an event is already pending (PendingEvent
-        // bit 0). Injecting over any of these is an invalid VM entry and faults
-        // WHP. (Priority vs. TPR is the caller's responsibility.)
-        if rflags & RFLAGS_IF == 0
-            || (pending_interruption & 1) != 0
-            || (interrupt_state & 1) != 0
-            || (pending_event & 1) != 0
-        {
-            return Ok(false);
-        }
-        // WHV_X64_PENDING_INTERRUPTION_REGISTER: pending=bit0, type=bits1..3
-        // (0 = external interrupt), vector=bits16..31.
-        let inj = 1u64 | ((vector as u64) << 16);
+    /// Queue `vector` as an **ExtINT** event for the next VM entry: how an 8259
+    /// PIC's INT output reaches the BSP's LINT0 in virtual-wire mode. It bypasses
+    /// the LAPIC's IRR/ISR, so the guest's PIC-only EOI fully acknowledges it --
+    /// a Fixed delivery would instead leave an ISR bit set that the guest never
+    /// clears. Only call while the vCPU isn't running and
+    /// [`Interruptibility::can_inject`] holds.
+    pub fn inject_ext_int(&self, vector: u8) -> Result<()> {
+        let (low, high) = ext_int_event(vector);
         self.set_register(
-            WHvRegisterPendingInterruption,
-            WHV_REGISTER_VALUE { Reg64: inj },
-        )?;
-        Ok(true)
+            WHvRegisterPendingEvent,
+            WHV_REGISTER_VALUE {
+                Reg128: WHV_UINT128 {
+                    Anonymous: WHV_UINT128_0 {
+                        Low64: low,
+                        High64: high,
+                    },
+                },
+            },
+        )
     }
 
     /// Ask WHP to exit this vCPU with an `X64InterruptWindow` exit as soon as the
     /// guest can accept an external interrupt (IF set, no interrupt shadow, no
-    /// interruption already pending). Call when [`Self::try_inject_interrupt`]
-    /// returned `Ok(false)`: the queued vector would otherwise strand if the
-    /// guest is in a tight, never-halting loop and the one-shot APIC timer that
-    /// kicked us has already disarmed -- there would be no further exit to retry
-    /// delivery on. The notification is one-shot; WHP clears it on the exit.
+    /// interruption already pending). Use it when an interrupt is waiting but
+    /// [`Interruptibility::can_inject`] is false, so delivery doesn't depend on
+    /// some unrelated later exit. The notification is one-shot; WHP clears it on
+    /// the exit.
     pub fn request_interrupt_window(&self) -> Result<()> {
         // WHV_X64_DELIVERABILITY_NOTIFICATIONS_REGISTER: bit0 NmiNotification,
         // bit1 InterruptNotification, bits2..5 InterruptPriority (0 = notify for
@@ -555,5 +569,50 @@ pub fn exit_reason_name(reason: u32) -> &'static str {
         "Canceled"
     } else {
         "<unknown>"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ext_int_event_matches_the_whp_register_layout() {
+        // WinHvPlatformDefs.h WHV_X64_PENDING_EXT_INT_EVENT: EventPending:1,
+        // EventType:3 (WHvX64PendingEventExtInt = 5), Reserved0:4, Vector:8.
+        // EventType 0 would be an *exception* event: the guest would take a
+        // fault at this vector instead of an interrupt.
+        assert_eq!(ext_int_event(0x34), (0x340B, 0));
+        assert_eq!(ext_int_event(0xFF), (0xFF0B, 0));
+    }
+
+    #[test]
+    fn injection_requires_if_and_nothing_already_queued() {
+        let ready = Interruptibility {
+            rflags: 0x202,
+            ..Default::default()
+        };
+        assert!(ready.can_inject());
+        let blocked = [
+            Interruptibility {
+                rflags: 0x002,
+                ..ready
+            },
+            Interruptibility {
+                interrupt_state: 1,
+                ..ready
+            },
+            Interruptibility {
+                pending_interruption: 1,
+                ..ready
+            },
+            Interruptibility {
+                pending_event: 1,
+                ..ready
+            },
+        ];
+        for b in blocked {
+            assert!(!b.can_inject(), "{b:?}");
+        }
     }
 }

@@ -511,6 +511,7 @@ mod tests {
             size,
             large_pages: false,
             split,
+            populate: None,
         }
     }
 
