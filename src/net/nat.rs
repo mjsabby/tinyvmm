@@ -67,6 +67,12 @@ const POOL_SENTINEL: u32 = u32::MAX;
 /// Cap on the per-flow guest->host queue. When reached we stop draining the
 /// tcb receive ring, which closes the guest-facing window (backpressure).
 const TO_HOST_CAP: usize = 64 * 1024;
+/// Fixed receive buffer for host sockets whose peer is this host. Windows'
+/// receive-window autotuning keeps such sub-millisecond connections at a small
+/// window, and the sender then stalls in ~15 ms steps: about 5.7 Gbps with ~40
+/// stalls per 512 MiB, vs ~25 Gbps with none at a fixed 1 MiB. Remote peers
+/// keep autotuning, since a fixed buffer would cap their window instead.
+const LOCAL_PEER_RCVBUF: i32 = 1 << 20;
 
 // ICMP echo proxy (guest pings to non-gateway hosts).
 const ICMP_WORKERS: usize = 2; // precreated blocking IcmpSendEcho threads
@@ -1414,6 +1420,9 @@ impl NatState {
             sys::close_sock(host_sock);
             return;
         }
+        if sys::peer_is_local(host_sock) {
+            sys::set_rcvbuf(host_sock, LOCAL_PEER_RCVBUF);
+        }
         let mut op = self.tcp_op_pool.acquire();
         op.overlapped = unsafe { core::mem::zeroed() };
         op.kind = 0;
@@ -1462,6 +1471,9 @@ impl NatState {
                     let _ = flow.tcb.as_mut().unwrap().abort();
                 } else {
                     sys::update_connect_ctx(flow.sock);
+                    if sys::peer_is_local(flow.sock) {
+                        sys::set_rcvbuf(flow.sock, LOCAL_PEER_RCVBUF);
+                    }
                     flow.connected = true;
                     flow.last_activity = now;
                 }

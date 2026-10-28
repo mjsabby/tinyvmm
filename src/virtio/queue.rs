@@ -173,6 +173,9 @@ impl Virtqueue {
     pub fn ready(&self) -> bool {
         self.ready
     }
+    pub fn size(&self) -> u32 {
+        self.size
+    }
     pub fn max_size(&self) -> u32 {
         self.max_size
     }
@@ -362,6 +365,25 @@ impl Virtqueue {
     pub fn pop(&mut self) -> Option<PoppedChain> {
         let mut c = PoppedChain::default();
         if self.pop_into(&mut c) { Some(c) } else { None }
+    }
+
+    /// Position of the next available-ring entry [`Self::pop_into`] will take;
+    /// pass it to [`Self::rewind_avail`] to give back the chains popped since.
+    pub fn avail_cursor(&self) -> u16 {
+        self.last_avail
+    }
+
+    /// Un-pop every chain taken since `cursor`, after a pop found the ring
+    /// empty. None of them may have been pushed to the used ring. With
+    /// EVENT_IDX, `pop_into` already left `avail_event` at the index where the
+    /// ring ran dry, so the driver's next refill kicks the device. Returns true
+    /// if the driver published more buffers before that request was visible;
+    /// such a refill may not kick, so the caller should retry now.
+    pub fn rewind_avail(&mut self, cursor: u16) -> bool {
+        let dry_at = self.last_avail;
+        self.last_avail = cursor;
+        fence(Ordering::SeqCst);
+        self.avail_idx() != dry_at
     }
 
     pub fn push(&mut self, head_index: u16, used_len: u32) {
