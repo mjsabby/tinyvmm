@@ -325,12 +325,18 @@ if grep -q 'tinyvmm.test=netcmp' /proc/cmdline 2>/dev/null; then
     # OFO mean loss or spurious retransmits, ZeroWindow is flow control. SNMP:
     # the IP/TCP/UDP MIBs (RetransSegs, InErrs, InTruncatedPkts, ...). NETDEV:
     # eth0 driver counters; rx drop/frame are frames the driver discarded.
-    snap() { cat /proc/net/snmp /proc/net/netstat > /tmp/ns$1; grep eth0 /proc/net/dev > /tmp/nd$1; }
+    # IRQ: interrupts taken for virtio-net's receive (input.N) and transmit
+    # (output.N) queues, summed over CPUs.
+    snap() {
+        cat /proc/net/snmp /proc/net/netstat > /tmp/ns$1; grep eth0 /proc/net/dev > /tmp/nd$1
+        awk 'NR==1{n=NF;next} /input\\.[0-9]+$/{for(i=2;i<=n+1;i++)r+=$i} /output\\.[0-9]+$/{for(i=2;i<=n+1;i++)t+=$i} END{print r+0, t+0}' /proc/interrupts > /tmp/ni$1
+    }
     netdelta() {
         snap 1
         log "NETCMP TCPEXT $1 $(awk 'NR==FNR{if($1 in h){for(i=2;i<=NF;i++)a[$1,i]=$i}else{h[$1]=1;for(i=2;i<=NF;i++)n[$1,i]=$i};next} $1=="TcpExt:"{if(g++)for(i=2;i<=NF;i++)if($i!=a[$1,i])printf "%s=%d ",n[$1,i],$i-a[$1,i]}' /tmp/ns0 /tmp/ns1)"
         log "NETCMP SNMP $1 $(awk 'NR==FNR{if($1 in h){for(i=2;i<=NF;i++)a[$1,i]=$i}else{h[$1]=1;for(i=2;i<=NF;i++)n[$1,i]=$i};next} $1!="TcpExt:"&&$1!="IcmpMsg:"{if($1 in g){for(i=2;i<=NF;i++)if($i!=a[$1,i])printf "%s%s=%d ",$1,n[$1,i],$i-a[$1,i]}else g[$1]=1}' /tmp/ns0 /tmp/ns1)"
         log "NETCMP NETDEV $1 $(awk '{sub(":"," ")} NR==FNR{for(i=2;i<=NF;i++)a[i]=$i;next} {printf "rx_pkts=%d rx_errs=%d rx_drop=%d rx_frame=%d tx_pkts=%d tx_errs=%d tx_drop=%d",$3-a[3],$4-a[4],$5-a[5],$7-a[7],$11-a[11],$12-a[12],$13-a[13]}' /tmp/nd0 /tmp/nd1)"
+        log "NETCMP IRQ $1 $(awk 'NR==FNR{r=$1;t=$2;next} {printf "rx_irqs=%d tx_irqs=%d",$1-r,$2-t}' /tmp/ni0 /tmp/ni1)"
     }
     log "NETCMP start host=${host} port=${port} size=${size} runs=${runs} rr=${rr} par=${par} ping=${pingn}"
     # Guest environment (differences here skew per-byte guest CPU cost).
@@ -384,6 +390,7 @@ if grep -q 'tinyvmm.test=netcmp' /proc/cmdline 2>/dev/null; then
     log "NETCMP PHASE ul end"
     netdelta ul
 
+    snap 0
     log "NETCMP PHASE par begin"
     for r in $(seq 1 "${runs}"); do
         for i in $(seq 1 "${par}"); do
@@ -393,6 +400,7 @@ if grep -q 'tinyvmm.test=netcmp' /proc/cmdline 2>/dev/null; then
         log "NETCMP PAR run=${r} done"
     done
     log "NETCMP PHASE par end"
+    netdelta par
 
     log "NETCMP DONE"
     # Stop tinyvmm cleanly so it prints its teardown counters (see

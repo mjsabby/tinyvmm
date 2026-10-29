@@ -312,6 +312,11 @@ impl PciTransport {
 
     // ---- Device -> transport interrupt signals.
 
+    /// MSI-X interrupts this function has injected into the guest.
+    pub fn msix_injected_count(&self) -> u64 {
+        self.msix.injected_count()
+    }
+
     pub fn raise_queue_interrupt(&self, qidx: u32) {
         self.isr_status.fetch_or(ISR_QUEUE_BIT, Ordering::Relaxed);
         let v = {

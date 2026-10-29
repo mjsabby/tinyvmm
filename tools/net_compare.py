@@ -17,7 +17,9 @@ guest's /proc/uptime only has 10 ms resolution):
   ul    single-stream upload guest->host (wget --post-file from tmpfs)
   par   PAR concurrent download streams, RUNS rounds, aggregate throughput
 For every phase the driver also records the VMM process's host CPU time
-(user+kernel via GetProcessTimes) to report CPU-seconds per GiB moved.
+(user+kernel via GetProcessTimes) to report CPU-seconds per GiB moved, and the
+guest reports its virtio-net interrupts over the dl, ul and par phases (from
+/proc/interrupts) to report guest interrupts per GiB.
 
 Usage:
   python tools\\net_compare.py
@@ -263,7 +265,7 @@ def vmm_argv(name: str, a: argparse.Namespace, host: str, port: int) -> list[str
 
 PHASE_RE = re.compile(r"NETCMP PHASE (\w+) (begin|end)")
 # Guest network counter deltas over a phase: "NETCMP <kind> <phase> k=v k=v ...".
-GUEST_RE = re.compile(r"NETCMP (TCPEXT|SNMP|NETDEV) (\w+)(.*)$")
+GUEST_RE = re.compile(r"NETCMP (TCPEXT|SNMP|NETDEV|IRQ) (\w+)(.*)$")
 
 
 @dataclass
@@ -353,6 +355,7 @@ def summarize(rs: list[RunResult]) -> dict:
     rtts, losses, rr_tps = [], [], []
     dl, ul, par = [], [], []
     cpu = {k: [0.0, 0] for k in ("dl", "ul", "par")}  # cpu secs, bytes
+    irq = {k: [0, 0, 0] for k in ("dl", "ul", "par")}  # guest rx irqs, tx irqs, bytes
     for r in rs:
         m = re.search(r"min/avg/max = ([\d.]+)/([\d.]+)/([\d.]+)", r.ping)
         if m:
@@ -377,6 +380,12 @@ def summarize(rs: list[RunResult]) -> dict:
             if ph in r.phases:
                 cpu[ph][0] += r.phases[ph]["cpu"]
                 cpu[ph][1] += sum(x.nbytes for x in r.xfers.get(ph, []))
+        for ph in irq:
+            g = r.guest.get(ph, {})
+            if "rx_irqs" in g:
+                irq[ph][0] += g["rx_irqs"]
+                irq[ph][1] += g.get("tx_irqs", 0)
+                irq[ph][2] += sum(x.nbytes for x in r.xfers.get(ph, []))
     s["ping_avg_ms"] = statistics.mean(t[1] for t in rtts) if rtts else None
     s["ping_min_ms"] = min(t[0] for t in rtts) if rtts else None
     s["ping_max_ms"] = max(t[2] for t in rtts) if rtts else None
@@ -398,6 +407,8 @@ def summarize(rs: list[RunResult]) -> dict:
         s[f"{k}_n"] = len(v)
         c, b = cpu[k]
         s[f"{k}_cpu_s_per_gib"] = c / (b / (1 << 30)) if b else None
+        rx, tx, b = irq[k]
+        s[f"{k}_irq_per_gib"] = (rx / (b / (1 << 30)), tx / (b / (1 << 30))) if b else None
     return s
 
 
@@ -419,6 +430,9 @@ def report(results: dict[str, list[RunResult]], a: argparse.Namespace) -> dict:
         ("VMM CPU s/GiB download   lower=better", "dl_cpu_s_per_gib", ".3f"),
         ("VMM CPU s/GiB upload", "ul_cpu_s_per_gib", ".3f"),
         (f"VMM CPU s/GiB x{a.par} download", "par_cpu_s_per_gib", ".3f"),
+        ("guest irqs/GiB download (rx/tx)", "dl_irq_per_gib", ".0f"),
+        ("guest irqs/GiB upload (rx/tx)", "ul_irq_per_gib", ".0f"),
+        (f"guest irqs/GiB x{a.par} download (rx/tx)", "par_irq_per_gib", ".0f"),
         ("guest TCP holes in download (OFO)", "dl_holes", "d"),
         ("guest dup segments in download (D-SACK)", "dl_dups", "d"),
         ("guest NIC rx drops in download", "dl_rx_drops", "d"),
@@ -438,7 +452,10 @@ def report(results: dict[str, list[RunResult]], a: argparse.Namespace) -> dict:
             cells = []
             for s in sums.values():
                 v = s[key]
-                cell = fmt(v, spec)
+                if isinstance(v, tuple):
+                    cell = "/".join(format(x, spec) for x in v)
+                else:
+                    cell = fmt(v, spec)
                 if key.endswith("_gbps") and v is not None:
                     cell += f" ({s[key + '_min']:.2f}-{s[key + '_max']:.2f})"
                 cells.append(cell)

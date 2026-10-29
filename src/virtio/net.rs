@@ -302,6 +302,9 @@ pub struct NetDevice {
     backend_detached: AtomicBool,
     tx_packets: AtomicU64,
     rx_packets: AtomicU64,
+    /// Interrupts this device asked its transport to raise, per queue.
+    rx_irqs: AtomicU64,
+    tx_irqs: AtomicU64,
     rx_ctr: RxCounters,
     /// `rx.pending.len()`, readable without the lock.
     rx_backlog: AtomicUsize,
@@ -328,6 +331,8 @@ impl NetDevice {
             backend_detached: AtomicBool::new(false),
             tx_packets: AtomicU64::new(0),
             rx_packets: AtomicU64::new(0),
+            rx_irqs: AtomicU64::new(0),
+            tx_irqs: AtomicU64::new(0),
             rx_ctr: RxCounters::default(),
             rx_backlog: AtomicUsize::new(0),
             rx_wake: AtomicBool::new(false),
@@ -366,16 +371,20 @@ impl NetDevice {
         self.rx_packets.load(Ordering::Relaxed)
     }
 
-    /// One-line data-path summary for the exit report: frame counts, the RX
-    /// slow-path counters, and whatever the backend adds.
-    pub fn diag_summary(&self) -> String {
+    /// One-line data-path summary for the exit report: frame counts, interrupt
+    /// counts (`msix`: what the transport's MSI-X actually injected, from the
+    /// caller), the RX slow-path counters, and whatever the backend adds.
+    pub fn diag_summary(&self, msix: u64) -> String {
         let c = &self.rx_ctr;
         let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
         let mut s = format!(
-            "rx_frames={} tx_frames={} rx_backlogged={} rx_rewinds={} rx_truncated={} \
-             rx_backlog_drops={} rx_backlog_max={} rx_throttles={}",
+            "rx_frames={} tx_frames={} msix={msix} rx_irqs={} tx_irqs={} rx_backlogged={} \
+             rx_rewinds={} rx_truncated={} rx_backlog_drops={} rx_backlog_max={} \
+             rx_throttles={}",
             self.rx_packets(),
             self.tx_packets(),
+            ld(&self.rx_irqs),
+            ld(&self.tx_irqs),
             ld(&c.backlogged),
             ld(&c.rewinds),
             ld(&c.truncated),
@@ -425,6 +434,12 @@ impl NetDevice {
     }
 
     fn raise(&self, qidx: u32) {
+        let n = if qidx == NET_RX_QUEUE {
+            &self.rx_irqs
+        } else {
+            &self.tx_irqs
+        };
+        n.fetch_add(1, Ordering::Relaxed);
         if let Some(cb) = self.irq.get() {
             cb(qidx);
         }
