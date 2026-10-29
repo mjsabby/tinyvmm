@@ -147,6 +147,36 @@ pub fn run() -> Result<()> {
     }
     log.record(&format!("config path={path}"));
     let mut config = log.step("config-read", || Config::read(path))?;
+    for (target, size) in &config.tmpfs {
+        log.record(&format!("tmpfs target={target} size={size}"));
+    }
+    log.step("tmpfs-limits", || {
+        for (target, size) in &config.tmpfs {
+            // Remount must restate per-mount flags; tmpfs changes only `size`.
+            let flags = if target == "/" { 0 } else { libc::MS_NOSUID };
+            unix::mount(
+                "tmpfs",
+                target,
+                "tmpfs",
+                libc::MS_REMOUNT | flags,
+                &format!("size={size}"),
+            )?;
+        }
+        Ok(())
+    })?;
+    for (name, value) in &config.sysctls {
+        log.record(&format!("sysctl {name}={value}"));
+    }
+    log.step("sysctls", || {
+        for (name, value) in &config.sysctls {
+            fs::write(
+                format!("/proc/sys/{}", name.replace('.', "/")),
+                value.to_string(),
+            )
+            .with_context(|| format!("set sysctl {name}"))?;
+        }
+        Ok(())
+    })?;
     for share in &config.mounts {
         log.record(&format!(
             "share tag={} target={} readonly={}",
@@ -199,12 +229,26 @@ pub fn run() -> Result<()> {
     let mut services = HashMap::new();
     for app in &config.apps {
         let user = config.user(&app.user)?;
+        let spawn = unix::Spawn {
+            groups: app.groups.clone(),
+            umask: app.umask_bits()?,
+            capabilities: app.capability_mask()?,
+            rlimits: config.app_rlimits(app)?,
+        };
         log.record(&format!(
-            "service={} uid={} gid={} executable={:?} cwd={:?} log=/run/log/{}.log",
-            app.name, user.uid, user.gid, app.argv[0], app.cwd, app.name
+            "service={} uid={} gid={} groups={:?} umask={} capabilities={:?} executable={:?} cwd={:?} log=/run/log/{}.log",
+            app.name,
+            user.uid,
+            user.gid,
+            app.groups,
+            app.umask.as_deref().unwrap_or("0022"),
+            app.capabilities,
+            app.argv[0],
+            app.cwd,
+            app.name
         ));
         log.step(&format!("service:{}", app.name), || {
-            let mut command = unix::command(&user, &app.argv[0], &app.cwd);
+            let mut command = unix::command(&user, &app.argv[0], &app.cwd, &config.env);
             command.args(&app.argv[1..]).envs(&app.env);
             unix::child_setup(
                 &mut command,
@@ -212,21 +256,34 @@ pub fn run() -> Result<()> {
                 Some(cgroup(&app.name, &app.limits)?),
                 false,
                 true,
+                spawn,
             );
-            start(&app.name, &mut command, &mut services)
+            start(
+                &app.name,
+                &mut command,
+                &mut services,
+                config.logs.max_bytes,
+            )
         })?;
     }
     log.step("service:sshd", || {
-        let mut command = unix::command(&config.user("root")?, "/bin/tinyinit", "/");
+        let root = config.user("root")?;
+        let mut command = unix::command(&root, "/bin/tinyinit", "/", &config.env);
         command.args(["sshd", "/run/tinyinit.json"]);
+        // Login sessions inherit these limits from sshd.
+        let spawn = unix::Spawn {
+            rlimits: crate::config::rlimits(&config.rlimits)?,
+            ..Default::default()
+        };
         unix::child_setup(
             &mut command,
-            &config.user("root")?,
+            &root,
             Some(cgroup("sshd", &Limits::default())?),
             false,
             false,
+            spawn,
         );
-        start("sshd", &mut command, &mut services)
+        start("sshd", &mut command, &mut services, config.logs.max_bytes)
     })?;
     log.record(&format!(
         "event=supervisor-ready kernel_uptime_ms={:.3}",
@@ -243,15 +300,27 @@ pub fn run() -> Result<()> {
             if pid <= 0 {
                 break;
             }
-            if let Some(name) = services.get(&pid) {
+            if let Some(Service { name, log }) = services.get(&pid) {
                 eprintln!(
                     "tinyinit: essential service {name} exited (wait status {status}); shutting down"
                 );
-                use std::io::Read;
-                if let Ok(file) = File::open(format!("/run/log/{name}.log")) {
-                    let mut log = String::new();
-                    let _ = file.take(4096).read_to_string(&mut log);
-                    eprintln!("{log}");
+                // Let the pump drain output written just before the exit. A
+                // surviving descendant can hold the pipe open, so wait briefly.
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while !log.is_finished() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                use std::io::{Read, Seek, SeekFrom};
+                if let Ok(mut file) = File::open(format!("/run/log/{name}.log")) {
+                    let length = file.metadata().map_or(0, |metadata| metadata.len());
+                    let mut tail = Vec::new();
+                    if file
+                        .seek(SeekFrom::Start(length.saturating_sub(4096)))
+                        .is_ok()
+                        && file.read_to_end(&mut tail).is_ok()
+                    {
+                        eprintln!("{}", String::from_utf8_lossy(&tail));
+                    }
                 }
                 shutdown();
             }
@@ -515,16 +584,69 @@ fn cgroup(name: &str, limits: &Limits) -> Result<File> {
         .open(format!("{dir}/cgroup.procs"))?)
 }
 
-fn start(name: &str, command: &mut Command, services: &mut HashMap<i32, String>) -> Result<()> {
-    let log = File::create(format!("/run/log/{name}.log"))?;
+struct Service {
+    name: String,
+    /// Copies output to the service log until every writer closes the pipe.
+    log: thread::JoinHandle<()>,
+}
+
+fn start(
+    name: &str,
+    command: &mut Command,
+    services: &mut HashMap<i32, Service>,
+    max_bytes: u64,
+) -> Result<()> {
+    let (reader, writer) = unix::pipe()?;
     command
         .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log);
+        .stdout(writer.try_clone()?)
+        .stderr(writer);
     let child = command.spawn().with_context(|| format!("start {name}"))?;
-    services.insert(child.id() as i32, name.into());
+    let path = format!("/run/log/{name}.log");
+    let log = thread::Builder::new()
+        .name(format!("log-{name}"))
+        .spawn(move || pump_log(reader, &path, max_bytes))?;
+    services.insert(
+        child.id() as i32,
+        Service {
+            name: name.into(),
+            log,
+        },
+    );
     println!("tinyinit: started {name} pid={}", child.id());
     Ok(())
+}
+
+/// Copy a service's output into `path`, rotating to `path.1` so each file
+/// stays within `max_bytes`. Reading never stops while the service runs, even
+/// if tmpfs is full, so the service cannot block on its output pipe.
+fn pump_log(mut reader: impl io::Read, path: &str, max_bytes: u64) {
+    let rotated = format!("{path}.1");
+    let mut file = File::create(path).ok();
+    let mut size = 0;
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(0) => return,
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        };
+        let mut chunk = &buffer[..read];
+        while !chunk.is_empty() {
+            if size >= max_bytes {
+                let _ = fs::rename(path, &rotated);
+                file = File::create(path).ok();
+                size = 0;
+            }
+            let take = chunk.len().min((max_bytes - size) as usize);
+            if let Some(file) = &mut file {
+                let _ = file.write_all(&chunk[..take]);
+            }
+            size += take as u64;
+            chunk = &chunk[take..];
+        }
+    }
 }
 
 pub fn shutdown() -> ! {
@@ -631,4 +753,24 @@ fn link_up(socket: i32, name: &str) -> Result<()> {
     req[16..18].copy_from_slice(&flags.to_ne_bytes());
     unix::check(unsafe { libc::ioctl(socket, libc::SIOCSIFFLAGS as _, req.as_mut_ptr()) })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_logs_rotate_within_the_cap() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("tinyinit-log-{}", std::process::id()));
+        fs::create_dir(&dir)?;
+        let path = dir.join("app.log").to_string_lossy().into_owned();
+        let output: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        pump_log(output.as_slice(), &path, 4096);
+        let current = fs::read(&path)?;
+        let previous = fs::read(format!("{path}.1"))?;
+        fs::remove_dir_all(&dir)?;
+        assert_eq!(current, output[8192..]);
+        assert_eq!(previous, output[4096..8192]);
+        Ok(())
+    }
 }

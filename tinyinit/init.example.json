@@ -1,5 +1,13 @@
 {
   "hostname": "tinyvm",
+  "env": {
+    "LANG": "C.UTF-8",
+    "DOTNET_ROOT": "/usr/share/dotnet",
+    "ASPNETCORE_HTTP_PORTS": "8080"
+  },
+  "rlimits": { "nofile": 1048576 },
+  "tmpfs": { "/run": "64m", "/tmp": "256m", "/dev/shm": "64m" },
+  "logs": { "max_bytes": 8388608 },
   "mounts": [
     { "tag": "apps", "target": "/mnt/apps", "readonly": true }
   ],
@@ -18,6 +26,7 @@
       "user": "app",
       "argv": ["/usr/share/dotnet/dotnet", "/mnt/apps/AppA.dll"],
       "cwd": "/home/app",
+      "umask": "0027",
       "limits": { "memory_max": 268435456, "pids_max": 64, "cpu_percent": 100 }
     },
     {
