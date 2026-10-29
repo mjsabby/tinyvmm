@@ -6,8 +6,8 @@ Three phases:
   Phase 1 -- cold boot with ``--save`` to produce a snapshot:
     * launches tinyvmm with ``tinyvmm.test=snapshot`` in the cmdline,
     * waits for the guest to fire the magic CPUID 0x4000DE57 trigger,
-    * asserts tinyvmm exits with rc=0 and the snapshot file is the
-      expected size (RAM_MB MiB + a few KiB of metadata),
+    * asserts tinyvmm exits with rc=0 and the snapshot file is smaller
+      than RAM (all-zero RAM chunks are left out),
     * asserts the guest log contains the pre-trigger sentinel and
       ``[snapshot] trigger fired`` host log line.
 
@@ -155,11 +155,11 @@ def phase1_save(args: argparse.Namespace) -> None:
     if actual_size != written:
         raise SystemExit(
             f"[save] FAIL: file size {actual_size} != reported {written}")
-    expected_min = args.ram_mb * 1024 * 1024
-    if actual_size < expected_min:
+    expected_max = args.ram_mb * 1024 * 1024
+    if actual_size >= expected_max:
         raise SystemExit(
-            f"[save] FAIL: file size {actual_size} < expected min "
-            f"{expected_min} (RAM bytes)")
+            f"[save] FAIL: file size {actual_size} >= {expected_max} (RAM bytes):"
+            " zero RAM chunks should be left out")
     print(f"[save] OK: wrote {actual_size} bytes in {wall:.2f}s")
 
 

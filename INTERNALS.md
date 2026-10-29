@@ -687,7 +687,8 @@ These are optional and don't change the core, but each teaches one more piece:
   (`"TVMMSAVE"` header + JSON machine description + typed sections + CRC32) holding
   per-vCPU register/XSAVE/APIC state, the HV MSR cache, the legacy devices, every
   PCI device (config/BAR/MSI-X/common-cfg/queues/device-state via the four
-  `VirtioDevice` hooks), and **guest RAM last**. The crucial discipline:
+  `VirtioDevice` hooks), and **guest RAM last**, sparse (only the 64 KiB chunks
+  that aren't all zero; a booted guest's RAM is mostly zero). The crucial discipline:
   **devices are constructed in a fixed order** (console=0, net*, rng, snd, blk*,
   input kbd+tablet, 9p*, gpu last) and save/restore must use the *same* order or
   the `device_index` tags misalign (`src/main.rs:1519` assigns the tags;

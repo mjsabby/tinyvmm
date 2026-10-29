@@ -2584,10 +2584,14 @@ fn write_snapshot(
     // RAM last (largest section; a writer crash then leaves the metadata intact,
     // and the CRC trailer catches truncation).
     let ram_slice = unsafe { std::slice::from_raw_parts(ram.host_base(), ram.size()) };
-    w.write_section(SectionType::RamRaw, ram_slice)?;
+    let stored = w.write_ram_sparse(ram_slice)?;
 
     let n = w.finalize()?;
-    println!("[snapshot] wrote {n} bytes to {path}");
+    println!(
+        "[snapshot] wrote {n} bytes to {path} (RAM: {} of {} MiB stored, the rest zero)",
+        stored.div_ceil(1 << 20),
+        ram.size() >> 20
+    );
     Ok(())
 }
 
@@ -3142,7 +3146,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
 
     while let Some(s) = reader.next_section()? {
         match s.ty {
-            SectionType::RamRaw => {
+            SectionType::RamRaw | SectionType::RamSparse => {
                 // Read straight into guest RAM after the loop
                 // (`load_ram_and_verify`).
                 n_ram += 1;

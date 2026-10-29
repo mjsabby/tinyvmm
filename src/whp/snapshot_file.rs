@@ -7,6 +7,12 @@
 //!   [Sections]*      : type u32 | reserved u32 | length u64 | payload[length]
 //!   [Trailer]        : crc32 u32 over every preceding byte
 //!
+//! Guest RAM is one section: `RamRaw` holds the whole image; `RamSparse` (what
+//! the writer emits) holds chunk_size u32 | reserved u32 | image_len u64 |
+//! a bitmap of the image's chunks (bit i of byte i/8: chunk i is stored) |
+//! the stored chunks in order, the last one short if image_len ends mid-chunk.
+//! Chunks that are all zero are left out and come back as zero.
+//!
 //! CRC-32 is IEEE-802.3 (poly 0xEDB88320 reflected, init/xorout 0xFFFFFFFF).
 //! Snapshots are self-consistent within this Rust binary (device-state payloads
 //! differ from the C++ port), but the container/section IDs match the C++.
@@ -26,6 +32,7 @@ pub const VERSION: u32 = 1;
 #[repr(u32)]
 pub enum SectionType {
     RamRaw = 0x0001,
+    RamSparse = 0x0002,
     VcpuRegs = 0x0010,
     VcpuXsave = 0x0011,
     VcpuApic = 0x0012,
@@ -52,6 +59,7 @@ impl SectionType {
         use SectionType::*;
         Some(match v {
             0x0001 => RamRaw,
+            0x0002 => RamSparse,
             0x0010 => VcpuRegs,
             0x0011 => VcpuXsave,
             0x0012 => VcpuApic,
@@ -428,6 +436,45 @@ impl JsonReader {
 }
 
 // ============================================================
+// Sparse RAM
+// ============================================================
+/// Granularity of a sparse RAM image: the writer leaves out all-zero chunks.
+pub const SPARSE_CHUNK: usize = 64 * 1024;
+
+fn is_zero(b: &[u8]) -> bool {
+    // SAFETY: every bit pattern is a valid u64.
+    let (head, words, tail) = unsafe { b.align_to::<u64>() };
+    head.iter().all(|&x| x == 0)
+        && tail.iter().all(|&x| x == 0)
+        && words
+            .chunks(32)
+            .all(|c| c.iter().fold(0, |a, &x| a | x) == 0)
+}
+
+/// Which [`SPARSE_CHUNK`]s of `image` hold a non-zero byte, scanned on up to
+/// eight threads.
+fn stored_chunks(image: &[u8]) -> Vec<bool> {
+    let n = image.len().div_ceil(SPARSE_CHUNK);
+    let mut stored = vec![false; n];
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |t| t.get())
+        .clamp(1, 8)
+        .min(n.max(1));
+    let per = n.div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        for (t, out) in stored.chunks_mut(per).enumerate() {
+            scope.spawn(move || {
+                for (j, s) in out.iter_mut().enumerate() {
+                    let at = (t * per + j) * SPARSE_CHUNK;
+                    *s = !is_zero(&image[at..(at + SPARSE_CHUNK).min(image.len())]);
+                }
+            });
+        }
+    });
+    stored
+}
+
+// ============================================================
 // Writer
 // ============================================================
 pub struct SnapshotWriter {
@@ -493,6 +540,46 @@ impl SnapshotWriter {
         Ok(())
     }
 
+    /// Write a guest RAM image as a [`SectionType::RamSparse`] section, leaving
+    /// out every all-zero [`SPARSE_CHUNK`]. A booted guest's RAM is mostly
+    /// zero (about 95% of a 1 GiB guest at a shell prompt), so this writes, and
+    /// a restore later reads, a small fraction of it. Returns the bytes of RAM
+    /// stored.
+    pub fn write_ram_sparse(&mut self, image: &[u8]) -> Result<u64> {
+        let stored = stored_chunks(image);
+        let chunk_len = |i: usize| SPARSE_CHUNK.min(image.len() - i * SPARSE_CHUNK);
+        let mut bitmap = vec![0u8; stored.len().div_ceil(8)];
+        let mut data_len = 0u64;
+        for (i, _) in stored.iter().enumerate().filter(|(_, s)| **s) {
+            bitmap[i / 8] |= 1 << (i % 8);
+            data_len += chunk_len(i) as u64;
+        }
+        let mut hdr = [0u8; 32];
+        hdr[0..4].copy_from_slice(&(SectionType::RamSparse as u32).to_le_bytes());
+        let len = 16 + bitmap.len() as u64 + data_len;
+        hdr[8..16].copy_from_slice(&len.to_le_bytes());
+        hdr[16..20].copy_from_slice(&(SPARSE_CHUNK as u32).to_le_bytes());
+        hdr[24..32].copy_from_slice(&(image.len() as u64).to_le_bytes());
+        self.write_raw(&hdr)?;
+        self.write_raw(&bitmap)?;
+        // Runs of stored chunks go out as single writes of up to 1 MiB.
+        const RUN: usize = (1 << 20) / SPARSE_CHUNK;
+        let mut i = 0;
+        while i < stored.len() {
+            if !stored[i] {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < stored.len() && stored[i] && i - start < RUN {
+                i += 1;
+            }
+            let end = (i * SPARSE_CHUNK).min(image.len());
+            self.write_raw(&image[start * SPARSE_CHUNK..end])?;
+        }
+        Ok(data_len)
+    }
+
     pub fn finalize(mut self) -> Result<u64> {
         let crc = self.crc ^ 0xFFFF_FFFF;
         self.out
@@ -543,9 +630,38 @@ pub struct SnapshotReader {
 /// Where the RAM payload sits: in the file, and where it was cut out of `meta`.
 #[derive(Clone, Copy)]
 struct RamSpan {
+    /// The RAM bytes stored in the file: the whole image, or a sparse
+    /// image's stored chunks.
     file_off: u64,
     len: u64,
+    /// Where the section's body starts in `meta`.
+    body_at: usize,
+    /// Where the stored RAM bytes were cut out of `meta` (after a sparse
+    /// image's sub-header and bitmap, which stay in `meta`).
     meta_at: usize,
+    sparse: Option<SparseMap>,
+}
+
+/// A [`SectionType::RamSparse`] image: which chunks the file stores.
+#[derive(Clone, Copy)]
+struct SparseMap {
+    chunk: usize,
+    image_len: u64,
+    /// The chunk bitmap, in `meta`.
+    bitmap_at: usize,
+    bitmap_len: usize,
+}
+
+impl SparseMap {
+    fn chunks(&self) -> usize {
+        self.image_len.div_ceil(self.chunk as u64) as usize
+    }
+    fn stored(&self, meta: &[u8], i: usize) -> bool {
+        meta[self.bitmap_at + i / 8] >> (i % 8) & 1 != 0
+    }
+    fn chunk_len(&self, i: usize) -> u64 {
+        (self.chunk as u64).min(self.image_len - (i * self.chunk) as u64)
+    }
 }
 
 pub struct SectionRef<'a> {
@@ -617,12 +733,67 @@ impl SnapshotReader {
             if len > end - pos {
                 return Err(Error::msg("snapshot: section length out of range"));
             }
-            if ty == SectionType::RamRaw as u32 && ram.is_none() {
-                ram = Some(RamSpan {
-                    file_off: pos,
-                    len,
-                    meta_at: meta.len(),
-                });
+            let is_ram = ty == SectionType::RamRaw as u32 || ty == SectionType::RamSparse as u32;
+            if is_ram && ram.is_none() {
+                let body_at = meta.len();
+                if ty == SectionType::RamSparse as u32 {
+                    // The sub-header and bitmap stay with the metadata; only
+                    // the stored chunks are cut out.
+                    let bad = |what: &str| Error::msg(format!("snapshot: sparse RAM {what}"));
+                    if len < 16 {
+                        return Err(bad("section too short"));
+                    }
+                    meta.resize(body_at + 16, 0);
+                    read_exact_at(&file, &mut meta[body_at..], pos).map_err(io)?;
+                    let sub = &meta[body_at..];
+                    let chunk = u32::from_le_bytes(sub[0..4].try_into().unwrap()) as usize;
+                    let reserved = u32::from_le_bytes(sub[4..8].try_into().unwrap());
+                    let image_len = u64::from_le_bytes(sub[8..16].try_into().unwrap());
+                    if !chunk.is_power_of_two() || !(4096..=16 << 20).contains(&chunk) {
+                        return Err(bad("chunk size invalid"));
+                    }
+                    if reserved != 0 {
+                        return Err(bad("reserved != 0"));
+                    }
+                    let bitmap_len = image_len.div_ceil(chunk as u64).div_ceil(8);
+                    if bitmap_len > len - 16 {
+                        return Err(bad("bitmap past the section"));
+                    }
+                    let map = SparseMap {
+                        chunk,
+                        image_len,
+                        bitmap_at: body_at + 16,
+                        bitmap_len: bitmap_len as usize,
+                    };
+                    meta.resize(map.bitmap_at + map.bitmap_len, 0);
+                    read_exact_at(&file, &mut meta[map.bitmap_at..], pos + 16).map_err(io)?;
+                    let chunks = map.chunks();
+                    if chunks % 8 != 0 && meta[meta.len() - 1] >> (chunks % 8) != 0 {
+                        return Err(bad("bitmap marks chunks past the image"));
+                    }
+                    let stored: u64 = (0..chunks)
+                        .filter(|&i| map.stored(&meta, i))
+                        .map(|i| map.chunk_len(i))
+                        .sum();
+                    if 16 + bitmap_len + stored != len {
+                        return Err(bad("section length does not match its bitmap"));
+                    }
+                    ram = Some(RamSpan {
+                        file_off: pos + 16 + bitmap_len,
+                        len: stored,
+                        body_at,
+                        meta_at: meta.len(),
+                        sparse: Some(map),
+                    });
+                } else {
+                    ram = Some(RamSpan {
+                        file_off: pos,
+                        len,
+                        body_at,
+                        meta_at: body_at,
+                        sparse: None,
+                    });
+                }
             } else {
                 let at = meta.len();
                 meta.resize(at + len as usize, 0);
@@ -679,8 +850,8 @@ impl SnapshotReader {
         let ty = SectionType::from_u32(ty_raw)
             .ok_or_else(|| Error::msg(format!("snapshot: unknown section type {ty_raw:#x}")))?;
         let body = self.pos + 16;
-        if self.ram.is_some_and(|r| r.meta_at == body) {
-            self.pos = body;
+        if let Some(r) = self.ram.filter(|r| r.body_at == body) {
+            self.pos = r.meta_at;
             return Ok(Some(SectionRef { ty, payload: &[] }));
         }
         // `open` read every other payload in full.
@@ -694,39 +865,31 @@ impl SnapshotReader {
     /// Read the RAM section into guest RAM (laid out as `GuestMemory::load_image`
     /// takes it), on several threads with a handle each, then verify the CRC of
     /// the whole file. Until this returns Ok, nothing parsed from the file may
-    /// be applied to the machine.
+    /// be applied to the machine. Chunks a sparse image leaves out are not
+    /// written: `ram` must still be the zero-filled allocation.
     pub fn load_ram_and_verify(&self, ram: &crate::whp::GuestMemory) -> Result<()> {
         let io = |e: std::io::Error| Error::msg(format!("snapshot: read {}: {e}", self.path));
         let crc = match self.ram {
             None => crc32(&self.meta),
             Some(span) => {
-                let n = (span.len as usize).min(ram.size());
-                let chunks = ram.fill_image(n, |off, chunk| {
-                    // Checksum each piece right after reading it, while it's
-                    // still in cache.
-                    const PIECE: usize = 1 << 20;
-                    let f = open_no_writers(&self.path)?;
-                    let mut reg = 0xFFFF_FFFFu32;
-                    for (i, piece) in chunk.chunks_mut(PIECE).enumerate() {
-                        read_exact_at(&f, piece, span.file_off + (off + i * PIECE) as u64)?;
-                        reg = crc32_update(reg, piece);
-                    }
-                    Ok::<_, std::io::Error>((reg ^ 0xFFFF_FFFF, chunk.len() as u64))
-                });
-                let mut ram_crc = 0u32;
-                for c in chunks {
+                // CRC of the stored RAM bytes, in file order: first those that
+                // land in guest RAM, then any past its end.
+                let (mut ram_crc, mut done) = (0u32, 0u64);
+                let image_len = span.sparse.map_or(span.len, |m| m.image_len);
+                let n = (image_len as usize).min(ram.size());
+                for c in self.fill_ram(ram, span, n) {
                     let (c, len) = c.map_err(io)?;
                     ram_crc = crc32_combine(ram_crc, c, len);
+                    done += len;
                 }
                 // A payload longer than this RAM (an allocation aligned
                 // differently at save time) is still part of the checksum.
-                let mut off = n as u64;
                 let mut scratch = Vec::new();
-                while off < span.len {
-                    scratch.resize(((span.len - off) as usize).min(16 << 20), 0);
-                    read_exact_at(&self._file, &mut scratch, span.file_off + off).map_err(io)?;
+                while done < span.len {
+                    scratch.resize(((span.len - done) as usize).min(16 << 20), 0);
+                    read_exact_at(&self._file, &mut scratch, span.file_off + done).map_err(io)?;
                     ram_crc = crc32_combine(ram_crc, crc32(&scratch), scratch.len() as u64);
-                    off += scratch.len() as u64;
+                    done += scratch.len() as u64;
                 }
                 let (before, after) = self.meta.split_at(span.meta_at);
                 let crc = crc32_combine(crc32(before), ram_crc, span.len);
@@ -740,6 +903,70 @@ impl SnapshotReader {
             )));
         }
         Ok(())
+    }
+
+    /// Read the stored RAM bytes for the first `n` bytes of the image into
+    /// guest RAM, in parallel slices. Returns each slice's (CRC, bytes read),
+    /// in image order, which is also the order the bytes sit in the file.
+    fn fill_ram(
+        &self,
+        ram: &crate::whp::GuestMemory,
+        span: RamSpan,
+        n: usize,
+    ) -> Vec<std::io::Result<(u32, u64)>> {
+        // Checksum each piece right after reading it, while it's still in
+        // cache.
+        const PIECE: usize = 1 << 20;
+        let read = |f: &File, dst: &mut [u8], file_off: u64, reg: &mut u32| {
+            for (i, piece) in dst.chunks_mut(PIECE).enumerate() {
+                read_exact_at(f, piece, file_off + (i * PIECE) as u64)?;
+                *reg = crc32_update(*reg, piece);
+            }
+            Ok::<_, std::io::Error>(())
+        };
+        let Some(map) = span.sparse else {
+            return ram.fill_image(n, |off, slice| {
+                let f = open_no_writers(&self.path)?;
+                let mut reg = 0xFFFF_FFFFu32;
+                read(&f, slice, span.file_off + off as u64, &mut reg)?;
+                Ok((reg ^ 0xFFFF_FFFF, slice.len() as u64))
+            });
+        };
+        // Where each chunk's bytes start among the stored bytes (for the
+        // chunks that land in guest RAM; the rest are read as the tail).
+        let needed = n.div_ceil(map.chunk);
+        let mut at = Vec::with_capacity(needed);
+        let mut sum = 0u64;
+        for i in 0..needed {
+            at.push(sum);
+            if map.stored(&self.meta, i) {
+                sum += map.chunk_len(i);
+            }
+        }
+        ram.fill_image(n, |off, slice| {
+            // `fill_image` slices start on chunk boundaries (chunks are powers
+            // of two of at most its slice size); only the image's end can cut
+            // a chunk short.
+            let f = open_no_writers(&self.path)?;
+            let mut reg = 0xFFFF_FFFFu32;
+            let mut got = 0u64;
+            let end = off + slice.len();
+            let mut i = off / map.chunk;
+            while i * map.chunk < end {
+                if !map.stored(&self.meta, i) {
+                    i += 1;
+                    continue;
+                }
+                let first = i;
+                while i * map.chunk < end && map.stored(&self.meta, i) {
+                    i += 1;
+                }
+                let run = first * map.chunk - off..(i * map.chunk).min(end) - off;
+                got += run.len() as u64;
+                read(&f, &mut slice[run], span.file_off + at[first], &mut reg)?;
+            }
+            Ok((reg ^ 0xFFFF_FFFF, got))
+        })
     }
 }
 
@@ -856,6 +1083,64 @@ mod tests {
             while let Ok(Some(_)) = r.next_section() {}
             assert!(r.load_ram_and_verify(&ram).is_err(), "flip at {at}");
             bytes[at] ^= 1;
+        }
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// RAM goes out sparse: all-zero chunks are left out of the file and the
+    /// rest come back in place, into RAM the image's size, larger (the rest
+    /// stays zero) or smaller (ending inside a stored chunk, whose remainder
+    /// is still checksummed). Moving a stored chunk in the bitmap or flipping
+    /// a stored bit fails the load.
+    #[test]
+    fn sparse_ram_roundtrip() {
+        const C: usize = SPARSE_CHUNK;
+        let mut image = vec![0u8; 5 * C + 1000];
+        image[C + 7] = 1;
+        for (i, b) in image[3 * C..5 * C].iter_mut().enumerate() {
+            *b = (i % 251) as u8 + 1;
+        }
+        image[5 * C + 999] = 9;
+        let stored = 3 * C + 1000;
+        let path = std::env::temp_dir().join("tv_snap_sparse_test.bin");
+        let p = path.to_str().unwrap();
+        {
+            let mut w = SnapshotWriter::create(p).unwrap();
+            w.write_header("{}").unwrap();
+            w.write_section(SectionType::VcpuRegs, &[7u8; 10]).unwrap();
+            assert_eq!(w.write_ram_sparse(&image).unwrap(), stored as u64);
+            w.finalize().unwrap();
+        }
+        let file_len = std::fs::metadata(p).unwrap().len() as usize;
+        assert_eq!(file_len, 24 + 2 + 26 + 16 + 16 + 1 + stored + 4);
+        let load = |ram_size: usize| -> Result<Vec<u8>> {
+            let mut r = SnapshotReader::open(p)?;
+            r.read_header()?;
+            let s = r.next_section()?.unwrap();
+            assert_eq!((s.ty, s.payload.len()), (SectionType::VcpuRegs, 10));
+            let s = r.next_section()?.unwrap();
+            assert_eq!((s.ty, s.payload.len()), (SectionType::RamSparse, 0));
+            assert!(r.next_section()?.is_none());
+            let ram = crate::whp::GuestMemory::new_host_only(ram_size).unwrap();
+            r.load_ram_and_verify(&ram)?;
+            let mut got = vec![0u8; ram_size];
+            assert!(ram.read_into(0, &mut got));
+            Ok(got)
+        };
+        for size in [image.len(), image.len() + 3 * C, 3 * C + 4096] {
+            let got = load(size).unwrap();
+            let n = size.min(image.len());
+            assert!(got[..n] == image[..n], "ram size {size}");
+            assert!(got[n..].iter().all(|&b| b == 0), "ram size {size}");
+        }
+        // The one-byte bitmap sits right before the stored chunks.
+        let bitmap = file_len - 4 - stored - 1;
+        let mut bytes = std::fs::read(p).unwrap();
+        for (at, flip) in [(bitmap, 0b11u8), (bitmap, 0b100), (file_len - 4 - 500, 1)] {
+            bytes[at] ^= flip;
+            std::fs::write(p, &bytes).unwrap();
+            assert!(load(image.len()).is_err(), "flip {flip:#b} at {at}");
+            bytes[at] ^= flip;
         }
         let _ = std::fs::remove_file(p);
     }

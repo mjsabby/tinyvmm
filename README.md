@@ -1281,18 +1281,26 @@ Section types cover per-vCPU register state (GPRs, control/segment/descriptor +
 debug regs, EFER + syscall MSRs, XSAVE, the APIC + interrupt-controller state,
 TSC), the **Hyper-V enlightenment** (4 MSR caches), the **legacy devices**
 (PIC/PIT/serial/ISA-stubs/PCI-bus), every **PCI device**, and **guest RAM last**.
+RAM is stored **sparse** (`RamSparse`): a bitmap of 64 KiB chunks, then only the
+chunks that aren't all zero, scanned on up to eight threads at save time. A 1 GiB
+guest at a shell prompt is ~95% zero, so its snapshot is ~51 MiB instead of
+1 GiB. Older whole-image (`RamRaw`) snapshots still restore.
 The CRC-32 folds 64 bytes per step with `PCLMULQDQ` (Intel's carry-less-multiply
 method, as in Linux and zlib; ~12 GB/s per core), with a byte table
 (`OnceLock<[u32; 256]>`) for tails and older CPUs.
 
 Restore never holds the RAM image in host memory: `SnapshotReader::open` reads
-everything else with positioned reads, and `load_ram_and_verify` reads the RAM
-payload straight into guest memory on up to eight threads, checksumming each
+everything else with positioned reads, and `load_ram_and_verify` reads the stored
+chunks straight into guest memory on up to eight threads, checksumming each
 piece as it lands, then checks the whole file's CRC (chunk CRCs combined the way
-zlib's `crc32_combine` does) before any parsed state is applied. The file is
-held open against writers meanwhile. A 1 GiB guest resumes about 125 ms after
-`--restore` starts on the reference host (it took 3.45 s when the CRC ran a byte
-at a time over a heap copy of the file); `[boot]` lines print the phases.
+zlib's `crc32_combine` does) before any parsed state is applied. Chunks the file
+leaves out are never touched: the freshly allocated guest RAM is already zero, and
+nothing writes it before the load. The file is held open against writers
+meanwhile. On the reference host a 1 GiB guest saves in under 0.1 s (from the
+trigger to process exit; ~0.7 s when RAM was written whole) and resumes about 60
+ms after `--restore` starts (RAM load + CRC ~15 ms; ~155 ms and ~110 ms for a
+whole-image snapshot, and 3.45 s back when the CRC ran a byte at a time over a
+heap copy of the file); `[boot]` lines print the phases.
 
 Each PCI device section is tagged with its `device_index` (the PCI-add order:
 console=0, then NICs, rng, blk*, **input keyboard+tablet**, 9p*, **gpu last**).
