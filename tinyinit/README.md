@@ -270,6 +270,14 @@ Linux disk for persistent data. No DAC-override workaround is granted.
 Root SSH can modify any writable host share: expose only directories you
 intend to grant it.
 
+Read-only shares (bootstrap, an external rootfs, and `ro` mounts) are mounted
+with `cache=readahead`: file data goes through the guest page cache in large
+reads, while a lookup of a file the guest doesn't hold open still asks the
+host, so a file the host replaces is seen when next opened. Uncached, Linux reads a 9p file one 4 KiB page per
+round trip; with the 57 MB external rootfs pack this cut `root-unpack` from
+about 540 ms to 265 ms at 2 vCPUs on the reference host. Writable shares stay
+uncached (`cache=none`), so the guest always reads what the host last wrote.
+
 A `mounts` target can be any absolute path except `/` and the paths init
 manages: `/bin`, `/dev`, `/etc`, `/mnt/bootstrap`, `/proc`, `/run`, `/sys`,
 `/tmp` and `/usr/bin`, including their parents and children. Parents mount

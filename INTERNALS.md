@@ -612,6 +612,10 @@ done. Build them in this order:
   `FILE_FLAG_OVERLAPPED`, bound to a per-disk **IOCP** with a worker thread, and
   overlaps `ReadFile`/`WriteFile` **directly into/out of guest RAM**. On
   completion the worker pushes the used element and raises the MSI-X vector.
+  Windows completes overlapped reads through a system worker and the IOCP even
+  on a page-cache hit, so a lone request (queue depth 1) is instead done
+  synchronously on the pump through a second, non-overlapped handle
+  (`BlockFile::submit_sync`).
 - **virtio-net** (`src/virtio/net.rs`, id 1) + a backend
   (`NetBackend`: loopback / user-mode NAT / wintun). The device negotiates
   checksum offload and TCPv4 segmentation offload (TSO4) in both directions plus
@@ -622,7 +626,9 @@ done. Build them in this order:
   sharded over `--nat-workers` threads (default a quarter of the host's logical
   CPUs, 1–4; `nat.rs:157`), each with its own IOCP and the flows it owns. A TCP
   flow's SYN assigns it to the least-loaded worker; UDP goes by 4-tuple hash;
-  ARP, ICMP and IP fragments go to the first worker (`nat.rs:190`, `:228`).
+  ARP, ICMP and IP fragments go to the first worker (`nat.rs:190`, `:228`). The
+  guest's SYN is answered only once the host connect succeeds, and every way a
+  flow ends reaches the guest as the far end would end it (gotcha 20).
 - **virtio-9p** (`src/virtio/p9.rs`, id 9) — a 9P2000.L file share with a worker
   pool. Note the **path-security** layer: every component is validated
   (reject `..`, control chars, Win32 metacharacters, reserved DOS names), `..` is
@@ -634,7 +640,11 @@ done. Build them in this order:
   `Tsetattr`, `Tlcreate` and `Tmkdir` write them (`NtSetEaFile`) and `Rgetattr`
   reads them back through `NtQueryInformationFile(FileStatLxInformation)`, NTFS's
   own decoder of those attributes (`crates/winsys/src/fs.rs`). Each fid
-  remembers its attacher's `n_uname`, the owner of what it creates.
+  remembers its attacher's `n_uname`, the owner of what it creates. Give files a
+  **non-zero `qid.version`** (here, as in QEMU, derived from the last write time
+  and size): Linux treats version 0 as a synthetic file and bypasses its page
+  cache for it whatever the mount's `cache=` mode, which turns a big read into
+  one Tread per guest page.
 
 **The doorbell fast path** (`crates/whpsys/src/doorbell.rs`,
 `transport.rs:383`). A queue kick is a guest write to the notify register, which
@@ -648,7 +658,12 @@ rng/input/gpu (low-rate, serviced inline) and snd (its WASAPI threads pace the
 I/O). The pump waits `INFINITE` with no periodic sweep — the virtqueue's fenced
 re-check of `avail.idx` (M5) closes the EVENT_IDX race, and any non-matching
 write still falls through to the MMIO handler as a backstop
-(`transport.rs:143`).
+(`transport.rs:143`). A doorbell's trip to the pump costs tens of microseconds
+(hypervisor signal, host DPC, thread wake-up), so after serving blk or 9p work
+the pump **busy-polls** the ring for an adaptive window (`PollWindow`, after
+KVM's halt polling: it grows while requests keep arriving back to back and
+decays to zero when they don't), and runs a lone request itself instead of
+handing it to a worker.
 
 > **The performance philosophy** in one line: *optimize the number of VM exits,
 > not the handler code.* The VMM's own code is at noise level under profiling; the
@@ -674,7 +689,8 @@ These are optional and don't change the core, but each teaches one more piece:
   (`"TVMMSAVE"` header + JSON machine description + typed sections + CRC32) holding
   per-vCPU register/XSAVE/APIC state, the HV MSR cache, the legacy devices, every
   PCI device (config/BAR/MSI-X/common-cfg/queues/device-state via the four
-  `VirtioDevice` hooks), and **guest RAM last**. The crucial discipline:
+  `VirtioDevice` hooks), and **guest RAM last**, sparse (only the 64 KiB chunks
+  that aren't all zero; a booted guest's RAM is mostly zero). The crucial discipline:
   **devices are constructed in a fixed order** (console=0, net*, rng, snd, blk*,
   input kbd+tablet, 9p*, gpu last) and save/restore must use the *same* order or
   the `device_index` tags misalign (`src/main.rs:1519` assigns the tags;
@@ -855,6 +871,38 @@ real debugging time in this project.
     first touch of a 4 KiB page faults into the root partition (~40 µs), which
     made guest page-zeroing ~25× slower. Pre-populate with
     `WHvAdviseGpaRange(Populate)` in the background. (§M0)
+16. **A 9p `qid.version` of 0 disables the guest's page cache.** Linux treats it
+    as a synthetic file and goes uncached whatever `cache=` says, and its
+    uncached virtio path pins one page per Tread: a 512 MiB read became 131 072
+    round trips (85 MB/s) instead of ~1 000 (1.7 GB/s). Derive the version from
+    the file's write time and size. (§M6)
+17. **Overlapped file I/O on Windows rarely completes inline.** Even a page-cache
+    hit on an overlapped handle goes through a system worker thread and the
+    IOCP, so `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` alone doesn't shorten the
+    path. For latency-bound (QD1) requests, a synchronous handle on the pump
+    thread is two hand-offs shorter. And don't add
+    `FILE_SKIP_SET_EVENT_ON_HANDLE` to a handle that also sees
+    `DeviceIoControl` without an `OVERLAPPED`: kernel32 waits on the handle
+    itself for one that pends, and that wait never ends. (§M6)
+18. **The doorbell wake is the latency floor of a QD1 request.** Hypervisor
+    signal, host DPC, and readying the pump (often on a core in a deep C-state)
+    take tens of microseconds; busy-poll the ring for a bounded, adaptive window
+    after each request. (§M6)
+19. **A user-mode NAT shouldn't hold TIME_WAIT for 2·MSL.** When the host closes
+    a connection first, the guest-facing TCB is the active closer, and a TCP
+    stack keeps it for 60 s. With a fixed flow table (256 here), the guest's
+    `connect()`s were refused after 256 such connections in a minute. Over the
+    virtual link nothing is reordered, so release the flow as soon as only
+    TIME_WAIT is left, and answer anything the guest sends it afterwards (a
+    retransmitted FIN) with a RST. (§M6)
+20. **A terminating NAT must end connections the way the far end would.** It
+    owns a TCP stack on each side, so nothing forces the two to agree. Answer
+    the guest's SYN only after the host connect succeeds, or every `connect()`
+    succeeds, even to closed ports, and fails later with a reset. Turn a host
+    reset into a guest reset, not a FIN, which would make a cut-off stream look
+    complete. And when the NAT gives up on a flow (a watchdog, a failed host
+    send), send the guest a RST: a flow dropped silently leaves the guest
+    retransmitting into nothing until its own timeout, minutes later. (§M6)
 
 ---
 

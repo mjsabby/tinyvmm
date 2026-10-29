@@ -213,6 +213,7 @@ repo root) and need WHP — bare metal or nested Hyper-V:
 | `python tools\irq_test.py` | interrupt delivery at 1 and 2 vCPUs: COM1 IRQs reach the guest as ExtINT (also waking an idle BSP), MSIs keep flowing afterwards, the LAPIC timer is calibrated to WHP's interrupt clock, and `sleep 2` takes 2 s of host time |
 | `python tools\irq_bench.py --tinyvmm base=<exe> --tinyvmm new=<exe>` | A/B interrupt-path latency: timer wake-up, virtio-blk QD1 round trip, cross-CPU wake-up, idle host CPU, VM exits |
 | `python tools\net_compare.py` | NAT networking vs OpenVMM |
+| `python tools\nat_test.py` | NAT connection semantics: refused connects, host resets, host-closed churn |
 
 ### Large pages
 
@@ -271,6 +272,7 @@ Parsed in `parse_pvh_args` (`main.rs:590`). Defaults and clamps are exact.
 | `--input` | off | Add **two** virtio-input devices — a keyboard and an absolute tablet (pointer + scroll + buttons). With `--gpu`, the host source is the GPU window (1:1 pixel coordinates); otherwise it falls back to the interactive console. Needs a guest kernel with `CONFIG_VIRTIO_INPUT`. |
 | `--sound` | off | Add a virtio-snd sound card — one playback + one capture PCM stream (48 kHz / S16_LE / stereo) backed by Windows **WASAPI** (shared mode). Needs a guest kernel with `CONFIG_SND_VIRTIO`. On a host with no audio endpoint the card still appears but plays/records silence. |
 | `--cpu-affinity all\|p\|e\|p-physical` | `all` | Pin every vCPU thread to a CPU-set class (P/E cores via `EfficiencyClass`). |
+| `--poll-us <N>` | `50` | Ceiling, in µs, of the doorbell pumps' adaptive busy-poll (see [Doorbells](#doorbells--the-notify-without-a-vm-exit-path)); `0` disables it. **0–10000.** |
 | `--save <path>` | — | Arm snapshot-on-trigger: when the guest issues `CPUID(0x4000DE57)`, quiesce the machine, write `<path>`, and exit. |
 | `--unsafe-save-mutable-drive` | off | Allow `--save` with a *writable* `--drive` attached (otherwise refused — the disk is not part of the snapshot, so a mutated disk would diverge from restored RAM). |
 | `--watchdog-secs <N>` | `0` | `0` = run until stopped; else stop after N seconds, printing `io/cpuid/msr` exit counters each second. |
@@ -292,7 +294,7 @@ and accepts a small set of overrides:
 |------|-----------|
 | `--drive <path>[,ro\|rw]` | Re-attach disks (blk content is not in the snapshot, so the operator supplies the backing files in the same order). |
 | `--unsafe-restore-mutable-drive` | Permit re-attaching a writable disk whose size differs from save time. |
-| `--cpu-affinity …` / `--watchdog-secs N` | Same as `--pvh-run`. |
+| `--cpu-affinity …` / `--watchdog-secs N` / `--poll-us N` | Same as `--pvh-run`. |
 
 ### Examples
 
@@ -388,7 +390,13 @@ order they are created — that order is fixed (it is also the snapshot
 * **virtio-blk** — async backend: one Win32 file opened `FILE_FLAG_OVERLAPPED`,
   bound to a per-disk IOCP with one worker thread. READ / WRITE / FLUSH plus a RO
   feature bit and DISCARD / WRITE_ZEROES (via `FSCTL_SET_ZERO_DATA` on a sparse
-  NTFS file).
+  NTFS file). Windows completes overlapped reads asynchronously through a system
+  worker and the IOCP even when the host page cache holds the data, so a
+  request the guest is waiting on alone (nothing else queued or in flight) is
+  instead read or written synchronously on the doorbell pump through a second,
+  non-overlapped handle: two thread hand-offs fewer per QD1 round trip.
+  Concurrent requests stay asynchronous, so a host cache miss never stalls the
+  others.
 * **virtio-input** — `--input` adds two devices (`src/virtio/input.rs`): a
   **keyboard** and an **absolute tablet** (pointer motion, buttons, scroll
   wheel). Two queues each (`eventq=0`, `statusq=1`); the host injects events with
@@ -399,7 +407,16 @@ order they are created — that order is fixed (it is also the snapshot
   workers), backed by Win32 file APIs through `winsys::fs`. Every entry reports
   the share's `uid=`/`gid=` owner (default root) and a synthesized mode, or, on a
   `metadata` share, the per-file owner and mode WSL keeps in NTFS extended
-  attributes.
+  attributes. A request the guest is waiting on alone runs on the doorbell pump
+  itself; Tread/Twrite payloads move between the host file and the guest's
+  buffers directly, or through a reused bounce buffer when the buffers are
+  scattered pages. Files report a non-zero `qid.version` derived from the last
+  write time and size (as QEMU does), so the guest's cache modes work: Linux
+  treats version 0 as a synthetic file and bypasses its page cache for it. For
+  big sequential reads mount with `cache=readahead` (coherent at open) or
+  `cache=loose`: the default `cache=none` path in Linux 7.3 pins one page per
+  Tread, so every 4 KiB is a round trip, while the cached modes read up to
+  `msize` per Tread.
 * **virtio-gpu** — basic 2D scanout (`src/virtio/gpu.rs`). Two queues
   (`controlq=0`, `cursorq=1`); single scanout (`NUM_SCANOUTS=1`); 32-bpp
   resources. It handles `GET_DISPLAY_INFO`, `RESOURCE_CREATE_2D` / `UNREF`,
@@ -494,7 +511,23 @@ axes).
   copied once into the guest's RX buffers. Each worker dequeues up to 16
   completions per `GetQueuedCompletionStatusEx` and interrupts the guest once
   for the TCP frames a batch delivered (sooner if 8 are waiting); ARP, ICMP and
-  UDP replies interrupt right away.
+  UDP replies interrupt right away. The NAT holds up to 256 TCP flows and
+  ends connections the way a real network would:
+  * The guest's SYN is answered only once the host connect succeeds. A refused
+    or unreachable destination, or one that doesn't answer within 10 s, fails
+    the guest's `connect()` with ECONNREFUSED.
+  * A host-side reset reaches the guest as a reset, not a clean EOF that would
+    make a cut-off stream look complete.
+  * A flow the NAT gives up on is reset toward the guest. That happens when it
+    is idle for 2 h 4 min, or half-closed and idle for 4 min (RFC 5382's
+    minimums), or when a host send fails.
+  * Guest segments for a connection the NAT no longer has draw a RST.
+  * A flow whose guest-facing TCB has only TIME_WAIT left (the host closed
+    first: HTTP/1.0, `Connection: close`) is released at once instead of after
+    `tcp-sans-io`'s 60 s. Holding it refused every guest `connect()` after 256
+    such connections in a minute.
+
+  `tools\nat_test.py` checks the first two and the TIME_WAIT case.
 * **`wintun`** — bridges onto a real WinTun L3 adapter (`wintun.dll` loaded at
   runtime via `GetProcAddress`; requires elevation to create the adapter).
 
@@ -513,6 +546,17 @@ its store and the load that pairs with the driver's barrier (publish
 `avail_event`, fence, re-read `avail.idx` before treating the ring as empty;
 publish `used.idx`, fence, read `used_event` before deciding to interrupt), and
 any non-matching write still falls through to the MMIO handler as a backstop.
+
+The doorbell's trip to the pump — hypervisor signal, a DPC in the host,
+readying the pump, often on a sleeping core — costs tens of microseconds, about
+as much as serving a cached 4 KiB request. blk and 9p therefore let their pump
+**busy-poll** the ring after each piece of work (`PollWindow` in
+`transport.rs`, modelled on KVM's halt polling): when the guest's next request
+arrives within the window the pump takes it straight from guest memory. The
+window grows while the gap between requests stays under the `--poll-us`
+ceiling (default 50 µs) and decays to zero otherwise, so an idle or lightly
+used device never spins. Polling trades host CPU for latency only while
+requests come back to back: a QD1 4 KiB read loop costs about half a core more.
 
 ---
 
@@ -747,10 +791,12 @@ completion" discipline to TCP.
 
 The tax the safety model adds versus a C VMM that derefs guest pointers directly:
 
-* **Per queue kick (doorbell path):** an OS-event wake on the pump thread +
-  `ResetEvent` + **one `Mutex<Virtqueue>` lock/unlock** per drain (uncontested in
-  steady state, ~10–20 ns). The win dwarfs it: a kick costs **0 VM exits** instead
-  of one (microseconds of hypervisor round-trip).
+* **Per queue kick (doorbell path):** an OS-event wake on the pump thread (the
+  events are auto-reset, so no `ResetEvent`) + **one `Mutex<Virtqueue>`
+  lock/unlock** per drain (uncontested in steady state, ~10–20 ns). The win
+  dwarfs it: a kick costs **0 VM exits** instead of one (microseconds of
+  hypervisor round-trip). Back-to-back blk/9p requests skip even the wake: the
+  pump busy-polls the ring between them (see [Doorbells](#doorbells--the-notify-without-a-vm-exit-path)).
 * **Per descriptor decode (control-plane only):** a bounds check (2–3 branches in
   `host_range`) + a **16-byte** `copy_nonoverlapping` of the *descriptor itself*
   into a stack `[u8; 16]` — a const-generic local returned by value, **no heap
@@ -792,11 +838,14 @@ NIC/display protocol, not to the guest-memory-access layer.
 | Workload | Result |
 |----------|--------|
 | virtio-blk single-stream read | ~533 MB/s (guest pipelines ~14 requests in flight) |
-| virtio-9p single-stream read | ~16 MB/s (request-response latency-bound) |
-| virtio-9p concurrent (32 readers) | ~190 MB/s (ceiling = one submit pump + the per-queue `Mutex<Virtqueue>`) |
+| virtio-blk QD1 4 KiB read (`tools\irq_bench.py`, sparse scratch disk) | ~30 µs per request (was ~67–88 µs before the synchronous lone-request path and pump polling) |
+| virtio-9p single-stream read, `cache=loose` / `cache=readahead` (`tools\p9_bench.py`, 512 MiB file) | ~1.7 / ~1.6 GB/s (~500 KB per Tread) |
+| virtio-9p single-stream read, `cache=none` | ~165 MB/s (4 KiB per Tread, latency-bound; was ~85 MB/s) |
+| virtio-9p 4 concurrent readers, `cache=none` / `cache=loose` | ~620 MB/s / ~3 GB/s |
 | virtio-net guest→host | 20 MB transfer at line rate with the pump's periodic sweep disabled |
 | NAT TCP host→guest (`tools\net_compare.py`, server on the same host, 1 vCPU) | ~14 Gbit/s one stream; across 16 streams ~11.7 Gbit/s with one NAT worker, ~23.5 with two, ~29 with three and ~33 with four (the guest's vCPU saturates) |
 | NAT TCP guest→host (same setup) | ~9 Gbit/s one stream |
+| NAT TCP connection churn (`net_compare.py --rr 3000`: guest `wget` per request, host closes first) | ~1 150 connect + request + response per second, all 3 000 succeed (connections 257 onward used to be refused for a minute) |
 
 ---
 
@@ -1147,6 +1196,31 @@ which thread a workload saturates without a profiler:
 tinyvmm par: busiest threads (% of one CPU): nat-worker 95, main 65, (host server) 16, virtio-pci-net[0]-doorbell 12
 ```
 
+### Storage counters
+
+Each virtio-blk disk reports its backend's ops and the device's queue depth:
+
+```text
+[pvh-run] virtio-blk[0] stats: submitted=2637 completed=2637 errors=0 max_inflight=4
+  max_depth=39 (virtio in=2307 out=255 flush=75 discard=0 wz=0 err=0)
+```
+
+`max_depth` is the most requests the guest had outstanding at once (in flight
+at the device plus still waiting in the ring); `max_inflight` counts only the
+ops the host completed asynchronously, so it stays low when requests are served
+synchronously.
+
+Each 9p share reports its request mix:
+
+```text
+[9p] share0 requests=1103 rlerrors=0 msize=512000 reads=1058 read_bytes=536870912
+  (avg 507439) writes=0 write_bytes=0 (avg 0) msix=1103
+```
+
+The average Tread size shows how the guest sized its reads: about one page
+means it bypassed its page cache (`cache=none`, or a file reported with
+`qid.version` 0); about `msize` means readahead is batching them.
+
 ---
 
 ## 12. Boot trace (measured)
@@ -1208,7 +1282,7 @@ CPUID (`src/whp/snapshot.rs`, `src/whp/run_loop.rs`). The VMM then quiesces (sto
 writes a self-describing file (`src/whp/snapshot_file.rs`):
 
 ```
-[24-byte header]  "TVMMSAVE" | version u32 (=1) | reserved u32 | header_json_size u64
+[24-byte header]  "TVMMSAVE" | version u32 (=2) | reserved u32 | header_json_size u64
 [ JSON header ]   machine description (vcpus, ram, large_pages, with_gpu/width/height,
                   with_input, device list …)
 [ sections... ]   type u32 | reserved u32 | length u64 | payload[length]
@@ -1219,7 +1293,27 @@ Section types cover per-vCPU register state (GPRs, control/segment/descriptor +
 debug regs, EFER + syscall MSRs, XSAVE, the APIC + interrupt-controller state,
 TSC), the **Hyper-V enlightenment** (4 MSR caches), the **legacy devices**
 (PIC/PIT/serial/ISA-stubs/PCI-bus), every **PCI device**, and **guest RAM last**.
-The CRC32 table is a `OnceLock<[u32; 256]>`.
+RAM is stored **sparse** (`RamSparse`): a bitmap of 64 KiB chunks, then only the
+chunks that aren't all zero, scanned on up to eight threads at save time. A 1 GiB
+guest at a shell prompt is ~95% zero, so its snapshot is ~51 MiB instead of
+1 GiB. Version-1 snapshots, which stored RAM whole, are rejected: the format
+keeps no backward compatibility.
+The CRC-32 folds 64 bytes per step with `PCLMULQDQ` (Intel's carry-less-multiply
+method, as in Linux and zlib; ~12 GB/s per core), with a byte table
+(`OnceLock<[u32; 256]>`) for tails and older CPUs.
+
+Restore never holds the RAM image in host memory: `SnapshotReader::open` reads
+everything else with positioned reads, and `load_ram_and_verify` reads the stored
+chunks straight into guest memory on up to eight threads, checksumming each
+piece as it lands, then checks the whole file's CRC (chunk CRCs combined the way
+zlib's `crc32_combine` does) before any parsed state is applied. Chunks the file
+leaves out are never touched: the freshly allocated guest RAM is already zero, and
+nothing writes it before the load. The file is held open against writers
+meanwhile. On the reference host a 1 GiB guest saves in under 0.1 s (from the
+trigger to process exit; ~0.7 s when RAM was written whole) and resumes about 60
+ms after `--restore` starts (RAM load + CRC ~15 ms; ~155 ms and ~110 ms when RAM
+was stored whole, and 3.45 s back when the CRC ran a byte at a time over a
+heap copy of the file); `[boot]` lines print the phases.
 
 Each PCI device section is tagged with its `device_index` (the PCI-add order:
 console=0, then NICs, rng, blk*, **input keyboard+tablet**, 9p*, **gpu last**).

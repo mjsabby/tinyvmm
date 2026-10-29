@@ -370,6 +370,23 @@ impl Virtqueue {
         if self.pop_into(&mut c) { Some(c) } else { None }
     }
 
+    /// Whether the driver has published entries not yet popped. A plain peek:
+    /// unlike an empty [`Self::pop_into`] it does not arm a kick.
+    pub fn has_avail(&self) -> bool {
+        self.avail_pending() != 0
+    }
+
+    /// Entries the driver has published but the device hasn't popped yet
+    /// (capped at the ring size, since `avail.idx` is guest-controlled).
+    pub fn avail_pending(&self) -> u16 {
+        if !self.ready || self.size == 0 {
+            return 0;
+        }
+        self.avail_idx()
+            .wrapping_sub(self.last_avail)
+            .min(self.size as u16)
+    }
+
     /// The ring looked empty: ask the driver to kick when it publishes the
     /// next entry, then look again (`vhost_enable_notify`). Returns the fresh
     /// `avail.idx`.

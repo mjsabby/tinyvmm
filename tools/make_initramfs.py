@@ -412,6 +412,54 @@ if grep -q 'tinyvmm.test=netcmp' /proc/cmdline 2>/dev/null; then
     exec cat
 fi
 
+# --- optional NAT connection-semantics test -----------------------------
+# Enabled via kernel cmdline marker `tinyvmm.test=nat`, driven by
+# tools/nat_test.py, whose host server is on 127.0.0.1:NATTEST_PORT (the
+# gateway, 10.0.0.1, here). NATTEST_CLOSED_PORT has nothing listening.
+#   A   connect to a closed port      refused, as on a real network
+#   B   server resets mid-response    an error, not a complete download
+#   C   300 connections, host closes  all succeed (each leaves the NAT's TCB
+#       first                         in TIME_WAIT)
+if grep -qE 'tinyvmm.test=nat( |$)' /proc/cmdline 2>/dev/null; then
+    arg() { tr ' ' '\\n' < /proc/cmdline | grep "^$1=" | cut -d= -f2; }
+    base="http://10.0.0.1:$(arg NATTEST_PORT)"
+    pass=0
+    total=0
+
+    total=$((total + 1))
+    out=$(wget -q -O /dev/null -T 10 -t 1 "http://10.0.0.1:$(arg NATTEST_CLOSED_PORT)/" 2>&1)
+    case "${out}" in
+        *"Connection refused"*) log "NATTEST A: closed port refused OK"; pass=$((pass + 1)) ;;
+        *) log "NATTEST A: closed port FAIL (${out})" ;;
+    esac
+
+    total=$((total + 1))
+    if wget -q -O /tmp/nat_rst -T 10 -t 1 "${base}/rst" 2>/tmp/nat_rst.err; then
+        log "NATTEST B: reset FAIL (cut-off download of $(wc -c < /tmp/nat_rst) bytes reported success)"
+    else
+        log "NATTEST B: reset reported OK ($(cat /tmp/nat_rst.err))"
+        pass=$((pass + 1))
+    fi
+
+    total=$((total + 1))
+    ok=0
+    for i in $(seq 1 300); do
+        wget -q -O /dev/null -T 5 -t 1 "${base}/ok" 2>/dev/null && ok=$((ok + 1))
+    done
+    if [ "${ok}" = "300" ]; then
+        log "NATTEST C: 300/300 host-closed connections OK"
+        pass=$((pass + 1))
+    else
+        log "NATTEST C: host-closed connections FAIL (${ok}/300)"
+    fi
+
+    log "NATTEST SUMMARY: ${pass}/${total} phases passed"
+    log "=== tinyvmm shutdown requested ==="
+    sync
+    poweroff -f 2>/dev/kmsg || halt -f 2>/dev/kmsg
+    exec cat
+fi
+
 # --- optional usernet networking benchmark ------------------------------
 # Enabled via kernel cmdline marker `tinyvmm.test=usernet-bench`.
 # Driven by tools/usernet_bench.py. Three measurements per run:
@@ -1621,12 +1669,10 @@ if grep -q 'tinyvmm.test=blk' /proc/cmdline 2>/dev/null; then
 
     # ---- Phase C: Concurrent queue-depth stress ----
     # 8 parallel dd writers, each writes 4 MiB at a distinct offset with
-    # conv=fsync. All 8 fsyncs land roughly together, so the host
-    # backend should see multiple in-flight FLUSH ops -- and the
-    # writeback ops behind them may also be concurrent. The host
-    # backend's max-outstanding-requests counter is logged at shutdown
-    # so the host harness can assert `max_inflight > 1` actually
-    # happened.
+    # conv=fsync. All 8 fsyncs land roughly together, so the device
+    # should see several requests outstanding at once. Its deepest queue
+    # is logged at shutdown so the host harness can assert
+    # `max_depth > 1` actually happened.
     log "+ phase C: concurrent writers (queue depth)"
     NPAR=8
     SLICE_MB=4

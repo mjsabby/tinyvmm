@@ -36,8 +36,17 @@ pub trait VirtioDevice: Send + Sync {
     /// Mark queue `idx` not-ready.
     fn disable_queue(&self, idx: u32);
 
-    /// Driver kicked QueueNotify with `idx`. Runs on the vCPU thread.
+    /// Driver kicked QueueNotify with `idx`. Runs on the doorbell pump thread
+    /// (or, without doorbells, the vCPU thread).
     fn notify_queue(&self, idx: u32);
+
+    /// Whether queue `idx` has requests waiting, checked cheaply enough for the
+    /// doorbell pump to spin on it (see `transport::doorbell_pump`). Devices
+    /// returning `None`, the default, are never busy-polled.
+    fn queue_has_work(&self, idx: u32) -> Option<bool> {
+        let _ = idx;
+        None
+    }
 
     fn driver_ok(&self);
     fn reset(&self);

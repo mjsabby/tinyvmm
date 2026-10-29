@@ -1,12 +1,13 @@
 //! virtio-blk device (spec §5.2). Port of src/virtio/virtio_blk.cpp.
 //!
 //! Single requestq (queue 0). Backed by an async [`BlockFile`] (one IOCP
-//! worker thread per disk). `notify_queue` (on the vCPU thread) drains the
-//! avail ring, decodes each `virtio_blk_req` header, and submits the data
-//! segments to the backend as independent, concurrent ops. The IOCP worker
-//! runs `on_seg_complete` per segment; the completion that retires a request's
-//! last segment pushes the used ring and raises the queue interrupt via the
-//! transport.
+//! worker thread per disk). `notify_queue` (on the doorbell pump thread) drains
+//! the avail ring, decodes each `virtio_blk_req` header, and submits the data
+//! segments to the backend as independent, concurrent ops. Each segment's
+//! completion (`on_seg_complete`) runs on the IOCP worker, or inline on the
+//! pump when the host page cache served it synchronously; the completion that
+//! retires a request's last segment pushes the used ring and raises the queue
+//! interrupt via the transport.
 //!
 //! Implements READ / WRITE / FLUSH plus the RO, DISCARD, and WRITE_ZEROES
 //! feature bits. DISCARD / WRITE_ZEROES are served synchronously on the host
@@ -293,6 +294,11 @@ pub struct BlockDevice {
     ops_write_zeroes: AtomicU64,
     ops_err: AtomicU64,
     ops_done: AtomicU64,
+    /// Requests between submit_request and finish_request.
+    active: AtomicU64,
+    /// Most requests the guest had outstanding at once (in flight here plus
+    /// still waiting in the avail ring), sampled at each pop.
+    max_depth: AtomicU64,
 }
 
 fn put_le(dst: &mut [u8], v: u64) {
@@ -363,6 +369,8 @@ impl BlockDevice {
             ops_write_zeroes: AtomicU64::new(0),
             ops_err: AtomicU64::new(0),
             ops_done: AtomicU64::new(0),
+            active: AtomicU64::new(0),
+            max_depth: AtomicU64::new(0),
         });
 
         // The IOCP worker invokes this on completion. Weak so the backend's
@@ -401,6 +409,11 @@ impl BlockDevice {
     pub fn ops_done(&self) -> u64 {
         self.ops_done.load(Ordering::Relaxed)
     }
+    /// Deepest queue the guest drove (see `max_depth`). Unlike the backend's
+    /// `max_inflight`, it counts requests the host served synchronously.
+    pub fn max_depth(&self) -> u64 {
+        self.max_depth.load(Ordering::Relaxed)
+    }
     pub fn pending_count(&self) -> usize {
         self.pool.lock().unwrap().inflight()
     }
@@ -438,7 +451,8 @@ impl BlockDevice {
     /// segment. A submission guard (`segs_outstanding` starts at 1) keeps the
     /// request from finishing until all segments have been submitted, even if
     /// some complete immediately; the decrement that drives the count to 0
-    /// finishes the request.
+    /// finishes the request. `sync` runs the segments to completion on this
+    /// thread instead (`BlockFile::submit_sync`).
     fn submit_request(
         &self,
         head: u16,
@@ -446,6 +460,7 @@ impl BlockDevice {
         base_offset: u64,
         status_ptr: *mut u8,
         data: &[ChainBuf],
+        sync: bool,
     ) {
         let parent: *mut BlkReq = {
             let mut pool = self.pool.lock().unwrap();
@@ -464,6 +479,7 @@ impl BlockDevice {
             p.failed.store(false, Ordering::Relaxed);
             p as *mut BlkReq
         };
+        self.active.fetch_add(1, Ordering::Relaxed);
 
         // Total payload + file-bounds (subtraction form so it can't wrap).
         let backend_size = self.backend.size();
@@ -505,7 +521,7 @@ impl BlockDevice {
         }
 
         if rtype == BLK_T_FLUSH {
-            self.submit_seg(parent, std::ptr::null_mut(), 0, 0, Op::Flush);
+            self.submit_seg(parent, std::ptr::null_mut(), 0, 0, Op::Flush, false);
         } else if let Some(bs) = bounce {
             // SAFETY: we own this slot from acquire() until finish_request()
             // releases it; no other thread touches it concurrently.
@@ -533,6 +549,7 @@ impl BlockDevice {
                 total_len as u32,
                 base_offset,
                 op,
+                sync,
             );
         } else {
             let op = if rtype == BLK_T_IN {
@@ -548,7 +565,7 @@ impl BlockDevice {
                     unsafe { (*parent).failed.store(true, Ordering::Relaxed) };
                     break;
                 }
-                self.submit_seg(parent, seg.ptr, seg.len as u32, file_off, op);
+                self.submit_seg(parent, seg.ptr, seg.len as u32, file_off, op, sync);
                 file_off += seg.len as u64;
             }
         }
@@ -565,7 +582,15 @@ impl BlockDevice {
     /// parent; the submission guard keeps the count from reaching 0 here, so the
     /// request is finished exactly once -- by `submit_request`'s guard drop or by
     /// the last real completion.
-    fn submit_seg(&self, parent: *mut BlkReq, buf: *mut u8, bytes: u32, file_offset: u64, op: Op) {
+    fn submit_seg(
+        &self,
+        parent: *mut BlkReq,
+        buf: *mut u8,
+        bytes: u32,
+        file_offset: u64,
+        op: Op,
+        sync: bool,
+    ) {
         let seg: *mut SegOp = {
             let mut sp = self.seg_pool.lock().unwrap();
             let Some(slot) = sp.acquire() else {
@@ -585,7 +610,13 @@ impl BlockDevice {
             s as *mut SegOp
         };
         unsafe { (*parent).segs_outstanding.fetch_add(1, Ordering::AcqRel) };
-        if !unsafe { self.backend.submit(&mut (*seg).req) } {
+        let req = unsafe { &mut (*seg).req as *mut Request };
+        let started = if sync {
+            unsafe { self.backend.submit_sync(req) }
+        } else {
+            unsafe { self.backend.submit(req) }
+        };
+        if !started {
             unsafe { (*parent).failed.store(true, Ordering::Relaxed) };
             unsafe { (*parent).segs_outstanding.fetch_sub(1, Ordering::AcqRel) };
             self.release_seg(seg);
@@ -604,14 +635,23 @@ impl BlockDevice {
         // and holding `drain_chain` serialises the rare concurrent drain without
         // extending the contended queue-lock hold time.
         let mut scratch = self.drain_chain.lock().unwrap();
+        // On the doorbell pump, a request the guest is waiting on alone is done
+        // synchronously right here (see `BlockFile::submit_sync`); concurrent
+        // ones stay async so a host cache miss never stalls the others.
+        let inline_ok = crate::virtio::transport::on_doorbell_pump();
         loop {
-            let got = {
+            let (got, waiting) = {
                 let mut q = self.queue.lock().unwrap();
-                q.pop_into(&mut scratch)
+                let got = q.pop_into(&mut scratch);
+                (got, if got { q.avail_pending() } else { 0 })
             };
             if !got {
                 break;
             }
+            let active = self.active.load(Ordering::Relaxed);
+            let depth = active + 1 + waiting as u64;
+            self.max_depth.fetch_max(depth, Ordering::Relaxed);
+            let lone = inline_ok && depth == 1;
             let bufs = &scratch.bufs;
             let head = scratch.head_index;
             if bufs.len() < 2 {
@@ -753,7 +793,7 @@ impl BlockDevice {
             // FLUSH: no data segments expected; ignore any present.
             if rtype == BLK_T_FLUSH {
                 self.ops_flush.fetch_add(1, Ordering::Relaxed);
-                self.submit_request(head, rtype, cur_file_offset, status_ptr, &[]);
+                self.submit_request(head, rtype, cur_file_offset, status_ptr, &[], false);
                 continue;
             }
 
@@ -789,16 +829,17 @@ impl BlockDevice {
                 self.ops_out.fetch_add(1, Ordering::Relaxed);
             }
 
-            self.submit_request(head, rtype, cur_file_offset, status_ptr, data);
+            self.submit_request(head, rtype, cur_file_offset, status_ptr, data, lone);
         }
     }
 
-    /// IOCP-worker completion for one segment. Records failure / bytes-read on
+    /// Segment completion: on the IOCP worker, or on the submitting thread when
+    /// the host served the op synchronously. Records failure / bytes-read on
     /// the parent, releases the SegOp slot, then decrements the parent's
     /// outstanding count; the decrement that drives it to 0 finishes the request.
-    /// All completions for a disk run on its single IOCP worker thread, so the
-    /// per-segment updates to the parent are serialized; the AcqRel on
-    /// `segs_outstanding` publishes them to whoever observes the count reach 0.
+    /// Two segments of one request can complete on different threads at once,
+    /// so the parent's running byte count is updated atomically; the AcqRel on
+    /// `segs_outstanding` publishes it to whoever observes the count reach 0.
     fn on_seg_complete(&self, req: *mut Request) {
         let seg = req as *mut SegOp;
         let (parent, ok, op, bytes) = unsafe {
@@ -833,11 +874,12 @@ impl BlockDevice {
                 }
             }
             // used_len is u32, so saturate the running total of bytes read.
-            // Single-writer (this worker thread), so load+store is race-free.
             let p = unsafe { &*parent };
-            let prev = p.total_done.load(Ordering::Relaxed);
-            p.total_done
-                .store(prev.saturating_add(bytes), Ordering::Relaxed);
+            let _ = p
+                .total_done
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
+                    Some(t.saturating_add(bytes))
+                });
         }
         self.release_seg(seg);
         if unsafe { (*parent).segs_outstanding.fetch_sub(1, Ordering::AcqRel) } == 1 {
@@ -888,6 +930,7 @@ impl BlockDevice {
             self.bounce_pool.lock().unwrap().release(bidx);
         }
         self.pool.lock().unwrap().release(slot);
+        self.active.fetch_sub(1, Ordering::Relaxed);
         self.raise_irq_if_needed();
     }
 }
@@ -952,6 +995,14 @@ impl VirtioDevice for BlockDevice {
         if idx == 0 {
             self.drain();
         }
+    }
+
+    fn queue_has_work(&self, idx: u32) -> Option<bool> {
+        if idx != 0 {
+            return None;
+        }
+        // A held lock is a completion pushing the used ring: let the drain look.
+        Some(self.queue.try_lock().map_or(true, |q| q.has_avail()))
     }
 
     fn driver_ok(&self) {}

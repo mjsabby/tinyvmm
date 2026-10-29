@@ -3,7 +3,10 @@
 //! Wraps a Win32 file opened with `FILE_FLAG_OVERLAPPED` and binds it to a
 //! per-file IOCP. A single worker thread drains the IOCP and dispatches
 //! completions through a user-supplied callback (which runs on the worker
-//! thread). The caller extends [`Request`] by embedding it as the first field
+//! thread). An op that completes synchronously — a read or write served by the
+//! host page cache — posts no packet (`FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`)
+//! and its callback runs on the submitting thread instead, saving the hand-off
+//! to the worker. The caller extends [`Request`] by embedding it as the first field
 //! of its own struct, so the worker can recover the surrounding request from
 //! the `OVERLAPPED` pointer (the `OVERLAPPED` is the first member of
 //! `Request`, so all three addresses coincide).
@@ -26,7 +29,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, FlushFileBuffers,
-    GetFileSizeEx, OPEN_EXISTING, ReadFile, WriteFile,
+    GetFileSizeEx, OPEN_EXISTING, ReadFile, SetFileCompletionNotificationModes, WriteFile,
 };
 use windows_sys::Win32::System::IO::{
     CreateIoCompletionPort, DeviceIoControl, GetQueuedCompletionStatus, OVERLAPPED,
@@ -41,6 +44,11 @@ use super::wide;
 const INFINITE: u32 = 0xFFFF_FFFF;
 const SHUTDOWN_KEY: usize = 0x1;
 const FLUSH_KEY: usize = 0x2;
+// SetFileCompletionNotificationModes flag (WindowsProgramming in windows-sys).
+// FILE_SKIP_SET_EVENT_ON_HANDLE must NOT be added: `zero_range` issues its
+// FSCTLs without an OVERLAPPED, and kernel32 waits on the file handle itself
+// for one that pends.
+const FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: u8 = 1;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Op {
@@ -81,8 +89,17 @@ type CompleteFn = Box<dyn Fn(*mut Request) + Send + Sync>;
 
 struct Inner {
     handle: HANDLE,
+    /// A second, non-overlapped handle to the same file for `submit_sync`:
+    /// Windows completes even page-cache hits on the overlapped handle
+    /// asynchronously, through a system worker and the IOCP. Null if the
+    /// second open failed; `submit_sync` then falls back to `submit`.
+    sync_handle: HANDLE,
     iocp: HANDLE,
     readonly: bool,
+    /// A read/write that completes synchronously posts no completion packet,
+    /// so `submit` finishes it inline (Windows does this for some writes,
+    /// e.g. cached writes on ReFS).
+    skip_on_success: bool,
     size: u64,
     complete: OnceLock<CompleteFn>,
     submitted: AtomicU64,
@@ -108,6 +125,9 @@ impl Drop for Inner {
             if !self.iocp.is_null() {
                 CloseHandle(self.iocp);
             }
+            if !self.sync_handle.is_null() {
+                CloseHandle(self.sync_handle);
+            }
             if self.handle != INVALID_HANDLE_VALUE && !self.handle.is_null() {
                 CloseHandle(self.handle);
             }
@@ -128,8 +148,10 @@ impl BlockFile {
         let closed = |err: u32| BlockFile {
             inner: Arc::new(Inner {
                 handle: INVALID_HANDLE_VALUE,
+                sync_handle: core::ptr::null_mut(),
                 iocp: core::ptr::null_mut(),
                 readonly,
+                skip_on_success: false,
                 size: 0,
                 complete: OnceLock::new(),
                 submitted: AtomicU64::new(0),
@@ -181,11 +203,32 @@ impl BlockFile {
             unsafe { CloseHandle(handle) };
             return closed(err);
         }
+        let skip_on_success = unsafe {
+            SetFileCompletionNotificationModes(handle, FILE_SKIP_COMPLETION_PORT_ON_SUCCESS)
+        } != 0;
+        let sync_handle = unsafe {
+            CreateFileW(
+                wpath.as_ptr(),
+                access,
+                share,
+                core::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                core::ptr::null_mut(),
+            )
+        };
+        let sync_handle = if sync_handle == INVALID_HANDLE_VALUE {
+            core::ptr::null_mut()
+        } else {
+            sync_handle
+        };
         BlockFile {
             inner: Arc::new(Inner {
                 handle,
+                sync_handle,
                 iocp,
                 readonly,
+                skip_on_success,
                 size: li as u64,
                 complete: OnceLock::new(),
                 submitted: AtomicU64::new(0),
@@ -322,24 +365,7 @@ impl BlockFile {
     pub unsafe fn submit(&self, req: *mut Request) -> bool {
         unsafe {
             let inner = &self.inner;
-            inner.submitted.fetch_add(1, Ordering::Relaxed);
-            (*req).ok = false;
-
-            // High-water mark of outstanding requests (queue depth actually
-            // reached). The blk-test asserts this exceeds 1.
-            let cur = inner.inflight.fetch_add(1, Ordering::Relaxed) + 1;
-            let mut prev = inner.max_inflight.load(Ordering::Relaxed);
-            while cur > prev {
-                match inner.max_inflight.compare_exchange_weak(
-                    prev,
-                    cur,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(p) => prev = p,
-                }
-            }
+            begin(inner, req);
 
             let op = (*req).op;
             if op == Op::Flush {
@@ -387,15 +413,101 @@ impl BlockFile {
                     inner.errors.fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
+            } else if inner.skip_on_success {
+                // Completed synchronously and no packet was queued: finish it
+                // here. `InternalHigh` is the byte count GetOverlappedResult
+                // would report.
+                let bytes = (*req).ovl.InternalHigh as u32;
+                finish(inner, req, bytes == (*req).bytes);
             }
+            true
+        }
+    }
+
+    /// Run a read or write to completion on the calling thread, through the
+    /// non-overlapped handle, then fire the completion callback here. Worth it
+    /// for a request the guest is waiting on alone: a page-cache hit costs one
+    /// copy instead of two thread hand-offs. A miss blocks the caller for the
+    /// device's latency, so callers keep concurrent requests on [`Self::submit`].
+    /// Flushes, and everything when the second handle couldn't be opened, go
+    /// through `submit`. Returns false on failure to start (as `submit`).
+    ///
+    /// # Safety
+    /// As [`Self::submit`].
+    pub unsafe fn submit_sync(&self, req: *mut Request) -> bool {
+        unsafe {
+            let inner = &self.inner;
+            let op = (*req).op;
+            if inner.sync_handle.is_null() || op == Op::Flush || (op == Op::Write && inner.readonly)
+            {
+                return self.submit(req);
+            }
+            begin(inner, req);
+            // Positioned I/O: on a synchronous handle the OVERLAPPED only
+            // carries the offset, and the call returns once the I/O is done.
+            core::ptr::write_bytes(&mut (*req).ovl as *mut OVERLAPPED, 0, 1);
+            (*req).ovl.Anonymous.Anonymous.Offset = ((*req).file_offset & 0xFFFF_FFFF) as u32;
+            (*req).ovl.Anonymous.Anonymous.OffsetHigh = ((*req).file_offset >> 32) as u32;
+            let mut done: u32 = 0;
+            let ok = if op == Op::Read {
+                ReadFile(
+                    inner.sync_handle,
+                    (*req).buf,
+                    (*req).bytes,
+                    &mut done,
+                    &mut (*req).ovl,
+                )
+            } else {
+                WriteFile(
+                    inner.sync_handle,
+                    (*req).buf,
+                    (*req).bytes,
+                    &mut done,
+                    &mut (*req).ovl,
+                )
+            };
+            finish(inner, req, ok != 0 && done == (*req).bytes);
             true
         }
     }
 }
 
+/// Account a newly started op.
+///
+/// # Safety
+/// `req` must point to a live [`Request`].
+unsafe fn begin(inner: &Inner, req: *mut Request) {
+    inner.submitted.fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        (*req).ok = false;
+    }
+    // High-water mark of ops outstanding at once.
+    let cur = inner.inflight.fetch_add(1, Ordering::Relaxed) + 1;
+    inner.max_inflight.fetch_max(cur, Ordering::Relaxed);
+}
+
 impl Drop for BlockFile {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// Record a finished op and hand it to the completion callback. Runs on the IOCP
+/// worker, or on the submitting thread for a synchronous completion.
+///
+/// # Safety
+/// `req` must be the live request of a just-finished op.
+unsafe fn finish(inner: &Inner, req: *mut Request, ok: bool) {
+    unsafe {
+        (*req).ok = ok;
+    }
+    if !ok {
+        inner.errors.fetch_add(1, Ordering::Relaxed);
+    }
+    inner.completed.fetch_add(1, Ordering::Relaxed);
+    inner.inflight.fetch_sub(1, Ordering::Relaxed);
+    if let Some(cb) = inner.complete.get() {
+        cb(req);
     }
 }
 
@@ -416,19 +528,12 @@ fn worker_loop(inner: Arc<Inner>) {
         // `ovl` is the first member of Request, so the addresses coincide.
         let req = ovl as *mut Request;
         unsafe {
-            if key == FLUSH_KEY || (*req).op == Op::Flush {
-                (*req).ok = FlushFileBuffers(inner.handle) != 0;
+            let ok = if key == FLUSH_KEY || (*req).op == Op::Flush {
+                FlushFileBuffers(inner.handle) != 0
             } else {
-                (*req).ok = ok != 0 && bytes == (*req).bytes;
-            }
-            if !(*req).ok {
-                inner.errors.fetch_add(1, Ordering::Relaxed);
-            }
-            inner.completed.fetch_add(1, Ordering::Relaxed);
-            inner.inflight.fetch_sub(1, Ordering::Relaxed);
-            if let Some(cb) = inner.complete.get() {
-                cb(req);
-            }
+                ok != 0 && bytes == (*req).bytes
+            };
+            finish(&inner, req, ok);
         }
     }
 }

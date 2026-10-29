@@ -252,6 +252,26 @@ fn enc_qid(o: &mut Vec<u8>, qtype: u8, version: u32, path: u64) {
     enc4(o, version);
     enc8(o, path);
 }
+
+/// `qid.version` of a regular file: QEMU's `mtime ^ (size << 8)`, here over the
+/// 100 ns FILETIME, and never 0. Linux treats version 0 as a synthetic file and
+/// forces uncached I/O on it whatever the mount's cache mode, so a 0 here would
+/// turn every read into one Tread per guest page. A host change to the file
+/// changes the version, so the guest drops its cached inode on the next lookup.
+/// Directories keep version 0: their contents never enter the page cache.
+fn file_qid_version(info: &fs::FileInfo) -> u32 {
+    let t = info.last_write_ticks;
+    let v = (t ^ (t >> 32) ^ (info.size << 8) ^ (info.size >> 24)) as u32;
+    v.max(1)
+}
+
+fn qid_version(info: &fs::FileInfo) -> u32 {
+    if info.attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        0
+    } else {
+        file_qid_version(info)
+    }
+}
 fn finalize(o: &mut [u8]) {
     let sz = o.len() as u32;
     o[0..4].copy_from_slice(&sz.to_le_bytes());
@@ -418,6 +438,29 @@ fn normalize_for_containment(p: &Path) -> Vec<u16> {
     w
 }
 
+/// Whether normalized path `p` is `root` or lies under it.
+fn contained_in(p: &[u16], root: &[u16]) -> bool {
+    p.starts_with(root) && (p.len() == root.len() || p[root.len()] == b'\\' as u16)
+}
+
+/// The share root's real path with its NT volume name, normalized, for
+/// `P9Device::handle_contained`.
+fn nt_root_path(root: &Path) -> Option<Vec<u16>> {
+    let wp = to_win32_long_path(root);
+    let h = fs::create_file(
+        &wp,
+        FILE_READ_ATTRIBUTES,
+        FILE_SHARE_RWD,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+    )
+    .ok()?;
+    let real = fs::final_nt_path_by_handle(h);
+    fs::close(h);
+    let os = std::ffi::OsString::from_wide(&real?);
+    Some(normalize_for_containment(Path::new(&os)))
+}
+
 fn is_safe_name_component(comp: &str) -> bool {
     if comp.is_empty() || comp == "." || comp == ".." {
         return false;
@@ -547,14 +590,39 @@ const P9_STOP_KEY: usize = usize::MAX;
 ///   free-list -> drain (fills t_msg/wbufs/head/cap) -> IOCP -> worker (fills
 ///   reply, writes guest RAM, pushes the used ring) -> free-list,
 /// so no two threads ever touch the same slot at once; the IOCP post/get pair is
-/// the synchronizing barrier. `t_msg`/`reply` are reused, so steady-state
-/// request handling allocates nothing.
+/// the synchronizing barrier. `t_msg`/`reply`/`bounce` are reused, so
+/// steady-state request handling allocates nothing.
 struct P9Slot {
     t_msg: Vec<u8>,
     reply: Vec<u8>,
     wbufs: Vec<ChainBuf>,
+    /// Device-readable buffers of a Twrite whose payload was left in guest RAM
+    /// (see `drain`); empty otherwise.
+    rbufs: Vec<ChainBuf>,
+    /// Total device-readable bytes of the request (capped at the max msize).
+    msg_len: usize,
+    /// Host bounce for Tread/Twrite payloads too scattered to move with one
+    /// syscall per run. Grown on demand, never shrunk or re-zeroed.
+    bounce: Vec<u8>,
+    runs: Vec<(*mut u8, usize)>,
     head_index: u16,
     cap: u32,
+}
+
+impl P9Slot {
+    fn new() -> Self {
+        P9Slot {
+            t_msg: Vec::new(),
+            reply: Vec::new(),
+            wbufs: Vec::new(),
+            rbufs: Vec::new(),
+            msg_len: 0,
+            bounce: Vec::new(),
+            runs: Vec::new(),
+            head_index: 0,
+            cap: 0,
+        }
+    }
 }
 
 /// Preallocated slot pool + free-list, sized to the max ring depth so an
@@ -563,6 +631,8 @@ struct P9Slot {
 struct SlotPool {
     slots: Vec<UnsafeCell<P9Slot>>,
     free: Mutex<Vec<u16>>,
+    /// Slots currently acquired (requests between pop and used-ring push).
+    in_use: AtomicU32,
 }
 
 // SAFETY: slots obey the linear-ownership discipline above, so the same slot is
@@ -576,23 +646,21 @@ impl SlotPool {
     fn new(n: usize) -> Self {
         let mut slots = Vec::with_capacity(n);
         for _ in 0..n {
-            slots.push(UnsafeCell::new(P9Slot {
-                t_msg: Vec::new(),
-                reply: Vec::new(),
-                wbufs: Vec::new(),
-                head_index: 0,
-                cap: 0,
-            }));
+            slots.push(UnsafeCell::new(P9Slot::new()));
         }
         SlotPool {
             slots,
             free: Mutex::new((0..n as u16).rev().collect()),
+            in_use: AtomicU32::new(0),
         }
     }
     fn acquire(&self) -> Option<u16> {
-        self.free.lock().unwrap().pop()
+        let i = self.free.lock().unwrap().pop()?;
+        self.in_use.fetch_add(1, Ordering::Relaxed);
+        Some(i)
     }
     fn release(&self, i: u16) {
+        self.in_use.fetch_sub(1, Ordering::Relaxed);
         self.free.lock().unwrap().push(i);
     }
     /// SAFETY: the caller must currently own slot `i` per the handoff discipline.
@@ -633,6 +701,10 @@ pub struct P9Device {
     gid: u32,
     metadata: bool,
     share_root_norm: Vec<u16>,
+    /// The share root's real path with its NT volume name, normalized like
+    /// `share_root_norm`; `handle_contained` compares against it. None if it
+    /// couldn't be resolved, in which case the drive-letter form is used.
+    share_root_nt: Option<Vec<u16>>,
     config_bytes: Vec<u8>,
     driver_ok: AtomicBool,
     acked_features: AtomicU64,
@@ -640,6 +712,11 @@ pub struct P9Device {
     next_qid_path: AtomicU64,
     requests: AtomicU64,
     rlerrors: AtomicU64,
+    // Data-path counters for the teardown `[9p]` line (relaxed increments).
+    reads: AtomicU64,
+    read_bytes: AtomicU64,
+    writes: AtomicU64,
+    write_bytes: AtomicU64,
     fids: Mutex<Fids>,
     irq: OnceLock<IrqFn>,
     engine: P9Engine,
@@ -655,6 +732,7 @@ impl P9Device {
         opts: ShareOptions,
     ) -> Arc<Self> {
         let share_root_norm = normalize_for_containment(&host_root);
+        let share_root_nt = nt_root_path(&host_root);
         let mut config_bytes = Vec::with_capacity(2 + tag.len());
         let n = tag.len().min(0xFFFF);
         config_bytes.extend_from_slice(&(n as u16).to_le_bytes());
@@ -669,6 +747,7 @@ impl P9Device {
             gid: opts.gid,
             metadata: opts.metadata,
             share_root_norm,
+            share_root_nt,
             config_bytes,
             driver_ok: AtomicBool::new(false),
             acked_features: AtomicU64::new(0),
@@ -676,6 +755,10 @@ impl P9Device {
             next_qid_path: AtomicU64::new(1),
             requests: AtomicU64::new(0),
             rlerrors: AtomicU64::new(0),
+            reads: AtomicU64::new(0),
+            read_bytes: AtomicU64::new(0),
+            writes: AtomicU64::new(0),
+            write_bytes: AtomicU64::new(0),
             fids: Mutex::new(Fids {
                 map: HashMap::new(),
             }),
@@ -711,6 +794,24 @@ impl P9Device {
         self.rlerrors.load(Ordering::Relaxed)
     }
 
+    /// One-line data-path summary for teardown. Average Tread/Twrite sizes show
+    /// how the guest sized its requests (msize, cache mode, page pinning).
+    pub fn diag_summary(&self, msix: u64) -> String {
+        let r = self.reads.load(Ordering::Relaxed);
+        let rb = self.read_bytes.load(Ordering::Relaxed);
+        let w = self.writes.load(Ordering::Relaxed);
+        let wb = self.write_bytes.load(Ordering::Relaxed);
+        format!(
+            "requests={} rlerrors={} msize={} reads={r} read_bytes={rb} (avg {}) \
+             writes={w} write_bytes={wb} (avg {}) msix={msix}",
+            self.requests_handled(),
+            self.rlerrors_emitted(),
+            self.negotiated_msize.load(Ordering::Relaxed),
+            rb.checked_div(r).unwrap_or(0),
+            wb.checked_div(w).unwrap_or(0),
+        )
+    }
+
     /// Wait for all in-flight 9p requests to drain (the slot pool becomes fully
     /// free) so a snapshot captures a consistent device — no reply landing in
     /// guest RAM / the used ring after the queue + device-state were captured.
@@ -738,18 +839,7 @@ impl P9Device {
     }
 
     fn path_contained(&self, p: &Path) -> bool {
-        let pn = normalize_for_containment(p);
-        let root = &self.share_root_norm;
-        if pn.len() < root.len() {
-            return false;
-        }
-        if pn[..root.len()] != root[..] {
-            return false;
-        }
-        if pn.len() == root.len() {
-            return true;
-        }
-        pn[root.len()] == b'\\' as u16
+        contained_in(&normalize_for_containment(p), &self.share_root_norm)
     }
 
     /// Re-check containment against the *real* path of an opened handle. The
@@ -757,13 +847,20 @@ impl P9Device {
     /// `CreateFileW` follows reparse points (symlinks / NTFS junctions). A
     /// reparse point that lives lexically inside the share but targets a
     /// directory outside it would pass the lexical check yet open an external
-    /// file. `GetFinalPathNameByHandleW` resolves the handle to its true path
-    /// (`\\?\C:\...`, same canonical form as the share root, which is
-    /// `std::fs::canonicalize`d at construction), so re-running the prefix check
-    /// on that real path closes the symlink/junction escape. Fails closed: if
-    /// the path can't be resolved, treat as not contained. This restores parity
+    /// file. `GetFinalPathNameByHandleW` resolves the handle to its true path,
+    /// so re-running the prefix check on that real path closes the
+    /// symlink/junction escape. Both sides use the NT volume name
+    /// (`\Device\HarddiskVolumeN\...`): resolving the drive letter costs a
+    /// Mount Manager round trip on every walk and getattr. Fails closed: if the
+    /// path can't be resolved, treat as not contained. This restores parity
     /// with the C++ backend's `weakly_canonical`-based normalization.
     fn handle_contained(&self, h: HANDLE) -> bool {
+        if let Some(root) = &self.share_root_nt {
+            return fs::final_nt_path_by_handle(h).is_some_and(|real| {
+                let os = std::ffi::OsString::from_wide(&real);
+                contained_in(&normalize_for_containment(Path::new(&os)), root)
+            });
+        }
         match fs::final_path_by_handle(h) {
             Some(real) => {
                 let os = std::ffi::OsString::from_wide(&real);
@@ -900,8 +997,8 @@ impl P9Device {
         }
     }
 
-    // Stat a path (no kept handle): fill qid type/path + is_dir.
-    fn stat_path_for_fid(&self, p: &Path) -> Result<(u8, u64, bool), u32> {
+    // Stat a path (no kept handle): fill qid type/version/path + is_dir.
+    fn stat_path_for_fid(&self, p: &Path) -> Result<(u8, u32, u64, bool), u32> {
         let h = self.open_for_attrs(p).map_err(errno_from_win32)?;
         let info = match fs::file_info(h) {
             Ok(i) => i,
@@ -917,7 +1014,7 @@ impl P9Device {
         if qp == 0 {
             qp = self.alloc_qid_path();
         }
-        Ok((qt, qp, is_dir))
+        Ok((qt, qid_version(&info), qp, is_dir))
     }
 
     #[allow(clippy::type_complexity)]
@@ -961,7 +1058,7 @@ impl P9Device {
         let blocks = size.div_ceil(512);
         Ok((
             qt,
-            0,
+            qid_version(&info),
             qp,
             mode,
             nlink,
@@ -974,10 +1071,22 @@ impl P9Device {
     }
 
     // ---- drain (submit) + dispatch ----
-    /// Pop every available request and hand each to the worker pool. Runs on the
-    /// doorbell pump thread (or the MMIO-fallback vCPU thread); never blocks on
-    /// I/O and never pushes the used ring — a worker does that on completion.
+    /// Pop every available request and run it. On the doorbell pump thread, a
+    /// lone request (nothing else queued or in flight) runs right here: the
+    /// guest is waiting on it alone, and waking a worker would add a thread
+    /// hand-off to every round trip of a sequential workload. Everything else
+    /// goes to the worker pool, so a slow request never stalls the pump while
+    /// others wait. On the MMIO-fallback vCPU thread nothing runs inline.
     fn drain(&self) {
+        let inline_ok = crate::virtio::transport::on_doorbell_pump();
+        while let Some(idx) = self.submit_available(inline_ok) {
+            self.complete_slot(idx);
+        }
+    }
+
+    /// Pop available requests into slots and post them to the worker pool.
+    /// Returns the slot of a lone request the caller should run itself.
+    fn submit_available(&self, inline_ok: bool) -> Option<u16> {
         // Reuse one PoppedChain across the whole drain AND across drain calls so
         // submit never allocates: each popped chain is copied into the slot's
         // reused t_msg/wbufs before the next pop. Holding `drain_chain` (instead
@@ -985,15 +1094,16 @@ impl P9Device {
         // extending the contended queue-lock hold time.
         let mut chain = self.drain_chain.lock().unwrap();
         loop {
-            {
+            let more = {
                 let mut q = self.queue.lock().unwrap();
                 if !q.ready() {
-                    return;
+                    return None;
                 }
                 if !q.pop_into(&mut chain) {
-                    return;
+                    return None;
                 }
-            }
+                q.has_avail()
+            };
             let Some(idx) = self.engine.pool.acquire() else {
                 // Pool exhausted (impossible when sized to ring depth): retire the
                 // descriptor empty so the guest isn't wedged, then stop draining.
@@ -1005,18 +1115,33 @@ impl P9Device {
                 if int {
                     self.raise(P9_REQUEST_QUEUE);
                 }
-                return;
+                return None;
             };
             // SAFETY: we just acquired `idx` and own it until we post it. The
-            // writable descriptors stay valid until the worker pushes the used
-            // ring, so copying them now (and writing through them later) is sound.
+            // descriptors stay valid until the request is pushed to the used
+            // ring, so keeping them now (and reading/writing through them later)
+            // is sound.
             let slot = unsafe { self.engine.pool.slot(idx) };
-            read_chain(&chain.bufs, &mut slot.t_msg, P9_MSIZE_MAX as usize);
+            let readable: usize = chain.bufs.iter().filter(|b| !b.write).map(|b| b.len).sum();
+            slot.msg_len = readable.min(P9_MSIZE_MAX as usize);
+            slot.rbufs.clear();
+            if peek_readable(&chain.bufs, 4) == Some(T_WRITE) && slot.msg_len > TWRITE_HEADER_SIZE {
+                // Leave the payload in guest RAM; `write_from_chain` hands it to
+                // the host file from there.
+                read_chain(&chain.bufs, &mut slot.t_msg, TWRITE_HEADER_SIZE);
+                slot.rbufs
+                    .extend(chain.bufs.iter().filter(|b| !b.write).copied());
+            } else {
+                read_chain(&chain.bufs, &mut slot.t_msg, P9_MSIZE_MAX as usize);
+            }
             slot.cap = writable_capacity(&chain.bufs);
             slot.head_index = chain.head_index;
             slot.wbufs.clear();
             slot.wbufs
                 .extend(chain.bufs.iter().filter(|b| b.write).copied());
+            if inline_ok && !more && self.engine.pool.in_use.load(Ordering::Relaxed) == 1 {
+                return Some(idx);
+            }
             if !sock::post(self.engine.iocp, 0, idx as usize, std::ptr::null_mut()) {
                 // Posting failed: complete inline so the request isn't lost.
                 self.complete_slot(idx);
@@ -1024,15 +1149,22 @@ impl P9Device {
         }
     }
 
-    /// Run one posted request to completion (on a worker thread): dispatch into
-    /// the slot's reply buffer, write it to guest RAM, push the used ring, raise
+    /// Run one request to completion (on a worker, or inline on the pump):
+    /// handle it straight into the guest's buffers, push the used ring, raise
     /// the IRQ, then recycle the slot.
     fn complete_slot(&self, idx: u16) {
-        // SAFETY: this slot was handed to us via the IOCP; we own it until release.
+        // SAFETY: this slot was handed to us via the IOCP (or kept by the
+        // drain for inline execution); we own it until release.
         let slot = unsafe { self.engine.pool.slot(idx) };
         slot.reply.clear();
-        self.dispatch(&slot.t_msg, &mut slot.reply, slot.cap);
-        let written = write_chain(&mut slot.wbufs, &slot.reply);
+        let written = match slot.t_msg.get(4).copied() {
+            Some(T_READ) if slot.t_msg.len() >= REPLY_HEADER_SIZE => self.read_into_chain(slot),
+            Some(T_WRITE) if !slot.rbufs.is_empty() => self.write_from_chain(slot),
+            _ => {
+                self.dispatch(&slot.t_msg, &mut slot.reply, slot.cap);
+                write_chain(&mut slot.wbufs, &slot.reply)
+            }
+        };
         let head = slot.head_index;
         let interrupt = {
             let mut q = self.queue.lock().unwrap();
@@ -1055,16 +1187,7 @@ impl P9Device {
         let mtype = t_msg[4];
         let tag = u16::from_le_bytes([t_msg[5], t_msg[6]]);
         let body = &t_msg[REPLY_HEADER_SIZE..];
-
-        let neg = self.negotiated_msize.load(Ordering::Relaxed);
-        // Bound the reply by the negotiated msize, or — before T_version — by the
-        // protocol ceiling, so a pre-negotiation Tread/Treaddir with a multi-GB
-        // writable descriptor can't drive a giant `reply.resize` (alloc failure
-        // → VMM abort).
-        let mut cap = writable_cap.min(P9_MSIZE_MAX);
-        if neg != 0 && neg < cap {
-            cap = neg;
-        }
+        let cap = self.reply_cap(writable_cap);
 
         match mtype {
             T_VERSION => self.h_version(tag, body, reply),
@@ -1094,6 +1217,16 @@ impl P9Device {
     }
 
     // ---- handlers ----
+    /// Bound a reply by the negotiated msize, or — before T_version — by the
+    /// protocol ceiling, so a pre-negotiation Tread/Treaddir with a multi-GB
+    /// writable descriptor can't drive a giant buffer (alloc failure → VMM
+    /// abort).
+    fn reply_cap(&self, writable_cap: u32) -> u32 {
+        let neg = self.negotiated_msize.load(Ordering::Relaxed);
+        let cap = writable_cap.min(P9_MSIZE_MAX);
+        if neg != 0 { cap.min(neg) } else { cap }
+    }
+
     fn h_version(&self, tag: u16, body: &[u8], reply: &mut Vec<u8>) {
         let mut d = Dec::new(body);
         let (Some(msize_req), Some(version)) = (d.u32(), d.string()) else {
@@ -1133,7 +1266,7 @@ impl P9Device {
             build_rlerror(reply, tag, E_NOENT);
             return;
         }
-        let (qt, qp, is_dir) = match self.stat_path_for_fid(&self.host_root) {
+        let (qt, qv, qp, is_dir) = match self.stat_path_for_fid(&self.host_root) {
             Ok(v) => v,
             Err(e) => {
                 build_rlerror(reply, tag, e);
@@ -1163,7 +1296,7 @@ impl P9Device {
         enc4(reply, 0);
         enc1(reply, R_ATTACH);
         enc2(reply, tag);
-        enc_qid(reply, qt, 0, qp);
+        enc_qid(reply, qt, qv, qp);
         finalize(reply);
     }
 
@@ -1235,7 +1368,7 @@ impl P9Device {
         }
 
         let mut cur = src_path;
-        let mut qids: Vec<(u8, u64)> = Vec::with_capacity(nwname as usize);
+        let mut qids: Vec<(u8, u32, u64)> = Vec::with_capacity(nwname as usize);
         for (i, name) in wnames.iter().enumerate() {
             let next: PathBuf = if name == "." {
                 cur.clone()
@@ -1271,7 +1404,7 @@ impl P9Device {
                 }
                 p
             };
-            let (qt, qp, isd) = match self.stat_path_for_fid(&next) {
+            let (qt, qv, qp, isd) = match self.stat_path_for_fid(&next) {
                 Ok(v) => v,
                 Err(e) => {
                     if i == 0 {
@@ -1288,12 +1421,12 @@ impl P9Device {
                 }
                 break;
             }
-            qids.push((qt, qp));
+            qids.push((qt, qv, qp));
             cur = next;
         }
 
         if qids.len() == nwname as usize {
-            let (qt, qp) = *qids.last().unwrap();
+            let (qt, _, qp) = *qids.last().unwrap();
             self.fids
                 .lock()
                 .unwrap()
@@ -1306,8 +1439,8 @@ impl P9Device {
         enc1(reply, R_WALK);
         enc2(reply, tag);
         enc2(reply, qids.len() as u16);
-        for (qt, qp) in &qids {
-            enc_qid(reply, *qt, 0, *qp);
+        for (qt, qv, qp) in &qids {
+            enc_qid(reply, *qt, *qv, *qp);
         }
         finalize(reply);
     }
@@ -1398,6 +1531,13 @@ impl P9Device {
             build_rlerror(reply, tag, E_ACCES);
             return;
         }
+        // Version from the opened (possibly just truncated) file; see
+        // `file_qid_version` for why it must not be 0.
+        let qv = if is_dir {
+            0
+        } else {
+            fs::file_info(h).map_or(1, |i| file_qid_version(&i))
+        };
         {
             let mut f = self.fids.lock().unwrap();
             let Some(e) = f.map.get_mut(&fid) else {
@@ -1419,7 +1559,7 @@ impl P9Device {
         enc4(reply, 0);
         enc1(reply, R_LOPEN);
         enc2(reply, tag);
-        enc_qid(reply, qt, 0, qid_path);
+        enc_qid(reply, qt, qv, qid_path);
         enc4(reply, 0); // iounit
         finalize(reply);
     }
@@ -1514,8 +1654,8 @@ impl P9Device {
                 },
             );
         }
-        let mut qp = match fs::file_info(h) {
-            Ok(info) => info.file_index,
+        let (mut qp, qv) = match fs::file_info(h) {
+            Ok(info) => (info.file_index, file_qid_version(&info)),
             Err(e) => {
                 let e = errno_from_win32(e);
                 fs::close(h);
@@ -1544,9 +1684,177 @@ impl P9Device {
         enc4(reply, 0);
         enc1(reply, R_LCREATE);
         enc2(reply, tag);
-        enc_qid(reply, QT_FILE, 0, qp);
+        enc_qid(reply, QT_FILE, qv, qp);
         enc4(reply, 0); // iounit
         finalize(reply);
+    }
+
+    /// The open, non-directory handle of `fid`, for Tread. The Arc keeps the
+    /// handle alive through the I/O even if a concurrent Tclunk drops the fid.
+    fn readable_handle(&self, fid: u32) -> Result<Arc<OwnedHandle>, u32> {
+        let f = self.fids.lock().unwrap();
+        let e = f.map.get(&fid).ok_or(E_BADF)?;
+        let h = e.handle.clone().filter(|_| e.opened).ok_or(E_BADF)?;
+        if e.is_dir {
+            return Err(E_ISDIR);
+        }
+        Ok(h)
+    }
+
+    /// As [`Self::readable_handle`], for Twrite: also the fid's open flags.
+    fn writable_handle(&self, fid: u32) -> Result<(Arc<OwnedHandle>, u32), u32> {
+        if self.readonly {
+            return Err(E_ROFS);
+        }
+        let f = self.fids.lock().unwrap();
+        let e = f.map.get(&fid).ok_or(E_BADF)?;
+        let h = e.handle.clone().filter(|_| e.opened).ok_or(E_BADF)?;
+        if e.is_dir {
+            return Err(E_ISDIR);
+        }
+        Ok((h, e.open_flags))
+    }
+
+    /// Reply Rlerror(ecode) to a request handled by the direct paths.
+    fn fail_slot(&self, slot: &mut P9Slot, tag: u16, ecode: u32) -> u32 {
+        self.rlerrors.fetch_add(1, Ordering::Relaxed);
+        build_rlerror(&mut slot.reply, tag, ecode);
+        write_chain(&mut slot.wbufs, &slot.reply)
+    }
+
+    /// Tread from the virtqueue: the data goes from the host file straight into
+    /// the guest's buffers — one ReadFile per contiguous run, or one into the
+    /// slot's bounce buffer plus a scatter when the runs are small — never
+    /// through a zero-filled reply. Returns the bytes written to the chain.
+    fn read_into_chain(&self, slot: &mut P9Slot) -> u32 {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        let tag = u16::from_le_bytes([slot.t_msg[5], slot.t_msg[6]]);
+        let mut d = Dec::new(&slot.t_msg[REPLY_HEADER_SIZE..]);
+        let (Some(fid), Some(offset), Some(count)) = (d.u32(), d.u64(), d.u32()) else {
+            return self.fail_slot(slot, tag, E_PROTO);
+        };
+        let h = match self.readable_handle(fid) {
+            Ok(h) => h,
+            Err(e) => return self.fail_slot(slot, tag, e),
+        };
+        let cap = self.reply_cap(slot.cap) as usize;
+        let count = (count as usize).min(cap.saturating_sub(RREAD_HEADER_SIZE));
+        let len = chain_runs(&slot.wbufs, RREAD_HEADER_SIZE, count, &mut slot.runs);
+        let got = if runs_direct(&slot.runs, len) {
+            let mut got = 0usize;
+            for &(p, n) in &slot.runs {
+                // SAFETY: each run lies in a host_range-validated, device-writable
+                // guest buffer that stays valid until the used-ring push.
+                let buf = unsafe { std::slice::from_raw_parts_mut(p, n) };
+                match fs::read_at(h.get(), buf, offset + got as u64) {
+                    Ok(k) => {
+                        got += k as usize;
+                        if (k as usize) < n {
+                            break;
+                        }
+                    }
+                    Err(e) if got == 0 => return self.fail_slot(slot, tag, errno_from_win32(e)),
+                    Err(_) => break,
+                }
+            }
+            got
+        } else {
+            if slot.bounce.len() < len {
+                slot.bounce.resize(len, 0);
+            }
+            match fs::read_at(h.get(), &mut slot.bounce[..len], offset) {
+                // SAFETY: as above; the runs cover `len` >= `k` bytes.
+                Ok(k) => unsafe {
+                    scatter(&slot.runs, &slot.bounce[..k as usize]);
+                    k as usize
+                },
+                Err(e) => return self.fail_slot(slot, tag, errno_from_win32(e)),
+            }
+        };
+        let mut hdr = [0u8; RREAD_HEADER_SIZE];
+        hdr[0..4].copy_from_slice(&((RREAD_HEADER_SIZE + got) as u32).to_le_bytes());
+        hdr[4] = R_READ;
+        hdr[5..7].copy_from_slice(&tag.to_le_bytes());
+        hdr[7..11].copy_from_slice(&(got as u32).to_le_bytes());
+        write_chain(&mut slot.wbufs, &hdr);
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.read_bytes.fetch_add(got as u64, Ordering::Relaxed);
+        (RREAD_HEADER_SIZE + got) as u32
+    }
+
+    /// Twrite from the virtqueue whose payload `drain` left in guest RAM
+    /// (`slot.rbufs`): written to the host file from there, by run or through
+    /// the bounce buffer, as in [`Self::read_into_chain`]. An append is always
+    /// one WriteFile so concurrent appenders can't interleave its pieces.
+    fn write_from_chain(&self, slot: &mut P9Slot) -> u32 {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        let tag = u16::from_le_bytes([slot.t_msg[5], slot.t_msg[6]]);
+        let mut d = Dec::new(&slot.t_msg[REPLY_HEADER_SIZE..]);
+        let (Some(fid), Some(offset), Some(count)) = (d.u32(), d.u64(), d.u32()) else {
+            return self.fail_slot(slot, tag, E_PROTO);
+        };
+        let count = count as usize;
+        if TWRITE_HEADER_SIZE + count > slot.msg_len {
+            return self.fail_slot(slot, tag, E_PROTO);
+        }
+        let (h, open_flags) = match self.writable_handle(fid) {
+            Ok(v) => v,
+            Err(e) => return self.fail_slot(slot, tag, e),
+        };
+        let append = open_flags & O_APPEND != 0;
+        let len = chain_runs(&slot.rbufs, TWRITE_HEADER_SIZE, count, &mut slot.runs);
+        let write = |buf: &[u8], at: u64| {
+            if append {
+                fs::write_append(h.get(), buf)
+            } else {
+                fs::write_at(h.get(), buf, at)
+            }
+        };
+        let res = if len == 0 {
+            Ok(0)
+        } else if slot.runs.len() == 1 || (!append && runs_direct(&slot.runs, len)) {
+            let mut done = 0usize;
+            let mut res = Ok(());
+            for &(p, n) in &slot.runs {
+                // SAFETY: each run lies in a host_range-validated, device-readable
+                // guest buffer that stays valid until the used-ring push.
+                let buf = unsafe { std::slice::from_raw_parts(p, n) };
+                match write(buf, offset + done as u64) {
+                    Ok(k) => {
+                        done += k as usize;
+                        if (k as usize) < n {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        if done == 0 {
+                            res = Err(e);
+                        }
+                        break;
+                    }
+                }
+            }
+            res.map(|()| done)
+        } else {
+            if slot.bounce.len() < len {
+                slot.bounce.resize(len, 0);
+            }
+            // SAFETY: as above; the runs cover exactly `len` bytes.
+            unsafe { gather(&slot.runs, &mut slot.bounce[..len]) };
+            write(&slot.bounce[..len], offset).map(|k| k as usize)
+        };
+        let wrote = match res {
+            Ok(n) => n as u32,
+            Err(e) => return self.fail_slot(slot, tag, errno_from_win32(e)),
+        };
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        self.write_bytes.fetch_add(wrote as u64, Ordering::Relaxed);
+        let mut rep = [0u8; REPLY_HEADER_SIZE + 4];
+        rep[0..4].copy_from_slice(&((REPLY_HEADER_SIZE + 4) as u32).to_le_bytes());
+        rep[4] = R_WRITE;
+        rep[5..7].copy_from_slice(&tag.to_le_bytes());
+        rep[7..11].copy_from_slice(&wrote.to_le_bytes());
+        write_chain(&mut slot.wbufs, &rep)
     }
 
     fn h_read(&self, tag: u16, body: &[u8], reply: &mut Vec<u8>, cap: u32) {
@@ -1555,27 +1863,13 @@ impl P9Device {
             build_rlerror(reply, tag, E_PROTO);
             return;
         };
-        let (h, opened, is_dir);
-        {
-            let f = self.fids.lock().unwrap();
-            let Some(e) = f.map.get(&fid) else {
-                build_rlerror(reply, tag, E_BADF);
+        let h = match self.readable_handle(fid) {
+            Ok(h) => h,
+            Err(e) => {
+                build_rlerror(reply, tag, e);
                 return;
-            };
-            h = e.handle.clone();
-            opened = e.opened;
-            is_dir = e.is_dir;
-        }
-        if !opened || h.is_none() {
-            build_rlerror(reply, tag, E_BADF);
-            return;
-        }
-        if is_dir {
-            build_rlerror(reply, tag, E_ISDIR);
-            return;
-        }
-        // Hold the Arc for the whole read so a concurrent clunk can't close it.
-        let h = h.unwrap();
+            }
+        };
         let max_payload = if cap as usize > RREAD_HEADER_SIZE {
             cap - RREAD_HEADER_SIZE as u32
         } else {
@@ -1604,6 +1898,8 @@ impl P9Device {
             }
             reply.truncate(base + got as usize);
         }
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.read_bytes.fetch_add(got as u64, Ordering::Relaxed);
         reply[7..11].copy_from_slice(&got.to_le_bytes());
         finalize(reply);
     }
@@ -1619,32 +1915,13 @@ impl P9Device {
             build_rlerror(reply, tag, E_PROTO);
             return;
         }
-        if self.readonly {
-            build_rlerror(reply, tag, E_ROFS);
-            return;
-        }
-        let (h, opened, is_dir, open_flags);
-        {
-            let f = self.fids.lock().unwrap();
-            let Some(e) = f.map.get(&fid) else {
-                build_rlerror(reply, tag, E_BADF);
+        let (h, open_flags) = match self.writable_handle(fid) {
+            Ok(v) => v,
+            Err(e) => {
+                build_rlerror(reply, tag, e);
                 return;
-            };
-            h = e.handle.clone();
-            opened = e.opened;
-            is_dir = e.is_dir;
-            open_flags = e.open_flags;
-        }
-        if !opened || h.is_none() {
-            build_rlerror(reply, tag, E_BADF);
-            return;
-        }
-        if is_dir {
-            build_rlerror(reply, tag, E_ISDIR);
-            return;
-        }
-        // Hold the Arc for the whole write so a concurrent clunk can't close it.
-        let h = h.unwrap();
+            }
+        };
         let mut wrote: u32 = 0;
         if count > 0 {
             let buf = &body[data_off..data_off + count as usize];
@@ -1661,6 +1938,8 @@ impl P9Device {
                 }
             }
         }
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        self.write_bytes.fetch_add(wrote as u64, Ordering::Relaxed);
         reply.clear();
         enc4(reply, 0);
         enc1(reply, R_WRITE);
@@ -2157,7 +2436,7 @@ impl P9Device {
                 },
             );
         }
-        let (qt, qp, _isd) = match self.stat_path_for_fid(&new_path) {
+        let (qt, qv, qp, _isd) = match self.stat_path_for_fid(&new_path) {
             Ok(v) => v,
             Err(e) => {
                 build_rlerror(reply, tag, e);
@@ -2168,7 +2447,7 @@ impl P9Device {
         enc4(reply, 0);
         enc1(reply, R_MKDIR);
         enc2(reply, tag);
-        enc_qid(reply, qt, 0, qp);
+        enc_qid(reply, qt, qv, qp);
         finalize(reply);
     }
 
@@ -2404,6 +2683,81 @@ fn writable_capacity(bufs: &[ChainBuf]) -> u32 {
     total.min(0xFFFF_FFFF) as u32
 }
 
+/// Twrite header: size[4] type[1] tag[2] fid[4] offset[8] count[4].
+const TWRITE_HEADER_SIZE: usize = 23;
+
+/// A payload whose contiguous runs average below this goes through the slot's
+/// bounce buffer (one syscall plus a memcpy) instead of one syscall per run.
+const DIRECT_MIN_RUN: usize = 32 * 1024;
+
+/// Byte `at` of the logical stream formed by `bufs`' readable buffers.
+fn peek_readable(bufs: &[ChainBuf], mut at: usize) -> Option<u8> {
+    for b in bufs.iter().filter(|b| !b.write) {
+        if at < b.len {
+            return Some(b.as_slice()[at]);
+        }
+        at -= b.len;
+    }
+    None
+}
+
+/// Collect bytes `[skip, skip + len)` of the logical stream formed by `bufs`
+/// as host-memory runs, merging buffers that are adjacent in host memory.
+/// Returns the bytes covered (short of `len` only if the buffers are).
+fn chain_runs(
+    bufs: &[ChainBuf],
+    mut skip: usize,
+    len: usize,
+    out: &mut Vec<(*mut u8, usize)>,
+) -> usize {
+    out.clear();
+    let mut covered = 0usize;
+    for b in bufs {
+        if covered == len {
+            break;
+        }
+        if skip >= b.len {
+            skip -= b.len;
+            continue;
+        }
+        let p = b.ptr.wrapping_add(skip);
+        let take = (b.len - skip).min(len - covered);
+        skip = 0;
+        match out.last_mut() {
+            Some(last) if last.0.wrapping_add(last.1) == p => last.1 += take,
+            _ => out.push((p, take)),
+        }
+        covered += take;
+    }
+    covered
+}
+
+fn runs_direct(runs: &[(*mut u8, usize)], total: usize) -> bool {
+    runs.len() <= 1 || runs.len() * DIRECT_MIN_RUN <= total
+}
+
+/// SAFETY: every run must be valid for writes of its length.
+unsafe fn scatter(runs: &[(*mut u8, usize)], mut src: &[u8]) {
+    for &(p, n) in runs {
+        if src.is_empty() {
+            break;
+        }
+        let k = n.min(src.len());
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), p, k) };
+        src = &src[k..];
+    }
+}
+
+/// SAFETY: every run must be valid for reads of its length.
+unsafe fn gather(runs: &[(*mut u8, usize)], dst: &mut [u8]) {
+    let mut off = 0usize;
+    for &(p, n) in runs {
+        let k = n.min(dst.len() - off);
+        unsafe { std::ptr::copy_nonoverlapping(p, dst[off..].as_mut_ptr(), k) };
+        off += k;
+    }
+}
+
 impl VirtioDevice for P9Device {
     fn device_id(&self) -> u32 {
         DEVICE_ID_P9
@@ -2459,6 +2813,14 @@ impl VirtioDevice for P9Device {
         if idx == P9_REQUEST_QUEUE {
             self.drain();
         }
+    }
+
+    fn queue_has_work(&self, idx: u32) -> Option<bool> {
+        if idx != P9_REQUEST_QUEUE {
+            return None;
+        }
+        // A held lock is a worker pushing a reply: let the drain look properly.
+        Some(self.queue.try_lock().map_or(true, |q| q.has_avail()))
     }
 
     fn driver_ok(&self) {
@@ -2813,6 +3175,182 @@ mod tests {
             assert_eq!((uid, gid), (1000, 1001), "fid {fid}");
         }
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// qid.version of the qid starting at byte `at` of a reply.
+    fn qid_version_at(r: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(r[at + 1..at + 5].try_into().unwrap())
+    }
+
+    /// Linux forces uncached I/O on any file whose qid.version is 0, so files
+    /// carry a version — the same through walk, lopen and getattr — that a host
+    /// change moves. Directories keep 0.
+    #[test]
+    fn file_qids_carry_a_version() {
+        use std::io::Write;
+        let base = std::env::temp_dir().join(format!("tinyvmm_p9_qv_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("f"), b"one").unwrap();
+        let root = std::fs::canonicalize(&base).unwrap();
+        let mem = std::sync::Arc::new(whpsys::memory::GuestMemory::new_host_only(4096).unwrap());
+        let dev = P9Device::new(mem, "t".into(), root, ShareOptions::default());
+
+        connect(&dev, 0);
+        let rwalk = call(&dev, T_WALK, |t| {
+            enc4(t, 0);
+            enc4(t, 1);
+            enc2(t, 1);
+            enc_str(t, "f");
+        });
+        // Rwalk: size[4] type[1] tag[2] nwqid[2] qid[13]...
+        let walked = qid_version_at(&rwalk, 9);
+        assert_ne!(walked, 0);
+        let rlopen = call(&dev, T_LOPEN, |t| {
+            enc4(t, 1);
+            enc4(t, O_RDONLY);
+        });
+        assert_eq!(qid_version_at(&rlopen, 7), walked);
+        let getattr_version = |fid: u32| {
+            let r = call(&dev, T_GETATTR, |t| {
+                enc4(t, fid);
+                enc8(t, STATS_BASIC);
+            });
+            qid_version_at(&r, 15)
+        };
+        assert_eq!(getattr_version(1), walked);
+        assert_eq!(getattr_version(0), 0, "directory");
+
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(base.join("f"))
+            .unwrap();
+        f.write_all(b"two").unwrap();
+        drop(f);
+        assert_ne!(
+            getattr_version(1),
+            walked,
+            "a host change must move the version"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The virtqueue path moves Tread/Twrite payloads between the host file and
+    /// the guest's buffers either run by run or through the bounce buffer. Both
+    /// must follow the chain's logical byte stream exactly, header included.
+    #[test]
+    fn direct_read_and_write_follow_scattered_chains() {
+        let base = std::env::temp_dir().join(format!("tinyvmm_p9_rw_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let file: Vec<u8> = (0..40_000u32).map(|i| (i * 7 + i / 251) as u8).collect();
+        std::fs::write(base.join("d"), &file).unwrap();
+        let mut file = file;
+        let root = std::fs::canonicalize(&base).unwrap();
+        let mem = std::sync::Arc::new(whpsys::memory::GuestMemory::new_host_only(4096).unwrap());
+        let dev = P9Device::new(mem, "t".into(), root, ShareOptions::default());
+        connect(&dev, 0);
+        // Room for the 9000-byte read (Tversion would also drop the fids).
+        dev.negotiated_msize.store(65536, Ordering::Relaxed);
+        walk(&dev, 0, 1, &["d"]);
+        call(&dev, T_LOPEN, |t| {
+            enc4(t, 1);
+            enc4(t, O_RDWR);
+        });
+
+        // Guest-RAM stand-in. Buffers are laid out 64 bytes apart so no two of
+        // them merge into one run.
+        let mut ram = vec![0u8; 1 << 20];
+        let ram_ptr = ram.as_mut_ptr();
+        let layout = |first: usize, lens: &[usize], write: bool| {
+            let mut off = 0usize;
+            let mut bufs = Vec::new();
+            for &len in std::iter::once(&first).chain(lens) {
+                bufs.push(ChainBuf {
+                    ptr: ram_ptr.wrapping_add(off),
+                    len,
+                    write,
+                });
+                off += len + 64;
+            }
+            bufs
+        };
+        let stream = |bufs: &[ChainBuf], n: usize| {
+            let mut s: Vec<u8> = bufs.iter().flat_map(|b| b.as_slice().to_vec()).collect();
+            s.truncate(n);
+            s
+        };
+
+        // One 9000-byte run takes the per-run path; 24 runs of 512 the bounce.
+        for data_lens in [vec![9000usize], vec![512; 24]] {
+            let payload: usize = data_lens.iter().sum();
+            for offset in [0u64, 12_345, 39_000] {
+                // Tread: header buffer, then the data buffers.
+                let mut slot = P9Slot::new();
+                slot.wbufs = layout(RREAD_HEADER_SIZE, &data_lens, true);
+                slot.cap = writable_capacity(&slot.wbufs);
+                enc4(&mut slot.t_msg, 0);
+                enc1(&mut slot.t_msg, T_READ);
+                enc2(&mut slot.t_msg, 7);
+                enc4(&mut slot.t_msg, 1);
+                enc8(&mut slot.t_msg, offset);
+                enc4(&mut slot.t_msg, payload as u32);
+                finalize(&mut slot.t_msg);
+                let n = dev.read_into_chain(&mut slot) as usize;
+                let want = &file[offset as usize..(offset as usize + payload).min(file.len())];
+                let r = stream(&slot.wbufs, n);
+                assert_eq!(n, RREAD_HEADER_SIZE + want.len(), "{data_lens:?} @{offset}");
+                assert_eq!(r[4], R_READ);
+                assert_eq!(u16::from_le_bytes([r[5], r[6]]), 7);
+                assert_eq!(
+                    u32::from_le_bytes(r[7..11].try_into().unwrap()) as usize,
+                    want.len()
+                );
+                assert!(r[RREAD_HEADER_SIZE..] == *want, "{data_lens:?} @{offset}");
+            }
+
+            // Twrite of `payload` new bytes at 100: header, then the data.
+            let mut slot = P9Slot::new();
+            slot.rbufs = layout(TWRITE_HEADER_SIZE, &data_lens, false);
+            let mut hdr = Vec::new();
+            enc4(&mut hdr, (TWRITE_HEADER_SIZE + payload) as u32);
+            enc1(&mut hdr, T_WRITE);
+            enc2(&mut hdr, 9);
+            enc4(&mut hdr, 1);
+            enc8(&mut hdr, 100);
+            enc4(&mut hdr, payload as u32);
+            let data: Vec<u8> = (0..payload).map(|i| (i % 253) as u8 ^ 0x5A).collect();
+            let mut src = hdr.clone();
+            src.extend_from_slice(&data);
+            let mut at = 0usize;
+            for b in &mut slot.rbufs {
+                let k = b.len;
+                b.as_mut_slice().copy_from_slice(&src[at..at + k]);
+                at += k;
+            }
+            slot.t_msg = hdr;
+            slot.msg_len = src.len();
+            let mut reply = vec![0u8; 64];
+            slot.wbufs = vec![ChainBuf {
+                ptr: reply.as_mut_ptr(),
+                len: reply.len(),
+                write: true,
+            }];
+            let n = dev.write_from_chain(&mut slot) as usize;
+            assert_eq!(n, REPLY_HEADER_SIZE + 4);
+            assert_eq!(reply[4], R_WRITE, "{data_lens:?}");
+            assert_eq!(
+                u32::from_le_bytes(reply[7..11].try_into().unwrap()) as usize,
+                payload
+            );
+            let host = std::fs::read(base.join("d")).unwrap();
+            assert!(host[100..100 + payload] == *data, "{data_lens:?}");
+            file[100..100 + payload].copy_from_slice(&data);
+        }
+
+        drop(dev);
         let _ = std::fs::remove_dir_all(&base);
     }
 

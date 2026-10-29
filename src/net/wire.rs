@@ -350,6 +350,9 @@ pub struct TcpView {
     pub src_port: u16,
     pub dst_port: u16,
     pub seq: u32,
+    pub ack: u32,
+    /// TCP header length in bytes (data offset).
+    pub hdr_len: usize,
     pub flags: u8,
 }
 
@@ -361,6 +364,8 @@ pub fn parse_tcp(p: &[u8]) -> Option<TcpView> {
         src_port: be16(&p[0..2]),
         dst_port: be16(&p[2..4]),
         seq: be32(&p[4..8]),
+        ack: be32(&p[8..12]),
+        hdr_len: usize::from(p[12] >> 4) * 4,
         flags: p[13],
     })
 }

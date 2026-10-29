@@ -138,6 +138,99 @@ struct SendHandles(Vec<HANDLE>);
 // WaitForMultipleObjects only; OS handle waits are thread-safe.
 unsafe impl Send for SendHandles {}
 
+thread_local! {
+    static ON_DOORBELL_PUMP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// True on a doorbell pump thread. A device may run a request inline there
+/// (the pump has nothing else to do) but must not on a vCPU thread, where
+/// `notify_queue` arrives through the MMIO fallback.
+pub fn on_doorbell_pump() -> bool {
+    ON_DOORBELL_PUMP.with(|c| c.get())
+}
+
+/// Default ceiling of a pump's busy-poll window (`--poll-us`).
+pub const DEFAULT_POLL_US: u64 = 50;
+static POLL_MAX_NS: AtomicU64 = AtomicU64::new(DEFAULT_POLL_US * 1000);
+
+/// Set the busy-poll ceiling for pumps started from now on; 0 disables polling.
+pub fn set_poll_max_us(us: u64) {
+    POLL_MAX_NS.store(us.saturating_mul(1000), Ordering::Relaxed);
+}
+
+/// Adaptive busy-poll window of one pump, after KVM's halt polling. A
+/// doorbell's trip to the pump (hypervisor signal, DPC, thread wake-up, often
+/// from a sleeping core) costs tens of microseconds, about as much as a whole
+/// cached 4 KiB request. When the guest issues requests back to back, the pump
+/// therefore spins on the ring for a while after each one and picks the next
+/// request up from guest memory. The window grows while requests keep arriving
+/// within the ceiling and decays to zero when they don't, so an idle or
+/// sparsely used device never spins.
+struct PollWindow {
+    ns: u64,
+    max: u64,
+    last_done: std::time::Instant,
+}
+
+impl PollWindow {
+    const MIN_NS: u64 = 2_000;
+
+    fn new() -> Self {
+        PollWindow {
+            ns: 0,
+            max: POLL_MAX_NS.load(Ordering::Relaxed),
+            last_done: std::time::Instant::now(),
+        }
+    }
+
+    /// Woken by a doorbell: a poll as long as the idle gap since the last
+    /// work would have caught this request.
+    fn on_doorbell(&mut self) {
+        if self.max == 0 {
+            return;
+        }
+        let gap = self.last_done.elapsed().as_nanos() as u64;
+        if gap <= self.max {
+            self.ns = (self.ns * 2)
+                .max(gap + gap / 4)
+                .clamp(Self::MIN_NS, self.max);
+        } else {
+            self.shrink();
+        }
+    }
+
+    fn shrink(&mut self) {
+        self.ns /= 2;
+        if self.ns < Self::MIN_NS {
+            self.ns = 0;
+        }
+    }
+
+    /// Spin until queue `q` has work (true) or the window expires (false).
+    fn poll(&mut self, device: &dyn VirtioDevice, q: u32) -> bool {
+        let start = std::time::Instant::now();
+        loop {
+            match device.queue_has_work(q) {
+                Some(true) => return true,
+                Some(false) => {}
+                None => {
+                    // Not pollable: never try again on this pump.
+                    self.max = 0;
+                    self.ns = 0;
+                    return false;
+                }
+            }
+            if start.elapsed().as_nanos() as u64 >= self.ns {
+                self.shrink();
+                return false;
+            }
+            for _ in 0..16 {
+                std::hint::spin_loop();
+            }
+        }
+    }
+}
+
 /// Pump thread: block until a per-queue doorbell (or stop) fires and drive the
 /// existing `notify_queue` path — no VM exit, and no periodic wakeup. The
 /// doorbell is sufficient on its own: when a drain finds the ring empty, the
@@ -153,10 +246,12 @@ unsafe impl Send for SendHandles {}
 /// back (via the irq closure) so there's no strong cycle, and teardown drives
 /// the exit via `stop_event` + join — so no per-fire `upgrade()` is needed.
 fn doorbell_pump(device: Arc<dyn VirtioDevice>, handles: SendHandles, qcount: u32) {
+    ON_DOORBELL_PUMP.with(|c| c.set(true));
     // INFINITE: wake only on a doorbell/stop. Set to a finite value to also run
     // a periodic all-queue safety sweep (not needed; see above).
     const SWEEP_MS: u32 = u32::MAX;
     let handles = handles.0;
+    let mut window = PollWindow::new();
     loop {
         let r =
             unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, SWEEP_MS) };
@@ -184,7 +279,16 @@ fn doorbell_pump(device: Arc<dyn VirtioDevice>, handles: SendHandles, qcount: u3
                     .u32("queue", (i - 1) as u32)
                     .write();
                 }
-                device.notify_queue((i - 1) as u32);
+                let q = (i - 1) as u32;
+                window.on_doorbell();
+                device.notify_queue(q);
+                // Requests the poll catches are drained like a doorbell's. If
+                // the guest kicked for one anyway, the event stays set and the
+                // next wait returns at once into a drain that finds nothing.
+                while window.ns > 0 && window.poll(device.as_ref(), q) {
+                    device.notify_queue(q);
+                }
+                window.last_done = std::time::Instant::now();
             } else {
                 break; // WAIT_FAILED or unexpected
             }

@@ -7,9 +7,8 @@ initramfs mode, captures the guest log, and asserts:
   1. The guest's six-phase blk-test (A..F) reported all phases pass via
      ``BLK SUMMARY: N/N phases passed``.
   2. tinyvmm's per-disk shutdown summary line reported
-     ``max_inflight > 1`` on the writable drive (proves the concurrent-
-     writer phase actually reached parallel queue depth from the host
-     backend's point of view).
+     ``max_depth > 1`` on the writable drive (proves the concurrent-
+     writer phase actually reached parallel queue depth at the device).
   3. The host backing file for the writable drive contains the
      ``TINYVMM_BLK_TEST_MARKER_v1`` sentinel that Phase E wrote into a
      mounted ext2 fs. Finding the literal bytes in the raw file proves
@@ -209,24 +208,28 @@ def assert_blk_summary(log: str) -> None:
     print(f"[blk-test] guest reports {passed}/{total} phases PASS")
 
 
-def assert_max_inflight(log: str, disk_index: int = 0) -> int:
+def assert_max_depth(log: str, disk_index: int = 0) -> int:
     """Look for the per-disk shutdown summary printed by --pvh-run.
 
     Format:
       [pvh-run] virtio-blk[<i>] stats: submitted=A completed=B errors=C
-                max_inflight=D (virtio in=... out=... flush=... err=...)
+                max_inflight=D max_depth=E (virtio in=... out=... err=...)
+
+    max_depth counts the requests the guest had outstanding at once; the
+    backend's max_inflight only counts ops the host completed asynchronously
+    (page-cache misses, flushes), which a warm host cache keeps near 1.
     """
-    needle = rf"virtio-blk\[{disk_index}\].*?max_inflight=(\d+)"
+    needle = rf"virtio-blk\[{disk_index}\].*?max_depth=(\d+)"
     m = re.search(needle, log)
     if not m:
         raise SystemExit(
-            f"[blk-test] FAIL: no max_inflight line for disk[{disk_index}]")
+            f"[blk-test] FAIL: no max_depth line for disk[{disk_index}]")
     n = int(m.group(1))
     if n <= 1:
         raise SystemExit(
-            f"[blk-test] FAIL: max_inflight={n} on disk[{disk_index}] "
+            f"[blk-test] FAIL: max_depth={n} on disk[{disk_index}] "
             "(want > 1; Phase C should have parallelized 8 writers)")
-    print(f"[blk-test] disk[{disk_index}] max_inflight={n} (>1 OK)")
+    print(f"[blk-test] disk[{disk_index}] max_depth={n} (>1 OK)")
     return n
 
 
@@ -319,13 +322,13 @@ def main() -> int:
 
     try:
         assert_blk_summary(log)
-        assert_max_inflight(log, disk_index=0)
+        assert_max_depth(log, disk_index=0)
         assert_marker_in_file(vdb)
     except SystemExit as e:
         print(str(e), file=sys.stderr)
         return 1
 
-    print("[blk-test] PASS: guest blk test, max_inflight > 1, "
+    print("[blk-test] PASS: guest blk test, max_depth > 1, "
           "marker found in host file")
     if not args.keep_workdir:
         for p in (vdb, vdc):

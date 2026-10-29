@@ -91,11 +91,14 @@ const ICMP_WORKERS: usize = 2; // precreated blocking IcmpSendEcho threads
 const MAX_ICMP_INFLIGHT: usize = 16; // bound the handoff queue
 const ICMP_TIMEOUT_MS: u32 = 4_000;
 
-// Flow-lifecycle timeouts (mirrors the C++ usernet backend).
+// Flow-lifecycle timeouts. A TCP flow the NAT gives up on is reset toward the
+// guest, never dropped silently. The idle limits are RFC 5382's minimums
+// (REQ-5): 2 h 4 min for an established connection, 4 min for a half-closed
+// one.
 const UDP_IDLE_MS: u64 = 60_000; // reap a UDP NAT entry idle this long
-const TCP_CONNECT_MS: u64 = 10_000; // abort if the host connect never completes
-const TCP_IDLE_MS: u64 = 10 * 60_000; // abort an established flow idle this long
-const TCP_HALF_CLOSE_MS: u64 = 30_000; // abort a half-closed flow idle this long
+const TCP_CONNECT_MS: u64 = 10_000; // limit on the host connect, then on the guest handshake
+const TCP_IDLE_MS: u64 = (2 * 60 + 4) * 60_000; // reset an established flow idle this long
+const TCP_HALF_CLOSE_MS: u64 = 4 * 60_000; // reset a half-closed flow idle this long
 const EXPIRE_GATE_MS: u64 = 1_000; // how often the idle sweep runs
 
 // tcp-sans-io poll() event flags (mirror crate::tcb::events).
@@ -861,6 +864,11 @@ struct TcpFlow {
     published: Losses,        // TCB loss counters already added to NatStats
     rx_blocked: bool,         // paused on the NIC's RX backlog (in rx_blocked list)
     csum_offload: bool,       // the TCB leaves TCP checksums partial (guest GUEST_CSUM)
+    /// Length of the guest's SYN, kept in `send_op.buf` (idle until the host
+    /// connect completes) while the host connect is pending; 0 otherwise.
+    syn_len: usize,
+    /// That SYN came with a partial (offloaded) TCP checksum.
+    syn_csum_trusted: bool,
 }
 
 impl Drop for TcpFlow {
@@ -873,6 +881,57 @@ impl Drop for TcpFlow {
             sys::close_sock(self.sock);
         }
     }
+}
+
+impl TcpFlow {
+    /// Finished both ways, with only the guest-facing TIME_WAIT left: the
+    /// guest's FIN is acknowledged (tcp-sans-io ACKs a FIN at once), every
+    /// guest byte went to the host socket before its send-side shutdown, and
+    /// no host op is in flight. Such a flow goes at once.
+    ///
+    /// tcp-sans-io holds TIME_WAIT for 2·MSL (60 s) to re-ACK a FIN whose ACK
+    /// was lost and to keep stale segments out of a reused 4-tuple. Over the
+    /// virtual link nothing is reordered, and a FIN the guest retransmits
+    /// after the flow is gone draws a RST ([`NatState::reset_stray`]), which
+    /// ends the guest's LAST_ACK just as well. Holding the full 60 s pinned a
+    /// flow slot per connection the host closed first (HTTP/1.0, `Connection:
+    /// close`): after 256 of those in a minute, every further guest connect()
+    /// was refused. And tcp-sans-io answers a new SYN on a TIME_WAIT TCB with
+    /// a challenge ACK, so a guest reusing the 4-tuple waited out a 1 s SYN
+    /// retransmit.
+    fn lingering(&self) -> bool {
+        !self.dead
+            && self.shutdown_done
+            && !self.send_inflight
+            && !self.recv_pending
+            && self.pending_to_host.is_empty()
+            && self
+                .tcb
+                .as_ref()
+                .is_some_and(|t| t.state() == State::TimeWait && t.poll() & EV_READABLE == 0)
+    }
+
+    /// The sequence number of the guest SYN waiting on the host connect, if
+    /// any; the SYN is then dropped.
+    fn take_syn_seq(&mut self) -> Option<u32> {
+        let len = std::mem::take(&mut self.syn_len);
+        let syn = &self.send_op.as_ref()?.buf[..len];
+        let at = usize::from(syn.first()? & 0x0F) * 4 + 4;
+        Some(u32::from_be_bytes(syn.get(at..at + 4)?.try_into().ok()?))
+    }
+}
+
+/// The (seq, ack, flags) of the RST that answers segment `tcp`, carrying `data`
+/// payload bytes, on a connection that doesn't exist (RFC 9293 §3.10.7.1): an
+/// ACK is answered from its acknowledgment number, anything else is
+/// acknowledged in full.
+fn reset_for(tcp: &TcpView, data: usize) -> (u32, u32, u8) {
+    if tcp.flags & TCP_ACK != 0 {
+        return (tcp.ack, 0, TCP_RST);
+    }
+    let len =
+        data as u32 + u32::from(tcp.flags & TCP_SYN != 0) + u32::from(tcp.flags & TCP_FIN != 0);
+    (0, tcp.seq.wrapping_add(len), TCP_RST | TCP_ACK)
 }
 
 /// Split a TCP/IPv4 datagram into (ip+tcp header, payload, seq, flags). `None`
@@ -1846,49 +1905,97 @@ impl NatState {
             return;
         };
         let key = (ip.src, tcp.src_port, ip.dst, tcp.dst_port);
-        if !self.tcp.contains_key(&key) {
-            if tcp.flags & TCP_SYN == 0 {
-                return;
-            }
-            // Own the key before creating the flow, so the guest's later
-            // segments are routed here; if another shard has it, that shard
-            // gets the guest's next SYN instead.
-            if !self.claim_flow(&key) {
-                return;
-            }
-            // At capacity (or socket setup failed): refuse with a RST so the
-            // guest's connect() fails fast instead of retrying for ~minutes.
-            if self.flows.tcp.load(Ordering::Relaxed) >= MAX_TCP_FLOWS
-                || self.new_tcp_flow(key).is_none()
-            {
-                build_tcp_rst_for_syn_into(
-                    &mut self.l3_scratch,
-                    ip.src,
-                    tcp.src_port,
-                    ip.dst,
-                    tcp.dst_port,
-                    tcp.seq,
-                );
-                self.wrap_and_inject(ip.dst, ip.src, IP_PROTO_TCP);
-                self.release_flow(&key);
-                return;
-            }
-        }
+        let syn_only = tcp.flags & (TCP_SYN | TCP_ACK | TCP_RST) == TCP_SYN;
         let now = self.now();
-        if let Some(flow) = self.tcp.get_mut(&key) {
-            flow.tcb.as_mut().unwrap().set_now(now);
-            let tcb = flow.tcb.as_mut().unwrap();
-            let _ = if self.l4_csum_trusted {
-                tcb.inject_packet_l4_csum_trusted(ip.datagram)
-            } else {
-                tcb.inject_packet(ip.datagram)
-            };
-            flow.last_activity = now;
+        let Some(flow) = self.tcp.get_mut(&key) else {
+            if syn_only {
+                self.open_tcp_flow(key, ip, &tcp);
+            } else if tcp.flags & TCP_RST == 0 {
+                self.reset_stray(ip, &tcp);
+            }
+            return;
+        };
+        if flow.syn_len > 0 {
+            // The host connect is still pending, so the guest has had no
+            // SYN-ACK: it can only be retransmitting its SYN (keep the latest,
+            // for its timestamp) or giving up.
+            if tcp.flags & TCP_RST != 0 {
+                self.begin_teardown(key);
+            } else if syn_only && ip.datagram.len() <= TCP_BUF {
+                flow.send_op.as_mut().unwrap().buf[..ip.datagram.len()]
+                    .copy_from_slice(ip.datagram);
+                flow.syn_len = ip.datagram.len();
+                flow.syn_csum_trusted = self.l4_csum_trusted;
+            }
+            return;
         }
+        flow.tcb.as_mut().unwrap().set_now(now);
+        let tcb = flow.tcb.as_mut().unwrap();
+        let _ = if self.l4_csum_trusted {
+            tcb.inject_packet_l4_csum_trusted(ip.datagram)
+        } else {
+            tcb.inject_packet(ip.datagram)
+        };
+        flow.last_activity = now;
         self.tcp_drive(key);
     }
 
-    fn new_tcp_flow(&mut self, key: FlowKey) -> Option<()> {
+    /// A guest SYN for a new connection: create the flow and start the host
+    /// connect, or refuse.
+    fn open_tcp_flow(&mut self, key: FlowKey, ip: &Ipv4View, tcp: &TcpView) {
+        // Own the key before creating the flow, so the guest's later segments
+        // are routed here; if another shard has it, that shard gets the
+        // guest's next SYN instead.
+        if !self.claim_flow(&key) {
+            return;
+        }
+        // At capacity (or socket setup failed): refuse with a RST so the
+        // guest's connect() fails fast instead of retrying for ~minutes.
+        if self.flows.tcp.load(Ordering::Relaxed) >= MAX_TCP_FLOWS
+            || self.new_tcp_flow(key, ip.datagram).is_none()
+        {
+            self.refuse_syn(key, tcp.seq);
+            self.release_flow(&key);
+        }
+    }
+
+    /// Refuse the guest SYN with sequence number `seq` on `key`: the guest's
+    /// connect() fails with ECONNREFUSED.
+    fn refuse_syn(&mut self, key: FlowKey, seq: u32) {
+        let (gip, gport, dip, dport) = key;
+        build_tcp_rst_for_syn_into(&mut self.l3_scratch, gip, gport, dip, dport, seq);
+        self.wrap_and_inject(dip, gip, IP_PROTO_TCP);
+    }
+
+    /// Answer a guest segment that belongs to no flow (one the NAT has closed,
+    /// or never had) with a RST, as a host without that connection would (RFC
+    /// 9293 §3.10.7.1), so the guest drops its side rather than retransmitting
+    /// into silence until it times out.
+    fn reset_stray(&mut self, ip: &Ipv4View, tcp: &TcpView) {
+        let data = ip.payload.len().saturating_sub(tcp.hdr_len);
+        let (seq, ack, flags) = reset_for(tcp, data);
+        build_tcp_into(
+            &mut self.l3_scratch,
+            ip.dst,
+            ip.src,
+            tcp.dst_port,
+            tcp.src_port,
+            seq,
+            ack,
+            flags,
+            0,
+        );
+        self.wrap_and_inject(ip.dst, ip.src, IP_PROTO_TCP);
+    }
+
+    /// Create the flow for guest SYN `syn` and start the host connect. The
+    /// TCB stays in LISTEN, and `syn` waits in the send op's buffer, until
+    /// the host connect completes ([`Self::on_tcp_connect`]): the guest's
+    /// connect() succeeds only if the host's does, and is refused otherwise.
+    fn new_tcp_flow(&mut self, key: FlowKey, syn: &[u8]) -> Option<()> {
+        if syn.len() > TCP_BUF {
+            return None;
+        }
         let (gip, gport, dip, dport) = key;
         let iss = self.next_iss();
         let now = self.now();
@@ -1936,6 +2043,7 @@ impl NatState {
         send_op.overlapped = unsafe { core::mem::zeroed() };
         send_op.kind = 2;
         send_op.key = key;
+        send_op.buf[..syn.len()].copy_from_slice(syn);
         let ovl = &mut op.overlapped as *mut OVERLAPPED;
         // Slirp convention: connections to the gateway IP target the host
         // loopback (so the guest can reach host-local services at 10.0.0.1:*).
@@ -1979,6 +2087,8 @@ impl NatState {
                 published: Losses::default(),
                 rx_blocked: false,
                 csum_offload,
+                syn_len: syn.len(),
+                syn_csum_trusted: self.l4_csum_trusted,
             },
         );
         self.flows.tcp.fetch_add(1, Ordering::Relaxed);
@@ -2110,6 +2220,8 @@ impl NatState {
                 published: Losses::default(),
                 rx_blocked: false,
                 csum_offload,
+                syn_len: 0,
+                syn_csum_trusted: false,
             },
         );
         self.flows.tcp.fetch_add(1, Ordering::Relaxed);
@@ -2121,22 +2233,40 @@ impl NatState {
         let key = unsafe { (*op_ptr).key };
         let now = self.now();
         let mut dead = false;
+        let mut refused = None;
         if let Some(flow) = self.tcp.get_mut(&key) {
             flow.connect_pending = false;
             if flow.dead {
                 dead = true;
+            } else if !ok {
+                // Refused, unreachable or timed out: the guest's connect()
+                // fails as it would have against the destination itself.
+                refused = flow.take_syn_seq();
             } else {
-                flow.tcb.as_mut().unwrap().set_now(now);
-                if !ok {
-                    let _ = flow.tcb.as_mut().unwrap().abort();
-                } else {
-                    sys::update_connect_ctx(flow.sock);
-                    if sys::peer_is_local(flow.sock) {
-                        sys::set_rcvbuf(flow.sock, LOCAL_PEER_RCVBUF);
-                    }
-                    flow.connected = true;
-                    flow.last_activity = now;
+                sys::update_connect_ctx(flow.sock);
+                if sys::peer_is_local(flow.sock) {
+                    sys::set_rcvbuf(flow.sock, LOCAL_PEER_RCVBUF);
                 }
+                flow.connected = true;
+                flow.last_activity = now;
+                // The guest's handshake gets its own TCP_CONNECT_MS.
+                flow.created_at = now;
+                // Now answer the guest's SYN, checked as it arrived.
+                let TcpFlow {
+                    tcb,
+                    send_op,
+                    syn_len,
+                    syn_csum_trusted,
+                    ..
+                } = flow;
+                let tcb = tcb.as_mut().unwrap();
+                tcb.set_now(now);
+                let syn = &send_op.as_ref().unwrap().buf[..std::mem::take(syn_len)];
+                let _ = if *syn_csum_trusted {
+                    tcb.inject_packet_l4_csum_trusted(syn)
+                } else {
+                    tcb.inject_packet(syn)
+                };
             }
         }
         if dead {
@@ -2145,8 +2275,14 @@ impl NatState {
             self.reap_if_idle(key);
             return;
         }
-        // tcp_drive flushes any data buffered before the connect completed (and,
-        // on abort, the RST toward the guest) and tears down on EV_CLOSED/ERROR.
+        if !ok {
+            if let Some(seq) = refused {
+                self.refuse_syn(key, seq);
+            }
+            self.begin_teardown(key);
+            return;
+        }
+        // Send the SYN-ACK; the guest's data follows the handshake.
         self.tcp_drive(key);
     }
 
@@ -2154,6 +2290,7 @@ impl NatState {
         let key = unsafe { (*op_ptr).key };
         let now = self.now();
         let mut dead = false;
+        let mut reset = false;
         if let Some(flow) = self.tcp.get_mut(&key) {
             flow.recv_pending = false;
             if let Some(t) = flow.diag.recv_posted.take() {
@@ -2166,7 +2303,13 @@ impl NatState {
             } else {
                 let tcb = flow.tcb.as_mut().unwrap();
                 tcb.set_now(now);
-                if !ok || bytes == 0 {
+                if !ok {
+                    // The host connection was reset or failed: reset the
+                    // guest's too. Passing it on as EOF would make a cut-off
+                    // stream look complete.
+                    let _ = tcb.send_commit(0);
+                    reset = true;
+                } else if bytes == 0 {
                     let _ = tcb.send_commit(0);
                     on_host_eof(flow);
                 } else {
@@ -2180,6 +2323,10 @@ impl NatState {
         }
         if dead {
             self.reap_if_idle(key);
+            return;
+        }
+        if reset {
+            self.abort_flow(key);
             return;
         }
         self.tcp_drive(key);
@@ -2219,7 +2366,8 @@ impl NatState {
             return;
         }
         if failed {
-            self.begin_teardown(key);
+            // The host connection broke: reset the guest's.
+            self.abort_flow(key);
             return;
         }
         // Post the next chunk and make any other progress (re-arm recv, etc.).
@@ -2256,6 +2404,8 @@ impl NatState {
         let csum_ok = dev.as_ref().is_some_and(|d| d.rx_csum_ok());
         let mut scratch = std::mem::take(&mut self.tx_scratch);
         let mut teardown = false;
+        let mut finished = false;
+        let mut reset = false;
         if let Some(flow) = self.tcp.get_mut(&key) {
             if flow.dead {
                 self.tx_scratch = scratch;
@@ -2389,9 +2539,43 @@ impl NatState {
             if !teardown && !maybe_post_recv(flow) {
                 teardown = true;
             }
+            finished = !teardown && flow.lingering();
+            // A host-side failure tears down a guest connection that is still
+            // open: it gets a RST.
+            reset = teardown && flow.tcb.as_ref().unwrap().state() != State::Closed;
         }
         self.tx_scratch = scratch;
-        if teardown {
+        if reset {
+            self.abort_flow(key);
+        } else if teardown || finished {
+            self.begin_teardown(key);
+        }
+    }
+
+    /// Give up on a live flow and tell the guest: a guest SYN still waiting on
+    /// the host connect is refused; an open connection gets a RST. Then tear
+    /// the flow down.
+    fn abort_flow(&mut self, key: FlowKey) {
+        let Some(flow) = self.tcp.get_mut(&key) else {
+            return;
+        };
+        if flow.dead {
+            return;
+        }
+        if flow.syn_len > 0 {
+            if let Some(seq) = flow.take_syn_seq() {
+                self.refuse_syn(key, seq);
+            }
+            self.begin_teardown(key);
+            return;
+        }
+        if flow.tcb.as_mut().unwrap().abort().is_ok() {
+            // Deliver the RST `abort` queued; the drive then sees the TCB
+            // closed and tears the flow down.
+            self.tcp_drive(key);
+        } else {
+            // No room to queue the RST (the egress ring is emptied by every
+            // drive, so not expected): go without it.
             self.begin_teardown(key);
         }
     }
@@ -2452,7 +2636,7 @@ impl NatState {
     }
 
     /// Periodic idle sweep (runs every EXPIRE_GATE_MS): reap idle UDP NAT
-    /// entries and abort stuck/dead TCP flows (connect-deadline, idle, and
+    /// entries, and reset stuck or idle TCP flows (connect-deadline, idle, and
     /// half-close watchdogs). Mirrors the C++ backend's ExpireIdle + the TSI
     /// engine's per-conn watchdogs.
     fn expire_idle(&mut self, now: u64) {
@@ -2475,7 +2659,7 @@ impl NatState {
             }
         }
 
-        // TCP: collect flows that tripped a watchdog, then tear them down.
+        // TCP: collect flows that tripped a watchdog, then reset them.
         let tcp_victims: Vec<FlowKey> = self
             .tcp
             .iter()
@@ -2494,8 +2678,9 @@ impl NatState {
                         | State::LastAck
                 );
                 // Establishment watchdog: fire if the host connect hasn't
-                // completed (outbound) or the TCB hasn't reached a synchronized
-                // state (covers an inbound flow whose guest never accepts).
+                // completed (outbound; the guest's SYN is then refused) or,
+                // since it did, the TCB hasn't reached a synchronized state
+                // (also covers an inbound flow whose guest never accepts).
                 let establishing = !f.connected || !st.is_synchronized();
                 (establishing && now.saturating_sub(f.created_at) > TCP_CONNECT_MS)
                     || (half && idle > TCP_HALF_CLOSE_MS)
@@ -2504,10 +2689,7 @@ impl NatState {
             .map(|(k, _)| *k)
             .collect();
         for k in tcp_victims {
-            if let Some(f) = self.tcp.get_mut(&k) {
-                let _ = f.tcb.as_mut().unwrap().abort();
-            }
-            self.begin_teardown(k);
+            self.abort_flow(k);
         }
     }
 
@@ -2966,11 +3148,9 @@ mod tests {
         }) {}
     }
 
-    /// Host bytes land in the tcb's send ring as recvs complete (wrapping
-    /// around it as the guest drains it); when the host then closes, the guest
-    /// gets every byte, then the FIN.
-    #[test]
-    fn host_bytes_reach_the_guest_through_the_ring_then_fin() {
+    /// A NAT-side tcb (listening on 10.0.0.1:80) and a guest-side tcb,
+    /// handshaken to ESTABLISHED.
+    fn established_pair() -> (Box<dyn TcbDyn>, Box<dyn TcbDyn>) {
         let nat_end = Endpoint {
             ip: [10, 0, 0, 1],
             port: 80,
@@ -3003,10 +3183,12 @@ mod tests {
             shuttle(&mut *nat, &mut *guest);
         }
         assert_eq!(nat.state(), State::Established);
+        (nat, guest)
+    }
 
-        // The host sends three rings' worth, then closes.
-        let data: Vec<u8> = (0..3 * TIER_BUF[0] as u32).map(|i| (i * 7) as u8).collect();
-        let mut flow = TcpFlow {
+    /// A connected flow around `nat`, with no host socket or ops.
+    fn connected_flow(nat: Box<dyn TcbDyn>) -> TcpFlow {
+        TcpFlow {
             tcb: Some(nat),
             tier: 0,
             sock: INVALID_SOCKET,
@@ -3027,7 +3209,21 @@ mod tests {
             published: Losses::default(),
             rx_blocked: false,
             csum_offload: false,
-        };
+            syn_len: 0,
+            syn_csum_trusted: false,
+        }
+    }
+
+    /// Host bytes land in the tcb's send ring as recvs complete (wrapping
+    /// around it as the guest drains it); when the host then closes, the guest
+    /// gets every byte, then the FIN.
+    #[test]
+    fn host_bytes_reach_the_guest_through_the_ring_then_fin() {
+        let (nat, mut guest) = established_pair();
+
+        // The host sends three rings' worth, then closes.
+        let data: Vec<u8> = (0..3 * TIER_BUF[0] as u32).map(|i| (i * 7) as u8).collect();
+        let mut flow = connected_flow(nat);
 
         // Pump both ends, as `tcp_drive` and the guest would, completing a
         // host recv into the lent ring space whenever there is room.
@@ -3071,6 +3267,75 @@ mod tests {
         assert_eq!(got.len(), data.len());
         assert!(got == data);
         assert_ne!(guest.poll() & EV_PEER_CLOSED, 0, "the FIN follows the data");
+        flow.tcb.take();
+    }
+
+    /// A segment for a connection the NAT doesn't have is reset the way the
+    /// guest will accept: an ACK (like a FIN retransmitted after the flow
+    /// was released) from its acknowledgment number, anything else by
+    /// acknowledging the whole segment, SYN and FIN included.
+    #[test]
+    fn stray_segments_are_reset_as_rfc_9293_says() {
+        let seg = |flags: u8| TcpView {
+            src_port: 40000,
+            dst_port: 80,
+            seq: 0xFFFF_FFF0,
+            ack: 1234,
+            hdr_len: 20,
+            flags,
+        };
+        assert_eq!(reset_for(&seg(TCP_ACK | TCP_FIN), 0), (1234, 0, TCP_RST));
+        assert_eq!(reset_for(&seg(TCP_ACK), 100), (1234, 0, TCP_RST));
+        assert_eq!(
+            reset_for(&seg(TCP_FIN), 0x20),
+            (0, 0x11, TCP_RST | TCP_ACK),
+            "data and FIN acknowledged, with wraparound"
+        );
+        assert_eq!(
+            reset_for(&seg(TCP_SYN), 0),
+            (0, 0xFFFF_FFF1, TCP_RST | TCP_ACK)
+        );
+    }
+
+    /// When the host closes first, the NAT's tcb ends in TIME_WAIT. The flow
+    /// may give up its slot early only once the guest's last bytes have gone
+    /// to the host and the host send side is shut down.
+    #[test]
+    fn a_time_wait_flow_lingers_only_once_the_guest_bytes_are_out() {
+        let (nat, mut guest) = established_pair();
+        let mut flow = connected_flow(nat);
+        on_host_eof(&mut flow);
+        {
+            let nat = flow.tcb.as_mut().unwrap();
+            nat.tick().unwrap();
+            shuttle(&mut **nat, &mut *guest);
+            assert_ne!(guest.poll() & EV_PEER_CLOSED, 0);
+            // The guest answers with its last bytes, then closes too.
+            let (a, _) = guest.send_reserve(4).unwrap();
+            a[..4].copy_from_slice(b"bye\n");
+            assert_eq!(guest.send_commit(4), Ok(4));
+            guest.close().unwrap();
+            guest.tick().unwrap();
+            shuttle(&mut *guest, &mut **nat);
+            assert_eq!(nat.state(), State::TimeWait);
+        }
+        assert!(!flow.lingering(), "guest bytes still in the tcb");
+
+        // The worker drains them toward the host (as `tcp_drive` does)...
+        let mut rb = [0u8; 16];
+        let n = flow.tcb.as_mut().unwrap().recv(&mut rb).unwrap();
+        assert_eq!(&rb[..n], b"bye\n");
+        flow.pending_to_host.extend_from_slice(&rb[..n]);
+        flow.want_shutdown = true;
+        assert!(!flow.lingering(), "guest bytes queued for the host");
+        flow.pending_to_host.clear();
+        flow.send_inflight = true;
+        assert!(!flow.lingering(), "guest bytes in flight to the host");
+        flow.send_inflight = false;
+        // ...and, with the queue empty, shuts down the host send side.
+        assert!(pump_send(&mut flow));
+        assert!(flow.shutdown_done);
+        assert!(flow.lingering());
         flow.tcb.take();
     }
 }

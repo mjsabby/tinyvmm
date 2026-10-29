@@ -18,7 +18,7 @@ Phases
      mounts, opens FD 3, chowns the fixture to 1234:5678 (stored as WSL
      metadata), fires the trigger. Assert rc=0, the guest ``P9SNAP: pre-trigger
      sentinel``, the host ``[snapshot] trigger fired`` + ``[snapshot] wrote N
-     bytes``, and that the snapshot file is >= RAM bytes.
+     bytes``, and that the snapshot file is smaller than RAM (sparse).
   2. --restore: ``--restore <snap>``. The 9p share root, owner and metadata
      flag are reconstructed FROM THE SNAPSHOT HEADER, so no
      ``--virtio-9p-share`` is needed. Assert ``P9SNAP: POST-RESTORE-CONTINUE
@@ -181,9 +181,10 @@ def phase1_save(args: argparse.Namespace, share: Path) -> None:
     actual = args.snap_path.stat().st_size
     if actual != written:
         raise SystemExit(f"[save] FAIL: file size {actual} != reported {written}")
-    if actual < args.ram_mb * 1024 * 1024:
+    if actual >= args.ram_mb * 1024 * 1024:
         raise SystemExit(
-            f"[save] FAIL: file size {actual} < RAM bytes {args.ram_mb * 1024 * 1024}")
+            f"[save] FAIL: file size {actual} >= RAM bytes {args.ram_mb * 1024 * 1024}"
+            " (zero RAM chunks should be left out)")
     # The post-trigger lines must NOT appear in the save invocation (the host
     # exits at the cpuid boundary before they run).
     if POST_CONTINUE_RE.search(log):

@@ -127,20 +127,37 @@ pub fn close(h: HANDLE) {
 /// inside the share but targets a directory outside it, so the *real* path of
 /// the opened handle must be re-validated to defeat that escape.
 pub fn final_path_by_handle(h: HANDLE) -> Option<Vec<u16>> {
-    // First probe with a zero-length buffer: the return is the required length
-    // INCLUDING the terminating NUL.
-    let needed = unsafe { GetFinalPathNameByHandleW(h, core::ptr::null_mut(), 0, 0) };
-    if needed == 0 {
-        return None;
+    final_path(h, 0)
+}
+
+/// As [`final_path_by_handle`], but with the volume as its NT device name
+/// (`\Device\HarddiskVolume3\...`, `VOLUME_NAME_NT`). Same resolution, without
+/// the Mount Manager round trip that maps the device to a drive letter: about
+/// half the cost, which matters when it runs for every 9p walk and getattr.
+pub fn final_nt_path_by_handle(h: HANDLE) -> Option<Vec<u16>> {
+    const VOLUME_NAME_NT: u32 = 0x2;
+    final_path(h, VOLUME_NAME_NT)
+}
+
+fn final_path(h: HANDLE, flags: u32) -> Option<Vec<u16>> {
+    // One call into a buffer that fits nearly every path; each call repeats the
+    // whole name query. On success the return is the length WITHOUT the NUL; if
+    // the buffer is too small, it is the length needed INCLUDING the NUL.
+    let mut buf = vec![0u16; 512];
+    loop {
+        let n = unsafe { GetFinalPathNameByHandleW(h, buf.as_mut_ptr(), buf.len() as u32, flags) };
+        if n == 0 {
+            return None;
+        }
+        if (n as usize) < buf.len() {
+            buf.truncate(n as usize);
+            return Some(buf);
+        }
+        if n as usize <= buf.len() {
+            return None;
+        }
+        buf.resize(n as usize, 0);
     }
-    let mut buf = vec![0u16; needed as usize];
-    // On success the return is the length WITHOUT the NUL (and < needed).
-    let written = unsafe { GetFinalPathNameByHandleW(h, buf.as_mut_ptr(), needed, 0) };
-    if written == 0 || written >= needed {
-        return None;
-    }
-    buf.truncate(written as usize);
-    Some(buf)
 }
 
 /// `GetFileInformationByHandle` decoded into a [`FileInfo`].

@@ -539,15 +539,19 @@ fn record_unpack(log: &mut BootLog, report: &crate::rootfs::Unpacked) {
 fn mount_share(share: &Share) -> Result<()> {
     fs::create_dir_all(&share.target)?;
     let flags = libc::MS_NOSUID | libc::MS_NODEV | if share.readonly { libc::MS_RDONLY } else { 0 };
+    // Read-only shares cache file data (`readahead`): reads go through the page
+    // cache in msize-sized Treads instead of one 4 KiB round trip per page, and
+    // since lookups of files not held open still go to the host, a file the
+    // host replaces is seen when next opened. Writable shares stay uncached, so
+    // the guest always reads what the host last wrote.
+    let options = if share.readonly {
+        "trans=virtio,version=9p2000.L,msize=512000,cache=readahead"
+    } else {
+        "trans=virtio,version=9p2000.L,msize=512000"
+    };
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match unix::mount(
-            &share.tag,
-            &share.target,
-            "9p",
-            flags,
-            "trans=virtio,version=9p2000.L,msize=512000",
-        ) {
+        match unix::mount(&share.tag, &share.target, "9p", flags, options) {
             Ok(()) => return Ok(()),
             Err(error) if Instant::now() >= deadline => return Err(error),
             Err(_) => thread::sleep(Duration::from_millis(100)),
