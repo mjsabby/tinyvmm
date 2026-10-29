@@ -131,6 +131,10 @@ pub struct NatOptions {
     /// ports to a smaller tier to save memory). Keyed by the destination port
     /// (outbound) / guest service port (inbound).
     pub tcb_port_tier: Vec<(u16, usize)>,
+    /// Worker threads (shards), each with its own IOCP and the flows assigned
+    /// to it (see `FlowRouter`); ARP, ICMP and other non-TCP/UDP traffic goes
+    /// to the first. Clamped to 1..=MAX_WORKERS.
+    pub workers: usize,
 }
 
 impl Default for NatOptions {
@@ -142,6 +146,147 @@ impl Default for NatOptions {
             tcb_warm: DEFAULT_TCB_WARM,
             default_tier: DEFAULT_TIER,
             tcb_port_tier: Vec::new(),
+            workers: default_workers(),
+        }
+    }
+}
+
+/// Default NAT worker threads: a quarter of the host's logical CPUs, at most
+/// four (where a 1-vCPU guest already saturates on 16 download streams) and
+/// at least one.
+pub fn default_workers() -> usize {
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    (cpus / 4).clamp(1, 4)
+}
+
+/// Most NAT worker threads `--nat-workers` accepts.
+pub const MAX_WORKERS: usize = 16;
+
+/// The shard that owns a flow. Guest frames are routed by it, and a shard
+/// opening an inbound flow picks an ephemeral port whose key maps back to
+/// itself, so every frame and completion of a flow reaches the one worker
+/// that owns it.
+fn shard_of(key: &FlowKey, shards: usize) -> usize {
+    if shards <= 1 {
+        return 0;
+    }
+    let (sip, sport, dip, dport) = *key;
+    let mut x = (u64::from(u32::from_be_bytes(sip)) << 32 | u64::from(u32::from_be_bytes(dip)))
+        ^ (u64::from(sport) << 16 | u64::from(dport)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    // splitmix64's finalizer: every input bit reaches every output bit.
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    (x % shards as u64) as usize
+}
+
+/// The shard for a guest frame: by 4-tuple for unfragmented TCP and UDP over
+/// IPv4, the first shard for everything else (ARP, ICMP, fragments). Returns
+/// the TCP flow key and SYN flag too, for [`FlowRouter::route`]. Reads the
+/// datagram as the worker does (within its total length), so a frame routed
+/// as TCP here is the TCP segment the owning worker sees.
+fn shard_of_frame(frame: &[u8], shards: usize) -> (usize, Option<(FlowKey, bool)>) {
+    if shards <= 1 || frame.len() < ETH_HDR + 20 || frame[12..14] != [0x08, 0x00] {
+        return (0, None);
+    }
+    let ip = &frame[ETH_HDR..];
+    let total = usize::from(u16::from_be_bytes([ip[2], ip[3]])).min(ip.len());
+    let ip = &ip[..total];
+    if total < 20 {
+        return (0, None);
+    }
+    let ihl = usize::from(ip[0] & 0x0F) * 4;
+    let frag = u16::from_be_bytes([ip[6], ip[7]]) & 0x3FFF;
+    if ip[0] >> 4 != 4
+        || ihl < 20
+        || ip.len() < ihl + 4
+        || frag != 0
+        || (ip[9] != IP_PROTO_TCP && ip[9] != IP_PROTO_UDP)
+    {
+        return (0, None);
+    }
+    let port = |o: usize| u16::from_be_bytes([ip[ihl + o], ip[ihl + o + 1]]);
+    let src = [ip[12], ip[13], ip[14], ip[15]];
+    let dst = [ip[16], ip[17], ip[18], ip[19]];
+    let key = (src, port(0), dst, port(2));
+    let tcp =
+        (ip[9] == IP_PROTO_TCP && ip.len() >= ihl + 20).then(|| (key, ip[ihl + 13] & TCP_SYN != 0));
+    (shard_of(&key, shards), tcp)
+}
+
+/// NAT-wide flow counts behind the MAX_*_FLOWS caps, shared by the shards. A
+/// shard checks before it creates a flow, so concurrent shards can pass a cap
+/// by at most one flow each.
+#[derive(Default)]
+struct FlowCounts {
+    tcp: AtomicUsize,
+    udp: AtomicUsize,
+}
+
+/// Which shard owns each TCP flow. Hashing a handful of bulk flows onto a few
+/// shards leaves some workers with twice their share, so TCP flows are
+/// assigned instead: the guest TX path gives a new outbound flow (its SYN)
+/// to the shard with the fewest flows, a shard opening an inbound flow claims
+/// its key, and the owning shard releases the key when the flow is gone.
+/// Frames of unknown TCP flows, and all other traffic, are routed by hash.
+struct FlowRouter {
+    owner: std::sync::RwLock<HashMap<FlowKey, usize>>,
+    /// TCP flows per shard.
+    load: Box<[AtomicUsize]>,
+}
+
+impl FlowRouter {
+    fn new(shards: usize) -> Self {
+        FlowRouter {
+            owner: std::sync::RwLock::new(HashMap::new()),
+            load: (0..shards).map(|_| AtomicUsize::new(0)).collect(),
+        }
+    }
+
+    /// The shard for a guest TCP frame, and whether this call assigned it (a
+    /// SYN for a flow no shard owns: the shard creates a flow for any SYN).
+    fn route(&self, key: &FlowKey, syn: bool) -> (usize, bool) {
+        if let Some(&s) = self.owner.read().unwrap().get(key) {
+            return (s, false);
+        }
+        if !syn {
+            return (shard_of(key, self.load.len()), false);
+        }
+        let mut owner = self.owner.write().unwrap();
+        if let Some(&s) = owner.get(key) {
+            return (s, false);
+        }
+        let s = (0..self.load.len())
+            .min_by_key(|&i| self.load[i].load(Ordering::Relaxed))
+            .unwrap_or(0);
+        owner.insert(*key, s);
+        self.load[s].fetch_add(1, Ordering::Relaxed);
+        (s, true)
+    }
+
+    /// Claim `key` for shard `s` (an inbound flow, or a flow `s` creates from
+    /// a SYN): true if it was free or is already `s`'s.
+    fn claim(&self, key: &FlowKey, s: usize) -> bool {
+        let mut owner = self.owner.write().unwrap();
+        match owner.get(key) {
+            Some(&o) => o == s,
+            None => {
+                owner.insert(*key, s);
+                self.load[s].fetch_add(1, Ordering::Relaxed);
+                true
+            }
+        }
+    }
+
+    /// Shard `s` has no flow for `key` (reaped, refused, or its SYN never
+    /// arrived): drop the entry if `s` still owns it.
+    fn release(&self, key: &FlowKey, s: usize) {
+        let mut owner = self.owner.write().unwrap();
+        if owner.get(key) == Some(&s) {
+            owner.remove(key);
+            self.load[s].fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
@@ -1188,6 +1333,11 @@ fn note_data_out(d: &mut FlowDiag, key: FlowKey, wake: Wake, stats: &NatStats) {
 struct NatState {
     net: Weak<NetDevice>,
     iocp: Iocp,
+    /// This worker's shard index, of `shards`; see [`FlowRouter`].
+    shard: usize,
+    shards: usize,
+    router: Arc<FlowRouter>,
+    flows: Arc<FlowCounts>,
     gw_ip: [u8; 4],
     gw_mac: [u8; 6],
     guest_mac: [u8; 6],
@@ -1376,6 +1526,7 @@ impl NatState {
                 self.l4_csum_trusted = key == KEY_FRAME_OFFLOAD;
                 self.handle_frame(frame);
                 self.l4_csum_trusted = false;
+                self.settle_route(frame);
                 self.pool.release(idx);
             }
             KEY_FRAME_OFFLOAD_BIG => {
@@ -1384,6 +1535,7 @@ impl NatState {
                 self.l4_csum_trusted = true;
                 self.handle_frame(frame);
                 self.l4_csum_trusted = false;
+                self.settle_route(frame);
                 self.big_pool.release(idx);
             }
             KEY_UDP => self.on_udp_recv(ov as *mut UdpOp, ok, bytes),
@@ -1565,7 +1717,7 @@ impl NatState {
             f.last_use = now;
             return Some(f.op.as_ref().unwrap().sock);
         }
-        if self.udp.len() >= MAX_UDP_FLOWS {
+        if self.flows.udp.load(Ordering::Relaxed) >= MAX_UDP_FLOWS {
             return None;
         }
         let sock = sys::new_udp_socket()?;
@@ -1603,6 +1755,7 @@ impl NatState {
                 dead: false,
             },
         );
+        self.flows.udp.fetch_add(1, Ordering::Relaxed);
         Some(sock)
     }
 
@@ -1611,6 +1764,7 @@ impl NatState {
     /// completion, or after expire_idle closed the socket).
     fn reap_udp(&mut self, key: FlowKey) {
         if let Some(mut f) = self.udp.remove(&key) {
+            self.flows.udp.fetch_sub(1, Ordering::Relaxed);
             if let Some(op) = f.op.take() {
                 if op.sock != INVALID_SOCKET {
                     sys::close_sock(op.sock);
@@ -1676,9 +1830,17 @@ impl NatState {
             if tcp.flags & TCP_SYN == 0 {
                 return;
             }
+            // Own the key before creating the flow, so the guest's later
+            // segments are routed here; if another shard has it, that shard
+            // gets the guest's next SYN instead.
+            if !self.claim_flow(&key) {
+                return;
+            }
             // At capacity (or socket setup failed): refuse with a RST so the
             // guest's connect() fails fast instead of retrying for ~minutes.
-            if self.tcp.len() >= MAX_TCP_FLOWS || self.new_tcp_flow(key).is_none() {
+            if self.flows.tcp.load(Ordering::Relaxed) >= MAX_TCP_FLOWS
+                || self.new_tcp_flow(key).is_none()
+            {
                 build_tcp_rst_for_syn_into(
                     &mut self.l3_scratch,
                     ip.src,
@@ -1688,6 +1850,7 @@ impl NatState {
                     tcp.seq,
                 );
                 self.wrap_and_inject(ip.dst, ip.src, IP_PROTO_TCP);
+                self.release_flow(&key);
                 return;
             }
         }
@@ -1800,20 +1963,48 @@ impl NatState {
                 csum_offload,
             },
         );
+        self.flows.tcp.fetch_add(1, Ordering::Relaxed);
         Some(())
     }
 
-    /// Pick a free gateway-side ephemeral port for an inbound flow such that
-    /// the resulting FlowKey is unique. Returns None if none found.
+    /// Pick a free gateway-side ephemeral port for an inbound flow and claim
+    /// the resulting key for this shard, so the guest's replies are routed
+    /// here. Returns None if none found.
     fn alloc_ephem_port(&mut self, guest_ip: [u8; 4], guest_port: u16) -> Option<u16> {
         for _ in 0..64 {
             let p = 49152u16 + (self.next_iss() % 16384) as u16;
             let key = (guest_ip, guest_port, self.gw_ip, p);
-            if !self.tcp.contains_key(&key) {
+            if !self.tcp.contains_key(&key) && self.claim_flow(&key) {
                 return Some(p);
             }
         }
         None
+    }
+
+    /// Claim `key` for this shard in the flow router (only multi-shard NATs
+    /// route by it); false if another shard owns it.
+    fn claim_flow(&self, key: &FlowKey) -> bool {
+        self.shards == 1 || self.router.claim(key, self.shard)
+    }
+
+    /// Drop this shard's flow-router entry for a flow it no longer has.
+    fn release_flow(&self, key: &FlowKey) {
+        if self.shards > 1 {
+            self.router.release(key, self.shard);
+        }
+    }
+
+    /// After handling a guest frame: a SYN routed here that left no flow (it
+    /// was malformed or refused, or another shard owns its key) must not keep
+    /// a router entry, or the table would grow with every such SYN.
+    fn settle_route(&self, frame: &[u8]) {
+        if self.shards > 1 {
+            if let (_, Some((key, true))) = shard_of_frame(frame, self.shards) {
+                if !self.tcp.contains_key(&key) {
+                    self.router.release(&key, self.shard);
+                }
+            }
+        }
     }
 
     /// Create an inbound (port-forwarded) flow: the host already accepted a
@@ -1822,7 +2013,7 @@ impl NatState {
     /// from an outbound flow are tcb.connect() (vs listen) and that the host
     /// socket is already connected.
     fn new_inbound_flow(&mut self, host_sock: SOCKET, guest_ip: [u8; 4], guest_port: u16) {
-        if self.tcp.len() >= MAX_TCP_FLOWS {
+        if self.flows.tcp.load(Ordering::Relaxed) >= MAX_TCP_FLOWS {
             sys::close_sock(host_sock);
             return;
         }
@@ -1856,11 +2047,13 @@ impl NatState {
         if tcb.connect().is_err() {
             // active open: emits a SYN toward the guest
             self.tcb_pools[tier].release(tcb);
+            self.release_flow(&key);
             sys::close_sock(host_sock);
             return;
         }
         if !sys::associate(self.iocp, host_sock, KEY_TCP) {
             self.tcb_pools[tier].release(tcb);
+            self.release_flow(&key);
             sys::close_sock(host_sock);
             return;
         }
@@ -1903,6 +2096,7 @@ impl NatState {
                 csum_offload,
             },
         );
+        self.flows.tcp.fetch_add(1, Ordering::Relaxed);
         // Emit the SYN toward the guest and arm the host receive.
         self.tcp_drive(key);
     }
@@ -2223,6 +2417,8 @@ impl NatState {
             .unwrap_or(false);
         if reap {
             if let Some(mut f) = self.tcp.remove(&key) {
+                self.flows.tcp.fetch_sub(1, Ordering::Relaxed);
+                self.release_flow(&key);
                 // The socket was already closed by begin_teardown and all ops
                 // have drained, so recycle the pooled Tcb (into its size-tier)
                 // and the overlapped op buffers via take(); TcpFlow::drop then
@@ -2338,9 +2534,16 @@ impl NatState {
     }
 }
 
-pub struct NatBackend {
+/// One worker thread and the IOCP its flows' sockets complete to.
+struct Shard {
     iocp: Iocp,
     worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+pub struct NatBackend {
+    /// Empty when the NAT could not start (no IOCP).
+    shards: Vec<Shard>,
+    router: Arc<FlowRouter>,
     icmp: Option<Arc<IcmpPool>>,
     icmp_workers: Mutex<Vec<JoinHandle<()>>>,
     listeners: Mutex<Vec<SOCKET>>,
@@ -2356,31 +2559,31 @@ impl NatBackend {
         let pool = Arc::new(FramePool::new(POOL_SLOTS));
         let big_pool = Arc::new(FramePool::new(BIG_POOL_SLOTS));
         let stats = Arc::new(NatStats::default());
-        let iocp = match sys::create_iocp() {
-            Some(i) => i,
-            None => {
-                eprintln!("[nat] CreateIoCompletionPort failed; NAT disabled");
-                return Arc::new(NatBackend {
-                    iocp: Iocp(std::ptr::null_mut()),
-                    worker: Mutex::new(None),
-                    icmp: None,
-                    icmp_workers: Mutex::new(Vec::new()),
-                    listeners: Mutex::new(Vec::new()),
-                    listener_threads: Mutex::new(Vec::new()),
-                    pool,
-                    big_pool,
-                    stats,
-                });
-            }
+        let n = opts.workers.clamp(1, MAX_WORKERS);
+        let iocps: Option<Vec<Iocp>> = (0..n).map(|_| sys::create_iocp()).collect();
+        let Some(iocps) = iocps else {
+            eprintln!("[nat] CreateIoCompletionPort failed; NAT disabled");
+            return Arc::new(NatBackend {
+                shards: Vec::new(),
+                router: Arc::new(FlowRouter::new(1)),
+                icmp: None,
+                icmp_workers: Mutex::new(Vec::new()),
+                listeners: Mutex::new(Vec::new()),
+                listener_threads: Mutex::new(Vec::new()),
+                pool,
+                big_pool,
+                stats,
+            });
         };
         // Cross-thread message pools: producer threads (listeners / ICMP
-        // workers) acquire+fill, the NAT worker releases. Warmed lightly; they
+        // workers) acquire+fill, the NAT workers release. Warmed lightly; they
         // grow on demand and recycle, so steady state is allocation-free.
         let accept_pool = Arc::new(SyncBoxPool::new(32, make_accept_msg));
         let accept_inflight = Arc::new(AtomicUsize::new(0));
         let icmp_reply_pool = Arc::new(SyncBoxPool::new(MAX_ICMP_INFLIGHT, make_icmp_reply));
         // Precreate the ICMP echo worker pool (blocking IcmpSendEcho threads).
-        let icmp = Arc::new(IcmpPool::new(iocp, icmp_reply_pool.clone()));
+        // ICMP is handled by the first shard, so replies complete there.
+        let icmp = Arc::new(IcmpPool::new(iocps[0], icmp_reply_pool.clone()));
         let mut icmp_workers = Vec::with_capacity(ICMP_WORKERS);
         for i in 0..ICMP_WORKERS {
             let pool = icmp.clone();
@@ -2393,8 +2596,8 @@ impl NatBackend {
         }
         // Start a listener (+ accept thread) for each port-forward rule. The
         // accept thread blocks in accept() and hands each connected client to
-        // the worker via the IOCP (KEY_ACCEPT); closing the listener socket on
-        // shutdown unblocks it.
+        // a worker via its IOCP (KEY_ACCEPT), round-robin; closing the
+        // listener socket on shutdown unblocks it.
         let mut listeners = Vec::new();
         let mut listener_threads = Vec::new();
         for pf in &opts.port_forwards {
@@ -2409,24 +2612,19 @@ impl NatBackend {
             let pf = *pf;
             let ap = accept_pool.clone();
             let ai = accept_inflight.clone();
+            let targets = iocps.clone();
             if let Ok(h) = std::thread::Builder::new()
                 .name(format!("nat-listen-{}", pf.host_port))
-                .spawn(move || listener_loop(lsock, iocp, pf, ap, ai))
+                .spawn(move || listener_loop(lsock, &targets, pf, ap, ai))
             {
                 listener_threads.push(h);
             }
         }
-        // Worker-only object pools: one Tcb free-list per compile-time tier,
-        // plus the overlapped op buffers. Built here (heap-buffers keeps each
-        // boxed Tcb small on the stack) and owned solely by the worker thread.
         let default_tier = if opts.default_tier < N_TCB_TIERS {
             opts.default_tier
         } else {
             DEFAULT_TIER
         };
-        let tcb_pools: Vec<BoxPool<dyn TcbDyn>> = (0..N_TCB_TIERS)
-            .map(|i| BoxPool::new(opts.tcb_warm[i], TIER_MAKE[i]))
-            .collect();
         let mut port_tier = HashMap::new();
         for &(port, tier) in &opts.tcb_port_tier {
             if tier < N_TCB_TIERS {
@@ -2437,53 +2635,79 @@ impl NatBackend {
         if !host::random_fill(&mut tcb_secret) {
             panic!("nat: BCryptGenRandom failed (Tcb secret)");
         }
-        let state = NatState {
-            net: Arc::downgrade(net),
-            iocp,
-            gw_ip: opts.gateway_ip,
-            gw_mac: opts.gateway_mac,
-            guest_mac: net.mac(),
-            udp: HashMap::new(),
-            tcp: HashMap::new(),
-            icmp: icmp.clone(),
-            pool: pool.clone(),
-            big_pool: big_pool.clone(),
-            l4_csum_trusted: false,
-            tcb_pools,
-            tcp_op_pool: BoxPool::new(TCP_RECV_OP_WARM, make_tcp_op),
-            tcp_send_op_pool: BoxPool::new(MAX_TCP_FLOWS, make_tcp_send_op),
-            udp_op_pool: BoxPool::new(MAX_UDP_FLOWS, make_udp_op),
-            accept_pool,
-            accept_inflight,
-            icmp_reply_pool,
-            default_tier,
-            port_tier,
-            start: Instant::now(),
-            rng: 0x2545_F491,
-            tcb_secret,
-            last_tick: 0,
-            last_expire: 0,
-            tick_keys: Vec::new(),
-            rx_blocked: Vec::new(),
-            rx_spare: Vec::new(),
-            tx_scratch: Vec::with_capacity(GSO_FRAME_CAP),
-            l3_scratch: Vec::with_capacity(FRAME_CAP),
-            gso: GsoFrame::new(),
-            drain_scratch: vec![0; 16384],
-            wake: Wake::Other,
-            stats: stats.clone(),
-        };
-        // With `heap-buffers` the Tcb rings are boxed, so a Tcb is no longer a
-        // multi-MiB stack temporary; pooled construction above is cheap. The
-        // worker still gets a generous stack for deep packet-processing frames.
-        let handle = std::thread::Builder::new()
-            .name("nat-worker".into())
-            .stack_size(16 * 1024 * 1024)
-            .spawn(move || state.run())
-            .ok();
+        let flows = Arc::new(FlowCounts::default());
+        let router = Arc::new(FlowRouter::new(n));
+        let mut shards = Vec::with_capacity(n);
+        for (s, &iocp) in iocps.iter().enumerate() {
+            // Worker-only object pools: one Tcb free-list per compile-time
+            // tier, plus the overlapped op buffers, warmed with this shard's
+            // share. Built here (heap-buffers keeps each boxed Tcb small on
+            // the stack) and owned solely by the shard's worker.
+            let tcb_pools: Vec<BoxPool<dyn TcbDyn>> = (0..N_TCB_TIERS)
+                .map(|i| BoxPool::new(opts.tcb_warm[i].div_ceil(n), TIER_MAKE[i]))
+                .collect();
+            let state = NatState {
+                net: Arc::downgrade(net),
+                iocp,
+                shard: s,
+                shards: n,
+                router: router.clone(),
+                flows: flows.clone(),
+                gw_ip: opts.gateway_ip,
+                gw_mac: opts.gateway_mac,
+                guest_mac: net.mac(),
+                udp: HashMap::new(),
+                tcp: HashMap::new(),
+                icmp: icmp.clone(),
+                pool: pool.clone(),
+                big_pool: big_pool.clone(),
+                l4_csum_trusted: false,
+                tcb_pools,
+                tcp_op_pool: BoxPool::new(TCP_RECV_OP_WARM.div_ceil(n), make_tcp_op),
+                tcp_send_op_pool: BoxPool::new(MAX_TCP_FLOWS.div_ceil(n), make_tcp_send_op),
+                udp_op_pool: BoxPool::new(MAX_UDP_FLOWS.div_ceil(n), make_udp_op),
+                accept_pool: accept_pool.clone(),
+                accept_inflight: accept_inflight.clone(),
+                icmp_reply_pool: icmp_reply_pool.clone(),
+                default_tier,
+                port_tier: port_tier.clone(),
+                start: Instant::now(),
+                // Distinct non-zero xorshift seeds per shard.
+                rng: 0x2545_F491 ^ (s as u32).wrapping_mul(0x9E37_79B9),
+                tcb_secret,
+                last_tick: 0,
+                last_expire: 0,
+                tick_keys: Vec::new(),
+                rx_blocked: Vec::new(),
+                rx_spare: Vec::new(),
+                tx_scratch: Vec::with_capacity(GSO_FRAME_CAP),
+                l3_scratch: Vec::with_capacity(FRAME_CAP),
+                gso: GsoFrame::new(),
+                drain_scratch: vec![0; 16384],
+                wake: Wake::Other,
+                stats: stats.clone(),
+            };
+            // With `heap-buffers` the Tcb rings are boxed, so a Tcb is no
+            // longer a multi-MiB stack temporary; pooled construction above is
+            // cheap. Workers still get a generous stack for deep frames.
+            let name = if n == 1 {
+                "nat-worker".to_string()
+            } else {
+                format!("nat-worker-{s}")
+            };
+            let handle = std::thread::Builder::new()
+                .name(name)
+                .stack_size(16 * 1024 * 1024)
+                .spawn(move || state.run())
+                .ok();
+            shards.push(Shard {
+                iocp,
+                worker: Mutex::new(handle),
+            });
+        }
         Arc::new(NatBackend {
-            iocp,
-            worker: Mutex::new(handle),
+            shards,
+            router,
             icmp: Some(icmp),
             icmp_workers: Mutex::new(icmp_workers),
             listeners: Mutex::new(listeners),
@@ -2495,14 +2719,16 @@ impl NatBackend {
     }
 }
 
-/// Accept loop for one port-forward listener; runs on its own thread.
+/// Accept loop for one port-forward listener; runs on its own thread. Hands
+/// accepted clients to the workers in turn (`iocps`, one per shard).
 fn listener_loop(
     lsock: SOCKET,
-    iocp: Iocp,
+    iocps: &[Iocp],
     pf: PortForward,
     accept_pool: Arc<SyncBoxPool<AcceptMsg>>,
     accept_inflight: Arc<AtomicUsize>,
 ) {
+    let mut next = 0usize;
     loop {
         let c = sys::accept_one(lsock);
         if c == INVALID_SOCKET {
@@ -2510,7 +2736,7 @@ fn listener_loop(
         }
         // Bound accepted-but-undrained connections: a remote accept-flood is
         // dropped here (the client can retry) rather than piling up host sockets
-        // and AcceptMsg boxes faster than the single worker drains them.
+        // and AcceptMsg boxes faster than the workers drain them.
         if accept_inflight.load(Ordering::Acquire) >= MAX_ACCEPT_INFLIGHT {
             sys::close_sock(c);
             continue;
@@ -2521,6 +2747,8 @@ fn listener_loop(
         msg.guest_ip = pf.guest_ip;
         msg.guest_port = pf.guest_port;
         let ptr = Box::into_raw(msg);
+        let iocp = iocps[next % iocps.len()];
+        next = next.wrapping_add(1);
         if !sys::post(iocp, 0, KEY_ACCEPT, ptr as *mut OVERLAPPED) {
             accept_inflight.fetch_sub(1, Ordering::AcqRel);
             accept_pool.release(unsafe { Box::from_raw(ptr) });
@@ -2530,8 +2758,8 @@ fn listener_loop(
 }
 
 impl NatBackend {
-    /// Copy `frame` into a slot of `pool` and post it to the worker under
-    /// `key`. Returns false only if the pool is exhausted.
+    /// Copy `frame` into a slot of `pool` and post it, under `key`, to the
+    /// worker that owns its flow. Returns false only if the pool is exhausted.
     fn post_frame<const CAP: usize>(
         &self,
         pool: &FramePool<CAP>,
@@ -2544,8 +2772,17 @@ impl NatBackend {
         };
         let n = pool.fill(idx, frame);
         let ptr = pool.slot_ptr(idx);
-        if !sys::post(self.iocp, n as u32, key, ptr as *mut OVERLAPPED) {
+        let (hashed, tcp) = shard_of_frame(frame, self.shards.len());
+        let (s, assigned) = match tcp {
+            Some((key, syn)) => self.router.route(&key, syn),
+            None => (hashed, false),
+        };
+        if !sys::post(self.shards[s].iocp, n as u32, key, ptr as *mut OVERLAPPED) {
             pool.release(idx);
+            // The SYN that claimed a shard never got there.
+            if let (true, Some((flow, _))) = (assigned, tcp) {
+                self.router.release(&flow, s);
+            }
         }
         true
     }
@@ -2561,7 +2798,7 @@ impl NatBackend {
 
 impl NetBackend for NatBackend {
     fn on_guest_frame(&self, frame: &[u8]) {
-        if self.iocp.0.is_null() || frame.is_empty() || frame.len() > FRAME_CAP {
+        if self.shards.is_empty() || frame.is_empty() || frame.len() > FRAME_CAP {
             return;
         }
         // If the pool is exhausted, drop the frame (the guest will retransmit).
@@ -2577,7 +2814,7 @@ impl NetBackend for NatBackend {
     /// forwarded). So offloaded frames are handed over as-is — no per-MSS
     /// segmentation and no 64 KiB checksum pass on the vCPU thread.
     fn on_guest_frame_offload(&self, frame: &mut [u8], hdr: &TxHeader) {
-        if self.iocp.0.is_null() || frame.is_empty() {
+        if self.shards.is_empty() || frame.is_empty() {
             return;
         }
         let posted = if frame.len() <= FRAME_CAP {
@@ -2595,9 +2832,10 @@ impl NetBackend for NatBackend {
         Some(self.stats.summary())
     }
 
+    /// The NIC's RX backlog drained: every worker resumes the flows it paused.
     fn on_rx_space(&self) {
-        if !self.iocp.0.is_null() {
-            sys::post(self.iocp, 0, KEY_RX_SPACE, std::ptr::null_mut());
+        for s in &self.shards {
+            sys::post(s.iocp, 0, KEY_RX_SPACE, std::ptr::null_mut());
         }
     }
 
@@ -2618,11 +2856,13 @@ impl NetBackend for NatBackend {
             icmp.stop();
         }
         self.icmp_workers.lock().unwrap().clear();
-        if !self.iocp.0.is_null() {
-            sys::post(self.iocp, 0, KEY_STOP, std::ptr::null_mut());
+        for s in &self.shards {
+            sys::post(s.iocp, 0, KEY_STOP, std::ptr::null_mut());
         }
-        if let Some(h) = self.worker.lock().unwrap().take() {
-            let _ = h.join();
+        for s in &self.shards {
+            if let Some(h) = s.worker.lock().unwrap().take() {
+                let _ = h.join();
+            }
         }
     }
 }
@@ -2630,6 +2870,79 @@ impl NetBackend for NatBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Guest frames without a routed flow go to the shard of their key's hash
+    /// (spread over the shards), anything but unfragmented TCP/UDP to shard 0,
+    /// and a TCP flow's SYN assigns it to the shard with the fewest flows,
+    /// which its later frames follow until the flow is released.
+    #[test]
+    fn frames_route_to_the_shard_that_owns_their_flow() {
+        use crate::net::wire::{build_eth, build_ipv4, build_tcp};
+        let guest = [10, 0, 0, 2];
+        let host = [93, 184, 216, 34];
+        let frame = |sport: u16, flags: u8, frag: bool| {
+            let tcp = build_tcp(guest, host, sport, 443, 1, 0, flags, 512);
+            let mut ip = build_ipv4(guest, host, IP_PROTO_TCP, &tcp);
+            if frag {
+                ip[6] |= 0x20; // more fragments
+            }
+            build_eth([2; 6], [4; 6], ETHERTYPE_IPV4, &ip)
+        };
+        for shards in [2usize, 3, 4] {
+            let mut per = vec![0usize; shards];
+            for sport in 40000u16..41000 {
+                let (s, tcp) = shard_of_frame(&frame(sport, TCP_ACK, false), shards);
+                assert_eq!(s, shard_of(&(guest, sport, host, 443), shards));
+                assert_eq!(tcp, Some(((guest, sport, host, 443), false)));
+                per[s] += 1;
+            }
+            assert!(per.iter().all(|&c| c * shards * 2 >= 1000), "{per:?}");
+        }
+        let sport = (40000u16..)
+            .find(|&p| shard_of(&(guest, p, host, 443), 4) != 0)
+            .unwrap();
+        assert_eq!(
+            shard_of_frame(&frame(sport, 0, true), 4),
+            (0, None),
+            "fragment"
+        );
+        let arp = build_eth([0xff; 6], [2; 6], ETHERTYPE_ARP, &[0u8; 28]);
+        assert_eq!(shard_of_frame(&arp, 4), (0, None), "ARP");
+        // A SYN whose IPv4 total length leaves no full TCP header is not a
+        // TCP segment to the worker either: hash-routed, no router state.
+        let mut short = frame(sport, TCP_SYN, false);
+        short[ETH_HDR + 2..ETH_HDR + 4].copy_from_slice(&34u16.to_be_bytes());
+        assert_eq!(shard_of_frame(&short, 4).1, None, "truncated SYN");
+
+        // Eight SYNs spread two per shard over four shards, whatever their
+        // hashes; later segments follow, only the owner can claim or release
+        // a key, and a released flow is routed (and reassigned) afresh.
+        let router = FlowRouter::new(4);
+        let key = |p: u16| (guest, p, host, 443);
+        let owners: Vec<usize> = (0..8).map(|p| router.route(&key(p), true).0).collect();
+        for s in 0..4 {
+            assert_eq!(owners.iter().filter(|&&o| o == s).count(), 2, "{owners:?}");
+        }
+        for (p, &o) in owners.iter().enumerate() {
+            assert_eq!(router.route(&key(p as u16), false), (o, false));
+        }
+        let other = (owners[0] + 1) % 4;
+        assert!(router.claim(&key(0), owners[0]), "the owner's own key");
+        assert!(!router.claim(&key(0), other), "another shard's key");
+        router.release(&key(0), other);
+        assert_eq!(
+            router.route(&key(0), false),
+            (owners[0], false),
+            "not the owner"
+        );
+        router.release(&key(0), owners[0]);
+        assert_eq!(router.route(&key(0), false).0, shard_of(&key(0), 4));
+        assert_eq!(
+            router.route(&key(0), true),
+            (owners[0], true),
+            "the emptied shard"
+        );
+    }
 
     /// Move every datagram `from` has staged into `to`.
     fn shuttle(from: &mut dyn TcbDyn, to: &mut dyn TcbDyn) {

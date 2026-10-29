@@ -26,7 +26,7 @@ Usage:
   python tools\\net_compare.py
     [--vmm tinyvmm,openvmm-vpci,openvmm-pcie]  VMM configs (default all)
     [--iterations 1]             full boots per VMM (results aggregated)
-    [--tinyvmm <exe>] [--openvmm <exe>]
+    [--tinyvmm <exe>] [--openvmm <exe>] [--tinyvmm-arg=<arg>]...
     [--vmlinux <path>] [--initrd <path>] [--no-build]
     [--vcpus 1] [--ram-mb 1024]
     [--size-mib 256] [--runs 3] [--rr 200] [--par 4] [--ping 200]
@@ -299,6 +299,7 @@ def vmm_argv(name: str, a: argparse.Namespace, host: str, port: int) -> list[str
     if name == "tinyvmm":
         return [str(a.tinyvmm), "--pvh-run", "--ram-mb", str(a.ram_mb),
                 "--vcpus", str(a.vcpus), "--net", "--net-backend", "nat",
+                *a.tinyvmm_arg,
                 "--initrd", str(a.initrd), "--watchdog-secs", str(a.timeout_sec),
                 str(a.vmlinux), "--", guest_cmdline(a, host, port, "hvc0")]
     if name.startswith("openvmm"):
@@ -546,6 +547,9 @@ def main() -> int:
     ap.add_argument("--vmm", default="tinyvmm,openvmm-vpci,openvmm-pcie")
     ap.add_argument("--iterations", type=int, default=1)
     ap.add_argument("--tinyvmm", type=Path, default=DEFAULT_TINYVMM)
+    ap.add_argument("--tinyvmm-arg", action="append", default=[],
+                    help="extra tinyvmm argument after its NIC flags, e.g. "
+                         "--tinyvmm-arg=--nat-workers --tinyvmm-arg=2 (repeatable)")
     ap.add_argument("--openvmm", type=Path, default=DEFAULT_OPENVMM)
     ap.add_argument("--vmlinux", type=Path, default=DEFAULT_VMLINUX)
     ap.add_argument("--initrd", type=Path, default=DEFAULT_INITRD)
