@@ -11,16 +11,23 @@
 //! Callers pass NUL-terminated UTF-16 paths (`&[u16]`); building those (and any
 //! `\\?\` long-path / path-security policy) stays the caller's concern.
 
-use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, GetLastError, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, DeleteFileW,
-    FILE_ATTRIBUTE_DIRECTORY, FILE_BEGIN, FILE_ID_BOTH_DIR_INFO, FileIdBothDirectoryInfo,
-    FileIdBothDirectoryRestartInfo, FindClose, FindFirstFileW, FindNextFileW, FlushFileBuffers,
-    GetDiskFreeSpaceExW, GetFileAttributesW, GetFileInformationByHandle,
-    GetFileInformationByHandleEx, GetFinalPathNameByHandleW, MoveFileExW, ReadFile,
-    RemoveDirectoryW, SetEndOfFile, SetFilePointerEx, SetFileTime, WIN32_FIND_DATAW, WriteFile,
+use windows_sys::Wdk::Storage::FileSystem::{
+    FILE_STAT_LX_INFORMATION, FileStatLxInformation, LX_FILE_METADATA_HAS_GID,
+    LX_FILE_METADATA_HAS_MODE, LX_FILE_METADATA_HAS_UID, NtQueryInformationFile, NtSetEaFile,
 };
-use windows_sys::Win32::System::IO::OVERLAPPED;
+use windows_sys::Win32::Foundation::{
+    CloseHandle, FILETIME, GetLastError, INVALID_HANDLE_VALUE, RtlNtStatusToDosError,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, CREATE_ALWAYS, CREATE_NEW, CreateDirectoryW, CreateFileW,
+    DeleteFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_BEGIN, FILE_ID_BOTH_DIR_INFO,
+    FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, FindClose, FindFirstFileW,
+    FindNextFileW, FlushFileBuffers, GetDiskFreeSpaceExW, GetFileAttributesW,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
+    MoveFileExW, OPEN_ALWAYS, ReadFile, RemoveDirectoryW, SetEndOfFile, SetFilePointerEx,
+    SetFileTime, WIN32_FIND_DATAW, WriteFile,
+};
+use windows_sys::Win32::System::IO::{IO_STATUS_BLOCK, OVERLAPPED};
 use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
 
 pub use windows_sys::Win32::Foundation::HANDLE;
@@ -28,6 +35,7 @@ pub use windows_sys::Win32::Foundation::HANDLE;
 const ERROR_HANDLE_EOF: u32 = 38;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_NO_MORE_FILES: u32 = 18;
+const ERROR_ALREADY_EXISTS: u32 = 183;
 
 /// A neutral snapshot of `BY_HANDLE_FILE_INFORMATION`; all fields are plain
 /// integers so no windows-sys type crosses the crate boundary. Timestamps are
@@ -65,6 +73,18 @@ pub fn create_file(
     disposition: u32,
     flags: u32,
 ) -> Result<HANDLE, u32> {
+    create_file_ex(path, access, share, disposition, flags).map(|(h, _)| h)
+}
+
+/// [`create_file`] that also says whether this call created the file, as
+/// opposed to opening one that already existed.
+pub fn create_file_ex(
+    path: &[u16],
+    access: u32,
+    share: u32,
+    disposition: u32,
+    flags: u32,
+) -> Result<(HANDLE, bool), u32> {
     let h = unsafe {
         CreateFileW(
             path.as_ptr(),
@@ -76,11 +96,18 @@ pub fn create_file(
             core::ptr::null_mut(),
         )
     };
+    let err = unsafe { GetLastError() };
     if h == INVALID_HANDLE_VALUE {
-        Err(unsafe { GetLastError() })
-    } else {
-        Ok(h)
+        return Err(err);
     }
+    // OPEN_ALWAYS / CREATE_ALWAYS report an existing file through the last
+    // error; CREATE_NEW only succeeds by creating, the others never create.
+    let created = match disposition {
+        CREATE_NEW => true,
+        OPEN_ALWAYS | CREATE_ALWAYS => err != ERROR_ALREADY_EXISTS,
+        _ => false,
+    };
+    Ok((h, created))
 }
 
 /// `CloseHandle` (errors ignored). No-op on null / `INVALID_HANDLE_VALUE`.
@@ -131,6 +158,92 @@ pub fn file_info(h: HANDLE) -> Result<FileInfo, u32> {
         creation_ticks: ft_to_ticks(&info.ftCreationTime),
         last_access_ticks: ft_to_ticks(&info.ftLastAccessTime),
         last_write_ticks: ft_to_ticks(&info.ftLastWriteTime),
+    })
+}
+
+/// A file's WSL Linux metadata: the `$LXUID` / `$LXGID` / `$LXMOD` NTFS
+/// extended attributes that WSL's drvfs `metadata` mount option reads and
+/// writes. A field is `None` when the file doesn't carry that attribute.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LxMetadata {
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    /// The full `st_mode`, file type included (e.g. `0o100644`).
+    pub mode: Option<u32>,
+}
+
+#[inline]
+fn nt_result(status: i32) -> Result<(), u32> {
+    if status < 0 {
+        Err(unsafe { RtlNtStatusToDosError(status) })
+    } else {
+        Ok(())
+    }
+}
+
+/// Read a file's [`LxMetadata`] with `NtQueryInformationFile(FileStatLxInformation)`,
+/// which has NTFS decode the `$LX*` attributes itself.
+pub fn lx_metadata(h: HANDLE) -> Result<LxMetadata, u32> {
+    let mut info: FILE_STAT_LX_INFORMATION = unsafe { core::mem::zeroed() };
+    let mut iosb: IO_STATUS_BLOCK = unsafe { core::mem::zeroed() };
+    nt_result(unsafe {
+        NtQueryInformationFile(
+            h,
+            &mut iosb,
+            &mut info as *mut FILE_STAT_LX_INFORMATION as *mut core::ffi::c_void,
+            core::mem::size_of::<FILE_STAT_LX_INFORMATION>() as u32,
+            FileStatLxInformation,
+        )
+    })?;
+    let has = |flag: u32| info.LxFlags & flag != 0;
+    Ok(LxMetadata {
+        uid: has(LX_FILE_METADATA_HAS_UID).then_some(info.LxUid),
+        gid: has(LX_FILE_METADATA_HAS_GID).then_some(info.LxGid),
+        mode: has(LX_FILE_METADATA_HAS_MODE).then_some(info.LxMode),
+    })
+}
+
+/// Write the `Some` fields of `md` as WSL's `$LXUID` / `$LXGID` / `$LXMOD`
+/// extended attributes (each a little-endian u32) with `NtSetEaFile`, leaving
+/// the others untouched. Needs a handle opened with `FILE_WRITE_EA`.
+pub fn set_lx_metadata(h: HANDLE, md: LxMetadata) -> Result<(), u32> {
+    let fields: Vec<(&str, u32)> = [("$LXUID", md.uid), ("$LXGID", md.gid), ("$LXMOD", md.mode)]
+        .into_iter()
+        .filter_map(|(name, v)| v.map(|v| (name, v)))
+        .collect();
+    if fields.is_empty() {
+        return Ok(());
+    }
+    // A chain of FILE_FULL_EA_INFORMATION entries, each 4-byte aligned:
+    // NextEntryOffset u32, Flags u8, EaNameLength u8, EaValueLength u16,
+    // the name + NUL, then the value.
+    let mut bytes = Vec::new();
+    for (i, (name, value)) in fields.iter().enumerate() {
+        let entry_len = (8 + name.len() + 1 + 4).next_multiple_of(4);
+        let next = if i + 1 < fields.len() { entry_len } else { 0 };
+        let start = bytes.len();
+        bytes.extend_from_slice(&(next as u32).to_le_bytes());
+        bytes.push(0);
+        bytes.push(name.len() as u8);
+        bytes.extend_from_slice(&4u16.to_le_bytes());
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&value.to_le_bytes());
+        bytes.resize(start + entry_len, 0);
+    }
+    // The kernel checks the entries' alignment, so hand it u32-aligned memory.
+    let mut buf = vec![0u32; bytes.len() / 4];
+    for (word, chunk) in buf.iter_mut().zip(bytes.chunks_exact(4)) {
+        *word = u32::from_le_bytes(chunk.try_into().unwrap());
+    }
+    let mut iosb: IO_STATUS_BLOCK = unsafe { core::mem::zeroed() };
+    nt_result(unsafe {
+        NtSetEaFile(
+            h,
+            &mut iosb,
+            buf.as_ptr() as *const core::ffi::c_void,
+            bytes.len() as u32,
+        )
     })
 }
 
@@ -440,5 +553,63 @@ impl Drop for ReadDir {
         if self.handle != INVALID_HANDLE_VALUE {
             unsafe { FindClose(self.handle) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, FILE_READ_ATTRIBUTES, FILE_READ_EA,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_EA, OPEN_EXISTING,
+    };
+
+    const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+
+    fn wide(p: &std::path::Path) -> Vec<u16> {
+        use std::os::windows::ffi::OsStrExt;
+        p.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+
+    /// What we write must be what WSL writes: NTFS's own `FileStatLxInformation`
+    /// decoder of the `$LX*` attributes has to read it back, field by field.
+    #[test]
+    fn lx_metadata_round_trips_through_ntfs() {
+        let path = std::env::temp_dir().join(format!("winsys_lx_{}", std::process::id()));
+        let w = wide(&path);
+        let access = FILE_WRITE_EA | FILE_READ_EA | FILE_READ_ATTRIBUTES;
+        let h = create_file(&w, access, SHARE_ALL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL).unwrap();
+        assert_eq!(lx_metadata(h), Ok(LxMetadata::default()));
+        let all = LxMetadata {
+            uid: Some(1000),
+            gid: Some(1001),
+            mode: Some(0o100754),
+        };
+        set_lx_metadata(h, all).unwrap();
+        let mode_only = LxMetadata {
+            mode: Some(0o100640),
+            ..Default::default()
+        };
+        set_lx_metadata(h, mode_only).unwrap();
+        close(h);
+
+        let h = create_file(
+            &w,
+            FILE_READ_ATTRIBUTES | FILE_READ_EA,
+            SHARE_ALL,
+            OPEN_EXISTING,
+            0,
+        )
+        .unwrap();
+        let got = lx_metadata(h);
+        close(h);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            got,
+            Ok(LxMetadata {
+                mode: Some(0o100640),
+                ..all
+            })
+        );
     }
 }

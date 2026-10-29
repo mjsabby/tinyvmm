@@ -19,7 +19,14 @@
 //! share's configured `uid`/`gid` (default 0, root) and a synthesized mode
 //! (dirs 0755, files 0644, or 0444 when read-only on the host). The guest
 //! enforces those bits itself, so only that owner (or root) can write. chmod
-//! and chown are accepted but not stored.
+//! and chown are accepted but not stored, unless the share has `metadata`.
+//!
+//! Metadata (opt-in, like WSL's drvfs `metadata` mount option): owner, group
+//! and permission bits live in WSL's `$LXUID`/`$LXGID`/`$LXMOD` NTFS extended
+//! attributes. chmod/chown write them, a new file records its creator (the
+//! attaching user's `n_uname`), its `gid` and its mode, and getattr prefers
+//! them over the defaults above, so the guest and WSL see the same owners and
+//! permissions. The file type always comes from the host.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -117,6 +124,7 @@ const E_NAMETOOLONG: u32 = 36;
 const E_NOSYS: u32 = 38;
 const E_NOTEMPTY: u32 = 39;
 const E_PROTO: u32 = 71;
+const E_OPNOTSUPP: u32 = 95;
 
 // 9P2000.L open flags (== Linux x86_64 <fcntl.h>).
 const O_ACCMODE: u32 = 0x0003;
@@ -129,6 +137,9 @@ const O_APPEND: u32 = 0x0400;
 const O_DIRECTORY: u32 = 0x10000;
 
 // Tsetattr valid bits.
+const SETATTR_MODE: u32 = 0x0000_0001;
+const SETATTR_UID: u32 = 0x0000_0002;
+const SETATTR_GID: u32 = 0x0000_0004;
 const SETATTR_SIZE: u32 = 0x0000_0008;
 const SETATTR_ATIME: u32 = 0x0000_0010;
 const SETATTR_MTIME: u32 = 0x0000_0020;
@@ -141,8 +152,12 @@ const AT_REMOVEDIR: u32 = 0x200;
 // Linux dirent d_type + mode bits.
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
+const S_IFMT: u32 = 0o170000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
+const PERM_BITS: u32 = 0o7777;
+// Tattach's n_uname when the client names no numeric user.
+const NONUNAME: u32 = u32::MAX;
 
 const V9FS_MAGIC: u32 = 0x0102_1997;
 const FILETIME_BIAS_TO_1970: u64 = 116_444_736_000_000_000;
@@ -155,6 +170,8 @@ const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const FILE_LIST_DIRECTORY: u32 = 0x0001;
 const FILE_APPEND_DATA: u32 = 0x0004;
+const FILE_READ_EA: u32 = 0x0008;
+const FILE_WRITE_EA: u32 = 0x0010;
 const FILE_READ_ATTRIBUTES: u32 = 0x0080;
 const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
 const FILE_SHARE_RWD: u32 = 0x0000_0007; // READ | WRITE | DELETE
@@ -194,8 +211,20 @@ const ERROR_NOT_SUPPORTED: u32 = 50;
 const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_TOO_MANY_OPEN_FILES: u32 = 4;
 const ERROR_NEGATIVE_SEEK: u32 = 131;
+const ERROR_EAS_NOT_SUPPORTED: u32 = 282;
 
 pub type IrqFn = Box<dyn Fn(u32) + Send + Sync>;
+
+/// Per-share policy from the `--virtio-9p-share` options.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ShareOptions {
+    pub readonly: bool,
+    /// Owner reported for entries without WSL metadata (see the module docs).
+    pub uid: u32,
+    pub gid: u32,
+    /// Read and write WSL's `$LXUID`/`$LXGID`/`$LXMOD` metadata.
+    pub metadata: bool,
+}
 
 // ============================================================
 // Wire encoders
@@ -307,6 +336,7 @@ fn errno_from_win32(e: u32) -> u32 {
         ERROR_TOO_MANY_OPEN_FILES => E_MFILE,
         ERROR_WRITE_PROTECT => E_ROFS,
         ERROR_NOT_SUPPORTED => E_NOSYS,
+        ERROR_EAS_NOT_SUPPORTED => E_OPNOTSUPP,
         ERROR_DIRECTORY => E_NOTDIR,
         ERROR_NOT_READY | ERROR_OPERATION_ABORTED | ERROR_BROKEN_PIPE => E_IO,
         _ => E_IO,
@@ -460,6 +490,9 @@ struct FidEntry {
     host_path: PathBuf,
     is_dir: bool,
     qid_path: u64,
+    /// The attaching user's uid (Tattach `n_uname`), recorded as the owner of
+    /// files this fid creates on a `metadata` share.
+    uid: u32,
     /// `None` = not open. Shared so in-flight I/O keeps the handle alive past a
     /// concurrent clunk/remove/rename (see [`OwnedHandle`]).
     handle: Option<Arc<OwnedHandle>>,
@@ -470,11 +503,12 @@ struct FidEntry {
 }
 
 impl FidEntry {
-    fn new(host_path: PathBuf, is_dir: bool, qid_path: u64) -> FidEntry {
+    fn new(host_path: PathBuf, is_dir: bool, qid_path: u64, uid: u32) -> FidEntry {
         FidEntry {
             host_path,
             is_dir,
             qid_path,
+            uid,
             handle: None,
             opened: false,
             open_flags: 0,
@@ -594,9 +628,10 @@ pub struct P9Device {
     tag: String,
     host_root: PathBuf,
     readonly: bool,
-    // Owner reported for every entry (see the module docs).
+    // Owner reported for entries without metadata (see the module docs).
     uid: u32,
     gid: u32,
+    metadata: bool,
     share_root_norm: Vec<u16>,
     config_bytes: Vec<u8>,
     driver_ok: AtomicBool,
@@ -617,9 +652,7 @@ impl P9Device {
         _mem: Arc<GuestMemory>,
         tag: String,
         host_root: PathBuf,
-        readonly: bool,
-        uid: u32,
-        gid: u32,
+        opts: ShareOptions,
     ) -> Arc<Self> {
         let share_root_norm = normalize_for_containment(&host_root);
         let mut config_bytes = Vec::with_capacity(2 + tag.len());
@@ -631,9 +664,10 @@ impl P9Device {
             queue: Mutex::new(Virtqueue::new(_mem, P9_QUEUE_MAX)),
             tag,
             host_root,
-            readonly,
-            uid,
-            gid,
+            readonly: opts.readonly,
+            uid: opts.uid,
+            gid: opts.gid,
+            metadata: opts.metadata,
             share_root_norm,
             config_bytes,
             driver_ok: AtomicBool::new(false),
@@ -752,10 +786,16 @@ impl P9Device {
     // `OPEN_REPARSE_POINT` on the single new component) — that's the B1 fix
     // and the perf fix in one, left as follow-up.
     fn open_for_attrs(&self, p: &Path) -> Result<HANDLE, u32> {
+        self.open_contained(p, FILE_READ_ATTRIBUTES)
+    }
+
+    /// Open `p` (file or directory) with `access`, refusing a handle that
+    /// resolved outside the share.
+    fn open_contained(&self, p: &Path, access: u32) -> Result<HANDLE, u32> {
         let w = to_win32_long_path(p);
         let h = fs::create_file(
             &w,
-            FILE_READ_ATTRIBUTES,
+            access,
             FILE_SHARE_RWD,
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS,
@@ -767,6 +807,46 @@ impl P9Device {
             return Err(ERROR_ACCESS_DENIED);
         }
         Ok(h)
+    }
+
+    /// [`Self::open_for_attrs`], plus FILE_READ_EA on a `metadata` share so
+    /// [`Self::lx_metadata`] can read through the same handle.
+    fn open_for_getattr(&self, p: &Path) -> Result<HANDLE, u32> {
+        if self.metadata
+            && let Ok(h) = self.open_contained(p, FILE_READ_ATTRIBUTES | FILE_READ_EA)
+        {
+            return Ok(h);
+        }
+        self.open_for_attrs(p)
+    }
+
+    /// The WSL metadata of `path`, read through `h` or, if `h` lacks
+    /// FILE_READ_EA, through a fresh handle. Empty unless the share has
+    /// `metadata`, or when the file system keeps none.
+    fn lx_metadata(&self, h: HANDLE, path: &Path) -> fs::LxMetadata {
+        if !self.metadata {
+            return fs::LxMetadata::default();
+        }
+        match fs::lx_metadata(h) {
+            Ok(md) => md,
+            Err(ERROR_ACCESS_DENIED) => match self.open_contained(path, FILE_READ_EA) {
+                Ok(h2) => {
+                    let md = fs::lx_metadata(h2).unwrap_or_default();
+                    fs::close(h2);
+                    md
+                }
+                Err(_) => fs::LxMetadata::default(),
+            },
+            Err(_) => fs::LxMetadata::default(),
+        }
+    }
+
+    /// Store the `Some` fields of `md` as `path`'s WSL metadata.
+    fn set_lx_metadata(&self, path: &Path, md: fs::LxMetadata) -> Result<(), u32> {
+        let h = self.open_contained(path, FILE_WRITE_EA)?;
+        let r = fs::set_lx_metadata(h, md);
+        fs::close(h);
+        r
     }
 
     /// Reopen a fid's host handle on restore from its saved (path, is_dir,
@@ -1039,7 +1119,7 @@ impl P9Device {
 
     fn h_attach(&self, tag: u16, body: &[u8], reply: &mut Vec<u8>) {
         let mut d = Dec::new(body);
-        let (Some(fid), Some(afid), Some(_uname), Some(aname), Some(_n_uname)) =
+        let (Some(fid), Some(afid), Some(_uname), Some(aname), Some(n_uname)) =
             (d.u32(), d.u32(), d.string(), d.string(), d.u32())
         else {
             build_rlerror(reply, tag, E_PROTO);
@@ -1071,8 +1151,13 @@ impl P9Device {
                 build_rlerror(reply, tag, E_MFILE);
                 return;
             }
+            let uid = if n_uname == NONUNAME {
+                self.uid
+            } else {
+                n_uname
+            };
             f.map
-                .insert(fid, FidEntry::new(self.host_root.clone(), true, qp));
+                .insert(fid, FidEntry::new(self.host_root.clone(), true, qp, uid));
         }
         reply.clear();
         enc4(reply, 0);
@@ -1103,7 +1188,7 @@ impl P9Device {
             }
         }
 
-        let (src_path, src_is_dir, src_qid_path);
+        let (src_path, src_is_dir, src_qid_path, src_uid);
         {
             let f = self.fids.lock().unwrap();
             let Some(src) = f.map.get(&fid) else {
@@ -1117,6 +1202,7 @@ impl P9Device {
             src_path = src.host_path.clone();
             src_is_dir = src.is_dir;
             src_qid_path = src.qid_path;
+            src_uid = src.uid;
             if newfid != fid && f.map.contains_key(&newfid) {
                 build_rlerror(reply, tag, E_INVAL);
                 return;
@@ -1130,11 +1216,10 @@ impl P9Device {
         }
 
         if nwname == 0 {
-            self.fids
-                .lock()
-                .unwrap()
-                .map
-                .insert(newfid, FidEntry::new(src_path, src_is_dir, src_qid_path));
+            self.fids.lock().unwrap().map.insert(
+                newfid,
+                FidEntry::new(src_path, src_is_dir, src_qid_path, src_uid),
+            );
             reply.clear();
             enc4(reply, 0);
             enc1(reply, R_WALK);
@@ -1213,7 +1298,7 @@ impl P9Device {
                 .lock()
                 .unwrap()
                 .map
-                .insert(newfid, FidEntry::new(cur, qt & QT_DIR != 0, qp));
+                .insert(newfid, FidEntry::new(cur, qt & QT_DIR != 0, qp, src_uid));
         }
 
         reply.clear();
@@ -1341,7 +1426,7 @@ impl P9Device {
 
     fn h_lcreate(&self, tag: u16, body: &[u8], reply: &mut Vec<u8>) {
         let mut d = Dec::new(body);
-        let (Some(fid), Some(name), Some(flags), Some(_mode), Some(_gid)) =
+        let (Some(fid), Some(name), Some(flags), Some(mode), Some(gid)) =
             (d.u32(), d.string(), d.u32(), d.u32(), d.u32())
         else {
             build_rlerror(reply, tag, E_PROTO);
@@ -1355,7 +1440,7 @@ impl P9Device {
             build_rlerror(reply, tag, E_INVAL);
             return;
         }
-        let parent_path;
+        let (parent_path, creator);
         {
             let f = self.fids.lock().unwrap();
             let Some(e) = f.map.get(&fid) else {
@@ -1371,6 +1456,7 @@ impl P9Device {
                 return;
             }
             parent_path = e.host_path.clone();
+            creator = e.uid;
         }
         let new_path = join_child(&parent_path, &name);
         if !self.path_contained(&new_path) {
@@ -1396,14 +1482,14 @@ impl P9Device {
             OPEN_ALWAYS
         };
         let wp = to_win32_long_path(&new_path);
-        let h = match fs::create_file(
+        let (h, created) = match fs::create_file_ex(
             &wp,
             access,
             FILE_SHARE_RWD,
             disposition,
             FILE_ATTRIBUTE_NORMAL,
         ) {
-            Ok(h) => h,
+            Ok(v) => v,
             Err(e) => {
                 build_rlerror(reply, tag, errno_from_win32(e));
                 return;
@@ -1415,6 +1501,18 @@ impl P9Device {
             fs::close(h);
             build_rlerror(reply, tag, E_ACCES);
             return;
+        }
+        if self.metadata && created {
+            // Best effort, like the create itself on a file system without
+            // extended attributes: the file just stays without metadata.
+            let _ = self.set_lx_metadata(
+                &new_path,
+                fs::LxMetadata {
+                    uid: Some(creator),
+                    gid: Some(gid),
+                    mode: Some(S_IFREG | (mode & PERM_BITS)),
+                },
+            );
         }
         let mut qp = match fs::file_info(h) {
             Ok(info) => info.file_index,
@@ -1743,7 +1841,7 @@ impl P9Device {
         // concurrent clunk can't close the fid's handle under us.
         let h = match &existing {
             Some(a) if was_open => a.get(),
-            _ => match self.open_for_attrs(&path) {
+            _ => match self.open_for_getattr(&path) {
                 Ok(nh) => {
                     opened_here = nh;
                     nh
@@ -1755,16 +1853,20 @@ impl P9Device {
             },
         };
         let attrs = self.read_attrs_by_handle(h);
+        let md = self.lx_metadata(h, &path);
         if opened_here != INVALID_HANDLE_VALUE {
             fs::close(opened_here);
         }
-        let (qt, qv, qp, mode, nlink, size, blocks, atime, mtime, ctime) = match attrs {
+        let (qt, qv, qp, mut mode, nlink, size, blocks, atime, mtime, ctime) = match attrs {
             Ok(v) => v,
             Err(e) => {
                 build_rlerror(reply, tag, e);
                 return;
             }
         };
+        if let Some(m) = md.mode {
+            mode = (mode & S_IFMT) | (m & PERM_BITS);
+        }
         reply.clear();
         enc4(reply, 0);
         enc1(reply, R_GETATTR);
@@ -1772,8 +1874,8 @@ impl P9Device {
         enc8(reply, STATS_BASIC & request_mask);
         enc_qid(reply, qt, qv, qp);
         enc4(reply, mode);
-        enc4(reply, self.uid);
-        enc4(reply, self.gid);
+        enc4(reply, md.uid.unwrap_or(self.uid));
+        enc4(reply, md.gid.unwrap_or(self.gid));
         enc8(reply, nlink);
         enc8(reply, 0); // rdev
         enc8(reply, size);
@@ -1797,9 +1899,9 @@ impl P9Device {
         let (
             Some(fid),
             Some(valid),
-            Some(_mode),
-            Some(_uid),
-            Some(_gid),
+            Some(mode),
+            Some(uid),
+            Some(gid),
             Some(sz),
             Some(atime_s),
             Some(atime_n),
@@ -1836,6 +1938,19 @@ impl P9Device {
             was_open = e.opened;
             existing = e.handle.clone();
             is_dir = e.is_dir;
+        }
+        // chmod/chown: stored on a `metadata` share, ignored otherwise.
+        if self.metadata && valid & (SETATTR_MODE | SETATTR_UID | SETATTR_GID) != 0 {
+            let file_type = if is_dir { S_IFDIR } else { S_IFREG };
+            let md = fs::LxMetadata {
+                uid: (valid & SETATTR_UID != 0).then_some(uid),
+                gid: (valid & SETATTR_GID != 0).then_some(gid),
+                mode: (valid & SETATTR_MODE != 0).then_some(file_type | (mode & PERM_BITS)),
+            };
+            if let Err(e) = self.set_lx_metadata(&path, md) {
+                build_rlerror(reply, tag, errno_from_win32(e));
+                return;
+            }
         }
         let need_size = valid & SETATTR_SIZE != 0;
         let need_handle = need_size || !was_open || existing.is_none();
@@ -1994,7 +2109,7 @@ impl P9Device {
 
     fn h_mkdir(&self, tag: u16, body: &[u8], reply: &mut Vec<u8>) {
         let mut d = Dec::new(body);
-        let (Some(dfid), Some(name), Some(_mode), Some(_gid)) =
+        let (Some(dfid), Some(name), Some(mode), Some(gid)) =
             (d.u32(), d.string(), d.u32(), d.u32())
         else {
             build_rlerror(reply, tag, E_PROTO);
@@ -2008,7 +2123,7 @@ impl P9Device {
             build_rlerror(reply, tag, E_INVAL);
             return;
         }
-        let parent;
+        let (parent, creator);
         {
             let f = self.fids.lock().unwrap();
             let Some(e) = f.map.get(&dfid) else {
@@ -2020,6 +2135,7 @@ impl P9Device {
                 return;
             }
             parent = e.host_path.clone();
+            creator = e.uid;
         }
         let new_path = join_child(&parent, &name);
         if !self.path_contained(&new_path) {
@@ -2030,6 +2146,16 @@ impl P9Device {
         if let Err(e) = fs::create_dir(&wp) {
             build_rlerror(reply, tag, errno_from_win32(e));
             return;
+        }
+        if self.metadata {
+            let _ = self.set_lx_metadata(
+                &new_path,
+                fs::LxMetadata {
+                    uid: Some(creator),
+                    gid: Some(gid),
+                    mode: Some(S_IFDIR | (mode & PERM_BITS)),
+                },
+            );
         }
         let (qt, qp, _isd) = match self.stat_path_for_fid(&new_path) {
             Ok(v) => v,
@@ -2366,7 +2492,7 @@ impl VirtioDevice for P9Device {
     /// they are reopened from each fid's path on `apply_device_state`.
     fn capture_device_state(&self) -> Vec<u8> {
         let mut b = Vec::new();
-        b.push(1u8); // format version
+        b.push(2u8); // format version (2 added each fid's uid)
         b.push(self.driver_ok.load(Ordering::Relaxed) as u8);
         b.extend_from_slice(&self.acked_features.load(Ordering::Relaxed).to_le_bytes());
         b.extend_from_slice(&self.negotiated_msize.load(Ordering::Relaxed).to_le_bytes());
@@ -2383,6 +2509,7 @@ impl VirtioDevice for P9Device {
             let pb = path.as_bytes();
             b.extend_from_slice(&(pb.len() as u32).to_le_bytes());
             b.extend_from_slice(pb);
+            b.extend_from_slice(&e.uid.to_le_bytes());
         }
         b
     }
@@ -2403,7 +2530,7 @@ impl VirtioDevice for P9Device {
                 s
             }};
         }
-        let _ver = take!(1)[0];
+        let ver = take!(1)[0];
         let drv_ok = take!(1)[0] != 0;
         let acked = u64::from_le_bytes(take!(8).try_into().unwrap());
         let msize = u32::from_le_bytes(take!(4).try_into().unwrap());
@@ -2424,7 +2551,12 @@ impl VirtioDevice for P9Device {
             let plen = u32::from_le_bytes(take!(4).try_into().unwrap()) as usize;
             let pbytes = take!(plen);
             let path = PathBuf::from(String::from_utf8_lossy(pbytes).into_owned());
-            let mut e = FidEntry::new(path.clone(), is_dir, qid);
+            let uid = if ver >= 2 {
+                u32::from_le_bytes(take!(4).try_into().unwrap())
+            } else {
+                self.uid
+            };
+            let mut e = FidEntry::new(path.clone(), is_dir, qid, uid);
             if opened {
                 let h = self.reopen_fid_handle(&path, is_dir, flags);
                 if h.is_null() {
@@ -2489,7 +2621,7 @@ mod tests {
 
         let canon_root = std::fs::canonicalize(&share).unwrap();
         let mem = std::sync::Arc::new(whpsys::memory::GuestMemory::new_host_only(4096).unwrap());
-        let dev = P9Device::new(mem, "test".into(), canon_root, false, 0, 0);
+        let dev = P9Device::new(mem, "test".into(), canon_root, ShareOptions::default());
 
         // A genuine subdir of the share opens fine.
         assert!(
@@ -2526,7 +2658,12 @@ mod tests {
         let root = std::fs::canonicalize(&share).unwrap();
 
         let mem = std::sync::Arc::new(whpsys::memory::GuestMemory::new_host_only(4096).unwrap());
-        let dev = P9Device::new(mem.clone(), "t".into(), root.clone(), false, 0, 0);
+        let dev = P9Device::new(
+            mem.clone(),
+            "t".into(),
+            root.clone(),
+            ShareOptions::default(),
+        );
         dev.driver_ok.store(true, Ordering::Relaxed);
         let feats = dev.device_features();
         dev.acked_features.store(feats, Ordering::Relaxed);
@@ -2538,23 +2675,24 @@ mod tests {
             let hd = dev.reopen_fid_handle(&sub, true, O_RDONLY);
             assert!(!hf.is_null() && !hd.is_null());
             let mut fids = dev.fids.lock().unwrap();
-            let mut ef = FidEntry::new(file, false, 7);
+            let mut ef = FidEntry::new(file, false, 7, 1000);
             ef.handle = Some(Arc::new(OwnedHandle(hf)));
             ef.opened = true;
             ef.open_flags = O_RDONLY;
             fids.map.insert(1, ef);
-            let mut ed = FidEntry::new(sub.clone(), true, 8);
+            let mut ed = FidEntry::new(sub.clone(), true, 8, 0);
             ed.handle = Some(Arc::new(OwnedHandle(hd)));
             ed.opened = true;
             ed.open_flags = O_RDONLY;
             fids.map.insert(2, ed);
             // A walked-but-not-opened fid: path only, no handle.
-            fids.map.insert(3, FidEntry::new(root.clone(), true, 1));
+            fids.map
+                .insert(3, FidEntry::new(root.clone(), true, 1, 1001));
         }
 
         let blob = dev.capture_device_state();
 
-        let dev2 = P9Device::new(mem, "t".into(), root, false, 0, 0);
+        let dev2 = P9Device::new(mem, "t".into(), root, ShareOptions::default());
         dev2.apply_device_state(&blob);
         assert!(dev2.driver_ok.load(Ordering::Relaxed));
         assert_eq!(dev2.acked_features.load(Ordering::Relaxed), feats);
@@ -2568,9 +2706,87 @@ mod tests {
         assert!(f2.is_dir && f2.opened && f2.handle.is_some() && f2.qid_path == 8);
         let f3 = fids.map.get(&3).unwrap();
         assert!(f3.is_dir && !f3.opened && f3.handle.is_none() && f3.qid_path == 1);
+        assert_eq!((f1.uid, f2.uid, f3.uid), (1000, 0, 1001));
         drop(fids);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Send one T-message to `dev` and return its R-message, which must not be
+    /// an Rlerror.
+    fn call(dev: &P9Device, mtype: u8, body: impl Fn(&mut Vec<u8>)) -> Vec<u8> {
+        let mut t = Vec::new();
+        enc4(&mut t, 0);
+        enc1(&mut t, mtype);
+        enc2(&mut t, 1);
+        body(&mut t);
+        finalize(&mut t);
+        let mut reply = Vec::new();
+        dev.dispatch(&t, &mut reply, 8192);
+        assert_eq!(reply[4], mtype + 1, "T-message {mtype} failed: {reply:?}");
+        reply
+    }
+
+    /// Tversion, then Tattach fid 0 to the share root as user `n_uname`.
+    fn connect(dev: &P9Device, n_uname: u32) {
+        call(dev, T_VERSION, |t| {
+            enc4(t, 8192);
+            enc_str(t, "9P2000.L");
+        });
+        call(dev, T_ATTACH, |t| {
+            enc4(t, 0);
+            enc4(t, NO_FID);
+            enc_str(t, "");
+            enc_str(t, "");
+            enc4(t, n_uname);
+        });
+    }
+
+    fn walk(dev: &P9Device, fid: u32, newfid: u32, names: &[&str]) {
+        call(dev, T_WALK, |t| {
+            enc4(t, fid);
+            enc4(t, newfid);
+            enc2(t, names.len() as u16);
+            for name in names {
+                enc_str(t, name);
+            }
+        });
+    }
+
+    /// (mode, uid, gid) from Rgetattr.
+    fn stat(dev: &P9Device, fid: u32) -> (u32, u32, u32) {
+        let r = call(dev, T_GETATTR, |t| {
+            enc4(t, fid);
+            enc8(t, STATS_BASIC);
+        });
+        // size[4] type[1] tag[2] valid[8] qid[13] mode[4] uid[4] gid[4]
+        let word = |o: usize| u32::from_le_bytes(r[o..o + 4].try_into().unwrap());
+        (word(28), word(32), word(36))
+    }
+
+    fn setattr(dev: &P9Device, fid: u32, valid: u32, mode: u32, uid: u32) {
+        call(dev, T_SETATTR, |t| {
+            enc4(t, fid);
+            enc4(t, valid);
+            enc4(t, mode);
+            enc4(t, uid);
+            enc4(t, 0); // gid
+            for _ in 0..5 {
+                enc8(t, 0); // size, atime, mtime
+            }
+        });
+    }
+
+    /// Tlcreate a write-only file: its handle can't read extended attributes,
+    /// so getattr through it must fall back to a fresh handle.
+    fn lcreate(dev: &P9Device, fid: u32, name: &str, mode: u32, gid: u32) {
+        call(dev, T_LCREATE, |t| {
+            enc4(t, fid);
+            enc_str(t, name);
+            enc4(t, O_WRONLY);
+            enc4(t, mode);
+            enc4(t, gid);
+        });
     }
 
     /// Rgetattr must report the share's configured owner for the root and for
@@ -2583,48 +2799,87 @@ mod tests {
         std::fs::write(base.join("file.txt"), b"hello").unwrap();
         let root = std::fs::canonicalize(&base).unwrap();
         let mem = std::sync::Arc::new(whpsys::memory::GuestMemory::new_host_only(4096).unwrap());
-        let dev = P9Device::new(mem, "t".into(), root, false, 1000, 1001);
-
-        let call = |mtype: u8, body: &dyn Fn(&mut Vec<u8>)| -> Vec<u8> {
-            let mut t = Vec::new();
-            enc4(&mut t, 0);
-            enc1(&mut t, mtype);
-            enc2(&mut t, 1);
-            body(&mut t);
-            finalize(&mut t);
-            let mut reply = Vec::new();
-            dev.dispatch(&t, &mut reply, 8192);
-            assert_eq!(reply[4], mtype + 1, "T-message {mtype} failed: {reply:?}");
-            reply
+        let opts = ShareOptions {
+            uid: 1000,
+            gid: 1001,
+            ..Default::default()
         };
-        call(T_VERSION, &|t| {
-            enc4(t, 8192);
-            enc_str(t, "9P2000.L");
-        });
-        call(T_ATTACH, &|t| {
-            enc4(t, 0);
-            enc4(t, NO_FID);
-            enc_str(t, "");
-            enc_str(t, "");
-            enc4(t, 0);
-        });
-        call(T_WALK, &|t| {
-            enc4(t, 0);
-            enc4(t, 1);
-            enc2(t, 1);
-            enc_str(t, "file.txt");
-        });
+        let dev = P9Device::new(mem, "t".into(), root, opts);
+
+        connect(&dev, 0);
+        walk(&dev, 0, 1, &["file.txt"]);
         for fid in [0u32, 1] {
-            let r = call(T_GETATTR, &|t| {
-                enc4(t, fid);
-                enc8(t, STATS_BASIC);
-            });
-            // size[4] type[1] tag[2] valid[8] qid[13] mode[4] uid[4] gid[4]
-            let uid = u32::from_le_bytes(r[32..36].try_into().unwrap());
-            let gid = u32::from_le_bytes(r[36..40].try_into().unwrap());
+            let (_, uid, gid) = stat(&dev, fid);
             assert_eq!((uid, gid), (1000, 1001), "fid {fid}");
         }
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// On a `metadata` share, new entries record their creator, gid and mode as
+    /// WSL metadata, chmod/chown update it, and it all reads back from the host:
+    /// through this device, a fresh one, and NTFS's own WSL metadata decoder.
+    #[test]
+    fn metadata_share_keeps_owner_and_mode_in_wsl_attributes() {
+        let base = std::env::temp_dir().join(format!("tinyvmm_p9_meta_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("plain.txt"), b"from the host").unwrap();
+        let root = std::fs::canonicalize(&base).unwrap();
+        let mem = std::sync::Arc::new(whpsys::memory::GuestMemory::new_host_only(4096).unwrap());
+        let opts = ShareOptions {
+            uid: 500,
+            gid: 501,
+            metadata: true,
+            ..Default::default()
+        };
+        let dev = P9Device::new(mem.clone(), "t".into(), root.clone(), opts);
+        connect(&dev, 1000);
+
+        // No metadata yet: the share's defaults.
+        walk(&dev, 0, 1, &["plain.txt"]);
+        assert_eq!(stat(&dev, 1), (S_IFREG | 0o644, 500, 501));
+
+        // Tlcreate turns a clone of the root fid into the new file.
+        walk(&dev, 0, 2, &[]);
+        lcreate(&dev, 2, "new.txt", S_IFREG | 0o640, 1001);
+        assert_eq!(stat(&dev, 2), (S_IFREG | 0o640, 1000, 1001));
+        call(&dev, T_MKDIR, |t| {
+            enc4(t, 0);
+            enc_str(t, "sub");
+            enc4(t, 0o750);
+            enc4(t, 7);
+        });
+        walk(&dev, 0, 3, &["sub"]);
+        assert_eq!(stat(&dev, 3), (S_IFDIR | 0o750, 1000, 7));
+
+        // A create that opens an existing file must not claim it.
+        walk(&dev, 0, 4, &[]);
+        lcreate(&dev, 4, "plain.txt", S_IFREG | 0o600, 1001);
+        assert_eq!(stat(&dev, 4), (S_IFREG | 0o644, 500, 501));
+
+        // chmod (setuid included), then chown of the uid alone.
+        setattr(&dev, 2, SETATTR_MODE, S_IFREG | 0o4755, 0);
+        setattr(&dev, 2, SETATTR_UID, 0, 42);
+        let want = (S_IFREG | 0o4755, 42, 1001);
+        assert_eq!(stat(&dev, 2), want);
+
+        let fresh = P9Device::new(mem, "t".into(), root.clone(), opts);
+        connect(&fresh, 0);
+        walk(&fresh, 0, 1, &["new.txt"]);
+        assert_eq!(stat(&fresh, 1), want);
+        let wp = to_win32_long_path(&root.join("new.txt"));
+        let h = fs::create_file(&wp, FILE_READ_EA, FILE_SHARE_RWD, OPEN_EXISTING, 0).unwrap();
+        let md = fs::lx_metadata(h);
+        fs::close(h);
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(
+            md,
+            Ok(fs::LxMetadata {
+                uid: Some(want.1),
+                gid: Some(want.2),
+                mode: Some(want.0),
+            })
+        );
     }
 }

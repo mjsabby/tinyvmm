@@ -629,7 +629,12 @@ done. Build them in this order:
   resolved clamp-to-root, and all host I/O goes through `\\?\` long paths
   (`README.md` §9). NTFS has no POSIX owner or mode, so `Rgetattr` reports the
   share's `uid=`/`gid=` (default root) and a synthesized mode; the guest enforces
-  those bits itself.
+  those bits itself. A `metadata` share instead keeps owner, group and
+  permission bits in WSL's `$LXUID`/`$LXGID`/`$LXMOD` extended attributes:
+  `Tsetattr`, `Tlcreate` and `Tmkdir` write them (`NtSetEaFile`) and `Rgetattr`
+  reads them back through `NtQueryInformationFile(FileStatLxInformation)`, NTFS's
+  own decoder of those attributes (`crates/winsys/src/fs.rs`). Each fid
+  remembers its attacher's `n_uname`, the owner of what it creates.
 
 **The doorbell fast path** (`crates/whpsys/src/doorbell.rs`,
 `transport.rs:383`). A queue kick is a guest write to the notify register, which

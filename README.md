@@ -161,7 +161,7 @@ Parsed in `parse_pvh_args` (`main.rs:590`). Defaults and clamps are exact.
 | `--nat-workers <N>` | a quarter of the host's logical CPUs, 1–4 | NAT worker threads for the current NIC, **1–16**. Each owns the TCP flows assigned to it; one flow never spans workers, so this scales many-flow traffic, not a single stream (see [§3](#3-devices-in-detail)). Kept across `--save`/`--restore`. |
 | `--wintun-name <adapter>` / `--wintun-host <ipv4>` | — | WinTun adapter name / host-side gateway IPv4 (wintun backend). |
 | `--drive <path>[,readonly\|ro]` | — | Add a virtio-blk disk. **Repeatable up to 8** (`/dev/vda`, `/dev/vdb`, …). |
-| `--virtio-9p-share <tag>=<host_dir>[,ro][,uid=<n>][,gid=<n>]` | — | Share a host directory over virtio-9p (9P2000.L). **Repeatable up to 8.** Tag 1–256 bytes; host path canonicalized and must be a directory; duplicate tags rejected. NTFS has no POSIX owners, so every entry reports owner `uid`:`gid` (default `0:0`, root) with a synthesized mode (dirs `0755`, files `0644`, `0444` if read-only on the host). The guest enforces those bits, so set `uid`/`gid` to the guest user that must write; `chmod`/`chown` succeed but aren't stored. Kept across `--save`/`--restore`. |
+| `--virtio-9p-share <tag>=<host_dir>[,ro][,uid=<n>][,gid=<n>][,metadata]` | — | Share a host directory over virtio-9p (9P2000.L). **Repeatable up to 8.** Tag 1–256 bytes; host path canonicalized and must be a directory; duplicate tags rejected. NTFS has no POSIX owners, so by default every entry reports owner `uid`:`gid` (default `0:0`, root) with a synthesized mode (dirs `0755`, files `0644`, `0444` if read-only on the host). The guest enforces those bits, so set `uid`/`gid` to the guest user that must write; `chmod`/`chown` succeed but aren't stored. With `metadata` (like WSL's drvfs option of the same name), owners and modes live in WSL's `$LXUID`/`$LXGID`/`$LXMOD` NTFS extended attributes: `chmod`/`chown` persist, new files record their creator, group and mode, WSL sees the same values, and `uid`/`gid` apply only to entries without metadata. Kept across `--save`/`--restore`. |
 | `--gpu [WxH]` | off | Add a virtio-gpu 2D device and open a Win32 window showing its scanout (CPU blit). Optional `WxH` (e.g. `--gpu 1024x768`) sets the preferred size (default **1280×800**). Dropping `nofb nomodeset` from the default cmdline so the guest DRM driver mode-sets. With `--input`, the window is also the host input source. |
 | `--input` | off | Add **two** virtio-input devices — a keyboard and an absolute tablet (pointer + scroll + buttons). With `--gpu`, the host source is the GPU window (1:1 pixel coordinates); otherwise it falls back to the interactive console. Needs a guest kernel with `CONFIG_VIRTIO_INPUT`. |
 | `--sound` | off | Add a virtio-snd sound card — one playback + one capture PCM stream (48 kHz / S16_LE / stereo) backed by Windows **WASAPI** (shared mode). Needs a guest kernel with `CONFIG_SND_VIRTIO`. On a host with no audio endpoint the card still appears but plays/records silence. |
@@ -292,7 +292,9 @@ order they are created — that order is fixed (it is also the snapshot
 * **virtio-9p** — 9P2000.L file-share with a **concurrent worker-pool** engine
   (an IOCP used as a work queue + preallocated slots + up to 8 precreated
   workers), backed by Win32 file APIs through `winsys::fs`. Every entry reports
-  the share's `uid=`/`gid=` owner (default root) and a synthesized mode.
+  the share's `uid=`/`gid=` owner (default root) and a synthesized mode, or, on a
+  `metadata` share, the per-file owner and mode WSL keeps in NTFS extended
+  attributes.
 * **virtio-gpu** — basic 2D scanout (`src/virtio/gpu.rs`). Two queues
   (`controlq=0`, `cursorq=1`); single scanout (`NUM_SCANOUTS=1`); 32-bpp
   resources. It handles `GET_DISPLAY_INFO`, `RESOURCE_CREATE_2D` / `UNREF`,

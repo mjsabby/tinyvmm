@@ -7,12 +7,14 @@ the guest log, and asserts:
 
   1. The guest's 9p harness reported all phases pass via
      ``9P SUMMARY: N/N phases passed``. The /init block in
-     tools/make_initramfs.py exercises 16 phases covering mount,
+     tools/make_initramfs.py exercises 19 phases covering mount,
      bulk sha256 verification, per-feature reads (empty, 1 MiB
      stream, 100-entry readdir, nested-dir walk), per-feature
      mutations (write+sha-roundtrip, create+delete, mkdir+rmdir,
      rename, truncate, append), the share's ``uid=``/``gid=`` owner
-     plus a write by that non-root user, and a clean umount.
+     plus a write by that non-root user, ``metadata`` (chmod +x then
+     exec, chown, a non-root create's owner and mode, all surviving
+     a remount), and a clean umount.
 
   2. Every fixture file on the host still hashes to its manifest
      value AFTER the run -- proves the guest did not mutate any
@@ -24,8 +26,13 @@ the guest log, and asserts:
      the host file system.
 
   4. No debris files remain under p9-share/ except the manifest +
-     fixture + guest_wrote.txt -- proves every create/delete /
+     fixture + guest_wrote.txt + meta.sh -- proves every create/delete /
      mkdir/rmdir / rename phase cleaned up after itself.
+
+  5. ``meta.sh`` carries the guest's chown/chmod as WSL metadata
+     (1234:5678, 0100750), read with the FileStatLxInformation query
+     WSL relies on -- proves the guest's changes landed on the host
+     file in WSL's format.
 
 Usage:
   python tools\\p9_test.py
@@ -44,15 +51,18 @@ Build initramfs (one-time, or whenever make_initramfs.py changes):
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from ctypes import wintypes
 from pathlib import Path
 
 
@@ -75,12 +85,18 @@ EXPECTED_MANIFEST_LINES = 105
 # guest before umount; the host harness re-asserts the content here.
 GUEST_WROTE_BYTES = b"guest-wrote\n"
 
-# Owner the share reports (--virtio-9p-share ...,uid=,gid=). The /init
-# block's owner-nonroot phase expects exactly 1000:1000.
-SHARE_OWNER = "uid=1000,gid=1000"
+# Share options (--virtio-9p-share host=<dir>,...). The /init block's
+# owner-nonroot phase expects exactly 1000:1000; its metadata-* phases
+# need `metadata`.
+SHARE_OPTS = "uid=1000,gid=1000,metadata"
+
+# The script the metadata-* phases leave behind, and the WSL metadata
+# (uid, gid, st_mode) its chown + chmod must have stored on the host.
+META_FILE = "meta.sh"
+META_EXPECTED = (1234, 5678, 0o100750)
 
 # Debris files that the guest creates and removes during phases
-# 10..15. After a clean run, none of these should exist on the host.
+# 10..18. After a clean run, none of these should exist on the host.
 GUEST_DEBRIS = [
     "guest_tmp.txt",      # phase 10 (create-delete)
     "new_dir",            # phase 11 (mkdir-rmdir)
@@ -89,6 +105,7 @@ GUEST_DEBRIS = [
     "trunc.txt",          # phase 13 (truncate)
     "append.txt",         # phase 14 (append)
     "nonroot.txt",        # phase 15 (owner-nonroot)
+    "meta_u.txt",         # phases 17-18 (metadata-owner, -persist)
 ]
 
 
@@ -295,6 +312,59 @@ def assert_guest_wrote(share_dir: Path) -> None:
     print("[p9-test] guest_wrote.txt visible on host with expected content")
 
 
+def wsl_metadata(path: Path) -> tuple[int, int, int] | None:
+    """(uid, gid, st_mode) from a file's WSL metadata -- its $LXUID / $LXGID
+    / $LXMOD extended attributes, decoded by NTFS itself through
+    NtQueryInformationFile(FileStatLxInformation). None if any is missing."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll")
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    ntdll.NtQueryInformationFile.restype = ctypes.c_long
+    ntdll.NtQueryInformationFile.argtypes = [
+        wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, wintypes.ULONG,
+        ctypes.c_int]
+    file_read_ea, share_all, open_existing = 0x8, 0x7, 3
+    backup_semantics = 0x0200_0000  # lets CreateFileW open directories too
+    file_stat_lx_information, info_size = 70, 96
+    h = kernel32.CreateFileW(str(path), file_read_ea, share_all, None,
+                             open_existing, backup_semantics, None)
+    if h is None or h == wintypes.HANDLE(-1).value:
+        raise OSError(ctypes.get_last_error(), f"CreateFileW({path})")
+    try:
+        info = ctypes.create_string_buffer(info_size)
+        iosb = ctypes.create_string_buffer(16)
+        status = ntdll.NtQueryInformationFile(
+            h, iosb, info, info_size, file_stat_lx_information)
+        if status < 0:
+            raise OSError(f"NtQueryInformationFile({path}) failed: "
+                          f"0x{status & 0xFFFFFFFF:08x}")
+        # LxFlags, LxUid, LxGid, LxMode follow seven LARGE_INTEGERs and four
+        # ULONGs in FILE_STAT_LX_INFORMATION.
+        flags, uid, gid, mode = struct.unpack_from("<4I", info.raw, 72)
+    finally:
+        kernel32.CloseHandle(h)
+    has_uid_gid_mode = 0x1 | 0x2 | 0x4
+    if flags & has_uid_gid_mode != has_uid_gid_mode:
+        return None
+    return uid, gid, mode
+
+
+def assert_meta_file(share_dir: Path) -> None:
+    got = wsl_metadata(share_dir / META_FILE)
+    if got != META_EXPECTED:
+        def fmt(md):
+            return "none" if md is None else f"{md[0]}:{md[1]} {md[2]:o}"
+        raise SystemExit(
+            f"[p9-test] FAIL: {META_FILE} WSL metadata on the host is "
+            f"{fmt(got)} (want {fmt(META_EXPECTED)})")
+    print(f"[p9-test] {META_FILE} carries WSL metadata {got[0]}:{got[1]} "
+          f"{got[2]:o} on the host")
+
+
 def assert_no_debris(share_dir: Path) -> None:
     """Verify every debris path the guest created has been removed."""
     leaked = []
@@ -326,6 +396,7 @@ def assert_no_unexpected_files(share_dir: Path,
     expected: set[str] = set()
     expected.add(".manifest.sha256")
     expected.add("guest_wrote.txt")
+    expected.add(META_FILE)
     for rel in contents.keys():
         expected.add(rel.replace("\\", "/"))
         parts = rel.split("/")
@@ -384,7 +455,7 @@ def main() -> int:
         str(args.tinyvmm),
         "--pvh-run",
         "--ram-mb", "256",
-        "--virtio-9p-share", f"host={share},{SHARE_OWNER}",
+        "--virtio-9p-share", f"host={share},{SHARE_OPTS}",
         "--initrd", str(args.initrd),
         str(args.vmlinux),
         "--",
@@ -407,6 +478,7 @@ def main() -> int:
         assert_p9_summary(log)
         assert_fixture_intact(share, contents)
         assert_guest_wrote(share)
+        assert_meta_file(share)
         assert_no_debris(share)
         assert_no_unexpected_files(share, contents)
     except SystemExit as e:
@@ -418,7 +490,7 @@ def main() -> int:
                 pass
         return 1
 
-    print("[p9-test] PASS: 16-phase guest test + 4 host post-conditions")
+    print("[p9-test] PASS: 19-phase guest test + 5 host post-conditions")
     if not args.keep_workdir:
         try:
             shutil.rmtree(args.workdir)

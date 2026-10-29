@@ -605,6 +605,8 @@ if grep -q 'tinyvmm.test=p9snapshot' /proc/cmdline 2>/dev/null; then
         log "P9SNAP: mounted tag=host -> /mnt/p9"
         if [ -r /mnt/p9/snapfile.txt ]; then
             exec 3< /mnt/p9/snapfile.txt
+            # Stored as WSL metadata: the harness shares with `metadata`.
+            chown 1234:5678 /mnt/p9/snapfile.txt 2>/dev/kmsg
             PRE=$(head -c 64 /mnt/p9/snapfile.txt)
             log "P9SNAP: pre-trigger read [$PRE]"
             log "P9SNAP: pre-trigger sentinel"
@@ -621,8 +623,9 @@ if grep -q 'tinyvmm.test=p9snapshot' /proc/cmdline 2>/dev/null; then
             # A brand-new open (fresh fid) must also still work post-restore.
             FRESH=$(head -c 64 /mnt/p9/snapfile.txt)
             log "P9SNAP: post-restore fresh-read [$FRESH]"
-            # The share's owner (uid=/gid=) is rebuilt from the snapshot header.
-            log "P9SNAP: post-restore owner [$(stat -c %u:%g /mnt/p9/snapfile.txt 2>&1)]"
+            # The share's default owner (uid=/gid=, for the root, which has no
+            # metadata) and its `metadata` flag are rebuilt from the header.
+            log "P9SNAP: post-restore owner [$(stat -c %u:%g /mnt/p9 2>&1)] file [$(stat -c %u:%g /mnt/p9/snapfile.txt 2>&1)]"
             exec 3<&-
         else
             log "P9SNAP: FAIL snapfile.txt not readable"
@@ -1153,7 +1156,7 @@ fi
 #   many/file000.bin .. file099.bin   -- 100 files (readdir + open stress)
 #   subdir/nested.bin                 -- nested-dir walk target
 #
-# Test phases (16 total):
+# Test phases (19 total):
 #   1.  driver-bind     -- 9pnet_virtio bound to >= 1 device
 #   2.  mount           -- mount -t 9p succeeds
 #   3.  manifest-readable -- .manifest.sha256 exists and is non-empty
@@ -1171,7 +1174,13 @@ fi
 #   14. append          -- printf > f; printf >> f; readback (O_APPEND)
 #   15. owner-nonroot   -- entries report the share's uid=1000,gid=1000, and
 #                          uid 1000 (no capabilities) can create + remove a file
-#   16. umount          -- clean umount, no -l fallback
+#   16. metadata-chmod-exec -- chmod 750 is stored (the share has `metadata`)
+#                          and the now-executable script runs
+#   17. metadata-owner  -- chown is stored; a file uid 1000 creates records
+#                          1000:<its gid> and its umask'd mode
+#   18. metadata-persist -- both survive a remount (they come from the host);
+#                          meta.sh stays for the host to check its WSL metadata
+#   19. umount          -- clean umount, no -l fallback
 #
 # Prints `9P SUMMARY: X/Y phases passed` and the tinyvmm shutdown sentinel.
 if grep -q 'tinyvmm.test=9p' /proc/cmdline 2>/dev/null; then
@@ -1383,10 +1392,49 @@ if grep -q 'tinyvmm.test=9p' /proc/cmdline 2>/dev/null; then
         rm -f /mnt/p9/nonroot.txt 2>/dev/null || true
     fi
 
+    # Phase 16: metadata-chmod-exec. p9_test.py shares with `metadata`, so
+    # chmod lands in the host file's $LXMOD and the x bit makes it runnable.
+    if printf '#!/bin/sh\\necho meta-ok\\n' > /mnt/p9/meta.sh 2>/dev/kmsg && \
+       chmod 750 /mnt/p9/meta.sh 2>/dev/kmsg && \
+       [ "$(stat -c %a /mnt/p9/meta.sh)" = "750" ] && \
+       [ "$(/mnt/p9/meta.sh 2>/dev/kmsg)" = "meta-ok" ]; then
+        np_pass metadata-chmod-exec "chmod 750 stored; the script runs"
+    else
+        np_fail metadata-chmod-exec "mode=[$(stat -c %a /mnt/p9/meta.sh 2>&1)]"
+    fi
+
+    # Phase 17: metadata-owner. chown lands in $LXUID/$LXGID, and a file that
+    # uid 1000 creates records its creator, group and umask'd mode.
+    if chown 1234:5678 /mnt/p9/meta.sh 2>/dev/kmsg && \
+       [ "$(stat -c %u:%g /mnt/p9/meta.sh)" = "1234:5678" ] && \
+       chpst -u 1000:2000 sh -c 'umask 027; echo x > /mnt/p9/meta_u.txt' \
+           2>/dev/kmsg && \
+       [ "$(stat -c %u:%g:%a /mnt/p9/meta_u.txt)" = "1000:2000:640" ]; then
+        np_pass metadata-owner "chown stored; uid 1000 created 1000:2000 0640"
+    else
+        np_fail metadata-owner \
+            "meta.sh=[$(stat -c %u:%g /mnt/p9/meta.sh 2>&1)] meta_u.txt=[$(stat -c %u:%g:%a /mnt/p9/meta_u.txt 2>&1)]"
+    fi
+
+    # Phase 18: metadata-persist. After a remount the values can only come
+    # from the host's extended attributes, not the guest's inode cache.
+    cd / || true
+    if umount /mnt/p9 2>/dev/kmsg && \
+       mount -t 9p -o trans=virtio,version=9p2000.L,msize=1048576 \
+             host /mnt/p9 2>/dev/kmsg && \
+       [ "$(stat -c %u:%g:%a /mnt/p9/meta.sh)" = "1234:5678:750" ] && \
+       [ "$(stat -c %u:%g:%a /mnt/p9/meta_u.txt)" = "1000:2000:640" ]; then
+        np_pass metadata-persist "owners + modes survive a remount"
+    else
+        np_fail metadata-persist \
+            "meta.sh=[$(stat -c %u:%g:%a /mnt/p9/meta.sh 2>&1)] meta_u.txt=[$(stat -c %u:%g:%a /mnt/p9/meta_u.txt 2>&1)]"
+    fi
+    rm -f /mnt/p9/meta_u.txt 2>/dev/null || true
+
     cd / || true
     sync
 
-    # Phase 16: umount. No -l fallback in the primary assertion --
+    # Phase 19: umount. No -l fallback in the primary assertion --
     # a clean umount requires all fids were Tclunked, which proves
     # we did not leak any references.
     if umount /mnt/p9 2>/dev/kmsg; then
