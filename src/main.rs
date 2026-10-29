@@ -2687,8 +2687,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
     btimer.mark("restore start");
 
     let mut reader = SnapshotReader::open(&path)?;
-    reader.verify_trailer()?;
-    btimer.mark("snapshot mapped + CRC verified");
+    btimer.mark("snapshot read (all but RAM)");
     let header = reader.read_header()?;
     let jr = JsonReader::parse(&header)?;
 
@@ -3143,13 +3142,9 @@ fn run_restore(args: &[String]) -> Result<i32> {
     while let Some(s) = reader.next_section()? {
         match s.ty {
             SectionType::RamRaw => {
+                // Read straight into guest RAM after the loop
+                // (`load_ram_and_verify`).
                 n_ram += 1;
-                // The image is a contiguous host-byte dump (low region then high
-                // region), so restore it the same way rather than by GPA — a GPA
-                // write of the whole image would span the MMIO hole.
-                btimer.mark("devices built");
-                ram.load_image(s.payload);
-                btimer.mark("guest RAM loaded");
             }
             SectionType::HvEnlightenment => sec_hv = Some(s.payload.to_vec()),
             SectionType::LegacyPic8259 => sec_pic = Some(s.payload.to_vec()),
@@ -3206,6 +3201,11 @@ fn run_restore(args: &[String]) -> Result<i32> {
             _ => {}
         }
     }
+    btimer.mark("devices built");
+    // RAM straight from the file into guest memory, then the whole-file CRC:
+    // nothing parsed above has been applied to the machine yet.
+    reader.load_ram_and_verify(&ram)?;
+    btimer.mark("guest RAM loaded + CRC verified");
 
     // Validate section cardinality before touching device state: a Rust-written
     // snapshot always carries exactly one RAM section, one VcpuRegs per vCPU, all

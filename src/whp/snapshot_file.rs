@@ -157,32 +157,6 @@ fn crc32_combine(crc_a: u32, crc_b: u32, len_b: u64) -> u32 {
     multmodp(x8nmodp(len_b), crc_a) ^ crc_b
 }
 
-/// The finalized CRC-32 of `data`, computed on several threads for big inputs.
-pub fn crc32_parallel(data: &[u8]) -> u32 {
-    const CHUNK: usize = 32 << 20;
-    const MAX_THREADS: usize = 8;
-    let threads = std::thread::available_parallelism()
-        .map_or(1, |n| n.get())
-        .min(MAX_THREADS)
-        .min(data.len().div_ceil(CHUNK));
-    if threads <= 1 {
-        return crc32_update(0xFFFF_FFFF, data) ^ 0xFFFF_FFFF;
-    }
-    let chunk = data.len().div_ceil(threads);
-    let parts: Vec<(u32, u64)> = std::thread::scope(|scope| {
-        let handles: Vec<_> = data
-            .chunks(chunk)
-            .map(|c| {
-                scope.spawn(move || (crc32_update(0xFFFF_FFFF, c) ^ 0xFFFF_FFFF, c.len() as u64))
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    parts[1..]
-        .iter()
-        .fold(parts[0].0, |crc, &(c, len)| crc32_combine(crc, c, len))
-}
-
 /// CRC-32 by carry-less multiplication: the folding method of Intel's "Fast CRC
 /// Computation for Generic Polynomials Using PCLMULQDQ Instruction" (Gopal et
 /// al., 2009) for the reflected IEEE polynomial, as Linux and zlib implement it.
@@ -550,14 +524,28 @@ impl Drop for SnapshotWriter {
 // ============================================================
 // Reader
 // ============================================================
-/// Reads a snapshot through a read-only mapping of the file: no heap copy of a
-/// gigabyte-sized RAM section, and its pages come straight from the file cache.
-/// Writers are locked out while it's open, so the bytes `verify_trailer`
-/// checked are the ones restored.
+/// Reads a snapshot without ever holding its RAM section in host memory: `open`
+/// reads everything else (header, the small sections) with positioned reads,
+/// and [`Self::load_ram_and_verify`] reads the RAM payload straight into guest
+/// memory on several threads, checksumming each chunk as it lands, then checks
+/// the whole file's CRC. Writers are locked out while it's open.
 pub struct SnapshotReader {
-    map: crate::host::mapped_file::MappedFile,
+    path: String,
+    _file: File,
+    /// Every byte before the trailer except the RAM payload.
+    meta: Vec<u8>,
+    ram: Option<RamSpan>,
+    trailer: u32,
     pos: usize,
     header_read: bool,
+}
+
+/// Where the RAM payload sits: in the file, and where it was cut out of `meta`.
+#[derive(Clone, Copy)]
+struct RamSpan {
+    file_off: u64,
+    len: u64,
+    meta_at: usize,
 }
 
 pub struct SectionRef<'a> {
@@ -565,26 +553,96 @@ pub struct SectionRef<'a> {
     pub payload: &'a [u8],
 }
 
+/// Open for reading, denying writers so the file can't change under a restore.
+fn open_no_writers(path: &str) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 1;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
+}
+
+fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        let n = f.seek_read(buf, off)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        buf = &mut buf[n..];
+        off += n as u64;
+    }
+    Ok(())
+}
+
+/// Finalized CRC-32 of `data`.
+fn crc32(data: &[u8]) -> u32 {
+    crc32_update(0xFFFF_FFFF, data) ^ 0xFFFF_FFFF
+}
+
 impl SnapshotReader {
     pub fn open(path: &str) -> Result<SnapshotReader> {
-        let map = crate::host::mapped_file::MappedFile::open_no_writers(path)
-            .map_err(|e| Error::msg(format!("snapshot: read {path}: {e}")))?;
-        if map.size() < 24 + 4 {
+        let io = |e: std::io::Error| Error::msg(format!("snapshot: read {path}: {e}"));
+        let file = open_no_writers(path).map_err(io)?;
+        let size = file.metadata().map_err(io)?.len();
+        if size < 24 + 4 {
             return Err(Error::msg("snapshot: file too small"));
         }
+        let end = size - 4;
+        let mut trailer = [0u8; 4];
+        read_exact_at(&file, &mut trailer, end).map_err(io)?;
+        let mut meta = vec![0u8; 24];
+        read_exact_at(&file, &mut meta, 0).map_err(io)?;
+        let jsz = u64::from_le_bytes(meta[16..24].try_into().unwrap());
+        if jsz > end - 24 {
+            return Err(Error::msg("snapshot: header_json_size out of range"));
+        }
+        meta.resize(24 + jsz as usize, 0);
+        read_exact_at(&file, &mut meta[24..], 24).map_err(io)?;
+        // Walk the section headers, reading every payload but the RAM image's.
+        // `next_section` validates types and reserved fields as it hands them out.
+        let mut pos = 24 + jsz;
+        let mut ram = None;
+        while pos < end {
+            if end - pos < 16 {
+                return Err(Error::msg("snapshot: truncated section header"));
+            }
+            let at = meta.len();
+            meta.resize(at + 16, 0);
+            read_exact_at(&file, &mut meta[at..], pos).map_err(io)?;
+            let ty = u32::from_le_bytes(meta[at..at + 4].try_into().unwrap());
+            let len = u64::from_le_bytes(meta[at + 8..at + 16].try_into().unwrap());
+            pos += 16;
+            if len > end - pos {
+                return Err(Error::msg("snapshot: section length out of range"));
+            }
+            if ty == SectionType::RamRaw as u32 && ram.is_none() {
+                ram = Some(RamSpan {
+                    file_off: pos,
+                    len,
+                    meta_at: meta.len(),
+                });
+            } else {
+                let at = meta.len();
+                meta.resize(at + len as usize, 0);
+                read_exact_at(&file, &mut meta[at..], pos).map_err(io)?;
+            }
+            pos += len;
+        }
         Ok(SnapshotReader {
-            map,
+            path: path.to_string(),
+            _file: file,
+            meta,
+            ram,
+            trailer: u32::from_le_bytes(trailer),
             pos: 0,
             header_read: false,
         })
     }
 
-    fn buf(&self) -> &[u8] {
-        self.map.bytes()
-    }
-
     pub fn read_header(&mut self) -> Result<String> {
-        let buf = self.map.bytes();
+        let buf = &self.meta;
         if buf[0..8] != MAGIC {
             return Err(Error::msg("snapshot: bad magic"));
         }
@@ -592,10 +650,8 @@ impl SnapshotReader {
         if ver != VERSION {
             return Err(Error::msg(format!("snapshot: version {ver} != {VERSION}")));
         }
+        // `open` read exactly the declared JSON after the fixed header.
         let jsz = u64::from_le_bytes(buf[16..24].try_into().unwrap()) as usize;
-        if jsz > buf.len().saturating_sub(24 + 4) {
-            return Err(Error::msg("snapshot: header_json_size out of range"));
-        }
         let json = std::str::from_utf8(&buf[24..24 + jsz])
             .map_err(|_| Error::msg("snapshot: header JSON not UTF-8"))?
             .to_string();
@@ -604,14 +660,14 @@ impl SnapshotReader {
         Ok(json)
     }
 
-    /// Returns the next section, or None when only the 4-byte trailer remains.
+    /// Returns the next section, or None at the trailer. The RAM section comes
+    /// back with an empty payload: [`Self::load_ram_and_verify`] reads it.
     pub fn next_section(&mut self) -> Result<Option<SectionRef<'_>>> {
-        let buf = self.map.bytes();
-        let end = buf.len() - 4; // trailer
-        if self.pos == end {
+        let buf = &self.meta;
+        if self.pos == buf.len() {
             return Ok(None);
         }
-        if self.pos + 16 > end {
+        if buf.len() - self.pos < 16 {
             return Err(Error::msg("snapshot: truncated section header"));
         }
         let ty_raw = u32::from_le_bytes(buf[self.pos..self.pos + 4].try_into().unwrap());
@@ -620,16 +676,14 @@ impl SnapshotReader {
             return Err(Error::msg("snapshot: section reserved != 0"));
         }
         let len = u64::from_le_bytes(buf[self.pos + 8..self.pos + 16].try_into().unwrap()) as usize;
-        let body = self.pos + 16;
-        // `body <= end` here (checked just above), so `end - body` can't
-        // underflow; written as subtraction to avoid `body + len` overflowing for
-        // a crafted near-u64::MAX length (which would bypass the guard and then
-        // panic on the slice below).
-        if len > end - body {
-            return Err(Error::msg("snapshot: section length out of range"));
-        }
         let ty = SectionType::from_u32(ty_raw)
             .ok_or_else(|| Error::msg(format!("snapshot: unknown section type {ty_raw:#x}")))?;
+        let body = self.pos + 16;
+        if self.ram.is_some_and(|r| r.meta_at == body) {
+            self.pos = body;
+            return Ok(Some(SectionRef { ty, payload: &[] }));
+        }
+        // `open` read every other payload in full.
         self.pos = body + len;
         Ok(Some(SectionRef {
             ty,
@@ -637,21 +691,55 @@ impl SnapshotReader {
         }))
     }
 
-    pub fn verify_trailer(&self) -> Result<()> {
-        let buf = self.buf();
-        let n = buf.len();
-        let saved = u32::from_le_bytes(buf[n - 4..n].try_into().unwrap());
-        let crc = crc32_parallel(&buf[..n - 4]);
-        if crc != saved {
+    /// Read the RAM section into guest RAM (laid out as `GuestMemory::load_image`
+    /// takes it), on several threads with a handle each, then verify the CRC of
+    /// the whole file. Until this returns Ok, nothing parsed from the file may
+    /// be applied to the machine.
+    pub fn load_ram_and_verify(&self, ram: &crate::whp::GuestMemory) -> Result<()> {
+        let io = |e: std::io::Error| Error::msg(format!("snapshot: read {}: {e}", self.path));
+        let crc = match self.ram {
+            None => crc32(&self.meta),
+            Some(span) => {
+                let n = (span.len as usize).min(ram.size());
+                let chunks = ram.fill_image(n, |off, chunk| {
+                    // Checksum each piece right after reading it, while it's
+                    // still in cache.
+                    const PIECE: usize = 1 << 20;
+                    let f = open_no_writers(&self.path)?;
+                    let mut reg = 0xFFFF_FFFFu32;
+                    for (i, piece) in chunk.chunks_mut(PIECE).enumerate() {
+                        read_exact_at(&f, piece, span.file_off + (off + i * PIECE) as u64)?;
+                        reg = crc32_update(reg, piece);
+                    }
+                    Ok::<_, std::io::Error>((reg ^ 0xFFFF_FFFF, chunk.len() as u64))
+                });
+                let mut ram_crc = 0u32;
+                for c in chunks {
+                    let (c, len) = c.map_err(io)?;
+                    ram_crc = crc32_combine(ram_crc, c, len);
+                }
+                // A payload longer than this RAM (an allocation aligned
+                // differently at save time) is still part of the checksum.
+                let mut off = n as u64;
+                let mut scratch = Vec::new();
+                while off < span.len {
+                    scratch.resize(((span.len - off) as usize).min(16 << 20), 0);
+                    read_exact_at(&self._file, &mut scratch, span.file_off + off).map_err(io)?;
+                    ram_crc = crc32_combine(ram_crc, crc32(&scratch), scratch.len() as u64);
+                    off += scratch.len() as u64;
+                }
+                let (before, after) = self.meta.split_at(span.meta_at);
+                let crc = crc32_combine(crc32(before), ram_crc, span.len);
+                crc32_combine(crc, crc32(after), after.len() as u64)
+            }
+        };
+        if crc != self.trailer {
             return Err(Error::msg(format!(
-                "snapshot: CRC mismatch (file {saved:#010x} != computed {crc:#010x})"
+                "snapshot: CRC mismatch (file {:#010x} != computed {crc:#010x})",
+                self.trailer
             )));
         }
         Ok(())
-    }
-
-    pub fn file_size(&self) -> u64 {
-        self.map.size() as u64
     }
 }
 
@@ -696,19 +784,20 @@ mod tests {
     }
 
     /// Independently checksummed chunks combine into the CRC of the whole, so
-    /// restore can verify a multi-GiB snapshot on several threads.
+    /// restore can verify the RAM image chunk by chunk on several threads.
     #[test]
     fn crc32_combines_chunks() {
-        let data: Vec<u8> = (0..(80u32 << 20) + 12_345)
+        let data: Vec<u8> = (0..(3u32 << 20) + 12_345)
             .map(|i| (i ^ (i >> 9)) as u8)
             .collect();
-        let whole = crc32_update(0xFFFF_FFFF, &data) ^ 0xFFFF_FFFF;
-        assert_eq!(crc32_parallel(&data), whole);
-        for cut in [0usize, 1, 4096, 1_000_001] {
+        let whole = crc32(&data);
+        for cut in [0usize, 1, 4096, 1_000_001, data.len()] {
             let (a, b) = data.split_at(cut);
-            let ca = crc32_update(0xFFFF_FFFF, a) ^ 0xFFFF_FFFF;
-            let cb = crc32_update(0xFFFF_FFFF, b) ^ 0xFFFF_FFFF;
-            assert_eq!(crc32_combine(ca, cb, b.len() as u64), whole, "cut {cut}");
+            assert_eq!(
+                crc32_combine(crc32(a), crc32(b), b.len() as u64),
+                whole,
+                "cut {cut}"
+            );
         }
     }
 
@@ -743,12 +832,31 @@ mod tests {
         );
         let s0 = r.next_section().unwrap().unwrap();
         assert_eq!(s0.ty, SectionType::RamRaw);
-        assert_eq!(s0.payload, &[1, 2, 3, 4, 5]);
+        assert!(s0.payload.is_empty(), "RAM is read by load_ram_and_verify");
         let s1 = r.next_section().unwrap().unwrap();
         assert_eq!(s1.ty, SectionType::VcpuRegs);
         assert_eq!(s1.payload.len(), 100);
         assert!(r.next_section().unwrap().is_none());
-        r.verify_trailer().unwrap();
+        let ram = crate::whp::GuestMemory::new_host_only(4096).unwrap();
+        r.load_ram_and_verify(&ram).unwrap();
+        let mut got = [0u8; 5];
+        assert!(ram.read_into(0, &mut got));
+        assert_eq!(got, [1, 2, 3, 4, 5]);
+        drop(r);
+
+        // A flipped bit anywhere, the RAM image included, fails verification:
+        // here in the JSON header and in the RAM payload, which ends where the
+        // 116-byte VcpuRegs section and the 4-byte trailer begin.
+        let mut bytes = std::fs::read(p).unwrap();
+        for at in [30usize, bytes.len() - 4 - 116 - 2] {
+            bytes[at] ^= 1;
+            std::fs::write(p, &bytes).unwrap();
+            let mut r = SnapshotReader::open(p).unwrap();
+            let _ = r.read_header();
+            while let Ok(Some(_)) = r.next_section() {}
+            assert!(r.load_ram_and_verify(&ram).is_err(), "flip at {at}");
+            bytes[at] ^= 1;
+        }
         let _ = std::fs::remove_file(p);
     }
 }

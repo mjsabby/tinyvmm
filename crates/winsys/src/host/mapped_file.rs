@@ -39,22 +39,12 @@ unsafe impl Sync for MappedFile {}
 impl MappedFile {
     /// Open and map `path` read-only. A zero-byte file maps as an empty view.
     pub fn open(path: &str) -> Result<MappedFile> {
-        Self::open_shared(path, FILE_SHARE_READ | FILE_SHARE_WRITE)
-    }
-
-    /// As [`Self::open`], but fails if the file is open for writing and keeps
-    /// writers out while mapped, so the view can't change under the caller.
-    pub fn open_no_writers(path: &str) -> Result<MappedFile> {
-        Self::open_shared(path, FILE_SHARE_READ)
-    }
-
-    fn open_shared(path: &str, share: u32) -> Result<MappedFile> {
         let wpath = wide(path);
         let file = unsafe {
             CreateFileW(
                 wpath.as_ptr(),
                 GENERIC_READ,
-                share,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
                 core::ptr::null(),
                 OPEN_EXISTING,
                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,

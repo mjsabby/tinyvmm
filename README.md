@@ -1275,7 +1275,18 @@ Section types cover per-vCPU register state (GPRs, control/segment/descriptor +
 debug regs, EFER + syscall MSRs, XSAVE, the APIC + interrupt-controller state,
 TSC), the **Hyper-V enlightenment** (4 MSR caches), the **legacy devices**
 (PIC/PIT/serial/ISA-stubs/PCI-bus), every **PCI device**, and **guest RAM last**.
-The CRC32 table is a `OnceLock<[u32; 256]>`.
+The CRC-32 folds 64 bytes per step with `PCLMULQDQ` (Intel's carry-less-multiply
+method, as in Linux and zlib; ~12 GB/s per core), with a byte table
+(`OnceLock<[u32; 256]>`) for tails and older CPUs.
+
+Restore never holds the RAM image in host memory: `SnapshotReader::open` reads
+everything else with positioned reads, and `load_ram_and_verify` reads the RAM
+payload straight into guest memory on up to eight threads, checksumming each
+piece as it lands, then checks the whole file's CRC (chunk CRCs combined the way
+zlib's `crc32_combine` does) before any parsed state is applied. The file is
+held open against writers meanwhile. A 1 GiB guest resumes about 125 ms after
+`--restore` starts on the reference host (it took 3.45 s when the CRC ran a byte
+at a time over a heap copy of the file); `[boot]` lines print the phases.
 
 Each PCI device section is tagged with its `device_index` (the PCI-add order:
 console=0, then NICs, rng, blk*, **input keyboard+tablet**, 9p*, **gpu last**).
