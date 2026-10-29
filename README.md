@@ -1270,7 +1270,7 @@ CPUID (`src/whp/snapshot.rs`, `src/whp/run_loop.rs`). The VMM then quiesces (sto
 writes a self-describing file (`src/whp/snapshot_file.rs`):
 
 ```
-[24-byte header]  "TVMMSAVE" | version u32 (=1) | reserved u32 | header_json_size u64
+[24-byte header]  "TVMMSAVE" | version u32 (=2) | reserved u32 | header_json_size u64
 [ JSON header ]   machine description (vcpus, ram, large_pages, with_gpu/width/height,
                   with_input, device list …)
 [ sections... ]   type u32 | reserved u32 | length u64 | payload[length]
@@ -1284,7 +1284,8 @@ TSC), the **Hyper-V enlightenment** (4 MSR caches), the **legacy devices**
 RAM is stored **sparse** (`RamSparse`): a bitmap of 64 KiB chunks, then only the
 chunks that aren't all zero, scanned on up to eight threads at save time. A 1 GiB
 guest at a shell prompt is ~95% zero, so its snapshot is ~51 MiB instead of
-1 GiB. Older whole-image (`RamRaw`) snapshots still restore.
+1 GiB. Version-1 snapshots, which stored RAM whole, are rejected: the format
+keeps no backward compatibility.
 The CRC-32 folds 64 bytes per step with `PCLMULQDQ` (Intel's carry-less-multiply
 method, as in Linux and zlib; ~12 GB/s per core), with a byte table
 (`OnceLock<[u32; 256]>`) for tails and older CPUs.
@@ -1298,8 +1299,8 @@ leaves out are never touched: the freshly allocated guest RAM is already zero, a
 nothing writes it before the load. The file is held open against writers
 meanwhile. On the reference host a 1 GiB guest saves in under 0.1 s (from the
 trigger to process exit; ~0.7 s when RAM was written whole) and resumes about 60
-ms after `--restore` starts (RAM load + CRC ~15 ms; ~155 ms and ~110 ms for a
-whole-image snapshot, and 3.45 s back when the CRC ran a byte at a time over a
+ms after `--restore` starts (RAM load + CRC ~15 ms; ~155 ms and ~110 ms when RAM
+was stored whole, and 3.45 s back when the CRC ran a byte at a time over a
 heap copy of the file); `[boot]` lines print the phases.
 
 Each PCI device section is tagged with its `device_index` (the PCI-add order:

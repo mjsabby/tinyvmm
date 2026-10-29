@@ -3146,7 +3146,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
 
     while let Some(s) = reader.next_section()? {
         match s.ty {
-            SectionType::RamRaw | SectionType::RamSparse => {
+            SectionType::RamSparse => {
                 // Read straight into guest RAM after the loop
                 // (`load_ram_and_verify`).
                 n_ram += 1;
