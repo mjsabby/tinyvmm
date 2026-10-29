@@ -128,7 +128,7 @@ a tmpfs root, bind-mount the original `/init` at `/usr/bin/tinyinit`, and move o
 mount proc/sys/dev/devpts/shm/run/tmp/cgroup2, create `/dev/fd` links and applet
 links, mount the read-only bootstrap share, read JSON, apply tmpfs limits and
 sysctls, mount workload shares,
-load public keys, create identities/homes, set static IPv4/DNS, create cgroups,
+load public keys, create homes, set static IPv4/DNS, create cgroups,
 then spawn the apps and another process using the same executable inode in `sshd` mode.
 
 Kernel requirements: built-in virtio PCI/net/console/RNG and 9p/9p-virtio,
@@ -146,12 +146,20 @@ The `-NoRootfs` binary is approximately 19 MiB.
 Init gives applications and SSH sessions `PATH=/bin:/usr/bin`, `HOME`, `USER`,
 `LOGNAME` and `SHELL`. Everything image-specific comes from `init.json`:
 top-level `env` supplies defaults for applications and SSH sessions, and
-application `env` overrides them. The ASP.NET base expects `DOTNET_ROOT`,
+application `env` overrides them; a `PATH` there replaces the default. The ASP.NET base expects `DOTNET_ROOT`,
 `ASPNETCORE_HTTP_PORTS` and `LANG`, as in `init.example.json`. The container
 image's configuration (entrypoint, user, environment, working directory) is not
-applied: init.json controls identities and services. Init supplies
+applied: init.json controls identities and services. Like Docker, init leaves
+the image's `/etc/passwd`, `/etc/group` and `/etc/shadow` as shipped, and looks
+up a `user` that `users` doesn't declare in the image's `/etc/passwd`: for
+example, `"user": "app"` gets the ASP.NET base's uid 1654. Init supplies
 DNS/hosts/NSS configuration and the host-derived clock. Timezone data is
 present; set `TZ` to choose a local timezone rather than the default UTC.
+
+All applications share one root filesystem from one rootfs source. Running
+applications from different images side by side, like containers in a
+Kubernetes pod, would need a separate root and mount namespace per
+application; that is substantial work and isn't implemented.
 
 Boot arguments:
 
@@ -171,10 +179,10 @@ and supported PAX `SCHILY.xattr.*` extended attributes (including file capabilit
 when represented in that format and supported by the guest kernel/filesystem).
 Failures restoring requested attributes fail the boot rather than silently
 discarding them. Standalone ACL extensions are not a separately implemented
-archive feature. Init subsequently replaces its own identity/network files
+archive feature. Init subsequently replaces its own network/NSS files
 and sets configured home ownership; this is intentional.
 
-Applications always receive `no_new_privs` and only explicitly configured
+Applications always receive `no_new_privs`, and non-root ones get only explicitly configured
 capabilities, so preserved setuid/file-capability metadata does not grant those
 apps privilege escalation.
 Mount permissions such as nosuid/read-only remain separate from inode modes.
@@ -183,14 +191,25 @@ Direct 9p shares use synthetic Unix metadata by default, with configurable
 WSL-compatible NTFS attributes. Extracting an archive restores metadata from
 inside the archive regardless of the transport share's metadata policy.
 
-JSON rejects unknown fields and invalid users/service names. `users` contains
-non-root accounts; root exists implicitly. Applications **must** use a non-root
-account and always get `no_new_privs`; supplementary groups and capabilities
+JSON rejects unknown fields and invalid users/service names. `users` declares
+non-root accounts, overriding an image account of the same name; root exists
+implicitly. An application's `user` names a `users` entry, an account in the
+image's `/etc/passwd`, or `root`. Applications run as root only when configured
+that way; root already has every capability, so `capabilities` is rejected
+there. Applications always get `no_new_privs`; supplementary groups and capabilities
 are granted only when configured. `env`, `cwd`, and optional cgroup limits are
 per application. `cpu_percent=100` means one CPU's worth of time; values above
 100 allow multiple CPUs.
 Applications must stay in the foreground: exit, including exit code zero,
 means appliance death. Failed boot setup also shuts the VM down.
+
+An application's `argv[0]` is an absolute path or a program name, such as
+`dotnet`, found through its `PATH`. A script on a 9p share has no execute bit
+and the guest can't chmod it, so when an absolute `argv[0]` has none and
+starts with `#!`, init runs that interpreter itself as the kernel would:
+`["/mnt/apps/start.sh", "x"]` runs `/bin/sh /mnt/apps/start.sh x`. Only the
+entrypoint gets this; a script that starts another share script should run it
+as `sh other.sh`.
 
 Optional process and memory settings:
 
@@ -224,7 +243,7 @@ Optional process and memory settings:
 
 Settings are recorded in `/run/log/boot.log`, except environment values.
 
-SSH `logins` maps each configured Unix user (including root) to `public_keys`
+SSH `logins` maps each user (including root and image accounts) to `public_keys`
 and/or a `public_keys_file`. The file is read once after shares mount. Use
 distinct users/keys when you want distinct access; an explicitly authorized
 root login is full guest administration without sudo. Ordinary logins have
@@ -250,6 +269,12 @@ writable but ephemeral; use an appropriately configured writable share or
 Linux disk for persistent data. No DAC-override workaround is granted.
 Root SSH can modify any writable host share: expose only directories you
 intend to grant it.
+
+A `mounts` target can be any absolute path except `/` and the paths init
+manages: `/bin`, `/dev`, `/etc`, `/mnt/bootstrap`, `/proc`, `/run`, `/sys`,
+`/tmp` and `/usr/bin`, including their parents and children. Parents mount
+before children, and a target that resolves through an image symlink into a
+managed path fails the boot.
 
 PID 1 alone reaps its children/adopted orphans. The SSH process waits for its
 own shell children; shells wait for commands. Login/command exits don't kill
