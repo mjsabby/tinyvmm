@@ -1,11 +1,12 @@
 use crate::config::User;
 use anyhow::{Context, Result};
 use std::{
+    collections::BTreeMap,
     ffi::CString,
     fs::{self, File, OpenOptions},
     io::{self, Write},
     os::{
-        fd::AsRawFd,
+        fd::{AsRawFd, FromRawFd},
         unix::{
             fs::{OpenOptionsExt, PermissionsExt},
             process::CommandExt,
@@ -75,19 +76,41 @@ pub fn own(path: &str, user: &User, mode: u32) -> Result<()> {
     Ok(())
 }
 
-pub fn command(user: &User, executable: &str, cwd: &str) -> Command {
+pub fn command(
+    user: &User,
+    executable: &str,
+    cwd: &str,
+    env: &BTreeMap<String, String>,
+) -> Command {
     let mut cmd = Command::new(executable);
-    cmd.current_dir(cwd).env_clear().envs([
-        ("PATH", "/bin:/usr/bin"),
-        ("HOME", &user.home),
-        ("USER", &user.name),
-        ("LOGNAME", &user.name),
-        ("SHELL", "/bin/sh"),
-        ("LANG", "C.UTF-8"),
-        ("DOTNET_ROOT", "/usr/share/dotnet"),
-        ("ASPNETCORE_HTTP_PORTS", "8080"),
-    ]);
+    cmd.current_dir(cwd)
+        .env_clear()
+        .envs([
+            ("PATH", "/bin:/usr/bin"),
+            ("HOME", &user.home),
+            ("USER", &user.name),
+            ("LOGNAME", &user.name),
+            ("SHELL", "/bin/sh"),
+        ])
+        .envs(env);
     cmd
+}
+
+pub fn pipe() -> io::Result<(File, File)> {
+    let mut fds = [0; 2];
+    check(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) })?;
+    Ok(unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) })
+}
+
+/// Per-process settings applied in the child before it drops root.
+#[derive(Default)]
+pub struct Spawn {
+    pub groups: Vec<libc::gid_t>,
+    pub umask: Option<libc::mode_t>,
+    /// Capability bits kept as ambient capabilities across the UID change.
+    pub capabilities: u64,
+    /// `(resource, soft, hard)`.
+    pub rlimits: Vec<(u32, u64, u64)>,
 }
 
 pub fn child_setup(
@@ -96,6 +119,7 @@ pub fn child_setup(
     cgroup: Option<File>,
     tty: bool,
     no_new_privs: bool,
+    spawn: Spawn,
 ) {
     let uid = user.uid;
     let gid = user.gid;
@@ -117,13 +141,77 @@ pub fn child_setup(
             {
                 return Err(io::Error::last_os_error());
             }
-            check(libc::setgroups(0, std::ptr::null()))?;
+            for &(resource, soft, hard) in &spawn.rlimits {
+                let limit = libc::rlimit {
+                    rlim_cur: soft,
+                    rlim_max: hard,
+                };
+                check(libc::setrlimit(resource as _, &limit))?;
+            }
+            if let Some(mask) = spawn.umask {
+                libc::umask(mask);
+            }
+            if spawn.capabilities != 0 {
+                check(libc::prctl(
+                    libc::PR_SET_KEEPCAPS,
+                    1 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                ))?;
+            }
+            check(libc::setgroups(spawn.groups.len(), spawn.groups.as_ptr()))?;
             check(libc::setgid(gid))?;
             check(libc::setuid(uid))?;
+            if spawn.capabilities != 0 {
+                ambient(spawn.capabilities)?;
+            }
             if no_new_privs {
                 check(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))?;
             }
             Ok(())
         });
     }
+}
+
+/// Make `capabilities` permitted, inheritable, effective and ambient, so they
+/// survive exec of an ordinary program after the switch to a non-root UID.
+fn ambient(capabilities: u64) -> io::Result<()> {
+    #[repr(C)]
+    struct Header {
+        version: u32,
+        pid: libc::c_int,
+    }
+    #[repr(C)]
+    struct Data {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    const VERSION_3: u32 = 0x2008_0522;
+    let set = |bits: u32| Data {
+        effective: bits,
+        permitted: bits,
+        inheritable: bits,
+    };
+    let header = Header {
+        version: VERSION_3,
+        pid: 0,
+    };
+    let data = [set(capabilities as u32), set((capabilities >> 32) as u32)];
+    if unsafe { libc::syscall(libc::SYS_capset, &header, data.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for bit in (0..64).filter(|bit| capabilities & 1 << bit != 0) {
+        check(unsafe {
+            libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_RAISE as libc::c_ulong,
+                bit as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            )
+        })?;
+    }
+    Ok(())
 }

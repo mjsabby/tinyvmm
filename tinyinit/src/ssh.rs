@@ -9,7 +9,7 @@ use russh::{
     server::{self, Auth, ChannelOpenHandle, Msg, Server as _, Session, VerifiedPublicKey},
 };
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs::File,
     io,
     net::SocketAddr,
@@ -88,14 +88,18 @@ pub async fn run(config: Config) -> Result<()> {
         started.elapsed().as_secs_f64() * 1000.0,
         unix::uptime_ms()?
     );
-    SshServer { users }
-        .run_on_socket(server_config, &socket)
-        .await?;
+    SshServer {
+        users,
+        env: Arc::new(config.env),
+    }
+    .run_on_socket(server_config, &socket)
+    .await?;
     Ok(())
 }
 
 struct SshServer {
     users: Arc<Vec<Authorized>>,
+    env: Arc<BTreeMap<String, String>>,
 }
 
 impl server::Server for SshServer {
@@ -104,6 +108,7 @@ impl server::Server for SshServer {
     fn new_client(&mut self, _: Option<SocketAddr>) -> Connection {
         Connection {
             users: self.users.clone(),
+            env: self.env.clone(),
             user: None,
             channels: HashMap::new(),
         }
@@ -116,6 +121,7 @@ impl server::Server for SshServer {
 
 struct Connection {
     users: Arc<Vec<Authorized>>,
+    env: Arc<BTreeMap<String, String>>,
     user: Option<User>,
     channels: HashMap<ChannelId, ChannelState>,
 }
@@ -149,7 +155,7 @@ impl Connection {
             session.channel_failure(id)?;
             return Ok(());
         };
-        let mut cmd = unix::command(user, "/bin/tinyinit", &user.home);
+        let mut cmd = unix::command(user, "/bin/tinyinit", &user.home, &self.env);
         cmd.arg("shell");
         if let Some(command) = command {
             cmd.args(["-c", command]);
@@ -166,7 +172,14 @@ impl Connection {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
         }
-        unix::child_setup(&mut cmd, user, None, master.is_some(), user.uid != 0);
+        unix::child_setup(
+            &mut cmd,
+            user,
+            None,
+            master.is_some(),
+            user.uid != 0,
+            unix::Spawn::default(),
+        );
         let mut cmd = tokio::process::Command::from(cmd);
         cmd.kill_on_drop(true);
         let child = cmd.spawn()?;

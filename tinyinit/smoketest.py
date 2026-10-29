@@ -128,8 +128,12 @@ def configuration(args):
         if args.dotnet:
             argv = ["/usr/share/dotnet/dotnet", "/mnt/apps/TinyinitProbe.dll", name]
         else:
-            argv = ["/bin/sh", "-c",
-                    f"while :; do id > /home/app/{name}.txt; sleep 0.2; done"]
+            # Unnamed supplementary groups make id warn on stderr, which would keep growing the service log.
+            loop = f"while :; do id > /home/app/{name}.txt 2>/dev/null; sleep 0.2; done"
+            if name == "a":
+                # Enough output to rotate the capped service log several times.
+                loop = "i=0; while [ $i -lt 3000 ]; do echo log-line-$i-padding; i=$((i + 1)); done; " + loop
+            argv = ["/bin/sh", "-c", loop]
         apps.append({
             "name": name, "user": "app", "argv": argv, "cwd": "/home/app",
             # The Windows test SDK is .NET 10; explicitly opt its probe into the .NET 11 RC runtime.
@@ -137,7 +141,16 @@ def configuration(args):
                     "TINYINIT_TEST_VALUE": "from-init-json"},
             "limits": {"memory_max": 536870912, "pids_max": 128, "cpu_percent": 100},
         })
+    apps[0].update({"groups": [2000, 2001], "umask": "0027"})
+    apps[1].update({"capabilities": ["CAP_NET_BIND_SERVICE"],
+                    "rlimits": {"nofile": {"soft": 4096, "hard": 8192}}})
     return {
+        "env": {"LANG": "C.UTF-8", "DOTNET_ROOT": "/usr/share/dotnet", "ASPNETCORE_HTTP_PORTS": "8080",
+                "TINYINIT_TEST_VALUE": "from-top-level"},
+        "rlimits": {"nofile": 1048576},
+        "sysctls": {"net.core.somaxconn": 1000, "net.ipv4.ip_unprivileged_port_start": "900"},
+        "tmpfs": {"/": "1g", "/run": "32m", "/tmp": "48m", "/dev/shm": "16m"},
+        "logs": {"max_bytes": 16384},
         "mounts": [{"tag": "apps", "target": "/mnt/apps", "readonly": True}],
         "users": [{"name": "app", "uid": 1000, "gid": 1000, "home": "/home/app"}],
         "network": {"interface": "eth0", "address": "10.0.0.2/24", "gateway": "10.0.0.1", "dns": ["1.1.1.1"]},
@@ -333,6 +346,28 @@ def main():
               "PID 1 and multicall tools share one init inode instead of copying the ELF")
         result = vm.ssh("cat /sys/fs/cgroup/a/memory.max /sys/fs/cgroup/a/pids.max /sys/fs/cgroup/a/cpu.max")
         check(result.stdout == b"536870912\n128\n100000 100000\n", "per-application cgroup limits")
+        result = vm.ssh("printenv LANG DOTNET_ROOT ASPNETCORE_HTTP_PORTS TINYINIT_TEST_VALUE; "
+                        "cat /proc/sys/net/core/somaxconn /proc/sys/net/ipv4/ip_unprivileged_port_start")
+        check(result.stdout == b"C.UTF-8\n/usr/share/dotnet\n8080\nfrom-top-level\n1000\n900\n",
+              "top-level environment reaches SSH sessions and sysctls apply", result)
+        result = vm.ssh("df -B1 / /run /tmp /dev/shm")
+        sizes = {fields[5]: int(fields[1]) for fields in
+                 (line.split() for line in result.stdout.decode().splitlines()[1:])}
+        check(sizes == {"/": 1 << 30, "/run": 32 << 20, "/tmp": 48 << 20, "/dev/shm": 16 << 20},
+              "tmpfs size limits", sizes)
+        processes = {}
+        for name in ("a", "b"):
+            result = vm.ssh(f"for p in $(cat /sys/fs/cgroup/{name}/cgroup.procs); do "
+                            "cat /proc/$p/status /proc/$p/limits; done")
+            processes[name] = result.stdout.decode()
+        check("Groups:\t2000 2001" in processes["a"] and "Umask:\t0027" in processes["a"],
+              "per-application supplementary groups and umask", processes["a"])
+        check(re.search(r"Max open files\s+1048576\s+1048576", processes["a"])
+              and re.search(r"Max open files\s+\d+\s+8192\s", processes["b"])
+              and re.search(r"Max open files\s+1048576\s+1048576", vm.ssh("cat /proc/self/limits").stdout.decode()),
+              "global rlimits for apps and SSH sessions, with per-app overrides")
+        check("CapEff:\t0000000000000400" in processes["b"] and "CapAmb:\t0000000000000400" in processes["b"]
+              and "NoNewPrivs:\t1" in processes["b"], "opt-in ambient capability keeps no_new_privs", processes["b"])
         if args.dotnet:
             result = vm.ssh("dotnet --list-runtimes; cat /etc/os-release; cat /etc/resolv.conf")
             check(result.returncode == 0 and b"Microsoft.AspNetCore.App " in result.stdout
@@ -358,6 +393,10 @@ def main():
                   "unprivileged .NET DNS and trusted HTTPS using embedded OpenSSL/CA data", result)
         else:
             check(result.stdout.count(b"uid=1000(app)") == 2, "both applications stay unprivileged")
+            result = vm.ssh("stat -c %s /run/log/a.log /run/log/a.log.1; tail -n 1 /run/log/a.log")
+            lines = result.stdout.split()
+            check(len(lines) == 3 and all(int(size) <= 16384 for size in lines[:2])
+                  and lines[2] == b"log-line-2999-padding", "service logs rotate within logs.max_bytes", result)
         result = vm.ssh("for p in $(cat /sys/fs/cgroup/a/cgroup.procs); do cat /proc/$p/status; done")
         check(b"CapEff:\t0000000000000000" in result.stdout and b"NoNewPrivs:\t1" in result.stdout,
               "application capability drop and no_new_privs")
@@ -381,11 +420,12 @@ def main():
     finally:
         vm.close()
 
-    config["apps"][0]["argv"] = ["/bin/sleep", "0.5"]
+    config["apps"][0]["argv"] = ["/bin/sh", "-c", "sleep 0.5; echo FINAL_OUTPUT_MARKER >&2"]
     vm = VM(args, config, "clean-exit")
     try:
         vm.finished()
         check("essential service a exited (wait status 0)" in vm.text(), "even successful service exit is fatal")
+        check("FINAL_OUTPUT_MARKER" in vm.text(), "fatal exit prints the service's final output")
     finally:
         vm.close()
     config["ssh"]["logins"][0]["public_keys"] = ["not a valid key"]

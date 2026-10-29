@@ -126,7 +126,8 @@ uses the plain VMM with external boot files; the appliance variants embed them.
 Top-down startup is in `src\boot.rs`: decompress the embedded filesystem into
 a tmpfs root, bind-mount the original `/init` at `/usr/bin/tinyinit`, and move off initramfs,
 mount proc/sys/dev/devpts/shm/run/tmp/cgroup2, create `/dev/fd` links and applet
-links, mount the read-only bootstrap share, read JSON, mount workload shares,
+links, mount the read-only bootstrap share, read JSON, apply tmpfs limits and
+sysctls, mount workload shares,
 load public keys, create identities/homes, set static IPv4/DNS, create cgroups,
 then spawn the apps and another process using the same executable inode in `sshd` mode.
 
@@ -142,12 +143,15 @@ regular-file contents, before applications and the kernel. The init ELF is
 shared through a read-only, nosuid bind mount, not copied into the new root.
 The `-NoRootfs` binary is approximately 19 MiB.
 
-Application/SSH environments include `DOTNET_ROOT=/usr/share/dotnet`,
-`ASPNETCORE_HTTP_PORTS=8080`, and `LANG=C.UTF-8`; application `env` overrides
-these defaults. The container's entrypoint/user are not run: init.json controls
-identities and services. Init supplies DNS/hosts/NSS configuration and the
-host-derived clock. Timezone data is present; set application `TZ` to choose
-a local timezone rather than the default UTC.
+Init gives applications and SSH sessions `PATH=/bin:/usr/bin`, `HOME`, `USER`,
+`LOGNAME` and `SHELL`. Everything image-specific comes from `init.json`:
+top-level `env` supplies defaults for applications and SSH sessions, and
+application `env` overrides them. The ASP.NET base expects `DOTNET_ROOT`,
+`ASPNETCORE_HTTP_PORTS` and `LANG`, as in `init.example.json`. The container
+image's configuration (entrypoint, user, environment, working directory) is not
+applied: init.json controls identities and services. Init supplies
+DNS/hosts/NSS configuration and the host-derived clock. Timezone data is
+present; set `TZ` to choose a local timezone rather than the default UTC.
 
 Boot arguments:
 
@@ -170,8 +174,9 @@ discarding them. Standalone ACL extensions are not a separately implemented
 archive feature. Init subsequently replaces its own identity/network files
 and sets configured home ownership; this is intentional.
 
-Applications still receive `no_new_privs` and no extra capabilities, so preserved
-setuid/file-capability metadata does not grant those apps privilege escalation.
+Applications always receive `no_new_privs` and only explicitly configured
+capabilities, so preserved setuid/file-capability metadata does not grant those
+apps privilege escalation.
 Mount permissions such as nosuid/read-only remain separate from inode modes.
 Direct 9p shares use synthetic Unix metadata by default, with configurable
 `uid=`/`gid=` ownership. Shares using `,metadata` persist owners and modes in
@@ -180,11 +185,44 @@ inside the archive regardless of the transport share's metadata policy.
 
 JSON rejects unknown fields and invalid users/service names. `users` contains
 non-root accounts; root exists implicitly. Applications **must** use a non-root
-account and receive no supplementary groups/capabilities and `no_new_privs`.
-`env`, `cwd`, and optional cgroup limits are per application. `cpu_percent=100`
-means one CPU's worth of time; values above 100 allow multiple CPUs.
+account and always get `no_new_privs`; supplementary groups and capabilities
+are granted only when configured. `env`, `cwd`, and optional cgroup limits are
+per application. `cpu_percent=100` means one CPU's worth of time; values above
+100 allow multiple CPUs.
 Applications must stay in the foreground: exit, including exit code zero,
 means appliance death. Failed boot setup also shuts the VM down.
+
+Optional process and memory settings:
+
+- `rlimits`, top level and per application, use `ulimit` names such as `nofile`,
+  `nproc`, `core`, `memlock` and `stack`. A number or `"unlimited"` sets both
+  limits; `{"soft": 4096, "hard": 65536}` sets each. Top-level limits apply to
+  applications and sshd, so SSH sessions inherit them; an application's entry
+  replaces the same resource. Init itself is unaffected. Linux otherwise starts
+  with a `nofile` soft limit of 1024 and a hard limit of 4096 (.NET raises its
+  soft limit to the hard limit); values above 1048576 also need a larger
+  `fs.nr_open`.
+- `groups`: supplementary numeric GIDs for an application, never 0. Init names
+  only users' primary groups in `/etc/group`, so tools such as `id` warn about
+  other GIDs.
+- `umask`: an octal string such as `"0027"`; the default is `0022`.
+- `capabilities`: opt-in Linux capabilities for an application, for example
+  `["CAP_NET_BIND_SERVICE"]`. They become ambient capabilities, so they survive
+  the switch to the application's user while `no_new_privs` still blocks
+  setuid and file-capability escalation. Each one is real privilege; prefer a
+  sysctl such as `net.ipv4.ip_unprivileged_port_start` when that is enough.
+- `sysctls`: values written to `/proc/sys` before services start, for example
+  `{"net.core.somaxconn": 4096}`. Any failure stops the boot.
+- `tmpfs`: `size=` limits for `/`, `/run`, `/tmp` and `/dev/shm`: bytes with an
+  optional `k`, `m` or `g` suffix, or a percentage of guest RAM. They are applied
+  by remounting after the config is read, so a size below current use fails the
+  boot. Mounts left unset keep the kernel default of half of guest RAM each.
+- `logs.max_bytes` (default 8 MiB): PID 1 drains each service's output into
+  `/run/log/<name>.log` and rotates it to `<name>.log.1`, so a stream holds at
+  most twice this much RAM. Output keeps draining even if a log cannot be
+  written, so a full tmpfs never blocks a service.
+
+Settings are recorded in `/run/log/boot.log`, except environment values.
 
 SSH `logins` maps each configured Unix user (including root) to `public_keys`
 and/or a `public_keys_file`. The file is read once after shares mount. Use
@@ -217,7 +255,8 @@ PID 1 alone reaps its children/adopted orphans. The SSH process waits for its
 own shell children; shells wait for commands. Login/command exits don't kill
 the appliance. Shutdown sends TERM, waits briefly, sends KILL, syncs, then
 prints tinyvmm's shutdown marker and requests kernel poweroff. No restarts.
-Logs are `/run/log/<app-name>.log` and `/run/log/sshd.log`.
+Logs are `/run/log/<app-name>.log` and `/run/log/sshd.log`, each with one rotated
+`.1` file; a fatal service exit also prints the last 4 KiB of its log.
 
 ## Diagnostics and boot benchmark
 
@@ -301,8 +340,9 @@ avoids a second copy of that executable in guest memory. The minimal-init varian
 is about 19 MiB and its external archive is unmounted after extraction.
 Optional initramfs overlay archives are not explicitly reclaimed yet.
 No guest swap is configured.
-Each tmpfs currently has the kernel's default size limit (roughly half guest
-memory), not a reserved allocation; combined growth can exhaust guest RAM.
+Unless `tmpfs` sets a size, each tmpfs has the kernel's default limit (roughly
+half guest memory), not a reserved allocation; combined growth can exhaust guest
+RAM. Application cgroup `memory_max` also counts tmpfs pages an application writes.
 Separate `/run`, `/tmp` and `/dev/shm` mounts are conventional isolation/lifecycle
 boundaries, not a way to make an already-RAM-backed root faster.
 
