@@ -1,0 +1,62 @@
+[package]
+name = "tinyinit"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Independent of the Windows-only parent workspace.
+[workspace]
+
+[features]
+default = ["embedded-rootfs"]
+embedded-rootfs = []
+
+[dependencies]
+anyhow = "1"
+brush-core = "0.5"
+brush-builtins = "0.2"
+brush-interactive = { version = "0.4", features = ["basic"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+libc = "0.2"
+rand = "0.10"
+russh = { version = "0.65", default-features = false, features = ["ring"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tar = "0.4"
+tokio = { version = "1", features = ["full"] }
+zstd = { version = "0.13", default-features = false }
+uucore = "0.12"
+uu_cat = "0.12"
+uu_chmod = "0.12"
+uu_chown = "0.12"
+uu_cp = "0.12"
+uu_date = "0.12"
+uu_df = "0.12"
+uu_du = "0.12"
+uu_env = "0.12"
+uu_head = "0.12"
+uu_id = "0.12"
+uu_kill = "0.12"
+uu_ln = "0.12"
+uu_ls = "0.12"
+uu_mkdir = "0.12"
+uu_mv = "0.12"
+uu_nproc = "0.12"
+uu_printenv = "0.12"
+uu_readlink = "0.12"
+uu_rm = "0.12"
+uu_sleep = "0.12"
+uu_sort = "0.12"
+uu_stat = "0.12"
+uu_stty = "0.12"
+uu_tail = "0.12"
+uu_tee = "0.12"
+uu_touch = "0.12"
+uu_tty = "0.12"
+uu_uname = "0.12"
+uu_wc = "0.12"
+uu_whoami = "0.12"
+
+[profile.release]
+opt-level = 2
+strip = true

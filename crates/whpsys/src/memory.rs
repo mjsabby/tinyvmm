@@ -4,7 +4,7 @@
 use crate::error::{Error, Result, check_hr};
 use crate::host;
 use core::ffi::c_void;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use windows_sys::Win32::System::Hypervisor::{
     WHV_ADVISE_GPA_RANGE_POPULATE, WHV_MEMORY_RANGE_ENTRY, WHV_PARTITION_HANDLE, WHvAdviseGpaRange,
@@ -38,10 +38,11 @@ struct Split {
 /// Pre-build the hypervisor's SLAT entries for freshly mapped guest RAM.
 /// Without this every first guest touch of a 4 KiB page takes a GPA fault
 /// that WHP resolves in the root partition (~40 µs each), which made guest
-/// page-zeroing ~25x slower than steady state. Populating 1 GiB takes ~90 ms,
-/// so it runs on a background thread that overlaps guest boot (lazy faults
-/// still resolve normally meanwhile). Best effort: hosts that lack the advice
-/// code simply keep the lazy behaviour.
+/// page-zeroing ~25x slower than steady state. Population takes ~90 ms per
+/// GiB and overlaps guest boot, so its order matters: background workers take
+/// the regions Linux touches first (lazy faults still resolve normally
+/// meanwhile). Best effort: hosts that lack the advice code simply keep the
+/// lazy behaviour.
 fn populate_async(part: WHV_PARTITION_HANDLE, ranges: &[(u64, u64)]) -> Option<JoinHandle<()>> {
     let ranges = ranges.to_vec();
     std::thread::Builder::new()
@@ -51,29 +52,60 @@ fn populate_async(part: WHV_PARTITION_HANDLE, ranges: &[(u64, u64)]) -> Option<J
 }
 
 fn populate(part: WHV_PARTITION_HANDLE, ranges: &[(u64, u64)]) {
-    let entries: Vec<WHV_MEMORY_RANGE_ENTRY> = ranges
+    const CHUNK: u64 = 64 << 20;
+    // Measured on a 1.5 GiB guest: two workers keep ahead of Linux boot; more
+    // mostly contend in the host's VM fault path.
+    const THREADS: usize = 2;
+    let mut chunks: Vec<(u64, u64)> = ranges
         .iter()
-        .map(|&(gpa, size)| WHV_MEMORY_RANGE_ENTRY {
-            GuestAddress: gpa,
-            SizeInBytes: size,
+        .flat_map(|&(gpa, size)| {
+            (0..size.div_ceil(CHUNK)).map(move |i| (gpa + i * CHUNK, CHUNK.min(size - i * CHUNK)))
         })
         .collect();
+    // Boot images sit in the lowest chunk, while Linux's early memblock
+    // allocations come from the top of RAM; populate those first.
+    if chunks.len() > 2 {
+        chunks[1..].reverse();
+    }
+    let threads = THREADS.min(chunks.len());
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                while !failed.load(Ordering::Relaxed) {
+                    let Some(&(gpa, size)) = chunks.get(next.fetch_add(1, Ordering::Relaxed))
+                    else {
+                        break;
+                    };
+                    let hr = advise_populate(part, gpa, size);
+                    if hr < 0 && !failed.swap(true, Ordering::Relaxed) {
+                        eprintln!("[mem] WARN: WHvAdviseGpaRange(Populate) failed: 0x{hr:08x}");
+                    }
+                }
+            });
+        }
+    });
+}
+
+fn advise_populate(part: WHV_PARTITION_HANDLE, gpa: u64, size: u64) -> i32 {
+    let entry = WHV_MEMORY_RANGE_ENTRY {
+        GuestAddress: gpa,
+        SizeInBytes: size,
+    };
     let advice = WHV_ADVISE_GPA_RANGE_POPULATE {
         AccessType: WHvMemoryAccessWrite,
         ..Default::default()
     };
-    let hr = unsafe {
+    unsafe {
         WHvAdviseGpaRange(
             part,
-            entries.as_ptr(),
-            entries.len() as u32,
+            &entry,
+            1,
             WHvAdviseGpaRangeCodePopulate,
             (&raw const advice).cast(),
             size_of_val(&advice) as u32,
         )
-    };
-    if hr < 0 {
-        eprintln!("[mem] WARN: WHvAdviseGpaRange(Populate) failed: 0x{hr:08x}");
     }
 }
 

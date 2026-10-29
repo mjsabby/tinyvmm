@@ -454,11 +454,18 @@ struct BoxPool<T: ?Sized> {
 
 impl<T: ?Sized> BoxPool<T> {
     fn new(warm: usize, make: fn() -> Box<T>) -> Self {
-        let mut free = Vec::with_capacity(warm);
-        for _ in 0..warm {
-            free.push(make());
+        let mut pool = BoxPool {
+            free: Vec::new(),
+            make,
+        };
+        pool.warm(warm);
+        pool
+    }
+    fn warm(&mut self, count: usize) {
+        self.free.reserve(count);
+        for _ in 0..count {
+            self.free.push((self.make)());
         }
-        BoxPool { free, make }
     }
     fn acquire(&mut self) -> Box<T> {
         match self.free.pop() {
@@ -2637,12 +2644,14 @@ impl NatBackend {
         let mut shards = Vec::with_capacity(n);
         for (s, &iocp) in iocps.iter().enumerate() {
             // Worker-only object pools: one Tcb free-list per compile-time
-            // tier, plus the overlapped op buffers, warmed with this shard's
-            // share. Built here (heap-buffers keeps each boxed Tcb small on
-            // the stack) and owned solely by the shard's worker.
+            // tier, plus the overlapped op buffers. Each worker warms its own
+            // share before serving completions, so VM start does not wait for
+            // tens of MiB of ring buffers to be zeroed.
             let tcb_pools: Vec<BoxPool<dyn TcbDyn>> = (0..N_TCB_TIERS)
-                .map(|i| BoxPool::new(opts.tcb_warm[i].div_ceil(n), TIER_MAKE[i]))
+                .map(|i| BoxPool::new(0, TIER_MAKE[i]))
                 .collect();
+            let tcb_warm: [usize; N_TCB_TIERS] =
+                std::array::from_fn(|i| opts.tcb_warm[i].div_ceil(n));
             let state = NatState {
                 net: Arc::downgrade(net),
                 iocp,
@@ -2660,9 +2669,9 @@ impl NatBackend {
                 big_pool: big_pool.clone(),
                 l4_csum_trusted: false,
                 tcb_pools,
-                tcp_op_pool: BoxPool::new(MAX_TCP_FLOWS.div_ceil(n), make_tcp_op),
-                tcp_send_op_pool: BoxPool::new(MAX_TCP_FLOWS.div_ceil(n), make_tcp_send_op),
-                udp_op_pool: BoxPool::new(MAX_UDP_FLOWS.div_ceil(n), make_udp_op),
+                tcp_op_pool: BoxPool::new(0, make_tcp_op),
+                tcp_send_op_pool: BoxPool::new(0, make_tcp_send_op),
+                udp_op_pool: BoxPool::new(0, make_udp_op),
                 accept_pool: accept_pool.clone(),
                 accept_inflight: accept_inflight.clone(),
                 icmp_reply_pool: icmp_reply_pool.clone(),
@@ -2685,8 +2694,8 @@ impl NatBackend {
                 stats: stats.clone(),
             };
             // With `heap-buffers` the Tcb rings are boxed, so a Tcb is no
-            // longer a multi-MiB stack temporary; pooled construction above is
-            // cheap. Workers still get a generous stack for deep frames.
+            // longer a multi-MiB stack temporary. Workers still get a generous
+            // stack for deep frames.
             let name = if n == 1 {
                 "nat-worker".to_string()
             } else {
@@ -2695,7 +2704,16 @@ impl NatBackend {
             let handle = std::thread::Builder::new()
                 .name(name)
                 .stack_size(16 * 1024 * 1024)
-                .spawn(move || state.run())
+                .spawn(move || {
+                    let mut state = state;
+                    for (pool, count) in state.tcb_pools.iter_mut().zip(tcb_warm) {
+                        pool.warm(count);
+                    }
+                    state.tcp_op_pool.warm(MAX_TCP_FLOWS.div_ceil(n));
+                    state.tcp_send_op_pool.warm(MAX_TCP_FLOWS.div_ceil(n));
+                    state.udp_op_pool.warm(MAX_UDP_FLOWS.div_ceil(n));
+                    state.run()
+                })
                 .ok();
             shards.push(Shard {
                 iocp,

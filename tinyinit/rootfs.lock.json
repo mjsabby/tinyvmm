@@ -1,0 +1,5 @@
+{
+  "image": "mcr.microsoft.com/dotnet/aspnet",
+  "tag": "11.0.0-rc.3-resolute-chiseled-extra-amd64",
+  "digest": "sha256:1c7aa7f94d7bd1997b75f8a81c71cd8125dd6457b61ba690557b0d1559fa0e7b"
+}

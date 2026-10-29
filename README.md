@@ -103,6 +103,102 @@ Boot a kernel:
 .\target\release\tinyvmm.exe --pvh-run --initrd initramfs.cpio vmlinux
 ```
 
+### Three deployment flavors
+
+The default Cargo build remains a VMM-only executable. Build the appliance
+variants on Windows with Rust/Cargo, Zig, cargo-zigbuild and Python 3.14+
+(the rootfs packer uses the standard-library zstd module):
+
+```powershell
+.\build-appliance.ps1 -Flavor all -Kernel C:\kernels\vmlinux.tinyvmm
+```
+
+The kernel must be PVH-capable with the built-in drivers/filesystems required
+by [tinyinit](tinyinit/README.md). No Linux kernel rebuild is performed here.
+
+| Output in `out\deploy` | Embedded boot assets | External inputs |
+|---|---|---|
+| `tinyvmm.exe` | None | Kernel, optional initramfs/storage |
+| `tinyvmm-init.exe` | Kernel + minimal Rust tinyinit | Optional trusted rootfs, workload/config/public keys |
+| `tinyvmm-dotnet.exe` | Kernel + tinyinit containing the pinned ASP.NET rootfs | Workload/config/public keys |
+
+Use `-Flavor plain`, `init` or `dotnet` to build just one. For `plain`, omit
+`-Kernel`; this does not build tinyinit or fetch a rootfs. For `init`, tinyinit
+is compiled without an embedded rootfs and can also run shell-only workloads.
+`-RootfsImage mcr.microsoft.com/dotnet/aspnet:TAG` and `-UpdateRootfs` select or
+refresh the pinned image as described in the tinyinit README.
+
+CI builds all three flavors and uploads their executables/PDBs in
+`tinyvmm-windows-x86_64`; main-branch releases publish the same files.
+A cached Ubuntu job builds Linux **7.3**, pinned to
+`c03c1a14507dfaf8b856c2608f9ac216021fc222`, using
+[`kernel/tinyvmm.config`](kernel/tinyvmm.config). Windows then cross-compiles
+tinyinit and packages the kernel; no WSL or nested virtualization is needed.
+The release also includes the corresponding kernel source archive, configuration,
+and build script. Inside its extracted `linux-7.3` directory, run
+`bash tinyvmm/build.sh .` with GCC, make, flex, bison, bc, Perl, libelf-dev,
+libssl-dev and dwarves installed to rebuild the kernel.
+
+Only the selected `.exe` is needed for appliance deployment: the generated
+`.cpio` files are build intermediates, and PDBs are optional diagnostics.
+Kernel and boot archive are siblings in the Windows PE image, not a rebuilt
+Linux kernel with a built-in archive. The VMM borrows their mapped PE bytes;
+there is no runtime asset extraction to disk or intermediate payload-sized Vec.
+One copy into writable/reclaimable guest RAM remains; it is split across up to
+eight threads because it is dominated by first-touch page faults, not memcpy.
+
+For an embedded ASP.NET boot, prepare `init.json` and `caller.pub` in a bootstrap
+directory, then:
+
+```powershell
+.\out\deploy\tinyvmm-dotnet.exe --pvh-run --vcpus 2 --rng --net --portfwd 10022:22 `
+    --virtio-9p-share bootstrap=C:\vm\bootstrap,ro `
+    --virtio-9p-share apps=C:\vm\apps,ro
+```
+
+The appliance defaults to 1024 MiB RAM and 4 KiB host pages, supplies the host
+Unix time, and uses the normal PCI/console boot arguments plus `idle=halt`.
+Explicit kernel and `--initrd` paths still override embedded defaults; pass
+`--large-pages` to opt into 2 MiB backing (see [Large pages](#large-pages)).
+Plain builds retain their existing external-kernel requirement, 256 MiB default
+and large-page attempt.
+
+Rootfs extraction parallelizes across guest vCPUs, so `--vcpus` matters during
+boot even when the workload itself needs fewer. Measured extraction of the
+pinned ASP.NET base: 436 ms with one vCPU, 216 ms with two and 115 ms with four.
+
+For an external rootfs, put a **trusted** archive named `rootfs.tar.zst`
+(preferred) or `rootfs.tar.gz` in a dedicated directory and use:
+
+```powershell
+.\out\deploy\tinyvmm-init.exe --pvh-run --vcpus 2 --rng --net --portfwd 10022:22 `
+    --virtio-9p-share bootstrap=C:\vm\bootstrap,ro `
+    --virtio-9p-share apps=C:\vm\apps,ro `
+    --virtio-9p-share rootfs=C:\vm\rootfs,ro `
+    -- console=hvc0 pci=conf1,nocrs,lastbus=0 idle=halt tinyinit.rootfs=9p:rootfs
+```
+
+The existing rootfs fetcher produces a suitable parallel archive at
+`tinyinit\out\rootfs-cache\rootfs.tar.zst`. The early share is extracted into
+the guest tmpfs and unmounted before normal startup; a `.tar.zst` is read into
+temporary guest memory for parallel extraction, while `.tar.gz` streams. Use a
+dedicated share directory because the whole directory, not just the archive, is
+exposed during extraction.
+The [metadata policy](tinyinit/README.md#trusted-rootfs-metadata-policy) applies.
+
+### Requested follow-up PRs: reducing memory copies
+
+These are deliberately deferred, not forgotten or claimed as implemented:
+
+| Follow-up | Required outcome / constraints |
+|---|---|
+| Payload pages as guest-physical backing | Eliminate the loader memcpy by mapping payload-backed ranges rather than copying into the current VirtualAlloc slab. Refactor contiguous guest-memory accessors, respect page/segment alignment and zero-filled BSS, keep writes VM-private, and handle Linux freeing/reusing boot pages. Validate WHP support for the chosen backing; Windows file-view COW is not assumed to work transparently for guest writes. |
+| DAX-capable shared backing | Explore a kernel/device path that maps host-backed pages into Linux instead of ordinary virtio-blk transfers. Ordinary virtio-blk still transfers data into guest buffers; mmap of the host file alone is not end-to-end zero-copy. |
+| Demand-loaded compressed rootfs | Evaluate SquashFS/EROFS plus writable tmpfs state/overlay, rather than eagerly expanding every file. Include kernel/tooling requirements and compare actual boot time and memory. |
+| Disposable compressed payload | Allow the rootfs to be a sibling payload in the single Windows executable rather than permanently part of the tinyinit ELF, so compressed guest-side bytes can be released after extraction. Keep the three deployment types and low-ceremony image selection/update controls. |
+| Boot-payload reclamation | Release obsolete extra archive contents after consumption. The original `/init` inode is now intentionally retained by a read-only bind mount, not copied. Copy/unlink/re-exec is an alternative fallback, not an additional required step on this path. |
+| Copy/memory accounting | Benchmark host load copies, guest extraction, per-VM private pages, peak and steady-state memory separately. Do not count host-allocated guest RAM as a second independent Linux RAM allocation or mistake clean file-backed executable pages for permanent anonymous copies. |
+
 ### Tests & benchmarks
 
 `cargo test --workspace --release` runs the unit tests (no WHP needed; CI runs
@@ -118,16 +214,24 @@ repo root) and need WHP — bare metal or nested Hyper-V:
 | `python tools\irq_bench.py --tinyvmm base=<exe> --tinyvmm new=<exe>` | A/B interrupt-path latency: timer wake-up, virtio-blk QD1 round trip, cross-CPU wake-up, idle host CPU, VM exits |
 | `python tools\net_compare.py` | NAT networking vs OpenVMM |
 
-### Large pages (recommended)
+### Large pages
 
-Guest RAM is allocated with `MEM_LARGE_PAGES` (2 MiB pages) when the process can
-hold **SeLockMemoryPrivilege** ("Lock pages in memory" in `gpedit.msc` → *User
-Rights Assignment*; sign out/in to apply). The `--pvh-run` / `--restore` paths
+Plain builds allocate guest RAM with `MEM_LARGE_PAGES` (2 MiB pages) when the
+process can hold **SeLockMemoryPrivilege** ("Lock pages in memory" in
+`gpedit.msc` → *User Rights Assignment*; sign out/in to apply). The `--pvh-run` / `--restore` paths
 call `enable_lock_memory_privilege()` (`crates/winsys/src/host.rs:53`) at startup
 and print `[host] SeLockMemoryPrivilege: enabled` when it succeeds. Large pages
 let Hyper-V back the second-level address translation (SLAT/EPT) with 2 MiB
 super-pages, cutting page-walk cost on the I/O path. Without the privilege,
 tinyvmm prints a warning and falls back to 4 KiB pages — functional, just slower.
+
+The allocation is synchronous and must find and zero physically contiguous
+2 MiB pages. On the reference host it took 20 ms for 256 MiB, 93 ms for 1 GiB
+and 509 ms for 1.5 GiB; on a fragmented host, a failed 1.5 GiB attempt cost
+about 128 ms before falling back. The 4 KiB path commits in about a millisecond
+and pre-builds SLAT entries on background threads while the guest boots.
+Appliance builds therefore default to 4 KiB pages for predictable startup.
+Use `--large-pages` or `--no-large-pages` to override either default.
 
 ---
 
@@ -154,6 +258,7 @@ Parsed in `parse_pvh_args` (`main.rs:590`). Defaults and clamps are exact.
 | `--initrd <cpio>` | none | initramfs; memory-mapped and copied into guest RAM. |
 | `--ram-mb <N>` | `256` | **Minimum 128 MiB; no hard upper bound** (limited only by what the host can allocate). RAM up to the 3584 MiB PCI MMIO window (`0xE000_0000`) stays at GPA 0; anything larger is split so the remainder is mapped above 4 GiB (`0x1_0000_0000`), leaving the window free for device BARs. |
 | `--vcpus <N>` | `1` | **Clamped to 1–32.** BSP runs on the main thread; each AP gets its own host thread. |
+| `--large-pages` / `--no-large-pages` | on (plain), off (appliance) | Attempt or skip 2 MiB `MEM_LARGE_PAGES` guest-RAM backing; see [Large pages](#large-pages). |
 | `--rng` | off | Add a virtio-rng device (`/dev/hwrng`). |
 | `--net` | off | Add a virtio-net NIC. **Repeatable** — each `--net` appends a NIC; the NIC-scoped flags below modify the *most recent* NIC. |
 | `--net-backend loopback\|nat\|wintun` | `nat` | Backend for the current NIC (see [§3](#3-devices-in-detail)). |
@@ -1048,52 +1153,46 @@ tinyvmm par: busiest threads (% of one CPU): nat-worker 95, main 65, (host serve
 
 `src/diag/boot_timer.rs` records QPC waypoints and prints `[boot] <total> ms
 (+<delta> ms) <phase>` to stderr (and an ETW `BootMark` per phase). The marks
-(`pvh-run start`, `WHP probe done`, `guest RAM mapped`, `vmlinux+initramfs
-loaded`, `entering guest`, `guest exited`, `teardown done`) cover **host-side
-setup**; the guest's own boot (kernel → `/init`) runs between `entering guest` and
-the hvc0 shell. **These numbers are machine-specific** (reference: an Intel
-i9-14900K-class host, `tsc_hz ≈ 3.187 GHz`, large pages enabled) but the *shape*
-is the point.
+(`pvh-run start`, `WHP probe done`, `partition ready`, `guest RAM mapped`,
+`vmlinux+initramfs loaded`, `entering guest`, `guest exited`, `teardown done`)
+cover **host-side setup**; the guest's own boot (kernel → `/init`) runs between
+`entering guest` and the guest's first log line. **These numbers are
+machine-specific** (reference: an Intel i9-14900K host, `tsc_hz ≈ 3.187 GHz`)
+but the *shape* is the point.
 
-**Default config — 256 MiB, 1 vCPU:**
-
-```
-[boot]    0.000 ms (+  0.000 ms) pvh-run start
-[boot]    0.714 ms (+  0.714 ms) WHP probe done
-[boot]   58.767 ms (+ 58.053 ms) guest RAM mapped
-[boot]   71.698 ms (+ 12.931 ms) vmlinux+initramfs loaded
-[boot]   72.446 ms (+  0.749 ms) entering guest
-...guest kernel boots, /init runs, drops to hvc0 shell (well within 1 s)...
-[pvh-run] stopped: reason=Cancelled uart_tx=0 \
-          exits[io=657 mmio=117 cpuid=486 msr=15 halt=0 other=0]
-```
-
-**Larger config — 1 GiB, 4 vCPUs, `--rng`:**
+**Embedded .NET appliance — 1536 MiB, 2 vCPUs, 4 KiB pages:**
 
 ```
 [boot]    0.000 ms (+  0.000 ms) pvh-run start
-[boot]    0.750 ms (+  0.750 ms) WHP probe done
-[boot]   70.916 ms (+ 70.165 ms) guest RAM mapped
-[boot]  105.070 ms (+ 34.154 ms) vmlinux+initramfs loaded
-[boot]  107.382 ms (+  2.312 ms) entering guest
+[boot]    0.590 ms (+  0.590 ms) WHP probe done
+[boot]    4.164 ms (+  3.574 ms) partition ready
+[pvh-run] guest RAM: 1536 MiB at GPA 0 (4 KiB pages)
+[boot]   23.752 ms (+ 19.588 ms) guest RAM mapped
+[boot]   49.929 ms (+ 26.177 ms) vmlinux+initramfs loaded
+[boot]   56.849 ms (+  6.920 ms) entering guest
 ```
 
 Reading it:
 
-* **WHP probe** is sub-millisecond.
-* **guest RAM mapped** dominates host setup and **scales with RAM size** — ~59 ms
-  to commit + map 256 MiB, ~70 ms for 1 GiB (committing pages and building the
-  SLAT mapping). This is the single biggest host-setup cost and the main reason a
-  microVM keeps RAM small.
-* **vmlinux+initramfs loaded** is the mmap-and-copy of the ELF `PT_LOAD` segments
-  plus the cpio into guest RAM (~13–34 ms here for a ~16 MB kernel image).
-* **entering guest** is where the BSP starts executing at the PVH entry; from here
-  the *guest* boots Linux and reaches its `/init` shell within the first watchdog
-  second.
+* **WHP probe** is sub-millisecond; partition creation and setup take ~4 ms.
+* **guest RAM mapped** is mostly `WHvMapGpaRange` hypercalls (~20 ms for
+  1.5 GiB). 4 KiB commitment is lazy; two background workers then pre-build SLAT
+  entries for the boot-image chunk first and the top of RAM next, where Linux's
+  early allocations land. With large pages this step also includes the
+  synchronous contiguous allocation and zeroing described in
+  [Large pages](#large-pages).
+* **vmlinux+initramfs loaded** copies the ELF `PT_LOAD` segments and the
+  ~76 MB appliance cpio on up to eight threads; it is bound by first-touch page
+  faults on the source mapping, not memcpy bandwidth.
+* **entering guest** follows vCPU and device creation. The NAT backend warms
+  its buffer pools on its own worker threads instead of delaying this step.
 
-So host-side "time to first guest instruction" is **~72 ms** for the default
-microVM and grows mainly with `--ram-mb`. (`--gpu`/`--input` add their device
-setup but do not change this host-RAM-dominated path.)
+From there, Linux reached PID 1 in 78-97 ms of guest uptime across five boots
+(median 80 ms).
+A WPR trace of the previous build attributed most host setup time to a failed
+1.5 GiB large-page allocation (~128 ms), eager zeroing of NAT TCP buffers
+(~54 ms), and a single-threaded boot copy (~62 ms); those are the costs removed
+above.
 
 ---
 

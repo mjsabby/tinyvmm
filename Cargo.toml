@@ -12,6 +12,11 @@ members = ["crates/winsys", "crates/whpsys"]
 name = "tinyvmm"
 path = "src/main.rs"
 
+[features]
+default = []
+embedded-init = []
+embedded-dotnet = []
+
 [dependencies]
 winsys = { path = "crates/winsys" }
 whpsys = { path = "crates/whpsys" }
