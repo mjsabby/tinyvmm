@@ -13,7 +13,8 @@ use windows_sys::Win32::Networking::WinSock::{
     socket,
 };
 use windows_sys::Win32::System::IO::{
-    CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED, PostQueuedCompletionStatus,
+    CreateIoCompletionPort, GetQueuedCompletionStatus, GetQueuedCompletionStatusEx, OVERLAPPED,
+    OVERLAPPED_ENTRY, PostQueuedCompletionStatus,
 };
 use windows_sys::core::GUID;
 
@@ -71,6 +72,35 @@ pub fn get_ms(iocp: Iocp, ms: u32) -> (bool, u32, usize, *mut OVERLAPPED) {
     let mut ov: *mut OVERLAPPED = std::ptr::null_mut();
     let ok = unsafe { GetQueuedCompletionStatus(iocp.0, &mut bytes, &mut key, &mut ov, ms) };
     (ok != 0, bytes, key, ov)
+}
+
+/// One dequeued completion: (success, bytes, key, overlapped), as `get_ms`
+/// would return it.
+pub type Completion = (bool, u32, usize, *mut OVERLAPPED);
+
+/// Dequeue up to `out.len()` completions in one call, waiting up to `ms` for
+/// the first. Returns how many were stored (0 on timeout).
+pub fn get_many(iocp: Iocp, out: &mut [Completion], ms: u32) -> usize {
+    const MAX: usize = 64;
+    let mut raw: [OVERLAPPED_ENTRY; MAX] = unsafe { core::mem::zeroed() };
+    let want = out.len().min(MAX) as u32;
+    let mut n = 0u32;
+    let ok = unsafe { GetQueuedCompletionStatusEx(iocp.0, raw.as_mut_ptr(), want, &mut n, ms, 0) };
+    if ok == 0 {
+        return 0;
+    }
+    for (o, e) in out.iter_mut().zip(&raw[..n as usize]) {
+        // `Internal` is the I/O's NTSTATUS: GetQueuedCompletionStatus reports
+        // failure exactly when it is not NT_SUCCESS (negative as i32).
+        let ok = (e.Internal as i32) >= 0;
+        *o = (
+            ok,
+            e.dwNumberOfBytesTransferred,
+            e.lpCompletionKey,
+            e.lpOverlapped,
+        );
+    }
+    n as usize
 }
 
 pub fn sockaddr_in(ip: [u8; 4], port: u16) -> SOCKADDR_IN {
