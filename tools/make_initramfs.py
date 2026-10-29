@@ -620,6 +620,8 @@ if grep -q 'tinyvmm.test=p9snapshot' /proc/cmdline 2>/dev/null; then
             # A brand-new open (fresh fid) must also still work post-restore.
             FRESH=$(head -c 64 /mnt/p9/snapfile.txt)
             log "P9SNAP: post-restore fresh-read [$FRESH]"
+            # The share's owner (uid=/gid=) is rebuilt from the snapshot header.
+            log "P9SNAP: post-restore owner [$(stat -c %u:%g /mnt/p9/snapfile.txt 2>&1)]"
             exec 3<&-
         else
             log "P9SNAP: FAIL snapfile.txt not readable"
@@ -1150,7 +1152,7 @@ fi
 #   many/file000.bin .. file099.bin   -- 100 files (readdir + open stress)
 #   subdir/nested.bin                 -- nested-dir walk target
 #
-# Test phases (15 total):
+# Test phases (16 total):
 #   1.  driver-bind     -- 9pnet_virtio bound to >= 1 device
 #   2.  mount           -- mount -t 9p succeeds
 #   3.  manifest-readable -- .manifest.sha256 exists and is non-empty
@@ -1166,7 +1168,9 @@ fi
 #   12. rename-roundtrip-- mv a -> b + rm b
 #   13. truncate        -- printf > f; : > f; stat size == 0 (Tsetattr size)
 #   14. append          -- printf > f; printf >> f; readback (O_APPEND)
-#   15. umount          -- clean umount, no -l fallback
+#   15. owner-nonroot   -- entries report the share's uid=1000,gid=1000, and
+#                          uid 1000 (no capabilities) can create + remove a file
+#   16. umount          -- clean umount, no -l fallback
 #
 # Prints `9P SUMMARY: X/Y phases passed` and the tinyvmm shutdown sentinel.
 if grep -q 'tinyvmm.test=9p' /proc/cmdline 2>/dev/null; then
@@ -1363,10 +1367,25 @@ if grep -q 'tinyvmm.test=9p' /proc/cmdline 2>/dev/null; then
         rm -f /mnt/p9/append.txt 2>/dev/null || true
     fi
 
+    # Phase 15: owner-nonroot. p9_test.py shares with uid=1000,gid=1000, so
+    # every entry must report that owner, and uid 1000 -- with no capability
+    # to override the guest's permission checks -- must be able to write.
+    OWNER=$(stat -c %u:%g /mnt/p9 /mnt/p9/empty.bin /mnt/p9/subdir 2>&1 | sort -u)
+    if [ "$OWNER" = "1000:1000" ] && \
+       chpst -u 1000:1000 sh -c 'echo nonroot > /mnt/p9/nonroot.txt && \
+           [ "$(cat /mnt/p9/nonroot.txt)" = nonroot ] && \
+           rm /mnt/p9/nonroot.txt' 2>/dev/kmsg && \
+       [ ! -e /mnt/p9/nonroot.txt ]; then
+        np_pass owner-nonroot "owner 1000:1000; uid 1000 created + removed a file"
+    else
+        np_fail owner-nonroot "owner=[$OWNER] or uid 1000 could not write"
+        rm -f /mnt/p9/nonroot.txt 2>/dev/null || true
+    fi
+
     cd / || true
     sync
 
-    # Phase 15: umount. No -l fallback in the primary assertion --
+    # Phase 16: umount. No -l fallback in the primary assertion --
     # a clean umount requires all fids were Tclunked, which proves
     # we did not leak any references.
     if umount /mnt/p9 2>/dev/kmsg; then

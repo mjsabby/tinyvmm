@@ -623,7 +623,9 @@ done. Build them in this order:
   pool. Note the **path-security** layer: every component is validated
   (reject `..`, control chars, Win32 metacharacters, reserved DOS names), `..` is
   resolved clamp-to-root, and all host I/O goes through `\\?\` long paths
-  (`README.md` §9).
+  (`README.md` §9). NTFS has no POSIX owner or mode, so `Rgetattr` reports the
+  share's `uid=`/`gid=` (default root) and a synthesized mode; the guest enforces
+  those bits itself.
 
 **The doorbell fast path** (`crates/whpsys/src/doorbell.rs`,
 `transport.rs:383`). A queue kick is a guest write to the notify register, which

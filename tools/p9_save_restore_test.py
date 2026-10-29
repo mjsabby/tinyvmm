@@ -13,17 +13,17 @@ Phases
 ------
   0. Stage a host dir with ``snapfile.txt`` (a known marker) exposed as 9p
      tag ``host``.
-  1. --save: boot ``--pvh-run --virtio-9p-share host=<dir> --save <snap>`` with
-     ``tinyvmm.test=p9snapshot``. The guest mounts, opens FD 3, fires the
-     trigger. Assert rc=0, the guest ``P9SNAP: pre-trigger sentinel``, the host
-     ``[snapshot] trigger fired`` + ``[snapshot] wrote N bytes``, and that the
-     snapshot file is >= RAM bytes.
-  2. --restore: ``--restore <snap>``. The 9p share root is reconstructed FROM
-     THE SNAPSHOT HEADER, so no ``--virtio-9p-share`` is needed. Assert
-     ``P9SNAP: POST-RESTORE-CONTINUE rc=0``, that BOTH the reopened-fid read
-     (``post-restore read [<marker>]``) and the fresh-open read
-     (``post-restore fresh-read [<marker>]``) return the marker, and the
-     shutdown sentinel.
+  1. --save: boot ``--pvh-run --virtio-9p-share host=<dir>,uid=1000,gid=1000
+     --save <snap>`` with ``tinyvmm.test=p9snapshot``. The guest mounts, opens
+     FD 3, fires the trigger. Assert rc=0, the guest ``P9SNAP: pre-trigger
+     sentinel``, the host ``[snapshot] trigger fired`` + ``[snapshot] wrote N
+     bytes``, and that the snapshot file is >= RAM bytes.
+  2. --restore: ``--restore <snap>``. The 9p share root and owner are
+     reconstructed FROM THE SNAPSHOT HEADER, so no ``--virtio-9p-share`` is
+     needed. Assert ``P9SNAP: POST-RESTORE-CONTINUE rc=0``, that BOTH the
+     reopened-fid read (``post-restore read [<marker>]``) and the fresh-open
+     read (``post-restore fresh-read [<marker>]``) return the marker, that the
+     share still reports owner 1000:1000, and the shutdown sentinel.
   3. sha256(snapshot) unchanged across the restore (restore is read-only wrt the
      file).
 
@@ -67,6 +67,8 @@ DEFAULT_SNAP = REPO / "p9snap_test.tvm"
 
 # Must match the bytes the harness writes into snapfile.txt (sans trailing NL).
 MARKER = "P9SNAPSHOT_MARKER_OK"
+# Owner the share is saved with; restore must rebuild it from the header.
+OWNER_UID, OWNER_GID = 1000, 1000
 
 PRE_SENTINEL_RE = re.compile(r"P9SNAP: pre-trigger sentinel")
 TRIGGER_FIRED_RE = re.compile(r"\[snapshot\] trigger fired from vp=\d+")
@@ -74,6 +76,7 @@ SNAP_WROTE_RE = re.compile(r"\[snapshot\] wrote (\d+) bytes")
 POST_CONTINUE_RE = re.compile(r"P9SNAP: POST-RESTORE-CONTINUE rc=0")
 POST_READ_RE = re.compile(r"P9SNAP: post-restore read \[" + re.escape(MARKER) + r"\]")
 FRESH_READ_RE = re.compile(r"P9SNAP: post-restore fresh-read \[" + re.escape(MARKER) + r"\]")
+OWNER_RE = re.compile(r"P9SNAP: post-restore owner \[(.*?)\]")
 SHUTDOWN_SENTINEL = "=== tinyvmm shutdown requested ==="
 
 
@@ -149,7 +152,7 @@ def phase1_save(args: argparse.Namespace, share: Path) -> None:
         str(args.tinyvmm),
         "--pvh-run",
         "--ram-mb", str(args.ram_mb),
-        "--virtio-9p-share", f"host={share}",
+        "--virtio-9p-share", f"host={share},uid={OWNER_UID},gid={OWNER_GID}",
         "--watchdog-secs", str(args.save_timeout),
         "--save", str(args.snap_path),
         "--initrd", str(args.initrd),
@@ -203,9 +206,16 @@ def phase2_restore(args: argparse.Namespace) -> None:
         raise SystemExit(
             f"[restore] FAIL: fresh-open read did not return [{MARKER}] "
             "(the 9p share is not usable after restore)")
+    m = OWNER_RE.search(log)
+    want_owner = f"{OWNER_UID}:{OWNER_GID}"
+    if not m or m.group(1) != want_owner:
+        raise SystemExit(
+            f"[restore] FAIL: share owner after restore is "
+            f"[{m.group(1) if m else '?'}], want [{want_owner}]")
     if SHUTDOWN_SENTINEL not in log:
         raise SystemExit("[restore] FAIL: shutdown sentinel not in log")
-    print(f"[restore] OK in {wall:.2f}s (open fid reopened + fresh open both read the marker)")
+    print(f"[restore] OK in {wall:.2f}s (open fid reopened + fresh open both read "
+          f"the marker; owner {want_owner} kept)")
 
 
 def main() -> int:

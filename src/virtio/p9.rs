@@ -14,6 +14,12 @@
 //! Security: a share root is trusted (the operator chose it). We sanitise each
 //! path component (reject separators / NUL / reserved DOS names) and resolve
 //! ".."/"." against the wire path so a guest cannot escape the share.
+//!
+//! Ownership: NTFS has no POSIX owner or mode bits, so every entry reports the
+//! share's configured `uid`/`gid` (default 0, root) and a synthesized mode
+//! (dirs 0755, files 0644, or 0444 when read-only on the host). The guest
+//! enforces those bits itself, so only that owner (or root) can write. chmod
+//! and chown are accepted but not stored.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -588,6 +594,9 @@ pub struct P9Device {
     tag: String,
     host_root: PathBuf,
     readonly: bool,
+    // Owner reported for every entry (see the module docs).
+    uid: u32,
+    gid: u32,
     share_root_norm: Vec<u16>,
     config_bytes: Vec<u8>,
     driver_ok: AtomicBool,
@@ -609,6 +618,8 @@ impl P9Device {
         tag: String,
         host_root: PathBuf,
         readonly: bool,
+        uid: u32,
+        gid: u32,
     ) -> Arc<Self> {
         let share_root_norm = normalize_for_containment(&host_root);
         let mut config_bytes = Vec::with_capacity(2 + tag.len());
@@ -621,6 +632,8 @@ impl P9Device {
             tag,
             host_root,
             readonly,
+            uid,
+            gid,
             share_root_norm,
             config_bytes,
             driver_ok: AtomicBool::new(false),
@@ -1759,8 +1772,8 @@ impl P9Device {
         enc8(reply, STATS_BASIC & request_mask);
         enc_qid(reply, qt, qv, qp);
         enc4(reply, mode);
-        enc4(reply, 0); // uid
-        enc4(reply, 0); // gid
+        enc4(reply, self.uid);
+        enc4(reply, self.gid);
         enc8(reply, nlink);
         enc8(reply, 0); // rdev
         enc8(reply, size);
@@ -2476,7 +2489,7 @@ mod tests {
 
         let canon_root = std::fs::canonicalize(&share).unwrap();
         let mem = std::sync::Arc::new(whpsys::memory::GuestMemory::new_host_only(4096).unwrap());
-        let dev = P9Device::new(mem, "test".into(), canon_root, false);
+        let dev = P9Device::new(mem, "test".into(), canon_root, false, 0, 0);
 
         // A genuine subdir of the share opens fine.
         assert!(
@@ -2513,7 +2526,7 @@ mod tests {
         let root = std::fs::canonicalize(&share).unwrap();
 
         let mem = std::sync::Arc::new(whpsys::memory::GuestMemory::new_host_only(4096).unwrap());
-        let dev = P9Device::new(mem.clone(), "t".into(), root.clone(), false);
+        let dev = P9Device::new(mem.clone(), "t".into(), root.clone(), false, 0, 0);
         dev.driver_ok.store(true, Ordering::Relaxed);
         let feats = dev.device_features();
         dev.acked_features.store(feats, Ordering::Relaxed);
@@ -2541,7 +2554,7 @@ mod tests {
 
         let blob = dev.capture_device_state();
 
-        let dev2 = P9Device::new(mem, "t".into(), root, false);
+        let dev2 = P9Device::new(mem, "t".into(), root, false, 0, 0);
         dev2.apply_device_state(&blob);
         assert!(dev2.driver_ok.load(Ordering::Relaxed));
         assert_eq!(dev2.acked_features.load(Ordering::Relaxed), feats);
@@ -2556,6 +2569,61 @@ mod tests {
         let f3 = fids.map.get(&3).unwrap();
         assert!(f3.is_dir && !f3.opened && f3.handle.is_none() && f3.qid_path == 1);
         drop(fids);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Rgetattr must report the share's configured owner for the root and for
+    /// the files under it, so that guest user can write to the share.
+    #[test]
+    fn getattr_reports_share_owner() {
+        let base = std::env::temp_dir().join(format!("tinyvmm_p9_owner_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("file.txt"), b"hello").unwrap();
+        let root = std::fs::canonicalize(&base).unwrap();
+        let mem = std::sync::Arc::new(whpsys::memory::GuestMemory::new_host_only(4096).unwrap());
+        let dev = P9Device::new(mem, "t".into(), root, false, 1000, 1001);
+
+        let call = |mtype: u8, body: &dyn Fn(&mut Vec<u8>)| -> Vec<u8> {
+            let mut t = Vec::new();
+            enc4(&mut t, 0);
+            enc1(&mut t, mtype);
+            enc2(&mut t, 1);
+            body(&mut t);
+            finalize(&mut t);
+            let mut reply = Vec::new();
+            dev.dispatch(&t, &mut reply, 8192);
+            assert_eq!(reply[4], mtype + 1, "T-message {mtype} failed: {reply:?}");
+            reply
+        };
+        call(T_VERSION, &|t| {
+            enc4(t, 8192);
+            enc_str(t, "9P2000.L");
+        });
+        call(T_ATTACH, &|t| {
+            enc4(t, 0);
+            enc4(t, NO_FID);
+            enc_str(t, "");
+            enc_str(t, "");
+            enc4(t, 0);
+        });
+        call(T_WALK, &|t| {
+            enc4(t, 0);
+            enc4(t, 1);
+            enc2(t, 1);
+            enc_str(t, "file.txt");
+        });
+        for fid in [0u32, 1] {
+            let r = call(T_GETATTR, &|t| {
+                enc4(t, fid);
+                enc8(t, STATS_BASIC);
+            });
+            // size[4] type[1] tag[2] valid[8] qid[13] mode[4] uid[4] gid[4]
+            let uid = u32::from_le_bytes(r[32..36].try_into().unwrap());
+            let gid = u32::from_le_bytes(r[36..40].try_into().unwrap());
+            assert_eq!((uid, gid), (1000, 1001), "fid {fid}");
+        }
 
         let _ = std::fs::remove_dir_all(&base);
     }

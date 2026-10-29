@@ -132,6 +132,9 @@ struct P9ShareSpec {
     tag: String,
     host_root: std::path::PathBuf,
     readonly: bool,
+    // Owner every entry reports to the guest (`uid=`/`gid=`; default root).
+    uid: u32,
+    gid: u32,
 }
 
 fn print_usage() {
@@ -148,7 +151,7 @@ fn print_usage() {
          \x20              [--net [--net-backend loopback|nat] [--portfwd H:G]... [--nat-workers N]]...\n\
          \x20              (repeat --net per NIC)\n\
          \x20              [--drive <path>[,readonly]]... [--cpu-affinity all|p|e|p-physical]\n\
-         \x20              [--virtio-9p-share <tag>=<host_path>[,ro]]...\n\
+         \x20              [--virtio-9p-share <tag>=<host_path>[,ro][,uid=N][,gid=N]]...\n\
          \x20              [--gpu [WxH]]  (virtio-gpu 2D scanout to a window; default 1280x800)\n\
          \x20              [--save <path> [--unsafe-save-mutable-drive]]\n\
          \x20              [--watchdog-secs N] [--debug-boot] <vmlinux> [-- <cmdline>]\n\
@@ -1131,12 +1134,13 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
                 drives.push(DriveSpec { path, readonly });
             }
             "--virtio-9p-share" => {
+                const WANT: &str = "<tag>=<host_path>[,ro][,uid=N][,gid=N]";
                 i += 1;
                 let spec = args
                     .get(i)
-                    .ok_or_else(|| Error::msg("--virtio-9p-share wants <tag>=<host_path>[,ro]"))?;
+                    .ok_or_else(|| Error::msg(format!("--virtio-9p-share wants {WANT}")))?;
                 let eq = spec.find('=').ok_or_else(|| {
-                    Error::msg("--virtio-9p-share: missing '=' (want <tag>=<host_path>[,ro])")
+                    Error::msg(format!("--virtio-9p-share: missing '=' (want {WANT})"))
                 })?;
                 let tag = spec[..eq].to_string();
                 if tag.is_empty() || tag.len() > 256 {
@@ -1145,15 +1149,26 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
                 let mut parts = spec[eq + 1..].splitn(2, ',');
                 let path = parts.next().unwrap_or("");
                 let mut readonly = false;
+                let (mut uid, mut gid) = (0u32, 0u32);
                 if let Some(opts) = parts.next() {
                     for kv in opts.split(',') {
-                        match kv {
-                            "readonly" | "ro" => readonly = true,
-                            other => {
-                                return Err(Error::msg(format!(
-                                    "--virtio-9p-share: unknown option '{other}' (want ro)"
-                                )));
-                            }
+                        let id = |v: &str| {
+                            v.parse::<u32>().map_err(|_| {
+                                Error::msg(format!(
+                                    "--virtio-9p-share: bad id in '{kv}' (want a number)"
+                                ))
+                            })
+                        };
+                        if let Some(v) = kv.strip_prefix("uid=") {
+                            uid = id(v)?;
+                        } else if let Some(v) = kv.strip_prefix("gid=") {
+                            gid = id(v)?;
+                        } else if kv == "readonly" || kv == "ro" {
+                            readonly = true;
+                        } else {
+                            return Err(Error::msg(format!(
+                                "--virtio-9p-share: unknown option '{kv}' (want ro, uid=N, gid=N)"
+                            )));
                         }
                     }
                 }
@@ -1183,6 +1198,8 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
                     tag,
                     host_root: host,
                     readonly,
+                    uid,
+                    gid,
                 });
             }
             "--save" => {
@@ -1730,7 +1747,14 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     //   mount -t 9p -o trans=virtio,version=9p2000.L <tag> /mnt/...
     let mut p9_devices: Vec<Arc<P9Device>> = Vec::with_capacity(cfg.p9_shares.len());
     for (i, s) in cfg.p9_shares.iter().enumerate() {
-        let p9 = P9Device::new(ram.clone(), s.tag.clone(), s.host_root.clone(), s.readonly);
+        let p9 = P9Device::new(
+            ram.clone(),
+            s.tag.clone(),
+            s.host_root.clone(),
+            s.readonly,
+            s.uid,
+            s.gid,
+        );
         let p9_dev: Arc<dyn VirtioDevice> = p9.clone();
         let popts = transport::Options {
             vendor_id: 0x1AF4,
@@ -1759,11 +1783,13 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         transports.push(pt.clone());
         p9_devices.push(p9.clone());
         println!(
-            "[pvh-run] virtio-9p[{}] on PCI 00:{:02x}.0 tag={} host={}{}",
+            "[pvh-run] virtio-9p[{}] on PCI 00:{:02x}.0 tag={} host={} owner={}:{}{}",
             i,
             pbdf.device,
             s.tag,
             s.host_root.display(),
+            s.uid,
+            s.gid,
             if s.readonly { " (ro)" } else { "" }
         );
     }
@@ -2427,11 +2453,13 @@ fn write_snapshot(
             .bool(&format!("drive{i}_readonly"), d.readonly);
     }
     // Per-9p-share config so restore rebuilds each virtio-9p device with the same
-    // tag/root/RO. The device's own fid table is captured in its PciDevice section.
+    // tag/root/RO/owner. The device's own fid table is captured in its PciDevice section.
     for (i, s) in cfg.p9_shares.iter().enumerate() {
         jw.str(&format!("p9{i}_tag"), &s.tag)
             .str(&format!("p9{i}_root"), &s.host_root.to_string_lossy())
-            .bool(&format!("p9{i}_readonly"), s.readonly);
+            .bool(&format!("p9{i}_readonly"), s.readonly)
+            .u64(&format!("p9{i}_uid"), s.uid as u64)
+            .u64(&format!("p9{i}_gid"), s.gid as u64);
     }
 
     let mut w = SnapshotWriter::create(path)?;
@@ -2910,11 +2938,16 @@ fn run_restore(args: &[String]) -> Result<i32> {
         let tag = jr.get_str(&format!("p9{i}_tag"))?;
         let root = jr.get_str(&format!("p9{i}_root"))?;
         let ro = jr.get_bool(&format!("p9{i}_readonly")).unwrap_or(false);
+        // Snapshots from before per-share owners report root, as those builds did.
+        let uid = jr.get_u64(&format!("p9{i}_uid")).unwrap_or(0) as u32;
+        let gid = jr.get_u64(&format!("p9{i}_gid")).unwrap_or(0) as u32;
         let p9 = P9Device::new(
             ram.clone(),
             tag.clone(),
             std::path::PathBuf::from(&root),
             ro,
+            uid,
+            gid,
         );
         let p9_dev: Arc<dyn VirtioDevice> = p9.clone();
         let popts = transport::Options {
@@ -2942,7 +2975,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
         pci_bus.add_device(pt.clone() as Arc<dyn PciFunction>);
         transports.push(pt.clone());
         println!(
-            "[restore] virtio-9p[{i}] tag={tag} host={root}{}",
+            "[restore] virtio-9p[{i}] tag={tag} host={root} owner={uid}:{gid}{}",
             if ro { " (ro)" } else { "" }
         );
     }
