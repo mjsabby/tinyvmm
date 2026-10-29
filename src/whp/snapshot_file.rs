@@ -1004,7 +1004,7 @@ mod tests {
             let mut w = SnapshotWriter::create(p).unwrap();
             w.write_header(&json).unwrap();
             w.write_ram_sparse(&[1u8, 2, 3, 4, 5]).unwrap();
-            w.write_section(SectionType::VcpuRegs, &vec![0xABu8; 100])
+            w.write_section(SectionType::VcpuRegs, &[0xABu8; 100])
                 .unwrap();
             w.finalize().unwrap();
         }

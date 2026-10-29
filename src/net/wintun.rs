@@ -250,18 +250,17 @@ fn rx_worker(
             let sz = size as usize;
             // WinTun hands us an L3 packet; only IPv4 is bridged (v6 dropped).
             let version = if sz > 0 { (unsafe { *p }) >> 4 } else { 0 };
-            if version == 4 && sz + ETH_HDR <= RX_FRAME_CAP {
-                if let Some(b) = weak.upgrade() {
-                    frame[0..6].copy_from_slice(&b.guest_mac);
-                    frame[6..12].copy_from_slice(&b.backend_mac);
-                    frame[12..14].copy_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(p, frame.as_mut_ptr().add(ETH_HDR), sz)
-                    };
-                    if let Some(net) = b.net.upgrade() {
-                        net.inject_rx(&frame[..ETH_HDR + sz]);
-                        b.rx_packets.fetch_add(1, Ordering::Relaxed);
-                    }
+            if version == 4
+                && sz + ETH_HDR <= RX_FRAME_CAP
+                && let Some(b) = weak.upgrade()
+            {
+                frame[0..6].copy_from_slice(&b.guest_mac);
+                frame[6..12].copy_from_slice(&b.backend_mac);
+                frame[12..14].copy_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+                unsafe { core::ptr::copy_nonoverlapping(p, frame.as_mut_ptr().add(ETH_HDR), sz) };
+                if let Some(net) = b.net.upgrade() {
+                    net.inject_rx(&frame[..ETH_HDR + sz]);
+                    b.rx_packets.fetch_add(1, Ordering::Relaxed);
                 }
             }
             handles.api.release_receive_packet(handles.session, p);

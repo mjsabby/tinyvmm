@@ -164,10 +164,11 @@ pub fn apply_non_timing(vp: &Vcpu, st: &CapturedVcpuState) -> Result<()> {
     // 1.5 Supervisor MSRs BEFORE XSAVE (XRSTORS validates IA32_XSS/CET). Per-reg
     // with WARN-on-failure (unsupported names on older WHP builds are tolerated).
     for (i, &name) in SUP_MSR_REGS.iter().enumerate() {
-        if i < st.sup_msr_ok.len() && st.sup_msr_ok[i] {
-            if let Err(e) = vp.set_register_bytes(name, &st.sup_msr[i]) {
-                eprintln!("[vcpu-state] WARN: set sup_msr[{i}] (0x{name:08x}) failed: {e}");
-            }
+        if i < st.sup_msr_ok.len()
+            && st.sup_msr_ok[i]
+            && let Err(e) = vp.set_register_bytes(name, &st.sup_msr[i])
+        {
+            eprintln!("[vcpu-state] WARN: set sup_msr[{i}] (0x{name:08x}) failed: {e}");
         }
     }
 
@@ -181,10 +182,11 @@ pub fn apply_non_timing(vp: &Vcpu, st: &CapturedVcpuState) -> Result<()> {
 
     // 4. Interrupt-control synthetic registers, individually (WARN on failure).
     for (i, &name) in INTR_CTL_REGS.iter().enumerate() {
-        if i < st.intr_ctl_ok.len() && st.intr_ctl_ok[i] {
-            if let Err(e) = vp.set_register_bytes(name, &st.intr_ctl[i]) {
-                eprintln!("[vcpu-state] WARN: set intr_ctl[{i}] (0x{name:08x}) failed: {e}");
-            }
+        if i < st.intr_ctl_ok.len()
+            && st.intr_ctl_ok[i]
+            && let Err(e) = vp.set_register_bytes(name, &st.intr_ctl[i])
+        {
+            eprintln!("[vcpu-state] WARN: set intr_ctl[{i}] (0x{name:08x}) failed: {e}");
         }
     }
     Ok(())

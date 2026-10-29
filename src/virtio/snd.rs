@@ -1222,8 +1222,10 @@ mod tests {
         let mut xfer = 0u32.to_le_bytes();
         let mut data = [1u8, 2, 3, 4, 5, 6, 7, 8];
         let mut status = [0xAAu8; 8];
-        let mut chain = PoppedChain::default();
-        chain.head_index = 9;
+        let mut chain = PoppedChain {
+            head_index: 9,
+            ..Default::default()
+        };
         chain.bufs.push(cb(false, &mut xfer));
         chain.bufs.push(cb(false, &mut data));
         chain.bufs.push(cb(true, &mut status));
@@ -1332,7 +1334,7 @@ mod tests {
         assert_eq!(resp.len(), 4 + 32);
         let used = scatter(&mut chain, &resp);
         assert_eq!(used as usize, resp.len());
-        assert_eq!(u32::from_le_bytes(hdr.try_into().unwrap()), S_OK);
+        assert_eq!(u32::from_le_bytes(hdr), S_OK);
         // The 4-byte status header fills the first writable buffer, so the info
         // entry starts at body[0]. direction byte is at info offset 24.
         assert_eq!(body[24], D_OUTPUT);

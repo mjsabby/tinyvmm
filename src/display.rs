@@ -348,10 +348,10 @@ fn shared_ptr(hwnd: HWND) -> *const Shared {
 
 /// Deliver a translated event to the installed input sink, if any.
 fn emit(shared: &Shared, ev: WindowEvent) {
-    if let Ok(mut guard) = shared.input.lock() {
-        if let Some(sink) = guard.as_mut() {
-            sink(ev);
-        }
+    if let Ok(mut guard) = shared.input.lock()
+        && let Some(sink) = guard.as_mut()
+    {
+        sink(ev);
     }
 }
 

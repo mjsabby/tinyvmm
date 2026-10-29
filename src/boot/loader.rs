@@ -196,12 +196,11 @@ fn inspect(bytes: &[u8]) -> Result<PvhInfo> {
         if p_type == PT_NOTE {
             let start = p_offset as usize;
             let end = start.saturating_add(p_filesz as usize);
-            if end <= bytes.len() {
-                if let Some(e) = find_pvh_note(&bytes[start..end]) {
-                    if info.phys32_entry.is_none() {
-                        info.phys32_entry = Some(e);
-                    }
-                }
+            if end <= bytes.len()
+                && let Some(e) = find_pvh_note(&bytes[start..end])
+                && info.phys32_entry.is_none()
+            {
+                info.phys32_entry = Some(e);
             }
         } else if p_type == PT_LOAD {
             if p_filesz == 0 && p_memsz == 0 {
@@ -238,11 +237,11 @@ fn inspect(bytes: &[u8]) -> Result<PvhInfo> {
                 let sh_offset = rd_u64(bytes, sh + 24)? as usize;
                 let sh_size = rd_u64(bytes, sh + 32)? as usize;
                 let end = sh_offset.saturating_add(sh_size);
-                if end <= bytes.len() {
-                    if let Some(e) = find_pvh_note(&bytes[sh_offset..end]) {
-                        info.phys32_entry = Some(e);
-                        break;
-                    }
+                if end <= bytes.len()
+                    && let Some(e) = find_pvh_note(&bytes[sh_offset..end])
+                {
+                    info.phys32_entry = Some(e);
+                    break;
                 }
             }
         }

@@ -2401,10 +2401,10 @@ fn parse_restore_nic(
     let mut port_forwards = Vec::new();
     let pf_count = jr.get_u64(&format!("{prefix}_portfwd_count")).unwrap_or(0) as usize;
     for j in 0..pf_count {
-        if let Ok(s) = jr.get_str(&format!("{prefix}_portfwd{j}")) {
-            if let Some(pf) = decode_portfwd(&s) {
-                port_forwards.push(pf);
-            }
+        if let Ok(s) = jr.get_str(&format!("{prefix}_portfwd{j}"))
+            && let Some(pf) = decode_portfwd(&s)
+        {
+            port_forwards.push(pf);
         }
     }
     let mac = match jr.get_u64(&format!("{prefix}_mac")) {
