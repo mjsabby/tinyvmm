@@ -81,4 +81,17 @@ mod tests {
         assert_eq!(config.initrd.as_deref(), Some("custom.cpio"));
         assert_eq!(config.cmdline, "console=hvc0 tinyinit.epoch=42");
     }
+
+    #[test]
+    fn large_pages_default_to_plain_builds_and_can_be_selected() {
+        let parse = |extra: &[&str]| {
+            let mut parts = vec!["tinyvmm", "--pvh-run"];
+            parts.extend_from_slice(extra);
+            parts.push("vmlinux");
+            parse_pvh_args(&args(&parts)).unwrap().large_pages
+        };
+        assert_eq!(parse(&[]), !BUNDLED);
+        assert!(parse(&["--large-pages"]));
+        assert!(!parse(&["--no-large-pages"]));
+    }
 }

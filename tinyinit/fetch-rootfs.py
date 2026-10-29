@@ -1,18 +1,33 @@
 """Fetch a digest-pinned MCR image and flatten its layers without Docker or WSL."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import copy
-import gzip
 import hashlib
 import io
 import json
 from pathlib import Path, PurePosixPath
 import posixpath
 import re
+import struct
+import sys
 import tarfile
 import time
 import urllib.request
 
+try:
+    from compression import zstd
+except ImportError:
+    sys.exit("Python 3.14+ is required for the standard-library zstd module.")
+
 HERE = Path(__file__).resolve().parent
+# A zstd skippable frame marks a tinyinit pack; standard zstd readers ignore it.
+PACK_MAGIC = 0x184D2A5E
+PACK_ID = b"tinyinit-rootfs-v1"
+FRAME_TARGET = 8 << 20
+ZSTD_OPTIONS = {
+    zstd.CompressionParameter.compression_level: 19,
+    zstd.CompressionParameter.checksum_flag: 1,
+}
 MANIFEST_TYPES = ", ".join([
     "application/vnd.docker.distribution.manifest.v2+json",
     "application/vnd.docker.distribution.manifest.list.v2+json",
@@ -162,6 +177,50 @@ def merge_layer(entries, layer):
         entries[name] = (member, data)
 
 
+def tar_fragment(items):
+    """Serialize whole tar entries without an end-of-archive marker."""
+    buffer = io.BytesIO()
+    archive = tarfile.open(fileobj=buffer, mode="w", format=tarfile.PAX_FORMAT)
+    for member, data in items:
+        archive.addfile(member, io.BytesIO(data) if member.isreg() else None)
+    return buffer.getvalue()[:archive.offset]
+
+
+def pack_fragments(entries):
+    """Split a flattened tree into independently extractable tar fragments.
+
+    The first fragment holds directories and symlinks; the rest hold regular
+    files in path order, cut near FRAME_TARGET uncompressed bytes. Concatenated,
+    the fragments are one ordinary tar stream."""
+    ordered = [entries[name] for name in sorted(entries)]
+    groups, current, size = [], [], 0
+    for member, data in ordered:
+        if not member.isreg():
+            continue
+        if current and size + len(data) > FRAME_TARGET:
+            groups.append(current)
+            current, size = [], 0
+        current.append((member, data))
+        size += len(data)
+    if current:
+        groups.append(current)
+    fragments = [tar_fragment([item for item in ordered if not item[0].isreg()])]
+    fragments += [tar_fragment(group) for group in groups]
+    fragments[-1] += bytes(2 * tarfile.BLOCKSIZE)
+    return fragments
+
+
+def write_pack(entries, output):
+    fragments = pack_fragments(entries)
+    with ThreadPoolExecutor() as pool:
+        frames = list(pool.map(lambda data: zstd.compress(data, options=ZSTD_OPTIONS), fragments))
+    with output.open("wb") as target:
+        target.write(struct.pack("<II", PACK_MAGIC, len(PACK_ID)) + PACK_ID)
+        for frame in frames:
+            target.write(frame)
+    return len(frames)
+
+
 def build():
     started = time.perf_counter()
     lock = json.loads((HERE / "rootfs.lock.json").read_text())
@@ -170,7 +229,7 @@ def build():
     repository = lock["image"].removeprefix("mcr.microsoft.com/")
     cache = HERE / "out" / "rootfs-cache"
     cache.mkdir(parents=True, exist_ok=True)
-    output = cache / "rootfs.tar.gz"
+    output = cache / "rootfs.tar.zst"
     receipt = cache / "rootfs.json"
     recipe = sha256(Path(__file__))
     if output.exists() and receipt.exists():
@@ -190,17 +249,12 @@ def build():
         print(f"Rootfs layer={index}/{len(manifest['layers'])} merged_entries={len(entries)} duration_ms={(time.perf_counter() - layer_started) * 1000:.1f}", flush=True)
     temporary = output.with_suffix(".partial")
     try:
-        with temporary.open("wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as zipped:
-            with tarfile.open(fileobj=zipped, mode="w|", format=tarfile.PAX_FORMAT) as archive:
-                # Directories precede their children; Linux symlinks remain symlinks.
-                for name in sorted(entries):
-                    member, data = entries[name]
-                    archive.addfile(member, io.BytesIO(data) if member.isreg() else None)
+        frames = write_pack(entries, temporary)
         temporary.replace(output)
     finally:
         temporary.unlink(missing_ok=True)
     receipt.write_text(json.dumps({"lock": lock, "recipe": recipe, "sha256": sha256(output)}, indent=2) + "\n")
-    print(f"Embedded rootfs prepared: {output} bytes={output.stat().st_size} duration_ms={(time.perf_counter() - started) * 1000:.1f}", flush=True)
+    print(f"Embedded rootfs prepared: {output} bytes={output.stat().st_size} frames={frames} duration_ms={(time.perf_counter() - started) * 1000:.1f}", flush=True)
     return output
 
 

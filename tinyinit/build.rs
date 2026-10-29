@@ -9,7 +9,7 @@ fn main() {
     let status = Command::new("python")
         .arg("fetch-rootfs.py")
         .status()
-        .expect("Python 3.11+ is required to fetch the embedded rootfs");
+        .expect("Python 3.14+ is required to fetch the embedded rootfs");
     assert!(
         status.success(),
         "failed to prepare embedded ASP.NET rootfs"
@@ -17,7 +17,7 @@ fn main() {
     let archive = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
         .join("out")
         .join("rootfs-cache")
-        .join("rootfs.tar.gz");
+        .join("rootfs.tar.zst");
     println!("cargo:rerun-if-changed={}", archive.display());
     println!("cargo:rustc-env=TINYINIT_ROOTFS={}", archive.display());
 }

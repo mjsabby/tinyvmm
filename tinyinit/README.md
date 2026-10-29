@@ -7,7 +7,7 @@ The applet crates (`uu_cat`, etc.) come from the uutils/coreutils project.
 
 ## Build on Windows
 
-One-time setup (Rust/Cargo, Zig and Python 3.11+ must be on PATH):
+One-time setup (Rust/Cargo, Zig and Python 3.14+ must be on PATH):
 
 ```powershell
 rustup target add x86_64-unknown-linux-musl
@@ -27,10 +27,36 @@ The default build embeds the official ASP.NET **11.0 RC3**, Ubuntu Resolute
 **chiseled-extra**, Linux x86-64 filesystem. `rootfs.lock.json` pins the image's
 immutable manifest digest. `build.rs` runs `fetch-rootfs.py`, which downloads
 and SHA-256-verifies the manifest/layers directly from Microsoft Container
-Registry, applies layer whiteouts, and creates a compressed tar. No Docker,
-WSL, administrator rights, or Windows symlink support is needed for this step.
-Downloads and the flattened archive are cached under `out\rootfs-cache`;
-unchanged builds reuse them. The first build needs internet access.
+Registry and applies them in order at build time: whiteouts and opaque
+directories remove lower-layer paths, upper entries replace lower ones, and
+the result is one flat tree with each path exactly once. The guest never sees
+layers. No Docker, WSL, administrator rights, or Windows symlink support is
+needed for this step. Downloads and the packed archive are cached under
+`out\rootfs-cache`; unchanged builds reuse them. The first build needs internet
+access.
+
+The packed `rootfs.tar.zst` starts with a zstd skippable marker frame, then one
+frame of directories and symlinks, then frames of whole regular-file tar entries
+cut near 8 MiB in path order (21 frames for the pinned image; zstd level 19 with
+checksums). Decompressed in order, it is one ordinary tar stream, so standard
+`zstd`/`tar` tools can inspect it. Tinyinit extracts the directory/symlink frame
+first, then the file frames largest-first across every guest vCPU. The pack is
+56.7 MB versus 71.5 MB for the previous gzip tar.
+
+The fetcher is deliberately small and uses only the Python standard library,
+not an OCI library. It supports Docker v2/OCI manifests and indexes, gzip or
+zstd layers, regular files, directories, symlinks, hardlinks (materialized as
+copies, since flattening must not depend on link targets) and OCI whiteouts.
+Absolute symlinks are rewritten as equivalent relative links. It fails closed:
+an ambiguous platform, a digest mismatch, device nodes, escaping paths/links,
+or an unsupported manifest stops the build rather than producing a different
+rootfs. Pinned digests mean a changed image only arrives through `-RootfsImage`
+or `-UpdateRootfs`. If a future image needs something the fetcher lacks, build a
+trusted tarball with another tool and use it as an external rootfs.
+For the pinned image, extracting the pack with tinyinit's code matched an
+independent flattening (`crane export` from go-containerregistry, extracted by
+GNU tar) on all 1,709 paths: type, mode bits, numeric owner, content hash, file
+mtime and xattrs; the eight absolute symlinks resolve to the same targets.
 
 The embedded base includes CoreCLR, ASP.NET, matching glibc/loader and native
 dependencies, OpenSSL, ICU, CA certificates, timezone data, and OS metadata.
@@ -58,9 +84,11 @@ The build prints rootfs preparation/cache verification and cross-build timings.
 
 `.\build.ps1 -NoRootfs` builds the small init/shell/SSH binary without downloading
 or embedding a rootfs (unless image selection/update was explicitly requested).
-At boot it can create an empty tmpfs for shell-only workloads, or stream a trusted
+At boot it can create an empty tmpfs for shell-only workloads, or extract a trusted
 external rootfs using `tinyinit.rootfs=9p:TAG`; that read-only 9p share must contain
-`rootfs.tar.gz`. The share is mounted early and unmounted after extraction.
+`rootfs.tar.zst` (a pack from `fetch-rootfs.py`, extracted in parallel) or
+`rootfs.tar.gz` (streamed sequentially). The share is mounted early and
+unmounted after extraction.
 This explicit boot argument also overrides an embedded base when one exists.
 The parent repository's `build-appliance.ps1` packages these two init variants
 with a kernel into `tinyvmm-init.exe` and `tinyvmm-dotnet.exe`.
@@ -109,7 +137,7 @@ The root switch is a real mount move, not just chroot.
 This is an ordinary writable, RAM-backed Linux filesystem, not a direct mount
 of ELF memory segments. The compressed bytes stay in the executable and the
 expanded files occupy tmpfs memory; there is no guest disk dependency.
-The current build is approximately 87 MiB, with about 162 MiB of expanded
+The current build is approximately 73 MiB, with about 162 MiB of expanded
 regular-file contents, before applications and the kernel. The init ELF is
 shared through a read-only, nosuid bind mount, not copied into the new root.
 The `-NoRootfs` binary is approximately 19 MiB.
@@ -126,8 +154,8 @@ Boot arguments:
 - `tinyinit.bootstrap=bootstrap`: initial 9p tag, default `bootstrap`.
 - `tinyinit.config=/mnt/bootstrap/init.json`: configuration path, default shown.
 - `tinyinit.epoch=SECONDS`: set guest wall time before applications start.
-- `tinyinit.rootfs=9p:TAG`: stream `rootfs.tar.gz` from an early read-only share
-  into the new root instead of using the embedded base.
+- `tinyinit.rootfs=9p:TAG`: extract `rootfs.tar.zst` or `rootfs.tar.gz` from an
+  early read-only share into the new root instead of using the embedded base.
 
 ## Trusted rootfs metadata policy
 
@@ -212,29 +240,34 @@ writes `out\smoke\benchmark.json`, per-boot console logs and `.snapshot` files.
 Snapshots include mountinfo, top-level directories, tmpfs usage and meminfo.
 Each VM is powered off after measurement. Without `--dotnet`, the workload is
 two shell loops. The non-embedded mode packages the binary once before timing.
+`--vcpus N` (default 2) sets the guest vCPU count.
 The .NET probe records readiness after ICU, timezone, trust-store
 and ASP.NET loopback checks; this is not a benchmark of your production apps.
 
-Measured on this Windows/WHP host with Linux 7.3, 2 vCPUs, 1536 MiB guest RAM,
-warm host caches, logging enabled, and the standalone embedded .NET deployment:
+Measured on this Windows/WHP host with Linux 7.3, 1536 MiB guest RAM, warm host
+caches, logging enabled, and the standalone embedded .NET deployment (medians of
+five boots; the first column is the earlier gzip/single-copy build at 2 vCPUs):
 
-| Metric | Median | Min-max |
-|---|---:|---:|
-| Rootfs gzip/tar extraction into tmpfs | 674 ms | 661-695 ms |
-| Bind original tinyinit into the new root | 0.025 ms | 0.022-0.030 ms |
-| PID 1 entry to all processes spawned | 692 ms | 680-715 ms |
-| PID 1 entry to SSH listener ready | 693 ms | 681-715 ms |
-| PID 1 entry to both .NET probes ready | 935 ms | 917-999 ms |
-| VMM process launch to authenticated SSH command completion | 2083 ms | 2081-2133 ms |
+| Metric | Before | 1 vCPU | 2 vCPUs | 4 vCPUs |
+|---|---:|---:|---:|---:|
+| Rootfs extraction into tmpfs | 674 ms | 436 ms | 216 ms | 115 ms |
+| VMM launch to PID 1 first log | 348 ms | 197 ms | 163 ms | 163 ms |
+| PID 1 entry to SSH listener ready | 693 ms | 452 ms | 236 ms | 132 ms |
+| PID 1 entry to both .NET probes ready | 935 ms | 1017 ms | 492 ms | 381 ms |
+| VMM launch to authenticated SSH command completion | 2083 ms | 692 ms | 449 ms | 341 ms |
 
-The old executable-copy step took 26.7 ms and duplicated about 87 MiB.
+Rootfs extraction is the boot stage that scales with vCPUs; .NET startup also
+benefits because both probes start at once. Linux itself reached PID 1 in about
+80 ms of guest uptime with two or four vCPUs and about 118 ms with one.
+
+The old executable-copy step took 26.7 ms and duplicated the init executable.
 The bind mount eliminates that copy and tests verify identical device/inode
 numbers for `/proc/1/exe` and `/bin/tinyinit`.
 Mounting the root tmpfs itself takes about 0.02 ms; eager decompression/file
 creation is the dominant init cost. Guest app timestamps have 10 ms resolution.
-Host timings also include VMM/kernel startup and SSH client overhead. Russh's
-unchanged default rejection delay is 1000 ms, including the initial SSH `none`
-authentication probe; do not mistake that for slow filesystem or app startup.
+Host timings also include VMM/kernel startup and SSH client overhead. The SSH
+server rejects clients' initial `none` probe immediately; rejected keys and
+other failed authentication attempts keep Russh's 1000 ms delay.
 The host observation of app readiness occurs after SSH and is only an upper
 bound; the report also contains the apps' own guest readiness timestamps.
 
@@ -262,9 +295,9 @@ directories on the root tmpfs, not additional filesystems. `/bin`, `/sbin`,
 Tmpfs is appropriate for this simple diskless, disposable appliance: it supplies
 normal Linux file/permission/exec semantics and a real root mount for namespaces.
 It is not a zero-copy compressed filesystem. The root currently uses about
-165 MiB, plus the single original init executable (about 87 MiB with the embedded
+165 MiB, plus the single original init executable (about 73 MiB with the embedded
 base) retained by the bind mount. Compared with the old copy-based boot, this
-removes about 87 MiB of guest file contents. The minimal-init variant's executable
+avoids a second copy of that executable in guest memory. The minimal-init variant's executable
 is about 19 MiB and its external archive is unmounted after extraction.
 Optional initramfs overlay archives are not explicitly reclaimed yet.
 No guest swap is configured.

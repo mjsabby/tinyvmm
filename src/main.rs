@@ -161,6 +161,7 @@ fn print_usage() {
          \x20 tinyvmm --pci-selftest        host-side PCI host-bridge + BAR + sizing test\n\
          \x20 tinyvmm --pvh-info <vmlinux>\n\
          \x20 tinyvmm --pvh-run [--initrd <cpio>] [--ram-mb N] [--vcpus N] [--rng] [--input] [--sound]\n\
+         \x20              [--large-pages|--no-large-pages]\n\
          \x20              [--net [--net-backend loopback|nat] [--portfwd H:G]... [--nat-workers N]]...\n\
          \x20              (repeat --net per NIC)\n\
          \x20              [--drive <path>[,readonly]]... [--cpu-affinity all|p|e|p-physical]\n\
@@ -929,6 +930,7 @@ struct PvhArgs {
     unsafe_save_mutable_drive: bool,
     with_input: bool,
     with_sound: bool,
+    large_pages: bool,
 }
 
 /// Parse a `--portfwd HOSTPORT:GUESTPORT` rule. The host side binds 127.0.0.1
@@ -986,6 +988,9 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
     let mut unsafe_save_mutable_drive = false;
     let mut with_input = false;
     let mut with_sound = false;
+    // A failed or fragmented large-page allocation can stall startup for
+    // hundreds of milliseconds, so latency-oriented appliance builds opt in.
+    let mut large_pages = !boot::payload::BUNDLED;
 
     let mut i = 2;
     while i < args.len() && args[i].starts_with("--") && args[i] != "--" {
@@ -1111,6 +1116,8 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
                 }
             }
             "--input" => with_input = true,
+            "--large-pages" => large_pages = true,
+            "--no-large-pages" => large_pages = false,
             "--sound" => with_sound = true,
             "--cpu-affinity" => {
                 i += 1;
@@ -1302,6 +1309,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
         unsafe_save_mutable_drive,
         with_input,
         with_sound,
+        large_pages,
     })
 }
 
@@ -1429,6 +1437,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     part.set_local_apic_emulation(WHvX64LocalApicEmulationModeX2Apic)?;
     part.setup()?;
     let part_handle = part.handle();
+    btimer.mark("partition ready");
 
     // --- Guest RAM ---
     // RAM up to the 3584 MiB PCI MMIO window stays at GPA 0; any remainder is
@@ -1439,7 +1448,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         mem_layout::MMIO_WINDOW_BASE as usize,
         mem_layout::HIGH_RAM_BASE,
         true,
-        true,
+        cfg.large_pages,
     )?);
     let pages = if ram.large_pages() {
         "MEM_LARGE_PAGES"

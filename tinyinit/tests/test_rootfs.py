@@ -2,6 +2,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import struct
 import tarfile
 import tempfile
 import unittest
@@ -35,6 +36,29 @@ class LayerTests(unittest.TestCase):
         merge(entries, [("etc/old", b"new"), ("etc/.wh.old", b""), ("etc/.wh.tree", b"")])
         self.assertEqual(entries["etc/old"][1], b"new")
         self.assertNotIn("etc/tree/file", entries)
+        # The spec is order-independent within a layer: a whiteout listed
+        # before a same-layer file still only hides lower layers.
+        merge(entries, [("etc/.wh.old", b""), ("etc/old", b"newest")])
+        self.assertEqual(entries["etc/old"][1], b"newest")
+
+    def test_layers_apply_in_order_with_deletes_and_type_changes(self):
+        entries = {}
+        merge(entries, [
+            ("etc/remove", b"v1"),
+            ("usr/share/doc/readme", b"doc"),
+            ("usr/lib/data", b"file"),
+        ])
+        merge(entries, [
+            ("etc/.wh.remove", b""),
+            ("usr/share/doc", b"now a file"),
+            ("usr/lib/data/child", b"child"),
+        ])
+        self.assertNotIn("etc/remove", entries)
+        self.assertNotIn("usr/share/doc/readme", entries)
+        self.assertTrue(entries["usr/share/doc"][0].isreg())
+        self.assertEqual(entries["usr/lib/data/child"][1], b"child")
+        merge(entries, [("etc/remove", b"back")])
+        self.assertEqual(entries["etc/remove"][1], b"back")
 
     def test_opaque_directory_preserves_new_files(self):
         entries = {}
@@ -63,6 +87,60 @@ class LayerTests(unittest.TestCase):
         ]:
             with self.subTest(name=name), self.assertRaises(ValueError):
                 merge({}, [(name, value)])
+
+
+class PackTests(unittest.TestCase):
+    def test_upper_layer_metadata_survives_packing(self):
+        lower = tarfile.TarInfo("srv/tool")
+        lower.size = 2
+        upper = tarfile.TarInfo("srv/tool")
+        upper.size = 2
+        upper.mode, upper.uid, upper.gid, upper.mtime = 0o4755, 1000, 1001, 1_700_000_200
+        upper.pax_headers = {"SCHILY.xattr.user.raw": b"\xff\x00tag".decode("utf-8", "surrogateescape")}
+        directory = tarfile.TarInfo("tmp")
+        directory.type, directory.mode = tarfile.DIRTYPE, 0o1777
+        entries = {}
+        for members in ([(lower, b"v1")], [(upper, b"v2"), (directory, b"")]):
+            buffer = io.BytesIO()
+            with tarfile.open(fileobj=buffer, mode="w", format=tarfile.PAX_FORMAT) as archive:
+                for member, data in members:
+                    archive.addfile(member, io.BytesIO(data) if member.isreg() else None)
+            buffer.seek(0)
+            with tarfile.open(fileobj=buffer) as archive:
+                rootfs.merge_layer(entries, archive)
+        with tarfile.open(fileobj=io.BytesIO(b"".join(rootfs.pack_fragments(entries)))) as archive:
+            tool, tmp = archive.getmember("srv/tool"), archive.getmember("tmp")
+            self.assertEqual(archive.extractfile(tool).read(), b"v2")
+        self.assertEqual((tool.mode, tool.uid, tool.gid, tool.mtime), (0o4755, 1000, 1001, 1_700_000_200))
+        self.assertEqual(tool.pax_headers["SCHILY.xattr.user.raw"].encode("utf-8", "surrogateescape"), b"\xff\x00tag")
+        self.assertEqual(tmp.mode, 0o1777)
+
+    def test_frames_are_independent_slices_of_one_tar(self):
+        entries = {}
+        merge(entries, [
+            ("etc/a", b"a" * 10),
+            ("usr/b", b"b" * 10),
+            ("usr/c", b"c" * 4),
+            ("lib", (tarfile.SYMTYPE, "usr")),
+        ])
+        with patch.object(rootfs, "FRAME_TARGET", 16), tempfile.TemporaryDirectory() as directory:
+            fragments = rootfs.pack_fragments(entries)
+            output = Path(directory) / "rootfs.tar.zst"
+            self.assertEqual(rootfs.write_pack(entries, output), len(fragments))
+            data = output.read_bytes()
+        self.assertEqual(struct.unpack_from("<II", data), (rootfs.PACK_MAGIC, len(rootfs.PACK_ID)))
+        self.assertEqual(rootfs.zstd.decompress(data), b"".join(fragments))
+        members = []
+        for fragment in fragments:
+            with tarfile.open(fileobj=io.BytesIO(fragment)) as archive:
+                members.append([(member.name, member.isreg()) for member in archive.getmembers()])
+        self.assertEqual(members, [
+            [("lib", False)],
+            [("etc/a", True)],
+            [("usr/b", True), ("usr/c", True)],
+        ])
+        with tarfile.open(fileobj=io.BytesIO(b"".join(fragments))) as archive:
+            self.assertEqual(sorted(archive.getnames()), sorted(entries))
 
 
 class ImageTests(unittest.TestCase):

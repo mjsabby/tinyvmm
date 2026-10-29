@@ -24,6 +24,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tar = "0.4"
 tokio = { version = "1", features = ["full"] }
+zstd = { version = "0.13", default-features = false }
 uucore = "0.12"
 uu_cat = "0.12"
 uu_chmod = "0.12"

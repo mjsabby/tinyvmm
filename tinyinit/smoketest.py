@@ -47,7 +47,7 @@ class VM:
         self.events = {}
         self.boot_ready = threading.Event()
         argv = [
-            str(args.vmm), "--pvh-run", "--vcpus", "2", "--ram-mb", "1536", "--rng",
+            str(args.vmm), "--pvh-run", "--vcpus", str(args.vcpus), "--ram-mb", "1536", "--rng",
             "--net", "--portfwd", f"{self.port}:22",
             "--virtio-9p-share", f"bootstrap={bootstrap},ro",
             "--virtio-9p-share", f"apps={args.apps},ro",
@@ -222,7 +222,7 @@ def benchmark(args, config, package_ms):
         for key, values in metrics.items()
     }
     report = {
-        "runs": args.benchmark, "warmup_runs": 1, "vcpus": 2, "ram_mib": 1536,
+        "runs": args.benchmark, "warmup_runs": 1, "vcpus": args.vcpus, "ram_mib": 1536,
         "workload": "dotnet-probe" if args.dotnet else "shell",
         "image": json.loads((HERE / "rootfs.lock.json").read_text()),
         "binary_bytes": None if args.embedded else args.binary.stat().st_size,
@@ -250,13 +250,16 @@ def main():
     parser.add_argument("--binary", type=Path, default=HERE / "target/x86_64-unknown-linux-musl/release/tinyinit")
     parser.add_argument("--rootfs", type=Path)
     parser.add_argument("--embedded", action="store_true", help="use only the VMM executable's embedded kernel/initramfs")
-    parser.add_argument("--external-rootfs", type=Path, help="directory containing trusted rootfs.tar.gz, shared read-only for early extraction")
+    parser.add_argument("--external-rootfs", type=Path, help="directory containing trusted rootfs.tar.zst or rootfs.tar.gz, shared read-only for early extraction")
     parser.add_argument("--apps", type=Path)
     parser.add_argument("--dotnet", action="store_true", help="run tests/DotnetApp DLLs from --apps using embedded ASP.NET")
     parser.add_argument("--benchmark", type=int, metavar="RUNS", help="benchmark RUNS boots after one warm-up, instead of the smoke suite")
+    parser.add_argument("--vcpus", type=int, default=2, help="guest vCPUs (default 2)")
     args = parser.parse_args()
     if args.benchmark is not None and args.benchmark < 1:
         parser.error("--benchmark must be at least 1")
+    if args.vcpus < 1:
+        parser.error("--vcpus must be at least 1")
     OUT.mkdir(parents=True, exist_ok=True)
     if not args.embedded and args.kernel is None:
         parser.error("--kernel is required without --embedded")
@@ -265,8 +268,8 @@ def main():
     for path in ([args.vmm] if args.embedded else [args.kernel, args.vmm, args.binary]):
         if not path.is_file():
             parser.error(f"missing {path}")
-    if args.external_rootfs and not (args.external_rootfs / "rootfs.tar.gz").is_file():
-        parser.error("--external-rootfs must contain rootfs.tar.gz")
+    if args.external_rootfs and not any((args.external_rootfs / name).is_file() for name in ("rootfs.tar.zst", "rootfs.tar.gz")):
+        parser.error("--external-rootfs must contain rootfs.tar.zst or rootfs.tar.gz")
     if args.apps is None:
         args.apps = OUT / "apps"
         args.apps.mkdir(exist_ok=True)

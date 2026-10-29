@@ -5,6 +5,7 @@
 use crate::error::{Error, Result};
 use crate::whp::regs::{reg64, seg, table};
 use crate::whp::{GuestMemory, Vcpu};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use windows_sys::Win32::System::Hypervisor::{
     WHvX64RegisterCr0, WHvX64RegisterCr4, WHvX64RegisterCs, WHvX64RegisterDs, WHvX64RegisterEs,
     WHvX64RegisterFs, WHvX64RegisterGdtr, WHvX64RegisterGs, WHvX64RegisterRax, WHvX64RegisterRbx,
@@ -75,6 +76,46 @@ fn rd_u64(b: &[u8], o: usize) -> Result<u64> {
 
 fn align_up(v: u64, a: u64) -> u64 {
     (v + a - 1) & !(a - 1)
+}
+
+/// Copy a boot image into guest RAM on several threads. The copy is dominated
+/// by first-touch faults on the mapped source pages rather than by memcpy, and
+/// Windows resolves faults on distinct pages concurrently.
+fn copy_to_guest(ram: &GuestMemory, gpa: u64, src: &[u8]) -> Result<()> {
+    const CHUNK: usize = 4 << 20;
+    const MAX_THREADS: usize = 8;
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(MAX_THREADS)
+        .min(src.len().div_ceil(CHUNK));
+    if threads <= 1 {
+        return ram.write_at(gpa, src);
+    }
+    if ram.host_range(gpa, src.len() as u64).is_none() {
+        return Err(Error::msg("GuestMemory::write_at out of range"));
+    }
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let offset = next.fetch_add(CHUNK, Ordering::Relaxed);
+                    if offset >= src.len() {
+                        break;
+                    }
+                    let end = (offset + CHUNK).min(src.len());
+                    if !ram.write_bytes(gpa + offset as u64, &src[offset..end]) {
+                        failed.store(true, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    if failed.load(Ordering::Relaxed) {
+        return Err(Error::msg("GuestMemory::write_at out of range"));
+    }
+    Ok(())
 }
 
 /// Scan a PT_NOTE/SHT_NOTE blob for the Xen PHYS32_ENTRY note.
@@ -257,7 +298,7 @@ pub fn load_pvh(
         if s.filesz > 0 {
             let start = s.file_offset as usize;
             let end = start + s.filesz as usize;
-            ram.write_at(s.paddr, &vmlinux[start..end])?;
+            copy_to_guest(ram, s.paddr, &vmlinux[start..end])?;
             bytes_loaded += s.filesz;
         }
     }
@@ -279,7 +320,7 @@ pub fn load_pvh(
                 "initramfs would extend past configured guest RAM",
             ));
         }
-        ram.write_at(gpa, img)?;
+        copy_to_guest(ram, gpa, img)?;
         initramfs_gpa = gpa;
         initramfs_size = img.len() as u64;
 

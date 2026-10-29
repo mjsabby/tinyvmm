@@ -337,7 +337,6 @@ fn switch_root(log: &mut BootLog, cmdline: &str) -> Result<()> {
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
             "invalid external rootfs share tag"
         );
-        log.record(&format!("rootfs source=9p:{tag}/rootfs.tar.gz"));
         log.step("rootfs-share", || {
             mount_share(&Share {
                 tag: tag.into(),
@@ -345,12 +344,34 @@ fn switch_root(log: &mut BootLog, cmdline: &str) -> Result<()> {
                 readonly: true,
             })
         })?;
-        log.step("root-unpack", || {
-            crate::rootfs::unpack(
-                File::open("/rootfs-source/rootfs.tar.gz")?,
-                std::path::Path::new("/newroot"),
-            )
+        let source = ["rootfs.tar.zst", "rootfs.tar.gz"]
+            .into_iter()
+            .map(|name| std::path::Path::new("/rootfs-source").join(name))
+            .find(|path| path.exists())
+            .context("external rootfs share needs rootfs.tar.zst or rootfs.tar.gz")?;
+        log.record(&format!(
+            "rootfs source=9p:{tag}/{}",
+            source.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        let report = log.step("root-unpack", || {
+            if source
+                .extension()
+                .is_some_and(|extension| extension == "zst")
+            {
+                // Packs need random access for parallel frames; the copy is
+                // released as soon as extraction finishes.
+                let archive = fs::read(&source)?;
+                crate::rootfs::unpack_bytes(&archive, std::path::Path::new("/newroot"))
+            } else {
+                crate::rootfs::unpack(File::open(&source)?, std::path::Path::new("/newroot"))?;
+                Ok(crate::rootfs::Unpacked {
+                    format: "streamed",
+                    frames: 1,
+                    threads: 1,
+                })
+            }
         })?;
+        record_unpack(log, &report);
         log.step("rootfs-share-unmount", || {
             Ok(unix::check(unsafe {
                 libc::umount2(c"/rootfs-source".as_ptr(), 0)
@@ -364,9 +385,10 @@ fn switch_root(log: &mut BootLog, cmdline: &str) -> Result<()> {
                 "rootfs source=embedded compressed_bytes={}",
                 archive.len()
             ));
-            log.step("root-unpack", || {
-                crate::rootfs::unpack(archive.as_slice(), std::path::Path::new("/newroot"))
+            let report = log.step("root-unpack", || {
+                crate::rootfs::unpack_bytes(archive.as_slice(), std::path::Path::new("/newroot"))
             })?;
+            record_unpack(log, &report);
         }
         #[cfg(not(feature = "embedded-rootfs"))]
         log.record("stage=root-unpack event=skipped source=empty");
@@ -412,6 +434,13 @@ fn argument<'a>(cmdline: &'a str, key: &str) -> Option<&'a str> {
     cmdline
         .split_whitespace()
         .find_map(|s| s.strip_prefix(key)?.strip_prefix('='))
+}
+
+fn record_unpack(log: &mut BootLog, report: &crate::rootfs::Unpacked) {
+    log.record(&format!(
+        "rootfs format={} frames={} threads={}",
+        report.format, report.frames, report.threads
+    ));
 }
 
 fn mount_share(share: &Share) -> Result<()> {

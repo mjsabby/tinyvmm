@@ -68,6 +68,9 @@ pub async fn run(config: Config) -> Result<()> {
         keys: vec![host_key],
         inactivity_timeout: None,
         nodelay: true,
+        // Clients probe with "none" before offering keys. Rejecting that probe
+        // immediately reveals nothing; failed key attempts keep the default delay.
+        auth_rejection_time_initial: Some(Duration::ZERO),
         ..Default::default()
     });
     eprintln!(
