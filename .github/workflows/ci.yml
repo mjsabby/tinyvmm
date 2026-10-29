@@ -84,18 +84,23 @@ jobs:
       - name: Install Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
+          python-version: '3.15'
 
       - name: Install Linux cross-build tools
         shell: pwsh
         run: |
-          python -m pip install cargo-zigbuild==0.24.0 ziglang==0.17.0
-          if ($LASTEXITCODE -ne 0) { throw 'Cross-build tool installation failed.' }
-          $zig = python -c "from pathlib import Path; import ziglang; print(Path(ziglang.__file__).parent / 'zig.exe')"
-          if ($LASTEXITCODE -ne 0) { throw 'Zig lookup failed.' }
+          # ziglang 0.17.0 publishes no Windows wheel; use the official archive.
+          $zip = Join-Path $env:RUNNER_TEMP 'zig.zip'
+          Invoke-WebRequest https://ziglang.org/download/0.17.0/zig-x86_64-windows-0.17.0.zip -OutFile $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne 'b5663f69581dcf391293fbf16c06cb80d81d806545ce618b4d0bab7f0eb8c428') { throw "Zig checksum mismatch: $hash" }
+          Expand-Archive $zip -DestinationPath $env:RUNNER_TEMP
+          $zig = Join-Path $env:RUNNER_TEMP 'zig-x86_64-windows-0.17.0\zig.exe'
           "CARGO_ZIGBUILD_ZIG_PATH=$zig" >> $env:GITHUB_ENV
           & $zig version
           if ($LASTEXITCODE -ne 0) { throw 'Zig execution failed.' }
+          python -m pip install cargo-zigbuild==0.24.0
+          if ($LASTEXITCODE -ne 0) { throw 'cargo-zigbuild installation failed.' }
 
       - name: Check formatting
         shell: pwsh
