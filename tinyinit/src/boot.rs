@@ -177,12 +177,27 @@ pub fn run() -> Result<()> {
         }
         Ok(())
     })?;
-    for share in &config.mounts {
+    // Mount parents before children, such as /srv before /srv/data.
+    let mut shares: Vec<&Share> = config.mounts.iter().collect();
+    shares.sort_by_key(|share| share.target.matches('/').count());
+    for share in shares {
         log.record(&format!(
             "share tag={} target={} readonly={}",
             share.tag, share.target, share.readonly
         ));
-        log.step(&format!("share:{}", share.tag), || mount_share(share))?;
+        log.step(&format!("share:{}", share.tag), || {
+            fs::create_dir_all(&share.target)?;
+            // An image symlink such as /var/run -> /run must not redirect a
+            // share onto a path tinyinit manages.
+            let real = fs::canonicalize(&share.target)?;
+            ensure!(
+                !crate::config::reserved(&real.to_string_lossy()),
+                "share target {} resolves to {}",
+                share.target,
+                real.display()
+            );
+            mount_share(share)
+        })?;
     }
     log.step("ssh-authorization", || {
         for login in &mut config.ssh.logins {
@@ -229,27 +244,30 @@ pub fn run() -> Result<()> {
     let mut services = HashMap::new();
     for app in &config.apps {
         let user = config.user(&app.user)?;
+        let argv = script_argv(&app.argv)?;
         let spawn = unix::Spawn {
             groups: app.groups.clone(),
             umask: app.umask_bits()?,
             capabilities: app.capability_mask()?,
             rlimits: config.app_rlimits(app)?,
         };
+        let script = (argv[0] != app.argv[0]).then(|| format!(" script={:?}", app.argv[0]));
         log.record(&format!(
-            "service={} uid={} gid={} groups={:?} umask={} capabilities={:?} executable={:?} cwd={:?} log=/run/log/{}.log",
+            "service={} uid={} gid={} groups={:?} umask={} capabilities={:?} executable={:?}{} cwd={:?} log=/run/log/{}.log",
             app.name,
             user.uid,
             user.gid,
             app.groups,
             app.umask.as_deref().unwrap_or("0022"),
             app.capabilities,
-            app.argv[0],
+            argv[0],
+            script.unwrap_or_default(),
             app.cwd,
             app.name
         ));
         log.step(&format!("service:{}", app.name), || {
-            let mut command = unix::command(&user, &app.argv[0], &app.cwd, &config.env);
-            command.args(&app.argv[1..]).envs(&app.env);
+            let mut command = unix::command(&user, &argv[0], &app.cwd, &config.env);
+            command.args(&argv[1..]).envs(&app.env);
             unix::child_setup(
                 &mut command,
                 &user,
@@ -258,12 +276,18 @@ pub fn run() -> Result<()> {
                 true,
                 spawn,
             );
+            let path = app
+                .env
+                .get("PATH")
+                .or(config.env.get("PATH"))
+                .map_or(unix::DEFAULT_PATH, String::as_str);
             start(
                 &app.name,
                 &mut command,
                 &mut services,
                 config.logs.max_bytes,
             )
+            .with_context(|| format!("executable {:?} with PATH={path}", argv[0]))
         })?;
     }
     log.step("service:sshd", || {
@@ -535,22 +559,12 @@ fn identity(config: &Config) -> Result<()> {
     unix::check(unsafe {
         libc::sethostname(config.hostname.as_ptr().cast(), config.hostname.len())
     })?;
-    let mut passwd = String::new();
-    let mut group = String::new();
-    let mut shadow = String::new();
+    // Like Docker, leave the image's /etc/passwd, group and shadow alone:
+    // processes only need numeric IDs, and init resolves names itself.
     for user in std::iter::once(config.user("root")?).chain(config.users.clone()) {
-        passwd += &format!(
-            "{}:x:{}:{}:{}:{}:/bin/sh\n",
-            user.name, user.uid, user.gid, user.name, user.home
-        );
-        group += &format!("{}:x:{}:\n", user.name, user.gid);
-        shadow += &format!("{}:!:20000:0:99999:7:::\n", user.name);
         fs::create_dir_all(&user.home)?;
         unix::own(&user.home, &user, 0o700)?;
     }
-    unix::write("/etc/passwd", passwd, 0o644)?;
-    unix::write("/etc/group", group, 0o644)?;
-    unix::write("/etc/shadow", shadow, 0o600)?;
     unix::write(
         "/etc/nsswitch.conf",
         "passwd: files\ngroup: files\nhosts: files dns\n",
@@ -588,6 +602,41 @@ struct Service {
     name: String,
     /// Copies output to the service log until every writer closes the pipe.
     log: thread::JoinHandle<()>,
+}
+
+/// Run a `#!` script that lacks an execute bit the way the kernel would if
+/// it had one: 9p shows Windows files without one, and the guest can't chmod.
+fn script_argv(argv: &[String]) -> Result<Vec<String>> {
+    use std::{io::Read, os::unix::fs::PermissionsExt};
+    let unchanged = || Ok(argv.to_vec());
+    let program = &argv[0];
+    if !program.starts_with('/') {
+        return unchanged();
+    }
+    match fs::metadata(program) {
+        Ok(metadata) if metadata.is_file() && metadata.permissions().mode() & 0o111 == 0 => {}
+        _ => return unchanged(),
+    }
+    // Linux reads at most 256 bytes for the #! line.
+    let mut head = Vec::with_capacity(256);
+    File::open(program)?.take(256).read_to_end(&mut head)?;
+    let Some(line) = head.strip_prefix(b"#!") else {
+        return unchanged();
+    };
+    let line = line.split(|&byte| byte == b'\n').next().unwrap_or_default();
+    let line = std::str::from_utf8(line)
+        .with_context(|| format!("{program}: #! line is not UTF-8"))?
+        .trim();
+    let (interpreter, argument) = line.split_once([' ', '\t']).unwrap_or((line, ""));
+    ensure!(!interpreter.is_empty(), "{program}: empty #! line");
+    let mut rewritten = vec![interpreter.to_owned()];
+    // Like Linux, everything after the interpreter is a single argument.
+    let argument = argument.trim();
+    if !argument.is_empty() {
+        rewritten.push(argument.to_owned());
+    }
+    rewritten.extend(argv.iter().cloned());
+    Ok(rewritten)
 }
 
 fn start(
@@ -771,6 +820,32 @@ mod tests {
         fs::remove_dir_all(&dir)?;
         assert_eq!(current, output[8192..]);
         assert_eq!(previous, output[4096..8192]);
+        Ok(())
+    }
+
+    #[test]
+    fn non_executable_scripts_run_through_their_interpreter() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tinyinit-script-{}", std::process::id()));
+        fs::create_dir(&dir)?;
+        let script = dir.join("start.sh").to_string_lossy().into_owned();
+        let argv = vec![script.clone(), "one".into()];
+        let mode = |bits| fs::set_permissions(&script, fs::Permissions::from_mode(bits));
+        // Windows line endings are trimmed from the #! line.
+        fs::write(&script, "#!/bin/sh  -e x \r\necho hi\n")?;
+        mode(0o644)?;
+        assert_eq!(
+            script_argv(&argv)?,
+            ["/bin/sh", "-e x", script.as_str(), "one"]
+        );
+        // Executable scripts and plain files are left to the kernel.
+        mode(0o755)?;
+        assert_eq!(script_argv(&argv)?, argv);
+        fs::write(&script, "echo no interpreter\n")?;
+        mode(0o644)?;
+        assert_eq!(script_argv(&argv)?, argv);
+        assert_eq!(script_argv(&["sleep".into()])?, ["sleep"]);
+        fs::remove_dir_all(&dir)?;
         Ok(())
     }
 }

@@ -76,6 +76,9 @@ pub fn own(path: &str, user: &User, mode: u32) -> Result<()> {
     Ok(())
 }
 
+/// PATH for apps and SSH sessions unless init.json `env` sets one.
+pub const DEFAULT_PATH: &str = "/bin:/usr/bin";
+
 pub fn command(
     user: &User,
     executable: &str,
@@ -86,7 +89,7 @@ pub fn command(
     cmd.current_dir(cwd)
         .env_clear()
         .envs([
-            ("PATH", "/bin:/usr/bin"),
+            ("PATH", DEFAULT_PATH),
             ("HOME", &user.home),
             ("USER", &user.name),
             ("LOGNAME", &user.name),

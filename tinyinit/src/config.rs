@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashSet},
-    fs,
+    fs, io,
     path::{Component, Path},
 };
 
@@ -28,6 +28,9 @@ pub struct Config {
     pub mounts: Vec<Share>,
     #[serde(default)]
     pub users: Vec<User>,
+    /// Accounts from the image's /etc/passwd, for names `users` doesn't declare.
+    #[serde(skip)]
+    image_users: Vec<User>,
     pub apps: Vec<App>,
     pub ssh: Ssh,
     #[serde(default)]
@@ -357,11 +360,75 @@ fn absolute(path: &str) -> bool {
             .any(|c| c == Component::ParentDir)
 }
 
+/// An absolute path without `.`, `..`, repeated or trailing slashes.
+fn canonical(path: &str) -> bool {
+    absolute(path)
+        && path
+            == Path::new(path)
+                .components()
+                .filter_map(|c| match c {
+                    Component::Normal(name) => name.to_str(),
+                    _ => None,
+                })
+                .fold(String::new(), |path, name| path + "/" + name)
+}
+
+/// A bare program name, which the app's `PATH` resolves.
+fn command_name_ok(name: &str) -> bool {
+    !name.is_empty() && !name.contains(['/', '\0'])
+}
+
+/// Paths tinyinit itself uses after shares mount.
+const RESERVED_PATHS: [&str; 9] = [
+    "/bin",
+    "/dev",
+    "/etc",
+    "/mnt/bootstrap",
+    "/proc",
+    "/run",
+    "/sys",
+    "/tmp",
+    "/usr/bin",
+];
+
+/// Whether a share at `target` would cover, or sit inside, a reserved path.
+pub fn reserved(target: &str) -> bool {
+    RESERVED_PATHS.iter().any(|path| {
+        target == *path
+            || target.starts_with(&format!("{path}/"))
+            || path.starts_with(&format!("{target}/"))
+    })
+}
+
+/// Parse /etc/passwd like libc does, skipping malformed lines.
+fn parse_passwd(text: &str) -> Vec<User> {
+    text.lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split(':').collect();
+            let [name, _, uid, gid, _, home, ..] = fields[..] else {
+                return None;
+            };
+            Some(User {
+                name: name.into(),
+                uid: uid.parse().ok()?,
+                gid: gid.parse().ok()?,
+                home: if home.is_empty() { "/" } else { home }.into(),
+            })
+        })
+        .collect()
+}
+
 impl Config {
     pub fn read(path: &str) -> Result<Self> {
-        let config: Self =
+        let mut config: Self =
             serde_json::from_slice(&fs::read(path).with_context(|| format!("read {path}"))?)
                 .with_context(|| format!("parse {path}"))?;
+        // Like Docker, resolve names init.json doesn't declare from the image.
+        config.image_users = match fs::read_to_string("/etc/passwd") {
+            Ok(text) => parse_passwd(&text),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error).context("read /etc/passwd"),
+        };
         config.validate()?;
         Ok(config)
     }
@@ -377,6 +444,7 @@ impl Config {
         }
         self.users
             .iter()
+            .chain(&self.image_users)
             .find(|u| u.name == name)
             .cloned()
             .with_context(|| format!("unknown user {name:?}"))
@@ -446,12 +514,13 @@ impl Config {
                 "invalid or duplicate app name"
             );
             ensure!(
-                self.user(&app.user)?.uid != 0,
-                "apps must run as non-root users"
+                self.user(&app.user)?.uid != 0 || app.capabilities.is_empty(),
+                "app {}: root already has every capability",
+                app.name
             );
             ensure!(
-                !app.argv.is_empty() && absolute(&app.argv[0]),
-                "app argv must start with an absolute executable"
+                !app.argv.is_empty() && (absolute(&app.argv[0]) || command_name_ok(&app.argv[0])),
+                "app argv must start with an absolute path or a program name found in PATH"
             );
             ensure!(absolute(&app.cwd), "app cwd must be absolute");
             ensure!(
@@ -481,10 +550,12 @@ impl Config {
                 "invalid share tag"
             );
             ensure!(
-                absolute(&share.target)
-                    && share.target.starts_with("/mnt/")
+                canonical(&share.target)
+                    && !reserved(&share.target)
                     && targets.insert(&share.target),
-                "share target must be unique and under /mnt"
+                "share target {:?} must be a unique absolute path that doesn't overlap {}",
+                share.target,
+                RESERVED_PATHS.join(", ")
             );
         }
         ensure!(
@@ -520,24 +591,92 @@ mod tests {
     }
 
     #[test]
-    fn root_login_does_not_make_apps_root() {
+    fn apps_run_as_root_only_when_configured() {
         let mut c = config();
         c.validate().unwrap();
+        assert_eq!(c.user(&c.apps[0].user).unwrap().uid, 1000);
         c.apps[0].user = "root".into();
+        c.validate().unwrap();
+        c.apps[0].capabilities.push("CAP_NET_ADMIN".into());
         assert!(c.validate().is_err());
     }
 
     #[test]
-    fn rejects_colliding_services_and_escaping_mounts() {
+    fn unknown_names_resolve_from_the_image_passwd_like_docker() {
+        let mut c = config();
+        c.image_users = parse_passwd(
+            "root:x:0:0:root:/root:/bin/sh\n\
+             # comment\n\
+             broken:x:not-a-number:1::/:\n\
+             app:x:1654:1654::/home/app:/usr/sbin/nologin\n\
+             svc:x:1500:1501::/var/lib/svc:/bin/false\n\
+             nohome:x:1600:1600:::\n",
+        );
+        c.apps[0].user = "svc".into();
+        c.ssh.logins[0].user = "nohome".into();
+        c.validate().unwrap();
+        let svc = c.user("svc").unwrap();
+        assert_eq!(
+            (svc.uid, svc.gid, svc.home.as_str()),
+            (1500, 1501, "/var/lib/svc")
+        );
+        assert_eq!(c.user("nohome").unwrap().home, "/");
+        // init.json users win over the image's.
+        assert_eq!(c.user("app").unwrap().uid, 1000);
+        assert!(c.user("broken").is_err());
+        // Image accounts aren't saved; sshd resolves them again when it reads the config.
+        let saved: Config = serde_json::from_slice(&serde_json::to_vec(&c).unwrap()).unwrap();
+        assert!(saved.user("svc").is_err());
+    }
+
+    #[test]
+    fn argv_starts_with_an_absolute_path_or_a_program_name() {
+        let mut c = config();
+        for program in ["/bin/sleep", "sleep", "dotnet"] {
+            c.apps[0].argv[0] = program.into();
+            c.validate().unwrap();
+        }
+        for program in ["", "./sleep", "bin/sleep", "/bin/../sleep"] {
+            c.apps[0].argv[0] = program.into();
+            assert!(c.validate().is_err(), "{program:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_colliding_services_and_reserved_or_unclean_mounts() {
         let mut c = config();
         c.apps.push(c.apps[0].clone());
         assert!(c.validate().is_err());
         c.apps.pop();
-        c.mounts.push(Share {
+        let share = |target: &str| Share {
             tag: "x".into(),
-            target: "/mnt/../etc".into(),
+            target: target.into(),
             readonly: true,
-        });
+        };
+        for target in ["/srv/data", "/mnt/apps", "/data", "/usr/share/dotnet"] {
+            c.mounts = vec![share(target)];
+            c.validate().unwrap();
+        }
+        for target in [
+            "/",
+            "relative",
+            "/mnt/../etc",
+            "/etc",
+            "/etc/app",
+            "/usr",
+            "/usr/bin",
+            "/mnt",
+            "/mnt/bootstrap",
+            "/proc/x",
+            "/run",
+            "/data/",
+            "/a//b",
+            "/a/./b",
+        ] {
+            c.mounts = vec![share(target)];
+            assert!(c.validate().is_err(), "{target}");
+        }
+        c.mounts = vec![share("/data"), share("/data")];
         assert!(c.validate().is_err());
     }
 

@@ -43,6 +43,10 @@ class VM:
         bootstrap.mkdir(exist_ok=True)
         (bootstrap / "init.json").write_text(json.dumps(config), encoding="utf-8")
         (bootstrap / "caller.pub").write_bytes((OUT / "caller.pub").read_bytes())
+        # A writable share mounted outside /mnt.
+        self.data = OUT / f"{name}-data"
+        shutil.rmtree(self.data, ignore_errors=True)
+        self.data.mkdir()
         self.lines = []
         self.events = {}
         self.boot_ready = threading.Event()
@@ -51,6 +55,7 @@ class VM:
             "--net", "--portfwd", f"{self.port}:22",
             "--virtio-9p-share", f"bootstrap={bootstrap},ro",
             "--virtio-9p-share", f"apps={args.apps},ro",
+            "--virtio-9p-share", f"data={self.data},uid=1000,gid=1000",
         ]
         if args.external_rootfs:
             argv += ["--virtio-9p-share", f"rootfs={args.external_rootfs.resolve()},ro"]
@@ -144,6 +149,8 @@ def configuration(args):
     apps[0].update({"groups": [2000, 2001], "umask": "0027"})
     apps[1].update({"capabilities": ["CAP_NET_BIND_SERVICE"],
                     "rlimits": {"nofile": {"soft": 4096, "hard": 8192}}})
+    # Root only when asked, started from a #! script on the read-only share, which has no execute bit.
+    apps.append({"name": "r", "user": "root", "argv": ["/mnt/apps/root-app.sh", "from-argv"]})
     return {
         "env": {"LANG": "C.UTF-8", "DOTNET_ROOT": "/usr/share/dotnet", "ASPNETCORE_HTTP_PORTS": "8080",
                 "TINYINIT_TEST_VALUE": "from-top-level"},
@@ -151,7 +158,8 @@ def configuration(args):
         "sysctls": {"net.core.somaxconn": 1000, "net.ipv4.ip_unprivileged_port_start": "900"},
         "tmpfs": {"/": "1g", "/run": "32m", "/tmp": "48m", "/dev/shm": "16m"},
         "logs": {"max_bytes": 16384},
-        "mounts": [{"tag": "apps", "target": "/mnt/apps", "readonly": True}],
+        "mounts": [{"tag": "apps", "target": "/mnt/apps", "readonly": True},
+                   {"tag": "data", "target": "/srv/data", "readonly": False}],
         "users": [{"name": "app", "uid": 1000, "gid": 1000, "home": "/home/app"}],
         "network": {"interface": "eth0", "address": "10.0.0.2/24", "gateway": "10.0.0.1", "dns": ["1.1.1.1"]},
         "apps": apps,
@@ -287,6 +295,8 @@ def main():
         args.apps = OUT / "apps"
         args.apps.mkdir(exist_ok=True)
     (args.apps / "share-marker.txt").write_text("WINDOWS_SHARE_OK", encoding="utf-8")
+    (args.apps / "root-app.sh").write_bytes(
+        b'#!/bin/sh\necho "root-app $1 uid=$(id -u)" > /run/root-app.txt\nexec sleep infinity\n')
     if not args.embedded:
         shutil.copyfile(args.kernel, OUT / "vmlinux")
     keygen(OUT / "caller")
@@ -308,10 +318,10 @@ def main():
         vm.ready()
         check(vm.ssh("true", key="wrong").returncode != 0, "reject unauthorized public key")
         check(vm.ssh("true", user="unknown").returncode != 0, "reject unknown SSH user")
-        result = vm.ssh("id")
-        check(result.returncode == 0 and b"uid=0(root)" in result.stdout, "authorized root administration")
-        result = vm.ssh("id; touch /home/app/login.txt; touch /root/forbidden", user="app")
-        check(b"uid=1000(app)" in result.stdout and result.returncode != 0, "ordinary login cannot access root home")
+        result = vm.ssh("id -u")
+        check(result.returncode == 0 and result.stdout == b"0\n", "authorized root administration")
+        result = vm.ssh("id -u; touch /home/app/login.txt; touch /root/forbidden", user="app")
+        check(result.stdout.startswith(b"1000\n") and result.returncode != 0, "ordinary login cannot access root home")
         result = vm.ssh("cat /mnt/apps/share-marker.txt")
         check(result.stdout.strip() == b"WINDOWS_SHARE_OK", "read Windows 9p deployment share")
         result = vm.ssh("touch /mnt/apps/forbidden", user="app")
@@ -368,6 +378,21 @@ def main():
               "global rlimits for apps and SSH sessions, with per-app overrides")
         check("CapEff:\t0000000000000400" in processes["b"] and "CapAmb:\t0000000000000400" in processes["b"]
               and "NoNewPrivs:\t1" in processes["b"], "opt-in ambient capability keeps no_new_privs", processes["b"])
+        result = vm.ssh("cat /etc/passwd /etc/group 2>/dev/null; true")
+        check(b"app:x:1000:" not in result.stdout, "init leaves the image's account files alone", result.stdout)
+        root_app = ("stat -c %a /mnt/apps/root-app.sh && cat /run/root-app.txt && "
+                    "cat /proc/$(cat /sys/fs/cgroup/r/cgroup.procs)/status")
+        for _ in range(50):
+            result = vm.ssh(root_app)
+            if result.returncode == 0:
+                break
+            time.sleep(0.2)
+        check(result.stdout.startswith(b"644\nroot-app from-argv uid=0\n")
+              and b"\nUid:\t0\t0\t0\t0\n" in result.stdout,
+              "explicit root app starts from a non-executable #! script on a read-only share", result)
+        result = vm.ssh("touch /srv/data/from-app && stat -c %u /srv/data/from-app", user="app")
+        check(result.stdout == b"1000\n" and (vm.data / "from-app").is_file(),
+              "writable share mounted outside /mnt", result)
         if args.dotnet:
             result = vm.ssh("dotnet --list-runtimes; cat /etc/os-release; cat /etc/resolv.conf")
             check(result.returncode == 0 and b"Microsoft.AspNetCore.App " in result.stdout
@@ -392,7 +417,7 @@ def main():
             check(result.returncode == 0 and b"DNS_HTTPS_OK" in result.stdout,
                   "unprivileged .NET DNS and trusted HTTPS using embedded OpenSSL/CA data", result)
         else:
-            check(result.stdout.count(b"uid=1000(app)") == 2, "both applications stay unprivileged")
+            check(result.stdout.count(b"uid=1000(") == 2, "both applications stay unprivileged", result.stdout)
             result = vm.ssh("stat -c %s /run/log/a.log /run/log/a.log.1; tail -n 1 /run/log/a.log")
             lines = result.stdout.split()
             check(len(lines) == 3 and all(int(size) <= 16384 for size in lines[:2])
@@ -420,7 +445,8 @@ def main():
     finally:
         vm.close()
 
-    config["apps"][0]["argv"] = ["/bin/sh", "-c", "sleep 0.5; echo FINAL_OUTPUT_MARKER >&2"]
+    # A bare program name resolves through PATH.
+    config["apps"][0]["argv"] = ["sh", "-c", "sleep 0.5; echo FINAL_OUTPUT_MARKER >&2"]
     vm = VM(args, config, "clean-exit")
     try:
         vm.finished()
