@@ -333,8 +333,10 @@ order they are created — that order is fixed (it is also the snapshot
   and block every MSI at or below its priority class.
 * **8254 PIT** at `0x40–0x43`, `0x61` — counters only; **IRQ0 intentionally not
   wired** (Linux uses the in-hypervisor LAPIC timer).
-* **CMOS/RTC** at `0x70/0x71` returns a fixed `2024-01-01` wall clock; POST port
-  `0x80` and port-A `0x92` are stubs (`src/devices/legacy.rs`).
+* **CMOS/RTC** at `0x70/0x71` reports the host's current time in UTC (read on
+  every access, BCD, 24-hour), so the guest boots with a correct wall clock;
+  guest writes to it are ignored. POST port `0x80` and port-A `0x92` are stubs
+  (`src/devices/legacy.rs`).
 
 The vCPU local APIC is emulated by WHP in **x2APIC mode** — on bare metal and
 nested alike — and delivers MSIs (`WHvRequestInterrupt`), IPIs, the LAPIC timer

@@ -119,6 +119,7 @@ log() { echo "[init] $*" > /dev/kmsg; }
 
 log "=== tinyvmm init starting ==="
 log "uname: $(uname -a)"
+log "date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
 # --- /sys snapshot ------------------------------------------------------
 log "--- /sys/bus/virtio/devices ---"
