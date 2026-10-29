@@ -97,12 +97,161 @@ fn crc_table() -> &'static [u32; 256] {
 }
 
 pub fn crc32_update(crc: u32, data: &[u8]) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    if data.len() >= 128
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+        && std::arch::is_x86_feature_detected!("sse4.1")
+    {
+        // SAFETY: the CPU supports both features (checked just above).
+        return unsafe { crc32_pclmul(crc, data) };
+    }
+    crc32_table(crc, data)
+}
+
+fn crc32_table(crc: u32, data: &[u8]) -> u32 {
     let tbl = crc_table();
     let mut c = crc;
     for &b in data {
         c = tbl[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
     }
     c
+}
+
+/// a(x)·b(x) mod P(x), bit-reflected (zlib's `multmodp`). `a` must not be 0.
+fn multmodp(a: u32, mut b: u32) -> u32 {
+    let mut m = 1u32 << 31;
+    let mut p = 0u32;
+    loop {
+        if a & m != 0 {
+            p ^= b;
+            if a & (m - 1) == 0 {
+                return p;
+            }
+        }
+        m >>= 1;
+        b = if b & 1 != 0 {
+            (b >> 1) ^ 0xEDB8_8320
+        } else {
+            b >> 1
+        };
+    }
+}
+
+/// x^(8·len) mod P(x): what appending `len` bytes does to a CRC register.
+fn x8nmodp(mut len: u64) -> u32 {
+    let mut p = 1u32 << 31; // x^0
+    let mut xk = 1u32 << 23; // x^8
+    while len != 0 {
+        if len & 1 != 0 {
+            p = multmodp(xk, p);
+        }
+        len >>= 1;
+        xk = multmodp(xk, xk);
+    }
+    p
+}
+
+/// The finalized CRC-32 of A‖B from those of A and B and B's length (zlib's
+/// `crc32_combine`), so chunks can be checksummed independently.
+fn crc32_combine(crc_a: u32, crc_b: u32, len_b: u64) -> u32 {
+    multmodp(x8nmodp(len_b), crc_a) ^ crc_b
+}
+
+/// The finalized CRC-32 of `data`, computed on several threads for big inputs.
+pub fn crc32_parallel(data: &[u8]) -> u32 {
+    const CHUNK: usize = 32 << 20;
+    const MAX_THREADS: usize = 8;
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(MAX_THREADS)
+        .min(data.len().div_ceil(CHUNK));
+    if threads <= 1 {
+        return crc32_update(0xFFFF_FFFF, data) ^ 0xFFFF_FFFF;
+    }
+    let chunk = data.len().div_ceil(threads);
+    let parts: Vec<(u32, u64)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = data
+            .chunks(chunk)
+            .map(|c| {
+                scope.spawn(move || (crc32_update(0xFFFF_FFFF, c) ^ 0xFFFF_FFFF, c.len() as u64))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    parts[1..]
+        .iter()
+        .fold(parts[0].0, |crc, &(c, len)| crc32_combine(crc, c, len))
+}
+
+/// CRC-32 by carry-less multiplication: the folding method of Intel's "Fast CRC
+/// Computation for Generic Polynomials Using PCLMULQDQ Instruction" (Gopal et
+/// al., 2009) for the reflected IEEE polynomial, as Linux and zlib implement it.
+/// Four 128-bit accumulators fold 64 bytes per step, then fold into one, reduce
+/// to 64 and 32 bits, and finish with a Barrett reduction. The byte table
+/// handles the tail. Snapshot RAM sections are gigabytes: a byte at a time this
+/// ran at ~0.4 GB/s and dominated save and restore. Needs `data.len() >= 64`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "pclmulqdq,sse4.1")]
+fn crc32_pclmul(crc: u32, data: &[u8]) -> u32 {
+    use std::arch::x86_64::*;
+
+    // Folding constants x^n mod P (bit-reflected, shifted), and P' / mu for
+    // the Barrett step.
+    let k1k2 = _mm_set_epi64x(0x1_c6e4_1596, 0x1_5444_2bd4);
+    let k3k4 = _mm_set_epi64x(0x0_ccaa_009e, 0x1_7519_97d0);
+    let k5 = _mm_set_epi64x(0, 0x1_63cd_6124);
+    let poly_mu = _mm_set_epi64x(0x1_f701_1641, 0x1_db71_0641);
+    let mask32 = _mm_set_epi32(0, 0, 0, -1);
+
+    #[inline]
+    #[target_feature(enable = "pclmulqdq,sse4.1")]
+    fn fold(x: __m128i, k: __m128i) -> __m128i {
+        _mm_xor_si128(
+            _mm_clmulepi64_si128(x, k, 0x00),
+            _mm_clmulepi64_si128(x, k, 0x11),
+        )
+    }
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    fn load(block: &[u8]) -> __m128i {
+        assert!(block.len() >= 16);
+        // SAFETY: `block` has at least 16 readable bytes; the load is unaligned.
+        unsafe { _mm_loadu_si128(block.as_ptr().cast()) }
+    }
+
+    let (body, tail) = data.split_at(data.len() & !15);
+    let mut x1 = _mm_xor_si128(load(&body[0..]), _mm_cvtsi32_si128(crc as i32));
+    let mut x2 = load(&body[16..]);
+    let mut x3 = load(&body[32..]);
+    let mut x4 = load(&body[48..]);
+    let mut rest = &body[64..];
+    while rest.len() >= 64 {
+        x1 = _mm_xor_si128(fold(x1, k1k2), load(&rest[0..]));
+        x2 = _mm_xor_si128(fold(x2, k1k2), load(&rest[16..]));
+        x3 = _mm_xor_si128(fold(x3, k1k2), load(&rest[32..]));
+        x4 = _mm_xor_si128(fold(x4, k1k2), load(&rest[48..]));
+        rest = &rest[64..];
+    }
+    x1 = _mm_xor_si128(fold(x1, k3k4), x2);
+    x1 = _mm_xor_si128(fold(x1, k3k4), x3);
+    x1 = _mm_xor_si128(fold(x1, k3k4), x4);
+    while rest.len() >= 16 {
+        x1 = _mm_xor_si128(fold(x1, k3k4), load(rest));
+        rest = &rest[16..];
+    }
+    // 128 -> 64 bits.
+    x1 = _mm_xor_si128(_mm_srli_si128(x1, 8), _mm_clmulepi64_si128(k3k4, x1, 0x01));
+    // 64 -> 32 bits.
+    let hi = _mm_srli_si128(x1, 4);
+    x1 = _mm_xor_si128(
+        _mm_clmulepi64_si128(_mm_and_si128(x1, mask32), k5, 0x00),
+        hi,
+    );
+    // Barrett reduction.
+    let t = _mm_clmulepi64_si128(_mm_and_si128(x1, mask32), poly_mu, 0x10);
+    let t = _mm_clmulepi64_si128(_mm_and_si128(t, mask32), poly_mu, 0x00);
+    let crc = _mm_extract_epi32(_mm_xor_si128(t, x1), 1) as u32;
+    crc32_table(crc, tail)
 }
 
 // ============================================================
@@ -401,8 +550,12 @@ impl Drop for SnapshotWriter {
 // ============================================================
 // Reader
 // ============================================================
+/// Reads a snapshot through a read-only mapping of the file: no heap copy of a
+/// gigabyte-sized RAM section, and its pages come straight from the file cache.
+/// Writers are locked out while it's open, so the bytes `verify_trailer`
+/// checked are the ones restored.
 pub struct SnapshotReader {
-    buf: Vec<u8>,
+    map: crate::host::mapped_file::MappedFile,
     pos: usize,
     header_read: bool,
 }
@@ -414,31 +567,36 @@ pub struct SectionRef<'a> {
 
 impl SnapshotReader {
     pub fn open(path: &str) -> Result<SnapshotReader> {
-        let buf =
-            std::fs::read(path).map_err(|e| Error::msg(format!("snapshot: read {path}: {e}")))?;
-        if buf.len() < 24 + 4 {
+        let map = crate::host::mapped_file::MappedFile::open_no_writers(path)
+            .map_err(|e| Error::msg(format!("snapshot: read {path}: {e}")))?;
+        if map.size() < 24 + 4 {
             return Err(Error::msg("snapshot: file too small"));
         }
         Ok(SnapshotReader {
-            buf,
+            map,
             pos: 0,
             header_read: false,
         })
     }
 
+    fn buf(&self) -> &[u8] {
+        self.map.bytes()
+    }
+
     pub fn read_header(&mut self) -> Result<String> {
-        if self.buf[0..8] != MAGIC {
+        let buf = self.map.bytes();
+        if buf[0..8] != MAGIC {
             return Err(Error::msg("snapshot: bad magic"));
         }
-        let ver = u32::from_le_bytes(self.buf[8..12].try_into().unwrap());
+        let ver = u32::from_le_bytes(buf[8..12].try_into().unwrap());
         if ver != VERSION {
             return Err(Error::msg(format!("snapshot: version {ver} != {VERSION}")));
         }
-        let jsz = u64::from_le_bytes(self.buf[16..24].try_into().unwrap()) as usize;
-        if jsz > self.buf.len().saturating_sub(24 + 4) {
+        let jsz = u64::from_le_bytes(buf[16..24].try_into().unwrap()) as usize;
+        if jsz > buf.len().saturating_sub(24 + 4) {
             return Err(Error::msg("snapshot: header_json_size out of range"));
         }
-        let json = std::str::from_utf8(&self.buf[24..24 + jsz])
+        let json = std::str::from_utf8(&buf[24..24 + jsz])
             .map_err(|_| Error::msg("snapshot: header JSON not UTF-8"))?
             .to_string();
         self.pos = 24 + jsz;
@@ -448,20 +606,20 @@ impl SnapshotReader {
 
     /// Returns the next section, or None when only the 4-byte trailer remains.
     pub fn next_section(&mut self) -> Result<Option<SectionRef<'_>>> {
-        let end = self.buf.len() - 4; // trailer
+        let buf = self.map.bytes();
+        let end = buf.len() - 4; // trailer
         if self.pos == end {
             return Ok(None);
         }
         if self.pos + 16 > end {
             return Err(Error::msg("snapshot: truncated section header"));
         }
-        let ty_raw = u32::from_le_bytes(self.buf[self.pos..self.pos + 4].try_into().unwrap());
-        let reserved = u32::from_le_bytes(self.buf[self.pos + 4..self.pos + 8].try_into().unwrap());
+        let ty_raw = u32::from_le_bytes(buf[self.pos..self.pos + 4].try_into().unwrap());
+        let reserved = u32::from_le_bytes(buf[self.pos + 4..self.pos + 8].try_into().unwrap());
         if reserved != 0 {
             return Err(Error::msg("snapshot: section reserved != 0"));
         }
-        let len =
-            u64::from_le_bytes(self.buf[self.pos + 8..self.pos + 16].try_into().unwrap()) as usize;
+        let len = u64::from_le_bytes(buf[self.pos + 8..self.pos + 16].try_into().unwrap()) as usize;
         let body = self.pos + 16;
         // `body <= end` here (checked just above), so `end - body` can't
         // underflow; written as subtraction to avoid `body + len` overflowing for
@@ -475,14 +633,15 @@ impl SnapshotReader {
         self.pos = body + len;
         Ok(Some(SectionRef {
             ty,
-            payload: &self.buf[body..body + len],
+            payload: &buf[body..body + len],
         }))
     }
 
     pub fn verify_trailer(&self) -> Result<()> {
-        let n = self.buf.len();
-        let saved = u32::from_le_bytes(self.buf[n - 4..n].try_into().unwrap());
-        let crc = crc32_update(0xFFFF_FFFF, &self.buf[..n - 4]) ^ 0xFFFF_FFFF;
+        let buf = self.buf();
+        let n = buf.len();
+        let saved = u32::from_le_bytes(buf[n - 4..n].try_into().unwrap());
+        let crc = crc32_parallel(&buf[..n - 4]);
         if crc != saved {
             return Err(Error::msg(format!(
                 "snapshot: CRC mismatch (file {saved:#010x} != computed {crc:#010x})"
@@ -492,13 +651,66 @@ impl SnapshotReader {
     }
 
     pub fn file_size(&self) -> u64 {
-        self.buf.len() as u64
+        self.map.size() as u64
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The carry-less-multiply CRC must match the byte table for every length
+    /// (the fold paths change at 64- and 16-byte steps) and alignment, and the
+    /// IEEE check value; snapshots written before it must still verify.
+    #[test]
+    fn crc32_fast_path_matches_table() {
+        let full = |data: &[u8]| crc32_update(0xFFFF_FFFF, data) ^ 0xFFFF_FFFF;
+        assert_eq!(full(b"123456789"), 0xCBF4_3926);
+        let mut seed = 0x9E37_79B9u32;
+        let buf: Vec<u8> = (0..4096 + 64)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as u8
+            })
+            .collect();
+        for align in 0..16 {
+            for len in (0..300).chain([1000, 4095, 4096]) {
+                let d = &buf[align..align + len];
+                for init in [0xFFFF_FFFFu32, 0x1234_5678] {
+                    assert_eq!(
+                        crc32_update(init, d),
+                        crc32_table(init, d),
+                        "len {len} align {align}"
+                    );
+                }
+            }
+        }
+        // Chunked updates compose like one pass.
+        let (a, b) = buf.split_at(777);
+        assert_eq!(
+            crc32_update(crc32_update(0xFFFF_FFFF, a), b),
+            crc32_update(0xFFFF_FFFF, &buf)
+        );
+    }
+
+    /// Independently checksummed chunks combine into the CRC of the whole, so
+    /// restore can verify a multi-GiB snapshot on several threads.
+    #[test]
+    fn crc32_combines_chunks() {
+        let data: Vec<u8> = (0..(80u32 << 20) + 12_345)
+            .map(|i| (i ^ (i >> 9)) as u8)
+            .collect();
+        let whole = crc32_update(0xFFFF_FFFF, &data) ^ 0xFFFF_FFFF;
+        assert_eq!(crc32_parallel(&data), whole);
+        for cut in [0usize, 1, 4096, 1_000_001] {
+            let (a, b) = data.split_at(cut);
+            let ca = crc32_update(0xFFFF_FFFF, a) ^ 0xFFFF_FFFF;
+            let cb = crc32_update(0xFFFF_FFFF, b) ^ 0xFFFF_FFFF;
+            assert_eq!(crc32_combine(ca, cb, b.len() as u64), whole, "cut {cut}");
+        }
+    }
 
     #[test]
     fn roundtrip() {

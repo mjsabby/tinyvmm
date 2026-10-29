@@ -2683,9 +2683,12 @@ fn run_restore(args: &[String]) -> Result<i32> {
 
     check_whp_available()?;
     println!("[restore] WHP available");
+    let mut btimer = diag::boot_timer::BootTimer::new();
+    btimer.mark("restore start");
 
     let mut reader = SnapshotReader::open(&path)?;
     reader.verify_trailer()?;
+    btimer.mark("snapshot mapped + CRC verified");
     let header = reader.read_header()?;
     let jr = JsonReader::parse(&header)?;
 
@@ -2751,6 +2754,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
     part.set_local_apic_emulation(WHvX64LocalApicEmulationModeX2Apic)?;
     part.setup()?;
     let part_handle = part.handle();
+    btimer.mark("partition ready");
 
     let ram = Arc::new(GuestMemory::new_split(
         part_handle,
@@ -2760,6 +2764,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
         true,
         large_pages,
     )?);
+    btimer.mark("guest RAM mapped");
     let hv = Arc::new(HvEnlightenment::new(
         ram.clone(),
         cached_tsc_hz(),
@@ -3142,7 +3147,9 @@ fn run_restore(args: &[String]) -> Result<i32> {
                 // The image is a contiguous host-byte dump (low region then high
                 // region), so restore it the same way rather than by GPA — a GPA
                 // write of the whole image would span the MMIO hole.
+                btimer.mark("devices built");
                 ram.load_image(s.payload);
+                btimer.mark("guest RAM loaded");
             }
             SectionType::HvEnlightenment => sec_hv = Some(s.payload.to_vec()),
             SectionType::LegacyPic8259 => sec_pic = Some(s.payload.to_vec()),
@@ -3419,6 +3426,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
         }
     }
 
+    btimer.mark("entering guest");
     println!("[restore] resuming {vcpu_count} vCPU(s)");
 
     let bsp = loops.remove(0);

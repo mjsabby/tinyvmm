@@ -406,14 +406,40 @@ impl GuestMemory {
     /// bytes must be laid out exactly as produced by reading
     /// `host_base()..host_base()+size()` (the low region followed by the high
     /// region), so this restores across the MMIO hole without re-deriving GPAs.
-    /// Copies `min(bytes.len(), size())` bytes.
+    /// Copies `min(bytes.len(), size())` bytes, on several threads for a big
+    /// image: a snapshot's RAM is gigabytes, read from a file mapping whose
+    /// first-touch faults Windows resolves concurrently on distinct pages.
     pub fn load_image(&self, bytes: &[u8]) {
-        let n = bytes.len().min(self.size);
-        if n > 0 {
-            unsafe {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.base.get(), n);
-            }
+        const CHUNK: usize = 16 << 20;
+        const MAX_THREADS: usize = 8;
+        let src = &bytes[..bytes.len().min(self.size)];
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(MAX_THREADS)
+            .min(src.len().div_ceil(CHUNK));
+        let copy = |off: usize, len: usize| unsafe {
+            // SAFETY: `off + len <= src.len() <= self.size`, so both ranges are
+            // in bounds, and they belong to different allocations.
+            std::ptr::copy_nonoverlapping(src.as_ptr().add(off), self.base.get().add(off), len);
+        };
+        if threads <= 1 {
+            copy(0, src.len());
+            return;
         }
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    loop {
+                        let off = next.fetch_add(CHUNK, Ordering::Relaxed);
+                        if off >= src.len() {
+                            break;
+                        }
+                        copy(off, CHUNK.min(src.len() - off));
+                    }
+                });
+            }
+        });
     }
 
     // `slice_mut(&self) -> &mut [u8]` was removed: returning an aliasable `&mut`
