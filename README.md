@@ -158,6 +158,7 @@ Parsed in `parse_pvh_args` (`main.rs:590`). Defaults and clamps are exact.
 | `--net` | off | Add a virtio-net NIC. **Repeatable** — each `--net` appends a NIC; the NIC-scoped flags below modify the *most recent* NIC. |
 | `--net-backend loopback\|nat\|wintun` | `nat` | Backend for the current NIC (see [§3](#3-devices-in-detail)). |
 | `--portfwd HOSTPORT:GUESTPORT` | — | Forward `127.0.0.1:HOSTPORT` (host) → `10.0.0.2:GUESTPORT` (guest). NAT only. Repeatable per NIC. |
+| `--nat-workers <N>` | a quarter of the host's logical CPUs, 1–4 | NAT worker threads for the current NIC, **1–16**. Each owns the TCP flows assigned to it; one flow never spans workers, so this scales many-flow traffic, not a single stream (see [§3](#3-devices-in-detail)). Kept across `--save`/`--restore`. |
 | `--wintun-name <adapter>` / `--wintun-host <ipv4>` | — | WinTun adapter name / host-side gateway IPv4 (wintun backend). |
 | `--drive <path>[,readonly\|ro]` | — | Add a virtio-blk disk. **Repeatable up to 8** (`/dev/vda`, `/dev/vdb`, …). |
 | `--virtio-9p-share <tag>=<host_dir>[,ro]` | — | Share a host directory over virtio-9p (9P2000.L). **Repeatable up to 8.** Tag 1–256 bytes; host path canonicalized and must be a directory; duplicate tags rejected. |
@@ -366,13 +367,18 @@ axes).
   works via an `IcmpSendEcho` helper-thread pool), **UDP** NAT (one connected host
   socket per 4-tuple), and **TCP** terminate-and-proxy (the guest-facing TCB is
   the `tcp-sans-io` crate; the host side dials out with `ConnectEx`). `--portfwd`
-  adds inbound forwarding — the VMM originates a SYN toward the guest. A **single
-  precreated worker thread** owns all flow state and a single IOCP. Host→guest
+  adds inbound forwarding — the VMM originates a SYN toward the guest.
+  **Precreated worker threads** (`--nat-workers`, by default a quarter of the
+  host's logical CPUs, 1–4) each own a share of the flows and their own IOCP.
+  A guest TCP flow's SYN assigns it to the worker with the fewest flows (a
+  table the guest TX path consults per TCP frame; the owner removes the entry
+  when the flow ends), an inbound flow to the worker its listener handed it
+  to; UDP goes by 4-tuple hash, and ARP and ICMP to the first worker. Host→guest
   TCP bytes go from a 256 KiB overlapped `WSARecv` per flow into the TCB's send
   ring, become segments built in place in the TCB's TX ring (TCP checksum left
   partial when the guest negotiated `VIRTIO_NET_F_GUEST_CSUM`), are appended to
   a GSO super-frame of up to 64 KiB built in place (`NEEDS_CSUM`), and are
-  copied once into the guest's RX buffers. The worker dequeues up to 16
+  copied once into the guest's RX buffers. Each worker dequeues up to 16
   completions per `GetQueuedCompletionStatusEx` and interrupts the guest once
   for the TCP frames a batch delivered (sooner if 8 are waiting); ARP, ICMP and
   UDP replies interrupt right away.
@@ -676,8 +682,8 @@ NIC/display protocol, not to the guest-memory-access layer.
 | virtio-9p single-stream read | ~16 MB/s (request-response latency-bound) |
 | virtio-9p concurrent (32 readers) | ~190 MB/s (ceiling = one submit pump + the per-queue `Mutex<Virtqueue>`) |
 | virtio-net guest→host | 20 MB transfer at line rate with the pump's periodic sweep disabled |
-| NAT TCP host→guest (`tools\net_compare.py`, server on the same host, 1 vCPU) | ~13.6 Gbit/s one stream, ~10.4 Gbit/s across 16 streams |
-| NAT TCP guest→host (same setup) | ~8.6 Gbit/s one stream |
+| NAT TCP host→guest (`tools\net_compare.py`, server on the same host, 1 vCPU) | ~14 Gbit/s one stream; across 16 streams ~11.7 Gbit/s with one NAT worker, ~23.5 with two, ~29 with three and ~33 with four (the guest's vCPU saturates) |
+| NAT TCP guest→host (same setup) | ~9 Gbit/s one stream |
 
 ---
 
@@ -708,7 +714,7 @@ Weak<T>                   6  ▌  break the device↔transport Arc cycle
 panic!                    4  ▌  setup-time invariants only
 trait (defined)           5  ▌  4 public device traits + private TcbDyn
 Condvar                   3  ▌  the NAT ICMP bounded handoff
-RwLock<T>                 1  ▏  the read-mostly MMIO dispatch table (one site)
+RwLock<T>                 2  ▏  read-mostly tables: MMIO dispatch, NAT flow → worker
 Rc / RefCell / Cow /      0     ← deliberately ABSENT (see below)
 Pin / PhantomData /
 static mut / Box::leak
@@ -719,7 +725,7 @@ static mut / Box::leak
 * **`Arc<T>` (167)** — shared, refcounted, thread-safe ownership. Guest RAM, the
   vCPUs, the HV enlightenment, every device, every backend, and the display are
   `Arc`-shared because multiple host threads (vCPUs, doorbell pumps, IOCP workers,
-  the 9p pool, the NAT worker, the window thread, the watchdog) hold them at once.
+  the 9p pool, the NAT workers, the window thread, the watchdog) hold them at once.
   This is the C "shared object with a refcount" pattern, but the refcount is
   correct by construction.
 * **`Weak<T>` (6) + `Arc::downgrade`** — breaks a **reference cycle**: the
@@ -742,7 +748,7 @@ static mut / Box::leak
   ownership** between acquire and release. `UnsafeCell` is the *only* legal way to
   tell the compiler "nobody else touches this slot right now", documented at each
   site.
-* **`Mutex<T>` (52) / `RwLock` (1) / `Condvar` (3)** — see
+* **`Mutex<T>` (52) / `RwLock` (2) / `Condvar` (3)** — see
   [§8](#8-concurrency-every-lock-and-why-it-exists). Yes, there are locks even
   though memory is preallocated — be suspicious, then read §8 for what each one
   serializes (host threads, never the guest).
@@ -798,7 +804,7 @@ A systems programmer sees "preallocated, partitioned buffers" and rightly asks
 *why are there locks at all?* Because **multiple host threads** touch shared
 device state: the vCPU threads (one per `--vcpus`), the per-device **doorbell
 pump** threads, the per-disk **IOCP worker** threads, the **9p worker pool**, the
-NAT worker + its ICMP helpers, the **display window** message-pump thread, and the
+NAT workers + their ICMP helpers, the **display window** message-pump thread, and the
 watchdog. The locks serialize *host-thread* access; they are **not** about the
 guest. Where single-ownership can be proven instead, there is no lock (the Treiber
 free-list, the `OnceLock` callbacks, the `UnsafeCell` slot bodies).
@@ -815,7 +821,8 @@ free-list, the `OnceLock` callbacks, the `UnsafeCell` slot bodies).
 | input `Mutex<Virtqueue>` + `Mutex<ChainScratch>` (event/status) | eventq/statusq + reused scratch | the window thread injecting vs the vCPU | host-event injection vs guest kicks |
 | display `Mutex<Frame>` + `Mutex<Option<InputSink>>` | the shared BGRA frame; the installed input sink | `present()` (vCPU/gpu) vs the window thread's `WM_PAINT` | the frame buffer is produced and consumed on different threads |
 | NAT `Mutex<VecDeque<IcmpJob>>` + `Condvar` | the bounded ping handoff queue | the vCPU enqueues, helper threads dequeue | classic bounded producer/consumer |
-| `RwLock<Vec<Entry>>` (MMIO bus, **the single site**) | the GPA→device dispatch table | written once at setup, read on every MMIO | read-mostly; readers never block readers |
+| NAT `RwLock<HashMap<FlowKey, usize>>` (`FlowRouter`, 2+ workers only) | which worker owns each TCP flow | the guest TX path reads it per TCP frame; a SYN, or a worker creating or ending a flow, writes it | a map keyed by 4-tuple; writes only at flow start and end, so reads rarely wait |
+| `RwLock<Vec<Entry>>` (MMIO bus) | the GPA→device dispatch table | written once at setup, read on every MMIO | read-mostly; readers never block readers |
 | `OnceLock` (IRQ / present callbacks, backends) | set-once handles | the setup writer, then lock-free readers | **not a lock in steady state** — `get()` is a plain Acquire load |
 
 **Lock-free** where ownership *is* provable: the NAT **FramePool** Treiber
@@ -985,7 +992,7 @@ and every other counter sits on a slow path):
   (`MsiX::injected_count`, one `WHvRequestInterrupt` each); `rx_irqs` /
   `tx_irqs` are the interrupts the device raised per queue. They add up to
   `msix` unless the guest had a vector masked. RX interrupts are raised by
-  the backend's thread (the NAT worker), TX ones by the doorbell pump.
+  the backend's threads (the NAT workers), TX ones by the doorbell pump.
 * **virtio-net RX:** `rx_backlogged` frames waited for guest RX buffers;
   `rx_rewinds` counts a ring running dry mid-frame (buffers given back, frame
   retried later); `rx_throttles` counts times the backlog got deep enough to
@@ -997,7 +1004,7 @@ and every other counter sits on a slow path):
   spurious), `dup_bytes_from_guest` / `ooo_drops` (guest data received twice, or
   dropped because the out-of-order tracker was full), `tx_drops` (guest
   frames dropped because the frame pool was full), and `iocp_backlog_max`: the
-  most completions the NAT worker found already queued when its 20 ms timer
+  most completions a NAT worker found already queued when its 20 ms timer
   sweep came due. The sweep spends up to 10 ms handling them first, so a worker
   that fell behind does not read the guest ACKs still in its queue as a lost
   tail.

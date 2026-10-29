@@ -97,11 +97,14 @@ impl NetBackendKind {
 }
 
 /// One virtio-net NIC. `--net` (repeatable) appends a NIC; `--net-backend`,
-/// `--portfwd`, `--wintun-name`, `--wintun-host` modify the most recent NIC.
+/// `--portfwd`, `--nat-workers`, `--wintun-name`, `--wintun-host` modify the
+/// most recent NIC.
 #[derive(Clone)]
 struct NicSpec {
     backend: NetBackendKind,
     port_forwards: Vec<PortForward>,
+    /// NAT worker threads (`NatOptions::workers`); None = the NAT default.
+    nat_workers: Option<usize>,
     wintun_name: Option<String>,
     wintun_host: Option<[u8; 4]>,
 }
@@ -111,6 +114,7 @@ impl NicSpec {
         NicSpec {
             backend: NetBackendKind::Nat,
             port_forwards: Vec::new(),
+            nat_workers: None,
             wintun_name: None,
             wintun_host: None,
         }
@@ -141,7 +145,8 @@ fn print_usage() {
          \x20 tinyvmm --pci-selftest        host-side PCI host-bridge + BAR + sizing test\n\
          \x20 tinyvmm --pvh-info <vmlinux>\n\
          \x20 tinyvmm --pvh-run [--initrd <cpio>] [--ram-mb N] [--vcpus N] [--rng] [--input] [--sound]\n\
-         \x20              [--net [--net-backend loopback|nat] [--portfwd H:G]...]...  (repeat --net per NIC)\n\
+         \x20              [--net [--net-backend loopback|nat] [--portfwd H:G]... [--nat-workers N]]...\n\
+         \x20              (repeat --net per NIC)\n\
          \x20              [--drive <path>[,readonly]]... [--cpu-affinity all|p|e|p-physical]\n\
          \x20              [--virtio-9p-share <tag>=<host_path>[,ro]]...\n\
          \x20              [--gpu [WxH]]  (virtio-gpu 2D scanout to a window; default 1280x800)\n\
@@ -1057,6 +1062,21 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
                     nics.push(NicSpec::new());
                 }
                 nics.last_mut().unwrap().port_forwards.push(pf);
+            }
+            "--nat-workers" => {
+                i += 1;
+                let max = crate::net::nat::MAX_WORKERS;
+                let n: usize = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .filter(|n| (1..=max).contains(n))
+                    .ok_or_else(|| {
+                        Error::msg(format!("--nat-workers wants an integer in 1..={max}"))
+                    })?;
+                if nics.is_empty() {
+                    nics.push(NicSpec::new());
+                }
+                nics.last_mut().unwrap().nat_workers = Some(n);
             }
             "--rng" => with_rng = true,
             "--gpu" => {
@@ -2229,6 +2249,9 @@ fn wire_net_backend(net: &Arc<NetDevice>, nic: &NicSpec) -> Result<String> {
         NetBackendKind::Nat => {
             let opts = NatOptions {
                 port_forwards: nic.port_forwards.clone(),
+                workers: nic
+                    .nat_workers
+                    .unwrap_or_else(crate::net::nat::default_workers),
                 ..NatOptions::default()
             };
             net.set_backend(NatBackend::new(net, opts));
@@ -2302,10 +2325,15 @@ fn parse_restore_nic(
         .get_str(&format!("{prefix}_wintun_host"))
         .ok()
         .and_then(|s| parse_ipv4(&s));
+    let nat_workers = jr
+        .get_u64(&format!("{prefix}_nat_workers"))
+        .ok()
+        .map(|n| n as usize);
     (
         NicSpec {
             backend,
             port_forwards,
+            nat_workers,
             wintun_name,
             wintun_host,
         },
@@ -2377,6 +2405,9 @@ fn write_snapshot(
             );
         for (j, pf) in nic.port_forwards.iter().enumerate() {
             jw.str(&format!("nic{i}_portfwd{j}"), &encode_portfwd(pf));
+        }
+        if let Some(n) = nic.nat_workers {
+            jw.u64(&format!("nic{i}_nat_workers"), n as u64);
         }
         if nic.backend == NetBackendKind::Wintun {
             let name = nic
