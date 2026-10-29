@@ -1948,17 +1948,18 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         }
     };
 
-    // Watchdog (optional): stop everything after N seconds.
-    let watchdog_done = Arc::new(AtomicBool::new(false));
+    // Watchdog (optional): stop everything after N seconds. Teardown hangs up
+    // `watchdog_done`, which wakes it at once rather than after its sleep.
+    let (watchdog_done, watchdog_wake) = std::sync::mpsc::channel::<()>();
     let watchdog = if cfg.watchdog_secs > 0 {
         let stop_all = stop_all.clone();
-        let done = watchdog_done.clone();
         let secs = cfg.watchdog_secs;
         let counters: Vec<_> = loops.iter().map(|l| l.counters()).collect();
         Some(std::thread::spawn(move || {
             for s in 1..=secs {
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                if done.load(Ordering::Acquire) {
+                if watchdog_wake.recv_timeout(std::time::Duration::from_secs(1))
+                    != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                {
                     return;
                 }
                 let io: u64 = counters.iter().map(|c| c.io.load(Ordering::Relaxed)).sum();
@@ -2087,11 +2088,11 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     let reason = bsp.run();
     btimer.mark("guest exited");
 
-    // Tear down: stop APs, signal watchdog, join. Capture each AP's stop reason
+    // Tear down: stop APs, wake the watchdog to end, join. Capture each AP's stop reason
     // and surface any abnormal one — otherwise an AP that died on an exception /
     // unhandled exit is invisible (only the BSP's reason is the process result).
     stop_all();
-    watchdog_done.store(true, Ordering::Release);
+    drop(watchdog_done);
     let mut ap_reasons: Vec<StopReason> = Vec::with_capacity(ap_handles.len());
     for h in ap_handles {
         match h.join() {
@@ -3374,16 +3375,16 @@ fn run_restore(args: &[String]) -> Result<i32> {
     // Watchdog (optional): stop everything after N seconds, printing per-second
     // exit counters. Mirrors the --pvh-run watchdog. Must be set up while `loops`
     // is still intact (it reads each loop's counters).
-    let watchdog_done = Arc::new(AtomicBool::new(false));
+    let (watchdog_done, watchdog_wake) = std::sync::mpsc::channel::<()>();
     let watchdog = if watchdog_secs > 0 {
         let stop_all = stop_all.clone();
-        let done = watchdog_done.clone();
         let secs = watchdog_secs;
         let counters: Vec<_> = loops.iter().map(|l| l.counters()).collect();
         Some(std::thread::spawn(move || {
             for s in 1..=secs {
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                if done.load(Ordering::Acquire) {
+                if watchdog_wake.recv_timeout(std::time::Duration::from_secs(1))
+                    != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                {
                     return;
                 }
                 let io: u64 = counters.iter().map(|c| c.io.load(Ordering::Relaxed)).sum();
@@ -3446,7 +3447,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
     let reason = bsp.run();
 
     stop_all();
-    watchdog_done.store(true, Ordering::Release);
+    drop(watchdog_done);
     // Surface any AP that stopped abnormally (exception / unhandled exit).
     let mut ap_reasons: Vec<StopReason> = Vec::with_capacity(ap_handles.len());
     for h in ap_handles {
