@@ -155,19 +155,20 @@ pub fn close_sock(s: SOCKET) {
     }
 }
 
-/// Post an overlapped receive. `wsabuf`/`ov` must outlive the operation. Returns
+/// Post an overlapped receive into `count` buffers (scatter, filled in order).
+/// `wsabufs`/`ov` must outlive the operation. Returns
 /// true if a completion will be delivered (an inline success still queues one),
 /// false if the receive failed synchronously (no completion will arrive — the
 /// caller must NOT mark the op pending, or it will wedge its reap gate forever).
 ///
 /// # Safety
-/// `wsabuf` must point to a valid `WSABUF` whose buffer, and `ov` (an
-/// `OVERLAPPED`), both remain alive and pinned until the IOCP completion for
+/// `wsabufs` must point to `count` valid `WSABUF`s whose buffers, and `ov` (an
+/// `OVERLAPPED`), all remain alive and pinned until the IOCP completion for
 /// this receive is dequeued.
-pub unsafe fn wsa_recv(s: SOCKET, wsabuf: *const WSABUF, ov: *mut OVERLAPPED) -> bool {
+pub unsafe fn wsa_recv(s: SOCKET, wsabufs: *const WSABUF, count: u32, ov: *mut OVERLAPPED) -> bool {
     let mut flags = 0u32;
     let mut recvd = 0u32;
-    let r = unsafe { WSARecv(s, wsabuf, 1, &mut recvd, &mut flags, ov, None) };
+    let r = unsafe { WSARecv(s, wsabufs, count, &mut recvd, &mut flags, ov, None) };
     r == 0 || unsafe { WSAGetLastError() } == WSA_IO_PENDING
 }
 

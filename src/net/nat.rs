@@ -56,15 +56,16 @@ const GSO_FRAME_CAP: usize = ETH_HDR + 60 + GSO_PAYLOAD_CAP;
 const UDP_BUF: usize = 2048;
 // Host-socket send buffer per overlapped op (one host send in flight per flow).
 const TCP_BUF: usize = 65536;
-// Host-socket recv buffer per overlapped op. Each WSARecv completion drives one
-// `tcp_drive` pass, so bigger recvs mean fewer syscalls, kernel wakeups, guest
-// interrupts and drives per byte: 256 KiB carried ~11% more single-stream
-// download than 64 KiB at ~11% less VMM CPU per byte. A pass still delivers
-// at most GSO_PAYLOAD_CAP per super-frame.
-const TCP_RECV_BUF: usize = 256 * 1024;
-/// Recv ops built up front; the pool grows on demand to the flow cap (and
-/// recycles), so idle VMs don't commit MAX_TCP_FLOWS of 256 KiB buffers.
-const TCP_RECV_OP_WARM: usize = 32;
+// Most a host recv takes at once. Each WSARecv lands straight in the free
+// space of the flow's TCB send ring (`Tcb::send_reserve`) and its completion
+// drives one `tcp_drive` pass, so bigger recvs mean fewer syscalls, kernel
+// wakeups, guest interrupts and drives per byte: 256 KiB carried ~11% more
+// single-stream download than 64 KiB at ~11% less VMM CPU per byte. A pass
+// still delivers at most GSO_PAYLOAD_CAP per super-frame.
+const TCP_RECV_MAX: usize = 256 * 1024;
+/// Least free send-ring space worth a recv (half the ring for smaller tiers),
+/// so a nearly full ring refills in a few large recvs, not many small ones.
+const TCP_RECV_MIN: usize = 64 * 1024;
 const MAX_UDP_FLOWS: usize = 256;
 const MAX_TCP_FLOWS: usize = 256;
 /// Number of preallocated guest-TX frame slots shared across all shards.
@@ -78,9 +79,6 @@ const POOL_SENTINEL: u32 = u32::MAX;
 /// Cap on the per-flow guest->host queue. When reached we stop draining the
 /// tcb receive ring, which closes the guest-facing window (backpressure).
 const TO_HOST_CAP: usize = 64 * 1024;
-/// Host->guest bytes spilled past a full tcb send ring above which no further
-/// host recv is posted, so a flow's spill stays under this plus one recv.
-const TO_GUEST_SPILL_CAP: usize = 64 * 1024;
 /// Fixed receive buffer for host sockets whose peer is this host. Windows'
 /// receive-window autotuning keeps such sub-millisecond connections at a small
 /// window, and the sender then stalls in ~15 ms steps: about 5.7 Gbps with ~40
@@ -366,7 +364,10 @@ trait TcbDyn {
     fn set_tx_csum_offload(&mut self, on: bool);
     fn poll(&self) -> u32;
     fn recv(&mut self, dst: &mut [u8]) -> Result<usize, TcpError>;
-    fn send(&mut self, data: &[u8]) -> Result<usize, TcpError>;
+    /// Lend the send ring's free space (two slices when it wraps) for the
+    /// host to fill in place; `send_commit` appends a prefix and ends the loan.
+    fn send_reserve(&mut self, max: usize) -> Result<(&mut [u8], &mut [u8]), TcpError>;
+    fn send_commit(&mut self, n: usize) -> Result<usize, TcpError>;
     fn state(&self) -> State;
     fn tick(&mut self) -> Result<(), TcpError>;
     /// Host back-pressure: build no more segments until resumed.
@@ -409,8 +410,11 @@ impl<const BUF: usize> TcbDyn for Tcb<BUF> {
     fn recv(&mut self, dst: &mut [u8]) -> Result<usize, TcpError> {
         self.recv(dst)
     }
-    fn send(&mut self, data: &[u8]) -> Result<usize, TcpError> {
-        self.send(data)
+    fn send_reserve(&mut self, max: usize) -> Result<(&mut [u8], &mut [u8]), TcpError> {
+        self.send_reserve(max)
+    }
+    fn send_commit(&mut self, n: usize) -> Result<usize, TcpError> {
+        self.send_commit(n)
     }
     fn state(&self) -> State {
         self.state()
@@ -498,10 +502,9 @@ impl<T> SyncBoxPool<T> {
 }
 
 fn make_tcp_op() -> Box<TcpOp> {
-    // All fields are POD (integers, byte arrays, OVERLAPPED/WSABUF), so a fully
-    // zeroed value is valid; the acquire site sets key/kind and arms the op.
-    // Zeroed on the heap: the op is too big for a stack temporary.
-    unsafe { Box::<TcpOp>::new_zeroed().assume_init() }
+    // All fields are POD (integers, OVERLAPPED/WSABUF), so a fully zeroed
+    // value is valid; the acquire site sets key/kind and arms the op.
+    Box::new(unsafe { core::mem::zeroed() })
 }
 fn make_tcp_send_op() -> Box<TcpSendOp> {
     Box::new(unsafe { core::mem::zeroed() })
@@ -803,15 +806,15 @@ struct TcpOvHeader {
 }
 
 /// The connect/recv op, owned by its flow and reused (ConnectEx, then WSARecv;
-/// the two are never in flight at the same time). `overlapped` MUST be first,
-/// `kind` second.
+/// the two are never in flight at the same time). A recv's buffers are the
+/// free space of the flow's TCB send ring (`wsabuf[1]` only where it wraps).
+/// `overlapped` MUST be first, `kind` second.
 #[repr(C)]
 struct TcpOp {
     overlapped: OVERLAPPED,
     kind: u8, // 0 = connect, 1 = recv
     key: FlowKey,
-    buf: [u8; TCP_RECV_BUF],
-    wsabuf: WSABUF,
+    wsabuf: [WSABUF; 2],
 }
 
 /// The send op, owned by its flow. At most one host send is in flight per flow
@@ -841,9 +844,7 @@ struct TcpFlow {
     recv_pending: bool,
     send_inflight: bool,
     pending_to_host: Vec<u8>, // guest->host queue (drained by overlapped sends)
-    pending_to_guest: Vec<u8>, // host->guest bytes the tcb hasn't accepted yet
     closing: bool,            // host sent FIN: our recv side is closing
-    fin_queued: bool,         // the host FIN was handed to the tcb (after its bytes)
     want_shutdown: bool,      // guest sent FIN: SD_SEND the host once the queue drains
     shutdown_done: bool,      // SD_SEND already issued
     dead: bool,               // tearing down; socket closed, awaiting op drain
@@ -1034,33 +1035,21 @@ fn emit_gso_tcp(
     dev.inject_rx_gso_batched(eth, vhdr);
 }
 
-/// Push buffered host->guest bytes into the tcb send ring (as much as fits),
-/// then, once the host has closed and every byte is in, queue the FIN.
-fn flush_to_tcb(flow: &mut TcpFlow) {
-    while !flow.pending_to_guest.is_empty() {
-        match flow.tcb.as_mut().unwrap().send(&flow.pending_to_guest) {
-            Ok(0) => break,
-            Ok(n) => {
-                flow.pending_to_guest.drain(..n);
-            }
-            Err(_) => break,
-        }
-    }
-    if flow.closing && !flow.fin_queued && flow.pending_to_guest.is_empty() {
-        flow.fin_queued = true;
+/// The host side reached EOF (or failed): stop receiving and queue the FIN
+/// toward the guest. Every byte the host sent is already in the tcb's send
+/// ring (recvs land there), so the FIN follows them.
+fn on_host_eof(flow: &mut TcpFlow) {
+    if !flow.closing {
+        flow.closing = true;
         let _ = flow.tcb.as_mut().unwrap().close();
     }
 }
 
-/// The host side reached EOF (or failed): stop receiving. The FIN toward the
-/// guest waits in [`flush_to_tcb`] for the bytes the tcb has not taken yet:
-/// closing the tcb now would make them unsendable and cut the stream short.
-fn on_host_eof(flow: &mut TcpFlow) {
-    flow.closing = true;
-}
-
-/// Re-arm a host receive if the flow is connected, idle, and the send ring
-/// has room (simple backpressure).
+/// Re-arm a host receive, straight into the free space of the flow's tcb send
+/// ring. Nothing is posted until the guest connection can take data and
+/// enough of the ring is free; the drive that frees it (a guest ACK) calls
+/// back here. A full ring leaves the host socket unread, which closes the
+/// host's TCP window (backpressure).
 /// Returns false only if the receive failed synchronously (no completion will
 /// arrive) — the caller must tear the flow down rather than wait on a recv that
 /// will never complete.
@@ -1069,23 +1058,35 @@ fn maybe_post_recv(flow: &mut TcpFlow) -> bool {
     if !flow.connected || flow.recv_pending || flow.closing || flow.dead {
         return true;
     }
-    if flow.pending_to_guest.len() > TO_GUEST_SPILL_CAP {
+    let min = TCP_RECV_MIN.min(TIER_BUF[flow.tier] / 2);
+    let tcb = flow.tcb.as_mut().unwrap();
+    let Ok((a, b)) = tcb.send_reserve(TCP_RECV_MAX) else {
+        return true;
+    };
+    if a.len() + b.len() < min {
+        let _ = tcb.send_commit(0);
         return true;
     }
+    let nbufs = if b.is_empty() { 1 } else { 2 };
     let op = flow.op.as_mut().unwrap();
     op.kind = 1;
-    let p = op.buf.as_mut_ptr();
-    let l = op.buf.len();
-    op.wsabuf = sys::wsabuf(p, l);
-    let sock = flow.sock;
-    let buf = &op.wsabuf as *const WSABUF;
+    op.wsabuf = [
+        sys::wsabuf(a.as_mut_ptr(), a.len()),
+        sys::wsabuf(b.as_mut_ptr(), b.len()),
+    ];
+    let bufs = op.wsabuf.as_ptr();
     let ovl = &mut op.overlapped as *mut OVERLAPPED;
-    let posted = unsafe { sys::wsa_recv(sock, buf, ovl) };
+    // SAFETY: the buffers are the tcb's lent ring space, which the tcb leaves
+    // alone until `send_commit`, and the tcb outlives the recv (a flow is
+    // reaped only after its recv completes). `op` is pinned in its Box.
+    let posted = unsafe { sys::wsa_recv(flow.sock, bufs, nbufs, ovl) };
     if posted {
         flow.recv_pending = true;
         if crate::diag::net_enabled() {
             flow.diag.recv_posted = Some(Instant::now());
         }
+    } else {
+        let _ = flow.tcb.as_mut().unwrap().send_commit(0);
     }
     posted
 }
@@ -1575,15 +1576,27 @@ impl NatState {
 
     /// Shutdown: drop all live flows. take() the pooled boxes first (the pools
     /// are dying, so just discard them) so the Drop-bomb treats these
-    /// intentional drops as reaped. TcpFlow::drop then closes the host socket;
-    /// for UDP the socket lives in the op, so close it here.
+    /// intentional drops as reaped. Closing a socket cancels its overlapped
+    /// ops, but their completions may still write into the op structs and
+    /// buffers (a recv, into the tcb's send ring) after the close returns, so
+    /// a flow's boxes are leaked instead of freed while it has an op in
+    /// flight. For UDP the socket lives in the op, so close it here.
     fn shutdown(&mut self) {
         for (_, mut f) in self.tcp.drain() {
             publish_tcb_stats(&mut f, &self.stats);
-            f.tcb.take();
-            f.op.take();
-            f.send_op.take();
-            // TcpFlow::drop closes f.sock
+            if f.sock != INVALID_SOCKET {
+                sys::close_sock(f.sock);
+                f.sock = INVALID_SOCKET;
+            }
+            let boxes = (f.tcb.take(), f.op.take(), f.send_op.take());
+            if f.recv_pending || f.send_inflight || f.connect_pending {
+                // Deliberate, bounded leak, not a buffer we forgot to free:
+                // close_sock cancels the op asynchronously, so the kernel may
+                // still write a cancelled recv into the tcb's send ring after
+                // it returns. Freeing these now would be a use-after-free; the
+                // process is tearing down, so the OS reclaims them instead.
+                std::mem::forget(boxes);
+            }
         }
         for (_, mut f) in self.udp.drain() {
             if let Some(op) = f.op.take() {
@@ -1738,7 +1751,7 @@ impl NatState {
         let l = op.buf.len();
         op.wsabuf = sys::wsabuf(p, l);
         let opp: *mut UdpOp = &mut *op;
-        let posted = unsafe { sys::wsa_recv(sock, &(*opp).wsabuf, &mut (*opp).overlapped) };
+        let posted = unsafe { sys::wsa_recv(sock, &(*opp).wsabuf, 1, &mut (*opp).overlapped) };
         if !posted {
             // Recv failed synchronously: no completion will arrive, so a tracked
             // flow could never be reaped through its recv. Release everything now
@@ -1813,7 +1826,7 @@ impl NatState {
         let buf = &op.wsabuf as *const WSABUF;
         let ovl = &mut op.overlapped as *mut OVERLAPPED;
         let sock = op.sock;
-        let posted = unsafe { sys::wsa_recv(sock, buf, ovl) };
+        let posted = unsafe { sys::wsa_recv(sock, buf, 1, ovl) };
         if !posted {
             // Re-arm failed synchronously: no further completion will arrive, so
             // reap now (the op is not in flight).
@@ -1949,9 +1962,7 @@ impl NatState {
                 recv_pending: false,
                 send_inflight: false,
                 pending_to_host: Vec::new(),
-                pending_to_guest: Vec::new(),
                 closing: false,
-                fin_queued: false,
                 want_shutdown: false,
                 shutdown_done: false,
                 dead: false,
@@ -2082,9 +2093,7 @@ impl NatState {
                 recv_pending: false,
                 send_inflight: false,
                 pending_to_host: Vec::new(),
-                pending_to_guest: Vec::new(),
                 closing: false,
-                fin_queued: false,
                 want_shutdown: false,
                 shutdown_done: false,
                 dead: false,
@@ -2144,29 +2153,20 @@ impl NatState {
                 flow.diag.last_recv_wait_ms = t.elapsed().as_millis() as u64;
             }
             if flow.dead {
+                // The recv is done writing the lent ring space: end the loan.
+                let _ = flow.tcb.as_mut().unwrap().send_commit(0);
                 dead = true;
             } else {
-                flow.tcb.as_mut().unwrap().set_now(now);
+                let tcb = flow.tcb.as_mut().unwrap();
+                tcb.set_now(now);
                 if !ok || bytes == 0 {
+                    let _ = tcb.send_commit(0);
                     on_host_eof(flow);
                 } else {
-                    let n = (bytes as usize).min(flow.op.as_ref().unwrap().buf.len());
-                    // Fast path: feed the WSARecv buffer straight into the tcb
-                    // send ring (skipping the `pending_to_guest` staging copy —
-                    // ~735 MB/s of memcpy at the current ceiling). Only the
-                    // remainder (send-ring full) spills to `pending_to_guest`;
-                    // with the default 1 MiB ring and a 256 KiB recv that's rare.
-                    // SAFETY: `op.buf` and `tcb` are disjoint Box fields of
-                    // `flow`; `send` only reads from the slice.
-                    let buf_ptr = flow.op.as_ref().unwrap().buf.as_ptr();
-                    let buf = unsafe { std::slice::from_raw_parts(buf_ptr, n) };
-                    let sent = match flow.tcb.as_mut().unwrap().send(buf) {
-                        Ok(m) => m,
-                        Err(_) => 0,
-                    };
-                    if sent < n {
-                        flow.pending_to_guest.extend_from_slice(&buf[sent..]);
-                    }
+                    // The recv landed in the tcb's send ring: append it to the
+                    // stream. This fails only if the guest connection closed
+                    // or reset meanwhile, when the bytes have nowhere to go.
+                    let _ = tcb.send_commit(bytes as usize);
                     flow.last_activity = now;
                 }
             }
@@ -2358,9 +2358,6 @@ impl NatState {
                     rx_paused = true;
                     break 'pump;
                 }
-                // Top up the send ring from any spillover before each tick so a
-                // recv larger than one egress-ring pass still drains in one drive.
-                flush_to_tcb(flow);
                 let _ = flow.tcb.as_mut().unwrap().tick();
                 ticked = true;
             } // 'pump
@@ -2663,7 +2660,7 @@ impl NatBackend {
                 big_pool: big_pool.clone(),
                 l4_csum_trusted: false,
                 tcb_pools,
-                tcp_op_pool: BoxPool::new(TCP_RECV_OP_WARM.div_ceil(n), make_tcp_op),
+                tcp_op_pool: BoxPool::new(MAX_TCP_FLOWS.div_ceil(n), make_tcp_op),
                 tcp_send_op_pool: BoxPool::new(MAX_TCP_FLOWS.div_ceil(n), make_tcp_send_op),
                 udp_op_pool: BoxPool::new(MAX_UDP_FLOWS.div_ceil(n), make_udp_op),
                 accept_pool: accept_pool.clone(),
@@ -2951,11 +2948,11 @@ mod tests {
         }) {}
     }
 
-    /// The host closes while bytes it sent are still spilled in
-    /// `pending_to_guest` (the tcb's send ring was full): the guest must get
-    /// every byte, then the FIN.
+    /// Host bytes land in the tcb's send ring as recvs complete (wrapping
+    /// around it as the guest drains it); when the host then closes, the guest
+    /// gets every byte, then the FIN.
     #[test]
-    fn host_eof_delivers_spilled_bytes_before_fin() {
+    fn host_bytes_reach_the_guest_through_the_ring_then_fin() {
         let nat_end = Endpoint {
             ip: [10, 0, 0, 1],
             port: 80,
@@ -2989,10 +2986,8 @@ mod tests {
         }
         assert_eq!(nat.state(), State::Established);
 
-        // The host sends more than the send ring holds, then closes.
+        // The host sends three rings' worth, then closes.
         let data: Vec<u8> = (0..3 * TIER_BUF[0] as u32).map(|i| (i * 7) as u8).collect();
-        let sent = nat.send(&data).unwrap();
-        assert!(sent < data.len());
         let mut flow = TcpFlow {
             tcb: Some(nat),
             tier: 0,
@@ -3004,9 +2999,7 @@ mod tests {
             recv_pending: false,
             send_inflight: false,
             pending_to_host: Vec::new(),
-            pending_to_guest: data[sent..].to_vec(),
             closing: false,
-            fin_queued: false,
             want_shutdown: false,
             shutdown_done: false,
             dead: false,
@@ -3017,13 +3010,29 @@ mod tests {
             rx_blocked: false,
             csum_offload: false,
         };
-        on_host_eof(&mut flow);
 
-        // Pump both ends, as `tcp_drive` and the guest would.
+        // Pump both ends, as `tcp_drive` and the guest would, completing a
+        // host recv into the lent ring space whenever there is room.
+        let mut off = 0;
         let mut got = Vec::new();
         let mut rb = [0u8; 16384];
         for now in (0..10_000).step_by(10) {
-            flush_to_tcb(&mut flow);
+            if off < data.len() {
+                let nat = flow.tcb.as_mut().unwrap();
+                if let Ok((a, b)) = nat.send_reserve(TCP_RECV_MAX) {
+                    let mut n = 0;
+                    for part in [a, b] {
+                        let k = part.len().min(data.len() - off - n);
+                        part[..k].copy_from_slice(&data[off + n..off + n + k]);
+                        n += k;
+                    }
+                    assert_eq!(nat.send_commit(n), Ok(n));
+                    off += n;
+                }
+                if off == data.len() {
+                    on_host_eof(&mut flow);
+                }
+            }
             let nat = flow.tcb.as_mut().unwrap();
             nat.set_now(now);
             nat.tick().unwrap();

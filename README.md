@@ -374,8 +374,11 @@ axes).
   table the guest TX path consults per TCP frame; the owner removes the entry
   when the flow ends), an inbound flow to the worker its listener handed it
   to; UDP goes by 4-tuple hash, and ARP and ICMP to the first worker. Host→guest
-  TCP bytes go from a 256 KiB overlapped `WSARecv` per flow into the TCB's send
-  ring, become segments built in place in the TCB's TX ring (TCP checksum left
+  TCP bytes land straight in the TCB's send ring: each flow's overlapped
+  `WSARecv` (up to 256 KiB, posted once at least 64 KiB of the ring is free)
+  writes into the free space the TCB lends (`Tcb::send_reserve`), so a full
+  ring leaves the host socket unread and closes the host's TCP window. They
+  become segments built in place in the TCB's TX ring (TCP checksum left
   partial when the guest negotiated `VIRTIO_NET_F_GUEST_CSUM`), are appended to
   a GSO super-frame of up to 64 KiB built in place (`NEEDS_CSUM`), and are
   copied once into the guest's RX buffers. Each worker dequeues up to 16
