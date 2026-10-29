@@ -438,6 +438,29 @@ fn normalize_for_containment(p: &Path) -> Vec<u16> {
     w
 }
 
+/// Whether normalized path `p` is `root` or lies under it.
+fn contained_in(p: &[u16], root: &[u16]) -> bool {
+    p.starts_with(root) && (p.len() == root.len() || p[root.len()] == b'\\' as u16)
+}
+
+/// The share root's real path with its NT volume name, normalized, for
+/// `P9Device::handle_contained`.
+fn nt_root_path(root: &Path) -> Option<Vec<u16>> {
+    let wp = to_win32_long_path(root);
+    let h = fs::create_file(
+        &wp,
+        FILE_READ_ATTRIBUTES,
+        FILE_SHARE_RWD,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+    )
+    .ok()?;
+    let real = fs::final_nt_path_by_handle(h);
+    fs::close(h);
+    let os = std::ffi::OsString::from_wide(&real?);
+    Some(normalize_for_containment(Path::new(&os)))
+}
+
 fn is_safe_name_component(comp: &str) -> bool {
     if comp.is_empty() || comp == "." || comp == ".." {
         return false;
@@ -678,6 +701,10 @@ pub struct P9Device {
     gid: u32,
     metadata: bool,
     share_root_norm: Vec<u16>,
+    /// The share root's real path with its NT volume name, normalized like
+    /// `share_root_norm`; `handle_contained` compares against it. None if it
+    /// couldn't be resolved, in which case the drive-letter form is used.
+    share_root_nt: Option<Vec<u16>>,
     config_bytes: Vec<u8>,
     driver_ok: AtomicBool,
     acked_features: AtomicU64,
@@ -705,6 +732,7 @@ impl P9Device {
         opts: ShareOptions,
     ) -> Arc<Self> {
         let share_root_norm = normalize_for_containment(&host_root);
+        let share_root_nt = nt_root_path(&host_root);
         let mut config_bytes = Vec::with_capacity(2 + tag.len());
         let n = tag.len().min(0xFFFF);
         config_bytes.extend_from_slice(&(n as u16).to_le_bytes());
@@ -719,6 +747,7 @@ impl P9Device {
             gid: opts.gid,
             metadata: opts.metadata,
             share_root_norm,
+            share_root_nt,
             config_bytes,
             driver_ok: AtomicBool::new(false),
             acked_features: AtomicU64::new(0),
@@ -810,18 +839,7 @@ impl P9Device {
     }
 
     fn path_contained(&self, p: &Path) -> bool {
-        let pn = normalize_for_containment(p);
-        let root = &self.share_root_norm;
-        if pn.len() < root.len() {
-            return false;
-        }
-        if pn[..root.len()] != root[..] {
-            return false;
-        }
-        if pn.len() == root.len() {
-            return true;
-        }
-        pn[root.len()] == b'\\' as u16
+        contained_in(&normalize_for_containment(p), &self.share_root_norm)
     }
 
     /// Re-check containment against the *real* path of an opened handle. The
@@ -829,13 +847,20 @@ impl P9Device {
     /// `CreateFileW` follows reparse points (symlinks / NTFS junctions). A
     /// reparse point that lives lexically inside the share but targets a
     /// directory outside it would pass the lexical check yet open an external
-    /// file. `GetFinalPathNameByHandleW` resolves the handle to its true path
-    /// (`\\?\C:\...`, same canonical form as the share root, which is
-    /// `std::fs::canonicalize`d at construction), so re-running the prefix check
-    /// on that real path closes the symlink/junction escape. Fails closed: if
-    /// the path can't be resolved, treat as not contained. This restores parity
+    /// file. `GetFinalPathNameByHandleW` resolves the handle to its true path,
+    /// so re-running the prefix check on that real path closes the
+    /// symlink/junction escape. Both sides use the NT volume name
+    /// (`\Device\HarddiskVolumeN\...`): resolving the drive letter costs a
+    /// Mount Manager round trip on every walk and getattr. Fails closed: if the
+    /// path can't be resolved, treat as not contained. This restores parity
     /// with the C++ backend's `weakly_canonical`-based normalization.
     fn handle_contained(&self, h: HANDLE) -> bool {
+        if let Some(root) = &self.share_root_nt {
+            return fs::final_nt_path_by_handle(h).is_some_and(|real| {
+                let os = std::ffi::OsString::from_wide(&real);
+                contained_in(&normalize_for_containment(Path::new(&os)), root)
+            });
+        }
         match fs::final_path_by_handle(h) {
             Some(real) => {
                 let os = std::ffi::OsString::from_wide(&real);
