@@ -1504,6 +1504,8 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     // Kept across the run so save-time quiesce can still each net backend
     // before capturing (a consistent snapshot needs the RX/TX data plane idle).
     let mut net_devices: Vec<Arc<NetDevice>> = Vec::with_capacity(cfg.nics.len());
+    // Each NIC's transport, for its MSI-X interrupt count in the exit report.
+    let mut net_transports: Vec<Arc<PciTransport>> = Vec::with_capacity(cfg.nics.len());
 
     // --- virtio-net NICs (repeatable --net), each with its own backend ---
     for (ni, nic) in cfg.nics.iter().enumerate() {
@@ -1536,6 +1538,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         let nfunc: Arc<dyn PciFunction> = nt.clone();
         let nbdf = pci_bus.add_device(nfunc);
         transports.push(nt.clone());
+        net_transports.push(nt.clone());
         let backend_name = wire_net_backend(&net, nic)?;
         println!(
             "[pvh-run] virtio-net[{}] on PCI 00:{:02x}.0 ({}, mac {})",
@@ -2123,8 +2126,8 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     );
     // Network data-path counters (always on; they cost nothing on the hot
     // path). TINYVMM_NET_DIAG adds live stall/loss lines during the run.
-    for (i, nd) in net_devices.iter().enumerate() {
-        println!("[net] nic{i} {}", nd.diag_summary());
+    for (i, (nd, nt)) in net_devices.iter().zip(&net_transports).enumerate() {
+        println!("[net] nic{i} {}", nd.diag_summary(nt.msix_injected_count()));
     }
 
     // TINYVMM_DIAG: per-vCPU exit breakdown + a guest-RAM dump for post-mortem.
@@ -2688,6 +2691,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
     // is applied (queues programmed + driver_ok), so live pre-snapshot flows
     // reset but the device model + new flows work.
     let mut net_devices: Vec<Arc<NetDevice>> = Vec::with_capacity(restore_nics.len());
+    let mut net_transports: Vec<Arc<PciTransport>> = Vec::with_capacity(restore_nics.len());
     for (ni, (_nic, mac)) in restore_nics.iter().enumerate() {
         let net = NetDevice::new(ram.clone(), *mac);
         net_devices.push(net.clone());
@@ -2716,6 +2720,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
         }));
         pci_bus.add_device(nt.clone() as Arc<dyn PciFunction>);
         transports.push(nt.clone());
+        net_transports.push(nt.clone());
     }
 
     if with_rng {
@@ -3323,8 +3328,8 @@ fn run_restore(args: &[String]) -> Result<i32> {
         reason,
         com1.tx_bytes()
     );
-    for (i, nd) in net_devices.iter().enumerate() {
-        println!("[net] nic{i} {}", nd.diag_summary());
+    for (i, (nd, nt)) in net_devices.iter().zip(&net_transports).enumerate() {
+        println!("[net] nic{i} {}", nd.diag_summary(nt.msix_injected_count()));
     }
     Ok(match reason {
         StopReason::GuestHalted | StopReason::Cancelled => 0,

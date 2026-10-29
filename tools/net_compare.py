@@ -17,7 +17,10 @@ guest's /proc/uptime only has 10 ms resolution):
   ul    single-stream upload guest->host (wget --post-file from tmpfs)
   par   PAR concurrent download streams, RUNS rounds, aggregate throughput
 For every phase the driver also records the VMM process's host CPU time
-(user+kernel via GetProcessTimes) to report CPU-seconds per GiB moved.
+(user+kernel via GetProcessTimes) to report CPU-seconds per GiB moved, each
+VMM thread's CPU (GetThreadTimes) to report the busiest threads, and the
+guest reports its virtio-net interrupts over the dl, ul and par phases (from
+/proc/interrupts) to report guest interrupts per GiB.
 
 Usage:
   python tools\\net_compare.py
@@ -224,6 +227,60 @@ def proc_cpu_seconds(proc: subprocess.Popen) -> float:
     return total
 
 
+# Per-thread CPU (which VMM thread saturates first): Toolhelp thread list,
+# GetThreadDescription for the name, GetThreadTimes for user+kernel time.
+TH32CS_SNAPTHREAD = 0x4
+THREAD_QUERY_LIMITED_INFORMATION = 0x0800
+
+
+class _TE32(ctypes.Structure):
+    _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                ("th32ThreadID", wintypes.DWORD), ("th32OwnerProcessID", wintypes.DWORD),
+                ("tpBasePri", ctypes.c_long), ("tpDeltaPri", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD)]
+
+
+_k32.Thread32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(_TE32)]
+_k32.Thread32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(_TE32)]
+_k32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_k32.OpenThread.restype = wintypes.HANDLE
+_k32.GetThreadTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+_k32.GetThreadTimes.restype = wintypes.BOOL
+_k32.GetThreadDescription.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_wchar_p)]
+_k32.GetThreadDescription.restype = ctypes.c_long
+_k32.LocalFree.argtypes = [ctypes.c_void_p]
+
+
+def thread_cpu_seconds(proc: subprocess.Popen) -> dict[str, float]:
+    """User+kernel CPU per thread of the VMM and its descendants, keyed by
+    thread name (or tid when unnamed)."""
+    pids = set(_descendants(proc.pid))
+    snap = _k32.CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+    te = _TE32(dwSize=ctypes.sizeof(_TE32))
+    out: dict[str, float] = {}
+    ok = _k32.Thread32First(snap, ctypes.byref(te))
+    while ok:
+        if te.th32OwnerProcessID in pids:
+            h = _k32.OpenThread(THREAD_QUERY_LIMITED_INFORMATION, False, te.th32ThreadID)
+            if h:
+                name = ctypes.c_wchar_p()
+                if _k32.GetThreadDescription(h, ctypes.byref(name)) >= 0 and name.value:
+                    key = name.value
+                else:
+                    key = f"tid{te.th32ThreadID}"
+                if name:
+                    _k32.LocalFree(ctypes.cast(name, ctypes.c_void_p))
+                c, e, k, u = (wintypes.FILETIME() for _ in range(4))
+                if _k32.GetThreadTimes(h, ctypes.byref(c), ctypes.byref(e),
+                                       ctypes.byref(k), ctypes.byref(u)):
+                    ft = lambda f: ((f.dwHighDateTime << 32) | f.dwLowDateTime) / 1e7  # noqa: E731
+                    out[key] = out.get(key, 0.0) + ft(k) + ft(u)
+                _k32.CloseHandle(h)
+        ok = _k32.Thread32Next(snap, ctypes.byref(te))
+    _k32.CloseHandle(snap)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # VMM launch
 # ---------------------------------------------------------------------------
@@ -263,7 +320,7 @@ def vmm_argv(name: str, a: argparse.Namespace, host: str, port: int) -> list[str
 
 PHASE_RE = re.compile(r"NETCMP PHASE (\w+) (begin|end)")
 # Guest network counter deltas over a phase: "NETCMP <kind> <phase> k=v k=v ...".
-GUEST_RE = re.compile(r"NETCMP (TCPEXT|SNMP|NETDEV) (\w+)(.*)$")
+GUEST_RE = re.compile(r"NETCMP (TCPEXT|SNMP|NETDEV|IRQ) (\w+)(.*)$")
 
 
 @dataclass
@@ -275,6 +332,7 @@ class RunResult:
     ping: str = ""
     rr: tuple | None = None                     # (n, ok, us)
     guest: dict = field(default_factory=dict)   # phase -> {counter: delta}
+    threads: dict = field(default_factory=dict)  # phase -> {thread: % of one CPU}
     log: str = ""
 
 
@@ -287,7 +345,7 @@ def run_one(name: str, a: argparse.Namespace, srv: Server, host: str) -> RunResu
     # stdin EOF (so DEVNULL would kill it immediately).
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, bufsize=0)
-    marks: dict[str, tuple[float, float]] = {}
+    marks: dict[str, tuple[float, float, dict[str, float], float]] = {}
     lines: list[str] = []
     done = threading.Event()
 
@@ -306,12 +364,20 @@ def run_one(name: str, a: argparse.Namespace, srv: Server, host: str) -> RunResu
             m = PHASE_RE.search(line)
             if m:
                 now, cpu = time.perf_counter(), proc_cpu_seconds(proc)
+                thr, own = thread_cpu_seconds(proc), time.process_time()
                 if m.group(2) == "begin":
-                    marks[m.group(1)] = (now, cpu)
+                    marks[m.group(1)] = (now, cpu, thr, own)
                 else:
-                    t0, c0 = marks.get(m.group(1), (now, cpu))
+                    t0, c0, thr0, own0 = marks.get(m.group(1), (now, cpu, thr, own))
                     res.phases[m.group(1)] = {"wall": now - t0, "cpu": cpu - c0}
                     res.xfers[m.group(1)] = srv.take()
+                    if now > t0:
+                        res.threads[m.group(1)] = {
+                            k: 100.0 * (v - thr0.get(k, 0.0)) / (now - t0)
+                            for k, v in thr.items()}
+                        # This process serves the transfers (one thread each).
+                        res.threads[m.group(1)]["(host server)"] = (
+                            100.0 * (own - own0) / (now - t0))
             if "NETCMP PING" in line:
                 res.ping = line
             mm = re.search(r"NETCMP RR n=(\d+) ok=(\d+) us=(\d+)", line)
@@ -353,6 +419,7 @@ def summarize(rs: list[RunResult]) -> dict:
     rtts, losses, rr_tps = [], [], []
     dl, ul, par = [], [], []
     cpu = {k: [0.0, 0] for k in ("dl", "ul", "par")}  # cpu secs, bytes
+    irq = {k: [0, 0, 0] for k in ("dl", "ul", "par")}  # guest rx irqs, tx irqs, bytes
     for r in rs:
         m = re.search(r"min/avg/max = ([\d.]+)/([\d.]+)/([\d.]+)", r.ping)
         if m:
@@ -377,6 +444,12 @@ def summarize(rs: list[RunResult]) -> dict:
             if ph in r.phases:
                 cpu[ph][0] += r.phases[ph]["cpu"]
                 cpu[ph][1] += sum(x.nbytes for x in r.xfers.get(ph, []))
+        for ph in irq:
+            g = r.guest.get(ph, {})
+            if "rx_irqs" in g:
+                irq[ph][0] += g["rx_irqs"]
+                irq[ph][1] += g.get("tx_irqs", 0)
+                irq[ph][2] += sum(x.nbytes for x in r.xfers.get(ph, []))
     s["ping_avg_ms"] = statistics.mean(t[1] for t in rtts) if rtts else None
     s["ping_min_ms"] = min(t[0] for t in rtts) if rtts else None
     s["ping_max_ms"] = max(t[2] for t in rtts) if rtts else None
@@ -398,6 +471,8 @@ def summarize(rs: list[RunResult]) -> dict:
         s[f"{k}_n"] = len(v)
         c, b = cpu[k]
         s[f"{k}_cpu_s_per_gib"] = c / (b / (1 << 30)) if b else None
+        rx, tx, b = irq[k]
+        s[f"{k}_irq_per_gib"] = (rx / (b / (1 << 30)), tx / (b / (1 << 30))) if b else None
     return s
 
 
@@ -419,6 +494,9 @@ def report(results: dict[str, list[RunResult]], a: argparse.Namespace) -> dict:
         ("VMM CPU s/GiB download   lower=better", "dl_cpu_s_per_gib", ".3f"),
         ("VMM CPU s/GiB upload", "ul_cpu_s_per_gib", ".3f"),
         (f"VMM CPU s/GiB x{a.par} download", "par_cpu_s_per_gib", ".3f"),
+        ("guest irqs/GiB download (rx/tx)", "dl_irq_per_gib", ".0f"),
+        ("guest irqs/GiB upload (rx/tx)", "ul_irq_per_gib", ".0f"),
+        (f"guest irqs/GiB x{a.par} download (rx/tx)", "par_irq_per_gib", ".0f"),
         ("guest TCP holes in download (OFO)", "dl_holes", "d"),
         ("guest dup segments in download (D-SACK)", "dl_dups", "d"),
         ("guest NIC rx drops in download", "dl_rx_drops", "d"),
@@ -438,7 +516,10 @@ def report(results: dict[str, list[RunResult]], a: argparse.Namespace) -> dict:
             cells = []
             for s in sums.values():
                 v = s[key]
-                cell = fmt(v, spec)
+                if isinstance(v, tuple):
+                    cell = "/".join(format(x, spec) for x in v)
+                else:
+                    cell = fmt(v, spec)
                 if key.endswith("_gbps") and v is not None:
                     cell += f" ({s[key + '_min']:.2f}-{s[key + '_max']:.2f})"
                 cells.append(cell)
@@ -446,6 +527,16 @@ def report(results: dict[str, list[RunResult]], a: argparse.Namespace) -> dict:
     print("  (Gbps cells: mean (min-max) over all runs; CPU = VMM process user+kernel)")
     print("  (guest rows: totals over all runs; non-zero means data was lost, dropped or "
           "duplicated between the host and the guest)")
+    for name, rs in results.items():
+        for ph in ("dl", "ul", "par"):
+            agg: dict[str, list[float]] = {}
+            for r in rs:
+                for t, pct in r.threads.get(ph, {}).items():
+                    agg.setdefault(t, []).append(pct)
+            top = sorted(((statistics.mean(v), t) for t, v in agg.items()), reverse=True)[:4]
+            if top:
+                print(f"  {name} {ph}: busiest threads (% of one CPU): "
+                      + ", ".join(f"{t} {p:.0f}" for p, t in top))
     return sums
 
 

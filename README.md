@@ -967,16 +967,22 @@ halt=0 other=0`. With a single vCPU the two agree by definition.
 
 ### Network counters
 
-Teardown also prints one line per NIC (always on: every counter sits on a slow
-path, so the steady state pays nothing):
+Teardown also prints one line per NIC (always on: the interrupt counts add one
+relaxed atomic increment per interrupt, next to the hypercall that injects it,
+and every other counter sits on a slow path):
 
 ```text
-[net] nic0 rx_frames=74851 tx_frames=41014 rx_backlogged=72 rx_rewinds=74 rx_truncated=0
-  rx_backlog_drops=0 rx_backlog_max=31 rx_throttles=0 | nat: tcp_flows=8 retransmits=0 (0 B)
-  rto=0 tlp=0 recoveries=0 dsacks=0 dup_bytes_from_guest=1144 ooo_drops=0 tx_drops=0
-  iocp_backlog_max=401
+[net] nic0 rx_frames=193859 tx_frames=84052 msix=99274 rx_irqs=60214 tx_irqs=39060
+  rx_backlogged=238 rx_rewinds=249 rx_truncated=0 rx_backlog_drops=0 rx_backlog_max=33
+  rx_throttles=1 | nat: tcp_flows=22 retransmits=0 (0 B) rto=0 tlp=0 recoveries=0
+  dsacks=0 dup_bytes_from_guest=0 ooo_drops=0 tx_drops=0 iocp_backlog_max=404
 ```
 
+* **Interrupts:** `msix` is what the NIC's MSI-X actually injected
+  (`MsiX::injected_count`, one `WHvRequestInterrupt` each); `rx_irqs` /
+  `tx_irqs` are the interrupts the device raised per queue. They add up to
+  `msix` unless the guest had a vector masked. RX interrupts are raised by
+  the backend's thread (the NAT worker), TX ones by the doorbell pump.
 * **virtio-net RX:** `rx_backlogged` frames waited for guest RX buffers;
   `rx_rewinds` counts a ring running dry mid-frame (buffers given back, frame
   retried later); `rx_throttles` counts times the backlog got deep enough to
@@ -1003,11 +1009,20 @@ The summary then also totals stalls of 3 ms or more:
 `stalls: host=… guest_rx=… other=…`.
 
 `tools/net_compare.py` reports the guest's side for every VMM: deltas of its
-`/proc/net/{snmp,netstat,dev}` counters over the download and upload phases
-(`NETCMP TCPEXT|SNMP|NETDEV` lines) and, in the table, TCP holes, duplicate
-segments and NIC RX drops during the download and retransmits during the
-upload. Non-zero means data was lost, dropped or duplicated between host and
-guest.
+`/proc/net/{snmp,netstat,dev}` counters and of its virtio-net interrupts
+(`/proc/interrupts`) over the download, upload and parallel-download phases
+(`NETCMP TCPEXT|SNMP|NETDEV|IRQ` lines) and, in the table, guest interrupts
+per GiB in each phase, TCP holes, duplicate segments and NIC RX drops during
+the download and retransmits during the upload. Non-zero holes, duplicates,
+drops or retransmits mean data was lost, dropped or duplicated between host
+and guest. Below the table it lists each phase's busiest VMM threads (CPU
+time from `GetThreadTimes`, as a percentage of one CPU, named by
+`GetThreadDescription`) and the host test server's own CPU, which shows
+which thread a workload saturates without a profiler:
+
+```text
+tinyvmm par: busiest threads (% of one CPU): nat-worker 95, main 65, (host server) 16, virtio-pci-net[0]-doorbell 12
+```
 
 ---
 
