@@ -1,0 +1,37 @@
+{
+  "hostname": "tinyvm",
+  "mounts": [
+    { "tag": "apps", "target": "/mnt/apps", "readonly": true }
+  ],
+  "users": [
+    { "name": "app", "uid": 1000, "gid": 1000, "home": "/home/app" }
+  ],
+  "network": {
+    "interface": "eth0",
+    "address": "10.0.0.2/24",
+    "gateway": "10.0.0.1",
+    "dns": ["1.1.1.1"]
+  },
+  "apps": [
+    {
+      "name": "app-a",
+      "user": "app",
+      "argv": ["/usr/share/dotnet/dotnet", "/mnt/apps/AppA.dll"],
+      "cwd": "/home/app",
+      "limits": { "memory_max": 268435456, "pids_max": 64, "cpu_percent": 100 }
+    },
+    {
+      "name": "app-b",
+      "user": "app",
+      "argv": ["/usr/share/dotnet/dotnet", "/mnt/apps/AppB.dll"],
+      "cwd": "/home/app",
+      "limits": { "memory_max": 268435456, "pids_max": 64 }
+    }
+  ],
+  "ssh": {
+    "listen": "0.0.0.0:22",
+    "logins": [
+      { "user": "root", "public_keys_file": "/mnt/bootstrap/caller.pub" }
+    ]
+  }
+}

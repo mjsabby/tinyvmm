@@ -103,6 +103,81 @@ Boot a kernel:
 .\target\release\tinyvmm.exe --pvh-run --initrd initramfs.cpio vmlinux
 ```
 
+### Three deployment flavors
+
+The default Cargo build remains a VMM-only executable. Build the appliance
+variants on Windows with Rust/Cargo, Zig, cargo-zigbuild and Python 3.11+:
+
+```powershell
+.\build-appliance.ps1 -Flavor all -Kernel C:\kernels\vmlinux.tinyvmm
+```
+
+The kernel must be PVH-capable with the built-in drivers/filesystems required
+by [tinyinit](tinyinit/README.md). No Linux kernel rebuild is performed here.
+
+| Output in `out\deploy` | Embedded boot assets | External inputs |
+|---|---|---|
+| `tinyvmm.exe` | None | Kernel, optional initramfs/storage |
+| `tinyvmm-init.exe` | Kernel + minimal Rust tinyinit | Optional trusted rootfs, workload/config/public keys |
+| `tinyvmm-dotnet.exe` | Kernel + tinyinit containing the pinned ASP.NET rootfs | Workload/config/public keys |
+
+Use `-Flavor plain`, `init` or `dotnet` to build just one. For `plain`, omit
+`-Kernel`; this does not build tinyinit or fetch a rootfs. For `init`, tinyinit
+is compiled without an embedded rootfs and can also run shell-only workloads.
+`-RootfsImage mcr.microsoft.com/dotnet/aspnet:TAG` and `-UpdateRootfs` select or
+refresh the pinned image as described in the tinyinit README.
+
+Only the selected `.exe` is needed for appliance deployment: the generated
+`.cpio` files are build intermediates, and PDBs are optional diagnostics.
+Kernel and boot archive are siblings in the Windows PE image, not a rebuilt
+Linux kernel with a built-in archive. The VMM borrows their mapped PE bytes;
+there is no runtime asset extraction to disk or intermediate payload-sized Vec.
+One copy into writable/reclaimable guest RAM remains.
+
+For an embedded ASP.NET boot, prepare `init.json` and `caller.pub` in a bootstrap
+directory, then:
+
+```powershell
+.\out\deploy\tinyvmm-dotnet.exe --pvh-run --vcpus 2 --rng --net --portfwd 10022:22 `
+    --virtio-9p-share bootstrap=C:\vm\bootstrap,ro `
+    --virtio-9p-share apps=C:\vm\apps,ro
+```
+
+The appliance defaults to 1024 MiB RAM, supplies the host Unix time, and uses
+the normal PCI/console boot arguments plus `idle=halt`. Explicit kernel and
+`--initrd` paths still override embedded defaults. Plain builds retain their
+existing external-kernel requirement and 256 MiB default.
+
+For an external rootfs, put a **trusted** tar/gzip-tar archive named
+`rootfs.tar.gz` in a dedicated directory and use:
+
+```powershell
+.\out\deploy\tinyvmm-init.exe --pvh-run --vcpus 2 --rng --net --portfwd 10022:22 `
+    --virtio-9p-share bootstrap=C:\vm\bootstrap,ro `
+    --virtio-9p-share apps=C:\vm\apps,ro `
+    --virtio-9p-share rootfs=C:\vm\rootfs,ro `
+    -- console=hvc0 pci=conf1,nocrs,lastbus=0 idle=halt tinyinit.rootfs=9p:rootfs
+```
+
+The existing rootfs fetcher produces a suitable archive at
+`tinyinit\out\rootfs-cache\rootfs.tar.gz`. The early share is streamed into the
+guest tmpfs and unmounted before normal startup. Use a dedicated share directory
+because the whole directory, not just the archive, is exposed during extraction.
+The [metadata policy](tinyinit/README.md#trusted-rootfs-metadata-policy) applies.
+
+### Requested follow-up PRs: reducing memory copies
+
+These are deliberately deferred, not forgotten or claimed as implemented:
+
+| Follow-up | Required outcome / constraints |
+|---|---|
+| Payload pages as guest-physical backing | Eliminate the loader memcpy by mapping payload-backed ranges rather than copying into the current VirtualAlloc slab. Refactor contiguous guest-memory accessors, respect page/segment alignment and zero-filled BSS, keep writes VM-private, and handle Linux freeing/reusing boot pages. Validate WHP support for the chosen backing; Windows file-view COW is not assumed to work transparently for guest writes. |
+| DAX-capable shared backing | Explore a kernel/device path that maps host-backed pages into Linux instead of ordinary virtio-blk transfers. Ordinary virtio-blk still transfers data into guest buffers; mmap of the host file alone is not end-to-end zero-copy. |
+| Demand-loaded compressed rootfs | Evaluate SquashFS/EROFS plus writable tmpfs state/overlay, rather than eagerly expanding every file. Include kernel/tooling requirements and compare actual boot time and memory. |
+| Disposable compressed payload | Allow the rootfs to be a sibling payload in the single Windows executable rather than permanently part of the tinyinit ELF, so compressed guest-side bytes can be released after extraction. Keep the three deployment types and low-ceremony image selection/update controls. |
+| Boot-payload reclamation | Release obsolete extra archive contents after consumption. The original `/init` inode is now intentionally retained by a read-only bind mount, not copied. Copy/unlink/re-exec is an alternative fallback, not an additional required step on this path. |
+| Copy/memory accounting | Benchmark host load copies, guest extraction, per-VM private pages, peak and steady-state memory separately. Do not count host-allocated guest RAM as a second independent Linux RAM allocation or mistake clean file-backed executable pages for permanent anonymous copies. |
+
 ### Tests & benchmarks
 
 `cargo test --workspace --release` runs the unit tests (no WHP needed; CI runs

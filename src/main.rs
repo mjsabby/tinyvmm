@@ -167,7 +167,8 @@ fn print_usage() {
          \x20              [--virtio-9p-share <tag>=<host_path>[,ro][,uid=N][,gid=N][,metadata]]...\n\
          \x20              [--gpu [WxH]]  (virtio-gpu 2D scanout to a window; default 1280x800)\n\
          \x20              [--save <path> [--unsafe-save-mutable-drive]]\n\
-         \x20              [--watchdog-secs N] [--debug-boot] <vmlinux> [-- <cmdline>]\n\
+         \x20              [--watchdog-secs N] [--debug-boot] [vmlinux] [-- <cmdline>]\n\
+         \x20              Kernel path is required in plain builds; appliance builds embed defaults.\n\
          \x20 tinyvmm --restore <path> [--drive <path>[,ro|rw]]... [--cpu-affinity all|p|e|p-physical]\n\
          \x20              [--watchdog-secs N] [--unsafe-restore-mutable-drive]\n\
          \x20 tinyvmm --dda-probe <PnpInstanceId>   probe a host PCI device for Discrete Device\n\
@@ -910,7 +911,7 @@ fn run_pvh_info(args: &[String]) -> Result<i32> {
 }
 
 struct PvhArgs {
-    vmlinux: String,
+    vmlinux: Option<String>,
     cmdline: String,
     initrd: Option<String>,
     ram_mb: u32,
@@ -965,7 +966,11 @@ fn parse_wxh(s: &str) -> Option<(u32, u32)> {
 
 fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
     let mut initrd = None;
-    let mut ram_mb = 256u32;
+    let mut ram_mb = if boot::payload::BUNDLED {
+        1024u32
+    } else {
+        256u32
+    };
     let mut vcpus = 1u32;
     let mut watchdog_secs = 0u32;
     let mut debug_boot = false;
@@ -1234,11 +1239,14 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
         i += 1;
     }
 
-    let vmlinux = args
-        .get(i)
-        .ok_or_else(|| Error::msg("--pvh-run: expected path to vmlinux"))?
-        .clone();
-    i += 1;
+    let vmlinux = if let Some(path) = args.get(i).filter(|path| path.as_str() != "--") {
+        i += 1;
+        Some(path.clone())
+    } else if boot::payload::BUNDLED {
+        None
+    } else {
+        return Err(Error::msg("--pvh-run: expected path to vmlinux"));
+    };
 
     // Everything after a bare "--" is the kernel cmdline.
     let mut cmdline = String::new();
@@ -1259,6 +1267,20 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
         } else {
             format!("console=hvc0 pci=conf1,nocrs,lastbus=0{fb}")
         };
+        if boot::payload::BUNDLED {
+            cmdline.push_str(" idle=halt");
+        }
+    }
+    if boot::payload::BUNDLED
+        && !cmdline
+            .split_whitespace()
+            .any(|arg| arg.starts_with("tinyinit.epoch="))
+    {
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| Error::msg(format!("host Unix time: {error}")))?
+            .as_secs();
+        cmdline.push_str(&format!(" tinyinit.epoch={epoch}"));
     }
 
     Ok(PvhArgs {
@@ -1380,7 +1402,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     btimer.mark("WHP probe done");
 
     diag::etw::Event::new("VmStart", diag::etw::INFO, diag::etw::kw::LIFECYCLE)
-        .str("kernel", &cfg.vmlinux)
+        .str("kernel", cfg.vmlinux.as_deref().unwrap_or("<embedded>"))
         .u64("ram_mb", cfg.ram_mb as u64)
         .u32("vcpus", cfg.vcpus)
         .u32("nics", cfg.nics.len() as u32)
@@ -1455,15 +1477,22 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     );
     btimer.mark("guest RAM mapped");
 
-    // --- Load kernel + initramfs (memory-mapped; pages go straight to a
-    // memcpy into guest RAM, no read-into-Vec copy). The mappings are dropped
-    // right after load_pvh has copied the bytes. ---
+    // Both file mappings and embedded PE data are borrowed, without a payload Vec.
+    // The loader still copies into writable, reclaimable guest RAM.
     let load = {
-        let vmlinux = host::mapped_file::MappedFile::open(&cfg.vmlinux)?;
-        let initramfs = match &cfg.initrd {
-            Some(p) => Some(host::mapped_file::MappedFile::open(p)?),
-            None => None,
-        };
+        let vmlinux = boot::payload::kernel(cfg.vmlinux.as_deref())?;
+        let initramfs = boot::payload::initrd(cfg.initrd.as_deref())?;
+        println!(
+            "[pvh-run] kernel={} bytes={} initramfs={} bytes={}",
+            cfg.vmlinux.as_deref().unwrap_or("<embedded>"),
+            vmlinux.bytes().len(),
+            cfg.initrd.as_deref().unwrap_or(if initramfs.is_some() {
+                "<embedded>"
+            } else {
+                "<none>"
+            }),
+            initramfs.as_ref().map_or(0, |image| image.bytes().len()),
+        );
         boot::loader::load_pvh(
             &ram,
             vmlinux.bytes(),

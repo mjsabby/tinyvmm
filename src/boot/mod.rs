@@ -2,3 +2,4 @@
 
 pub mod acpi;
 pub mod loader;
+pub mod payload;

@@ -1,0 +1,5 @@
+/target/
+/out/
+/tests/DotnetApp/bin/
+/tests/DotnetApp/obj/
+!Cargo.lock
