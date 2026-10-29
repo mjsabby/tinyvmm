@@ -358,35 +358,39 @@ legacy PIC, has to go in through the right door or it silently blocks every
 MSI. Getting Linux past `calibrate_delay()` with correct timers, and keeping
 interrupts flowing once the UART speaks, are the two hard problems here.
 
-**1. CPUID policy** (`src/whp/cpuid.rs:105`). Layer these overrides on WHP's
+**1. CPUID policy** (`src/whp/cpuid.rs:111`). Layer these overrides on WHP's
 host-passthrough defaults:
 
 - **Force x2APIC on** (leaf 1, ECX[21]) even if the host masks it — WHP's LAPIC
-  runs in x2APIC mode and the MADT lists x2APIC entries (`cpuid.rs:140`) — and
+  runs in x2APIC mode and the MADT lists x2APIC entries (`cpuid.rs:146`) — and
   set the **hypervisor present** bit (ECX[31]). Pack `(vcpu_count, vcpu_index)`
   into EBX[23:16]/[31:24].
 - **Advertise invariant TSC** (leaf `0x80000007` EDX[8]) and **ARAT** (leaf 6
   EAX[2]) so the LAPIC timer is "always running."
 - **Publish the TSC frequency** via leaves `0x15` (TSC/crystal ratio) and `0x16`
-  (base MHz). tinyvmm measures it once at startup (`cpuid.rs:74` — from leaf 0x15,
+  (base MHz). tinyvmm measures it once at startup (`cpuid.rs:80` — from leaf 0x15,
   else 0x16, else a 50 ms RDTSC calibration) and caches it in a `OnceLock`.
 - **Emulate the Hyper-V vendor leaves** `0x40000000`–`0x40000006`: vendor
   `"Microsoft Hv"`, interface `"Hv#1"`, and a feature bitmask advertising the
   hypercall page, VP index, reference TSC, and the **frequency MSRs**
-  (`cpuid.rs:39`).
+  (`cpuid.rs:45`).
 - **Hide TSC-deadline** (leaf 1 ECX[24]). Linux then runs the LAPIC timer in
   count mode, taking its period from the APIC-frequency MSR below — so that MSR
   has to be right.
+- **Hide MONITOR/MWAIT** (leaf 1 ECX[3], with leaf 5 returned empty) and AMD's
+  MONITORX/MWAITX (leaf `0x80000001` ECX[29]). They #UD in a WHP guest, yet a
+  bare-metal root partition sees MONITOR, and the static leaf 1 is copied from
+  the host: left visible, Linux idles in MWAIT and panics on its first idle.
 
 These also go in the *static* `CpuidResultList` set on the partition
-(`cpuid.rs:248`) so leaves that don't take an extended exit still get the override.
+(`cpuid.rs:262`) so leaves that don't take an extended exit still get the override.
 
 **Why the Hyper-V leaves?** Linux's `ms_hyperv_init_platform`, on seeing the
 frequency-MSR feature bits, sets `x86_platform.calibrate_tsc = hv_get_tsc_khz`,
 takes the LAPIC timer period from `HV_X64_MSR_APIC_FREQUENCY`, and **skips legacy
 timer calibration entirely**. Without them it falls back to PIT calibration,
 which — with no IRQ0/HPET/PM-timer — wedges `calibrate_delay()` forever
-(`cpuid.rs:48`). This is *the* trick that makes a deviceless microVM boot.
+(`cpuid.rs:54`). This is *the* trick that makes a deviceless microVM boot.
 
 **2. The Hyper-V enlightenment** (`src/whp/hv.rs`). A handful of MSRs the guest
 writes once it detects Hyper-V:
@@ -863,7 +867,8 @@ The minimum to boot an unmodified PVH Linux to a shell:
 - [ ] ACPI: RSDP → XSDT → MADT (one x2APIC entry per vCPU).
 - [ ] Exit loop: HLT, IO/MMIO via an instruction emulator + device buses,
       CPUID policy, MSR routing, `#GP` on unknown MSR.
-- [ ] Time: measure TSC Hz; CPUID leaves 1/6/0x15/0x16/0x80000007/0x40000000-06;
+- [ ] Time: measure TSC Hz; CPUID leaves 1/6/0x15/0x16/0x80000007/0x40000000-06
+      (and hide MONITOR/MWAIT: leaf 1 ECX[3], leaf 5);
       Hyper-V MSRs incl. the frequency MSRs (APIC = the interrupt clock) and
       reference-TSC page.
 - [ ] Interrupts: the hypervisor's x2APIC (`LocalApicEmulationMode = X2Apic`);

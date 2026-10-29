@@ -1,7 +1,7 @@
 //! CPUID exit policy. Layers tinyvmm overrides (invariant TSC, ARAT, TSC
-//! frequency via leaf 0x15/0x16, per-vCPU x2APIC topology, and the Hyper-V
-//! vendor/feature leaves) on top of WHP's host-passthrough defaults. Port of
-//! src/whp/cpuid.cpp.
+//! frequency via leaf 0x15/0x16, per-vCPU x2APIC topology, the Hyper-V
+//! vendor/feature leaves, and hiding MONITOR/MWAIT) on top of WHP's
+//! host-passthrough defaults. Port of src/whp/cpuid.cpp.
 
 use core::arch::x86_64::{__cpuid, __cpuid_count, _rdtsc};
 use std::sync::OnceLock;
@@ -21,9 +21,15 @@ pub struct CpuidContext {
     pub vcpu_count: u32,
 }
 
+// MONITOR/MWAIT #UD in a WHP guest, yet a bare-metal root partition sees
+// MONITOR and leaf 1 is copied from the host: left visible, Linux idles in
+// mwait_idle and panics on its first idle; hidden, it falls back to HLT. AMD's
+// MONITORX/MWAITX (leaf 0x80000001), which Linux uses for udelay, is hidden too.
+const ECX_MONITOR: u32 = 1 << 3;
 const ECX_X2APIC: u32 = 1 << 21;
 const ECX_TSC_DEADLINE: u32 = 1 << 24;
 const ECX_HYPERVISOR: u32 = 1 << 31;
+const ECX_EXT_MWAITX: u32 = 1 << 29;
 const EAX_ARAT: u32 = 1 << 2;
 const EDX_INVARIANT_TSC: u32 = 1 << 8;
 
@@ -146,8 +152,13 @@ pub fn resolve_cpuid(
                 r.ecx &= !ECX_TSC_DEADLINE;
             }
             r.ecx |= ECX_HYPERVISOR;
+            r.ecx &= !ECX_MONITOR;
             r.ebx =
                 (r.ebx & 0x0000_FFFF) | ((vcpu_count & 0xFF) << 16) | ((vcpu_index & 0xFF) << 24);
+        }
+        0x0000_0005 => {
+            // MONITOR/MWAIT leaf: empty, to match the hidden MONITOR bit.
+            r = CpuidResult::default();
         }
         0x0000_0006 => {
             r.eax |= EAX_ARAT;
@@ -184,6 +195,9 @@ pub fn resolve_cpuid(
             r.ebx = base_mhz;
             r.ecx = 100;
             r.edx = 0;
+        }
+        0x8000_0001 => {
+            r.ecx &= !ECX_EXT_MWAITX;
         }
         0x8000_0007 => {
             r.edx |= EDX_INVARIANT_TSC;
@@ -263,9 +277,11 @@ pub fn build_static_cpuid_result_list(hide_tsc_deadline: bool) -> Vec<WHV_X64_CP
             r1.ecx &= !ECX_TSC_DEADLINE;
         }
         r1.ecx |= ECX_HYPERVISOR | ECX_X2APIC;
+        r1.ecx &= !ECX_MONITOR;
         r1.ebx = (r1.ebx & 0x0000_FFFF) | (1 << 16);
         list.push(entry(0x0000_0001, &r1));
     }
+    list.push(entry(0x0000_0005, &CpuidResult::default()));
     {
         let mut r6 = host_cpuid(0x0000_0006, 0);
         r6.eax |= EAX_ARAT;
@@ -335,4 +351,40 @@ pub fn build_static_cpuid_result_list(hide_tsc_deadline: bool) -> Vec<WHV_X64_CP
     }
 
     list
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A guest must never see MONITOR/MWAIT (or AMD's MWAITX), whatever the
+    /// host or WHP's default result reports: MWAIT is a #UD in a WHP guest.
+    #[test]
+    fn monitor_and_mwait_are_hidden() {
+        let ctx = CpuidContext {
+            vcpu_index: 0,
+            vcpu_count: 1,
+        };
+        let r = resolve_cpuid(1, 0, 0, 0, u32::MAX, 0, &ctx);
+        assert_eq!(r.ecx & ECX_MONITOR, 0, "leaf 1 must hide MONITOR");
+        let r = resolve_cpuid(5, 0, 64, 64, 3, 0x0002_1120, &ctx);
+        assert_eq!(
+            (r.eax, r.ebx, r.ecx, r.edx),
+            (0, 0, 0, 0),
+            "leaf 5 must be empty"
+        );
+        let r = resolve_cpuid(0x8000_0001, 0, 0, 0, u32::MAX, u32::MAX, &ctx);
+        assert_eq!(r.ecx, !ECX_EXT_MWAITX, "only MWAITX is hidden");
+        assert_eq!(r.edx, u32::MAX);
+
+        let list = build_static_cpuid_result_list(true);
+        let leaf = |f: u32| list.iter().find(|e| e.Function == f).unwrap();
+        assert_eq!(
+            leaf(1).Ecx & ECX_MONITOR,
+            0,
+            "static leaf 1 must hide MONITOR"
+        );
+        let l5 = leaf(5);
+        assert_eq!((l5.Eax, l5.Ebx, l5.Ecx, l5.Edx), (0, 0, 0, 0));
+    }
 }
