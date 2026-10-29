@@ -10,7 +10,8 @@ you would actually implement them.
 
 It assumes you can read systems code but **not** that you know the Windows
 Hypervisor Platform (WHP), the PVH boot protocol, or virtio. Citations are
-`path:line` into this tree and are clickable.
+`path:line` into this tree as of the commit that last revised this file; lines
+drift as the code changes, so search for the named symbol if one has moved.
 
 ---
 
@@ -55,7 +56,7 @@ The feature set, framed as capabilities you must provide:
 | **Boot protocol** | Get a kernel image into RAM and the CPU pointed at its entry point with the right machine state | `src/boot/loader.rs` (PVH) |
 | **Firmware tables** | The minimal ACPI a modern Linux expects (so it finds the LAPIC) | `src/boot/acpi.rs` |
 | **A clock & invariant TSC** | The guest must be able to calibrate time without legacy timers | `src/whp/cpuid.rs`, `src/whp/hv.rs` |
-| **An interrupt controller** | Deliver device interrupts to the guest (LAPIC/x2APIC + MSI) | `crates/whpsys/src/lapic.rs`, `src/whp/msi`/`crates/whpsys/src/msi.rs` |
+| **An interrupt controller** | Deliver device interrupts to the guest (x2APIC + MSI, plus the legacy PIC) | WHP's in-hypervisor LAPIC, `crates/whpsys/src/msi.rs`, `src/devices/pic.rs` |
 | **A PCI host bridge** | The `0xCF8/0xCFC` config mechanism and a BAR allocator | `src/pci/` |
 | **A device transport** | virtio-PCI "modern" + the virtqueue ring protocol | `src/virtio/transport.rs`, `src/virtio/queue.rs` |
 | **Devices** | console, net, block, rng, 9p, gpu, input, sound | `src/virtio/*.rs`, `src/net/`, `src/display.rs` |
@@ -72,13 +73,13 @@ The block diagram of a running machine:
   BSP thread  ───run──▶│  vCPU0 ─┐                                       │
   AP threads  ───run──▶│  vCPU1  ├─ guest RAM (one VirtualAlloc slab,    │
                        │  ...    │   mapped at GPA 0 [+ above 4 GiB])    │
-                       │         └─ SLAT/EPT, hardware LAPIC (opt)       │
+                       │         └─ SLAT/EPT, in-hypervisor x2APIC       │
                        └─────▲───────────────────────┬──────────────────┘
                              │ exits (IO/MMIO/CPUID/  │ interrupts
                              │       MSR/HLT)         │ (MSI / IRQ inject)
                        ┌─────┴────────────────────────▼──────────────────┐
                        │  run loop  →  IO bus / MMIO bus  →  devices      │
-                       │  CPUID/MSR policy, (software) LAPIC, HV MSRs     │
+                       │  CPUID/MSR policy, PIC → ExtINT, HV MSRs         │
                        │  PCI host bridge → virtio-PCI transports         │
                        │  virtqueues → console/net/blk/rng/9p/gpu/...     │
                        └─────┬───────────────┬───────────────┬───────────┘
@@ -89,8 +90,8 @@ The block diagram of a running machine:
 
 The two ideas that make it tractable: **all guest I/O is virtio over one PCI bus
 with MSI-X**, and **the host hypervisor (WHP) does the genuinely hard parts**
-(VT-x/AMD-V, second-level address translation, instruction decode for trapped
-MMIO). You are writing the *user-mode* half.
+(VT-x/AMD-V, second-level address translation, the local APIC, instruction
+decode for trapped MMIO). You are writing the *user-mode* half.
 
 ---
 
@@ -105,8 +106,8 @@ single most useful map for a reimplementer.
 | VT-x/AMD-V root mode, VMCS/VMCB, world switches | nothing — you call `WHvRunVirtualProcessor` |
 | Second-level address translation (EPT/NPT) from your GPA→HVA map | provide the map (`WHvMapGpaRange`), and keep the host buffer pinned |
 | Decoding the faulting instruction on an MMIO/IO exit | provide the *data* (what the device returns), via the WHP **instruction emulator** callbacks |
-| Optionally emulating the LAPIC in hardware (APICv) | decide hardware vs software LAPIC; on nested hosts, emulate it yourself |
-| Delivering an MSI you hand it (`WHvRequestInterrupt`) | decode the MSI message and route it; or, with a software LAPIC, inject it at VM-entry yourself |
+| Emulating each vCPU's local APIC in x2APIC mode — MSIs, IPIs (incl. INIT/SIPI), the LAPIC timer, HLT wake-ups — on bare metal and nested alike | switch it on (`LocalApicEmulationMode = X2Apic`), tell the guest the timer's real frequency, and inject what doesn't arrive through it (the legacy PIC's ExtINT) |
+| Delivering an MSI you hand it (`WHvRequestInterrupt`) | decode the MSI address/data into that request |
 | CPUID/MSR *default* values (host passthrough) | override the leaves/MSRs the guest needs (TSC freq, x2APIC, Hyper-V) |
 | Nothing about boot, firmware, devices, or time | **all of it** |
 
@@ -115,16 +116,22 @@ WHP's public surface is a flat C API in `windows-sys`
 safely:
 
 - **`crates/whpsys/`** — WHP only: `partition`, `memory`, `vcpu` (+ run/exit
-  decode + XSAVE/APIC save-restore), `emulator` (the instruction-completion
-  callbacks), `msi`, `doorbell`, `lapic` (the software LAPIC), `vpci` (the
+  decode, interrupt injection, XSAVE/APIC save-restore), `emulator` (the
+  instruction-completion callbacks), `msi`, `doorbell`, `regs`, `vpci` (the
   undocumented passthrough APIs).
 - **`crates/winsys/`** — every *other* Win32 call: async disk IOCP, mmap loader,
   Winsock, CNG random, ETW, 9p file ops, WASAPI audio, the wintun loader.
 
-The binary (`src/`) keeps thin facades that re-export from these, so all `unsafe`
-is quarantined in two auditable crates. If you port to KVM you rewrite `whpsys`
-and the Win32 half of `winsys`; the `src/` protocol logic (PCI, virtqueue, boot,
-device models, NAT) is almost entirely OS-agnostic and `unsafe`-free.
+The binary (`src/`) keeps thin facades that re-export from these. Most `unsafe`
+lives in the two crates; the rest sits in a short list of audited hot-path files
+in `src/` — `net/nat.rs`, `virtio/blk.rs`, `virtio/p9.rs`, `virtio/queue.rs`,
+`display.rs` and a few more (README §5) — and `src/` still makes a few Win32/WHP
+calls directly (e.g. the doorbell pump's waits in `virtio/transport.rs`,
+`WHvGetCapability` in `whp/hv.rs`). The protocol logic — `pci/`, `devices/`,
+`boot/`, `net/wire.rs`, the virtqueue traversal, the gpu/input command decoders
+— is OS-agnostic and `unsafe`-free. If you port to KVM you rewrite `whpsys`, the
+Win32 half of `winsys`, and those Windows-shaped spots in `src/` (the
+IOCP-driven blk/NAT/9p backends, the doorbell pump, the GDI window).
 
 ---
 
@@ -132,7 +139,7 @@ device models, NAT) is almost entirely OS-agnostic and `unsafe`-free.
 
 Each milestone is independently testable and leaves you with something that
 visibly works. tinyvmm ships the first as `--smoke`
-(`src/main.rs:181`); the rest accrete into `--pvh-run`.
+(`src/main.rs:185`); the rest accrete into `--pvh-run`.
 
 ### M0 — A partition with RAM and a CPU that halts
 
@@ -148,39 +155,46 @@ WHvSetPartitionProperty(ProcessorCount, n)
 // optional knobs, all BEFORE setup:
 WHvSetPartitionProperty(ExtendedVmExits, bits)        // bit0=cpuid bit1=msr bit2=exception
 WHvSetPartitionProperty(CpuidResultList, &entries)    // static CPUID overrides
-WHvSetPartitionProperty(LocalApicEmulationMode, mode) // X2Apic | None
+WHvSetPartitionProperty(LocalApicEmulationMode, mode) // X2Apic: WHP emulates the LAPIC
 WHvSetupPartition(handle)                             // finalizes; properties locked after
 ```
 
 The partition is a kernel object; wrap it in RAII so `WHvDeletePartition` runs on
-drop (`partition.rs:120`). **Order matters:** every property must be set before
-`WHvSetupPartition`; `set_allow_device_assignment` likewise (`partition.rs:74`).
+drop (`partition.rs:126`). **Order matters:** every property must be set before
+`WHvSetupPartition`; `set_allow_device_assignment` likewise (`partition.rs:82`).
 
-**2. Allocate and map guest RAM** (`crates/whpsys/src/memory.rs:50`):
+**2. Allocate and map guest RAM** (`crates/whpsys/src/memory.rs:97`):
 
 ```
 base = VirtualAlloc(NULL, size, MEM_COMMIT|MEM_RESERVE[|MEM_LARGE_PAGES], PAGE_READWRITE)
 WHvMapGpaRange(part, base, gpa=0, size, Read|Write|Execute)
 ```
 
-Two subtleties that are easy to get wrong and painful to debug:
+Three subtleties that are easy to get wrong and painful to debug:
 
 - **The host buffer must stay put for the partition's life.** It backs the guest
-  via SLAT; you never hand the guest a copy. `Drop` does
-  `WHvUnmapGpaRange` then `VirtualFree` (`memory.rs:419`).
+  via SLAT; you never hand the guest a copy. `Drop` joins the SLAT-populate
+  thread (below), then does `WHvUnmapGpaRange` and `VirtualFree`
+  (`memory.rs:470`).
 - **The 32-bit PCI MMIO hole.** Device BARs live in `[0xE000_0000, 0xFEC0_0000)`
-  (just under the IOAPIC). Guest RAM may not overlap it. So RAM larger than
-  `0xE000_0000` (3584 MiB) is **split**: the first 3584 MiB map at GPA 0 and the
-  remainder maps at `0x1_0000_0000` (4 GiB), leaving the window free
-  (`memory.rs:103` `new_split`, constants in `src/mem_layout.rs`). The host
+  (just under the conventional IOAPIC address). Guest RAM may not overlap it. So
+  RAM larger than `0xE000_0000` (3584 MiB) is **split**: the first 3584 MiB map
+  at GPA 0 and the remainder maps at `0x1_0000_0000` (4 GiB), leaving the window
+  free (`memory.rs:151` `new_split`, constants in `src/mem_layout.rs`). The host
   backing store stays one contiguous allocation; only the *GPA* mapping has a
   hole.
+- **Pre-populate the SLAT.** WHP builds the second-level page tables lazily: the
+  first guest touch of each 4 KiB page faults into the root partition (~40 µs),
+  which made guest page-zeroing ~25× slower than steady state. tinyvmm issues
+  `WHvAdviseGpaRange(Populate)` for the new ranges on a background thread that
+  overlaps guest boot (`memory.rs:45` `populate_async`).
 
 **3. Funnel all guest-RAM access through one audited accessor.** This is the
 single most important design decision for a safe VMM. `GuestMemory` exposes
 `host_range(gpa, len) -> Option<*mut u8>` with a **wrap-safe** bounds check
 written in subtraction form so a near-`u64::MAX` address can't overflow the bound
-(`memory.rs:300`):
+(`memory.rs:351`; the check lives in `region_off`, `memory.rs:319`, the one place
+that knows about the MMIO hole):
 
 ```rust
 if gpa < self.gpa { return None; }
@@ -189,9 +203,10 @@ if off >= size || len > size - off { return None; }   // never `off + len > size
 ```
 
 Everything else — typed reads, ring-index atomics, bulk copies — is built on top
-(`read_array::<N>`, `load_acquire_u16`, `write_bytes`). Devices use these with
-**no `unsafe`**; the only raw pointers that escape are bulk DMA buffers wrapped in
-a `ChainBuf` (see M5).
+(`read_array::<N>`, `load_acquire_u16`, `write_bytes`). The virtqueue and the
+device models do their small typed reads and writes through these with **no
+`unsafe`**; the raw pointers that do escape are bulk guest buffers wrapped in a
+`ChainBuf` (see M5), which the async backends hand straight to OS I/O.
 
 **4. Create a vCPU and run it** (`crates/whpsys/src/vcpu.rs`):
 
@@ -203,7 +218,7 @@ loop {
 }
 ```
 
-Set RIP to the address of your `HLT`, run, and you should get
+Point `CS:RIP` at your `HLT` (real mode is fine), run, and you should get
 `WHvRunVpExitReasonX64Halt`. That is M0. (`run_smoke` does exactly this and
 prints the exit reason and RIP.)
 
@@ -212,7 +227,7 @@ prints the exit reason and RIP.)
 > `movaps`), but the `windows-sys` binding drops the alignment to 8. Passing a
 > raw array to `WHvGet/SetVirtualProcessorRegisters` faults inside WHP whenever
 > the buffer lands on an 8-but-not-16 boundary. tinyvmm copies through a
-> `#[repr(C, align(16))]` wrapper (`vcpu.rs:27`). If your bindings are similar,
+> `#[repr(C, align(16))]` wrapper (`vcpu.rs:31`). If your bindings are similar,
 > do the same.
 
 ### M1 — PVH boot to the first guest instruction
@@ -231,7 +246,7 @@ and in the `PT_NOTE` segment find the note with name `"Xen"` and type `18`
 (`loader.rs:81` `find_pvh_note`). If absent, the kernel isn't PVH-capable.
 
 **2. Load the image.** Copy each `PT_LOAD` segment's file bytes to its `p_paddr`
-in guest RAM (`loader.rs:256`). The BSS tail (`memsz > filesz`) is already zero
+in guest RAM (`loader.rs:253`). The BSS tail (`memsz > filesz`) is already zero
 because `VirtualAlloc(MEM_COMMIT)` hands back zeroed pages — don't memset it.
 tinyvmm memory-maps the kernel file (`MapViewOfFile`) and copies straight into
 guest RAM, so there's no intermediate `Vec` (`crates/winsys/src/host/mapped_file.rs`).
@@ -245,12 +260,18 @@ at a `hvm_start_info`." tinyvmm lays them out at fixed low GPAs (`loader.rs:18`)
 0x2100  e820 memmap  (array of 24-byte entries)
 0x2400  module list  (initramfs descriptor: paddr, size)
 0x2800  kernel cmdline (NUL-terminated)
-0x3000  ACPI tables  (RSDP/XSDT/MADT — see M3)
+0x3000  ACPI tables  (RSDP/XSDT/MADT — see below)
 ```
 
-The `hvm_start_info` fields you must fill (`loader.rs:352`): magic
+The `hvm_start_info` fields you must fill (`loader.rs:351`): magic
 `0x336ec578`, version 1, `nr_modules`, `modlist_paddr`, `cmdline_paddr`,
 `rsdp_paddr`, `memmap_paddr`, `memmap_entries`.
+
+The **ACPI tables** (`src/boot/acpi.rs:52`) are the minimum Linux needs to find
+its CPUs and their LAPIC: an RSDP (revision 2) pointing at an XSDT with a single
+entry, a MADT with one **x2APIC** entry (type 9) per vCPU (`MAX_VCPUS = 32`) and
+the LAPIC at `0xFEE0_0000`. There is no FADT/DSDT (so no ACPI power-off, §7) and
+no IOAPIC entry. `rsdp_paddr` points at the RSDP.
 
 The **e820 map** (`loader.rs:313`) is the guest's view of physical RAM. tinyvmm
 emits: reserved `[0,0x10000)` (boot artifacts), RAM `[0x10000,0xA0000)`, reserved
@@ -271,10 +292,11 @@ To *see* it, you need M2's serial port: add the default cmdline
 **Goal:** field the exits the booting kernel takes. This is the heart of the VMM
 (`src/whp/run_loop.rs`).
 
-The loop is: check the stop flag, deliver any pending interrupt (M3), run the
-vCPU, then `match` on the decoded exit reason (`run_loop.rs:154`). tinyvmm decodes
-the raw WHP union into a small enum (`vcpu.rs:374`): `Halt, IoPort, Memory
-(MMIO), Cpuid, Msr, InterruptWindow, ApicEoi, Canceled, Other`.
+The loop is: check the stop flag, inject a pending legacy-PIC interrupt (BSP
+only, M3), run the vCPU, then `match` on the decoded exit reason
+(`run_loop.rs:164`). tinyvmm decodes the raw WHP union into a small enum
+(`vcpu.rs:423`): `Halt, IoPort, Memory (MMIO), Cpuid, Msr, InterruptWindow,
+ApicEoi, Canceled, Other`.
 
 **IO and MMIO exits → the instruction emulator.** When the guest does `IN/OUT`
 or touches an unmapped GPA, hardware exits but does *not* tell you the decoded
@@ -298,44 +320,51 @@ emulation failure, `emulator.rs:234`).
 
 **The device buses.** Two trivial range-dispatch tables
 (`src/devices/io_bus.rs`, `src/devices/mmio_bus.rs`): register `[base, base+size)
-→ handler`, dispatch by address, and return all-ones for unclaimed reads (the ISA
-floating-bus convention). The IO bus is built once and shared immutably; the MMIO
-bus uses an `RwLock` because device BARs *remap at runtime* (M4) — reads never
-block reads, and registration must **never panic on overlap** (a guest can
-reprogram a BAR over another's range), so it returns `false` instead
-(`mmio_bus.rs:44`).
+→ handler` and dispatch by address. Unclaimed reads return all-ones on the IO
+bus (the ISA floating-bus convention) and zeros on the MMIO bus
+(`io_bus.rs:64`, `mmio_bus.rs:79`). The IO bus is built once and shared
+immutably; the MMIO bus uses an `RwLock` because device BARs *remap at runtime*
+(M4) — reads never block reads, and registration must **never panic on
+overlap** (a guest can reprogram a BAR over another's range), so it returns
+`false` instead (`mmio_bus.rs:44`).
 
 **CPUID exits** (`run_loop.rs:276`): advance RIP past the instruction, then write
 `RAX/RBX/RCX/RDX`. tinyvmm intercepts one magic leaf for snapshots (M7) and
 otherwise applies a policy layer (M3). WHP hands you its host-passthrough default
 in the exit; you override selectively.
 
-**MSR exits** (`run_loop.rs:383`): route to the software LAPIC (if active) or the
-Hyper-V enlightenment (M3); an unhandled MSR injects `#GP(0)` rather than killing
-the VM (`run_loop.rs:458`). On a read, write back `RAX:RDX`; always advance RIP.
+**MSR exits** (`run_loop.rs:380`): WHP's LAPIC owns the x2APIC MSRs, so only the
+Hyper-V enlightenment's MSRs (M3) and genuinely unknown ones reach you. A handled
+read writes back `RAX:RDX`, and a handled access advances RIP; an unhandled MSR
+injects `#GP(0)` at the faulting instruction (RIP not advanced) rather than
+killing the VM (`run_loop.rs:431`).
 
-**HLT** (`run_loop.rs:195`): if `RFLAGS.IF=1` the guest is just idle — re-run
-(hardware LAPIC) or **park** until a device/timer queues a vector (software LAPIC,
-M3). `HLT` with `IF=0` is a deliberate dead-end (no more interrupts can wake it) —
-treat it as terminal.
+**HLT** (`run_loop.rs:204`): if `RFLAGS.IF=1` the guest is just idle — re-run.
+WHP's LAPIC normally waits out `HLT` inside the hypervisor until an interrupt
+arrives, so this exit is rare. `HLT` with `IF=0` is a deliberate dead-end (no
+more interrupts can wake it) — treat it as terminal.
 
 At this point the kernel boots to the UART. Wire the **8250** (`src/devices/serial.rs`)
-at `0x3F8`: TX bytes → host stdout, and raise IRQ4 through the PIC when the guest
-enables transmit interrupts.
+at `0x3F8`: TX bytes → host stdout, and raise IRQ4 through the PIC (delivered as
+ExtINT, M3) when the guest enables transmit interrupts.
 
 ### M3 — Making time and interrupts work
 
 This milestone is the one that surprises people: a microVM with no PIT IRQ0, no
-HPET, and no PM timer has **no legacy way to calibrate time**, and on a nested
-host **interrupts don't reach an idle guest** unless you emulate the LAPIC.
-Getting Linux past `calibrate_delay()` and delivering a virtio completion to a
-halted vCPU are the two hard problems here.
+HPET, and no PM timer has **no legacy way to calibrate time**, so the guest must
+be *told* its TSC and LAPIC-timer frequencies — and told the right ones. The
+interrupt controller itself is WHP's; the one source you inject yourself, the
+legacy PIC, has to go in through the right door or it silently blocks every
+MSI. Getting Linux past `calibrate_delay()` with correct timers, and keeping
+interrupts flowing once the UART speaks, are the two hard problems here.
 
 **1. CPUID policy** (`src/whp/cpuid.rs:105`). Layer these overrides on WHP's
 host-passthrough defaults:
 
-- **Force x2APIC on** (leaf 1, ECX[21]) and set the **hypervisor present** bit
-  (ECX[31]). Pack `(vcpu_count, vcpu_index)` into EBX[23:16]/[31:24].
+- **Force x2APIC on** (leaf 1, ECX[21]) even if the host masks it — WHP's LAPIC
+  runs in x2APIC mode and the MADT lists x2APIC entries (`cpuid.rs:140`) — and
+  set the **hypervisor present** bit (ECX[31]). Pack `(vcpu_count, vcpu_index)`
+  into EBX[23:16]/[31:24].
 - **Advertise invariant TSC** (leaf `0x80000007` EDX[8]) and **ARAT** (leaf 6
   EAX[2]) so the LAPIC timer is "always running."
 - **Publish the TSC frequency** via leaves `0x15` (TSC/crystal ratio) and `0x16`
@@ -345,17 +374,19 @@ host-passthrough defaults:
   `"Microsoft Hv"`, interface `"Hv#1"`, and a feature bitmask advertising the
   hypercall page, VP index, reference TSC, and the **frequency MSRs**
   (`cpuid.rs:39`).
-- **Hide TSC-deadline** (leaf 1 ECX[24]) — the software LAPIC only implements the
-  count-based timer.
+- **Hide TSC-deadline** (leaf 1 ECX[24]). Linux then runs the LAPIC timer in
+  count mode, taking its period from the APIC-frequency MSR below — so that MSR
+  has to be right.
 
 These also go in the *static* `CpuidResultList` set on the partition
 (`cpuid.rs:248`) so leaves that don't take an extended exit still get the override.
 
 **Why the Hyper-V leaves?** Linux's `ms_hyperv_init_platform`, on seeing the
-frequency-MSR feature bits, sets `x86_platform.calibrate_tsc = hv_get_tsc_khz` and
-**skips legacy timer calibration entirely**. Without them it falls back to PIT
-calibration, which — with no IRQ0/HPET/PM-timer — wedges `calibrate_delay()`
-forever (`cpuid.rs:46`). This is *the* trick that makes a deviceless microVM boot.
+frequency-MSR feature bits, sets `x86_platform.calibrate_tsc = hv_get_tsc_khz`,
+takes the LAPIC timer period from `HV_X64_MSR_APIC_FREQUENCY`, and **skips legacy
+timer calibration entirely**. Without them it falls back to PIT calibration,
+which — with no IRQ0/HPET/PM-timer — wedges `calibrate_delay()` forever
+(`cpuid.rs:48`). This is *the* trick that makes a deviceless microVM boot.
 
 **2. The Hyper-V enlightenment** (`src/whp/hv.rs`). A handful of MSRs the guest
 writes once it detects Hyper-V:
@@ -363,56 +394,71 @@ writes once it detects Hyper-V:
 - `GUEST_OS_ID`, `VP_INDEX` — bookkeeping.
 - `HYPERCALL` (`0x40000001`): on enable, write a tiny stub page into guest RAM
   (`mov eax, 2; ret` — "invalid hypercall", since tinyvmm implements no
-  hypercalls, `hv.rs:99`).
+  hypercalls, `hv.rs:142`).
 - `REFERENCE_TSC` (`0x40000021`): write a page holding the **TSC scale**
   `(10^7 << 64) / tsc_hz`, so the guest reads a 100 ns reference clock straight
-  from the TSC with no exit (`hv.rs:83`).
-- `TSC_FREQUENCY` / `APIC_FREQUENCY`: just return the measured TSC Hz (`hv.rs:182`).
+  from the TSC with no exit (`hv.rs:126`).
+- `TSC_FREQUENCY`: the measured TSC Hz (`hv.rs:224`).
+- `APIC_FREQUENCY`: **WHP's interrupt clock** — the rate its LAPIC timer
+  actually counts at, read once with
+  `WHvGetCapability(WHvCapabilityCodeInterruptClockFrequency)` (200 MHz on
+  current builds, also the fallback) — *not* the TSC rate (`hv.rs:49`, `:229`).
+  Report the TSC rate (~3 GHz) and every LAPIC timer the guest programs runs
+  ~16× too long.
 - Unhandled Hyper-V MSR → inject `#GP`.
 
-**3. The interrupt controller.** You have two paths, and the choice is dictated by
-whether your *host* is itself a VM (`src/main.rs:1250` auto-detects):
+**3. The interrupt controller is WHP's.** Set `LocalApicEmulationMode = X2Apic`
+(`src/main.rs:1370`) and the hypervisor emulates every vCPU's local APIC in
+x2APIC mode — on bare metal *and* on a nested Hyper-V host. It delivers MSIs,
+IPIs (including the INIT/SIPI that start the APs; the VMM only programs the
+BSP's entry state, and `tools/smp_test.py` covers AP bring-up) and the LAPIC
+timer, and wakes halted vCPUs, all without VM exits; the guest's x2APIC MSR
+accesses never reach you. Delivering a device MSI is just decoding the message —
+vector, delivery and trigger mode from the data word, destination and
+logical/physical mode from the address — into `WHvRequestInterrupt`
+(`crates/whpsys/src/msi.rs:18`).
 
-- **Bare-metal host → WHP's hardware LAPIC** (`LocalApicEmulationMode = X2Apic`).
-  APIC virtualization (APICv / posted interrupts) lets WHP preempt a running vCPU
-  to deliver an interrupt. You deliver an MSI by decoding the message and calling
-  `WHvRequestInterrupt` (`crates/whpsys/src/msi.rs:44`).
-- **Nested host → a software LAPIC** (`LocalApicEmulationMode = None`,
-  `crates/whpsys/src/lapic.rs`). The L1 hypervisor doesn't expose APICv to WHP's
-  L2 partition, so WHP can only deliver a pending interrupt **at the next exit** —
-  it can't preempt. A guest that halts waiting for a virtio-blk completion would
-  then **hang forever**. The fix (mirroring OpenVMM's user-mode APIC) is to
-  emulate the LAPIC yourself.
+> tinyvmm used to carry a software x2APIC (`crates/whpsys/src/lapic.rs`,
+> deleted in #10) for nested hosts, on the theory that WHP's LAPIC can't deliver
+> to an idle L2 guest. It can; the hang that motivated it was the PIC bug in the
+> next step, which the software LAPIC only hid. The old code is still worth a
+> look if you port to Hypervisor.framework, which has no in-kernel APIC (§6).
 
-The software LAPIC is single-vCPU (BSP), x2APIC-only, and worth understanding
-because it's the subtle part:
+**4. The legacy PIC — inject it as ExtINT, never as a Fixed interrupt.** The
+8259 pair (`src/devices/pic.rs:4`) is the only ISA-IRQ → guest-IDT path (the
+8250 UART uses it). In virtual-wire mode its INT output is the BSP's LINT0, so
+its interrupts must arrive as **ExtINT** events. The tempting shortcut —
+`WHvRequestInterrupt` with a Fixed message — wedges the guest: Linux
+acknowledges an 8259 IRQ only at the PIC, never with a LAPIC EOI, so the
+vector's LAPIC ISR bit stays set for good, the processor priority sticks at the
+PIC vectors' class, and every vector at or below it — all of the virtio MSIs —
+is blocked. (That is how virtio-blk hung the first time COM1 raised IRQ4.)
+Delivery is therefore pull-based:
 
-- It traps the x2APIC MSR range `0x800–0x83F` plus `IA32_APIC_BASE` (`0x1B`),
-  keeping a 256-bit **IRR** (requested) and **ISR** (in-service) bitmap, the LVTs,
-  and a count-based timer (`lapic.rs:70`).
-- `IA32_APIC_BASE` comes up pre-enabled with the x2APIC bit set — Linux's
-  `check_x2apic()` reads it early; without that bit it stays in xAPIC mode, sends
-  LAPIC accesses to MMIO `0xFEE00000` (which you don't handle), and the timer is
-  never armed → jiffies freeze (`lapic.rs:99`).
-- **Delivery:** an MSI or timer tick sets an IRR bit and (a) notifies a run loop
-  parked on a halted guest via a condvar, and (b) `WHvCancelRunVirtualProcessor`s
-  a running vCPU so it exits promptly (`lapic.rs:246`). The run loop, before each
-  re-entry, peeks the highest-priority deliverable vector against the live TPR
-  (`CR8`) and injects it with `WHvRegisterPendingInterruption` — *but only when
-  the guest is injectable* (RFLAGS.IF set, no interrupt shadow, nothing already
-  pending), or the VM-entry is invalid and WHP faults (`vcpu.rs:159`).
-- **The timer** runs on its own thread, counting in host-TSC ticks (the APIC bus
-  frequency is *defined* as the TSC frequency, so the guest's calibration cancels
-  out), and fires the LVT timer vector at the deadline (`lapic.rs:421`).
+- `Pic8259::raise` (`pic.rs:124`) latches the IRQ in the IRR and, if the INT
+  output is now asserted, calls a `notify` closure that kicks the BSP out of
+  `WHvRunVirtualProcessor` with `WHvCancelRunVirtualProcessor`
+  (`main.rs:1254` `new_pic`), even if the guest is halted.
+- Before every re-entry, the BSP's run loop (`run_loop.rs:351`
+  `deliver_ext_int`) checks `output_pending` and reads the four
+  interruptibility gates in one WHP call (`vcpu.rs:54`: RFLAGS.IF, the
+  STI/MOV-SS interrupt shadow, an already-pending interruption, an
+  already-pending event). If the guest can take it, the loop runs the INTA
+  cycle (`Pic8259::acknowledge`, `pic.rs:145`) and queues the vector as an
+  ExtINT event in `WHvRegisterPendingEvent` (`vcpu.rs:212`). INTA happens only
+  once injection is certain, so a request is never dropped between the PIC and
+  the vCPU.
+- If the guest can't take it yet, the loop arms a one-shot interrupt-window
+  exit (`WHvX64RegisterDeliverabilityNotifications`, `vcpu.rs:233`) and injects
+  on that exit. Injecting regardless would be an invalid VM entry, which faults
+  WHP.
 
-MSI routing therefore forks on `lapic::active()`: queue-in-software-LAPIC vs
-`WHvRequestInterrupt` (`crates/whpsys/src/msi.rs:25`).
-
-**4. The legacy PIC** (`src/devices/pic.rs`) is the *only* ISA-IRQ → guest-IDT
-path (used by the 8250 UART in virtual-wire mode). Its injection closure calls
-`WHvRequestInterrupt` with a fixed/physical/edge message (`main.rs:1484`). The
-8254 PIT is present as counters but IRQ0 is intentionally **not** wired — Linux
-uses the LAPIC timer.
+The PIC's in-service register isn't modelled (EOIs are absorbed and every IRQ is
+edge-triggered), which is all the UART needs. The 8254 PIT is present as
+counters but IRQ0 is intentionally **not** wired — Linux uses the LAPIC timer.
+`tools/irq_test.py` checks this whole milestone end to end at 1 and 2 vCPUs:
+COM1 IRQs arrive as ExtINT (including waking an idle BSP), MSIs keep flowing
+afterwards, and `sleep 2` takes 2 s of host time.
 
 ### M4 — The PCI host bridge
 
@@ -447,7 +493,7 @@ size-aligned), so the guest sees BARs already placed and just flips
 tinyvmm's `recompute_mappings` already supports moves.)
 
 You can validate all of this with **no guest** via `--pci-selftest`
-(`main.rs:824`), which drives the config mechanism and BAR sizing against a
+(`main.rs:828`), which drives the config mechanism and BAR sizing against a
 synthetic function.
 
 ### M5 — The virtio-PCI transport, virtqueues, MSI-X
@@ -464,7 +510,7 @@ small trait — `device_id`, `device_features`, `set_driver_features`,
 
 **2. The virtio-PCI "modern" BAR layout** (`transport.rs:22`). One 16 KiB MMIO BAR
 (BAR0) carved into windows, each advertised by a vendor capability in config space
-(`transport.rs:204` `append_virtio_cap`):
+(`transport.rs:201` `append_virtio_cap`):
 
 ```
 0x0000  common_cfg   (feature negotiation, queue programming, status)
@@ -475,17 +521,18 @@ small trait — `device_id`, `device_features`, `set_driver_features`,
 0x3800  MSI-X PBA
 ```
 
-**3. The common-cfg state machine** (`transport.rs:490`). The driver:
+**3. The common-cfg state machine** (`transport.rs:492`). The driver:
 
 1. reads `device_feature` (in 32-bit halves via a select register), writes back
    the `driver_feature` it accepts;
 2. sets `FEATURES_OK` in the status byte — you call `set_driver_features` and, if
    the device rejects them, clear `FEATURES_OK` and set `NEEDS_RESET`
-   (`transport.rs:709`);
-3. for each queue: writes size, descriptor/avail/used physical addresses and an
-   MSI-X vector, then writes `queue_enable=1` — you validate alignment (desc
-   16-byte, avail 2-byte, used 4-byte) and power-of-two size, then call the
-   device's `enable_queue` (`transport.rs:651`);
+   (`transport.rs:711`);
+3. for each queue: writes the size (you ignore one that isn't a power of two
+   ≤ `queue_max`), the descriptor/avail/used physical addresses and an MSI-X
+   vector, then writes `queue_enable=1` — you validate alignment (desc 16-byte,
+   avail 2-byte, used 4-byte) and a non-zero size, then call the device's
+   `enable_queue` (`transport.rs:653`);
 4. sets `DRIVER_OK` — you call `driver_ok()`.
 
 A status write of 0 is a full reset.
@@ -495,26 +542,38 @@ A status write of 0 is a full reset.
 (16-byte entries: `addr,len,flags,next`), an **avail ring** (driver → device), and
 a **used ring** (device → driver). The device side:
 
-- `pop_into(&mut chain)` (`queue.rs:269`): read the avail index (Acquire), walk
+- `pop_into(&mut chain)` (`queue.rs:272`): read the avail index (Acquire), walk
   the descriptor chain following `NEXT`, resolve each `addr/len` through
   `host_range` into a `ChainBuf { ptr, len, write }`, and collect read-only vs
   device-writable buffers. **It reuses the chain's `Vec`, so the hot path
   allocates nothing.**
-- `push(head, used_len)` (`queue.rs:367`): write the used-ring element, then
-  publish `used.idx` after a `Release` fence.
-- **EVENT_IDX suppression** (`queue.rs:379`): when negotiated, the device writes
-  `avail_event` to ask for the next kick and reads `used_event` to decide whether
-  to actually raise an interrupt — this is what lets a busy queue run with almost
-  no interrupts/exits.
+- `push(head, used_len)` (`queue.rs:409`) is `add_used` + `publish_used`: write
+  the used-ring element, then publish `used.idx` after a `Release` fence.
+  Multi-buffer RX (`MRG_RXBUF`) calls `add_used` once per buffer and publishes
+  once, because the driver drops a packet whose later buffers aren't already in
+  the used ring (`queue.rs:419`, `:429`).
+- **EVENT_IDX suppression**: when negotiated, the device writes `avail_event` to
+  ask for the next kick and reads `used_event` to decide whether to actually
+  raise an interrupt — this is what lets a busy queue run with almost no
+  interrupts/exits. Both handshakes are "store mine, then load yours" on each
+  side, and Release/Acquire do **not** order a store before a later load, so
+  each needs a **full fence** that pairs with the barrier in the Linux driver:
+  when the ring looks empty, store `avail_event`, `fence(SeqCst)`, re-read
+  `avail.idx` (`queue.rs:384` `arm_kick_and_recheck`, vhost's `enable_notify`
+  pattern); after publishing `used.idx`, `fence(SeqCst)` before reading
+  `used_event` (`queue.rs:442` `should_interrupt_driver`). Without them a kick
+  or an interrupt is occasionally lost and the queue stalls for good.
+  Store-buffer litmus tests run both sides on real CPUs (`queue.rs:542`).
 
 This is also your **primary attack surface**. The guest controls every byte of
 those rings. The popper therefore: rejects an avail head `≥ size`; validates the
 descriptor table is mapped before walking; **bounds the walk by `size`** and
-re-checks every `next` (direct *and* indirect) `< size`, so a cyclic or
+re-checks every `next` against the table it indexes (the ring size for direct
+descriptors, the indirect table's length for indirect ones), so a cyclic or
 oversized chain can neither loop nor quadratically inflate your buffers
-(`queue.rs:297`). There's a fuzz test that scribbles random bytes over the rings
+(`queue.rs:306`). There's a fuzz test that scribbles random bytes over the rings
 and asserts `pop()` never panics, never loops, never returns a buffer outside RAM
-(`queue.rs:427`). **Write this test early.**
+(`queue.rs:494`). **Write this test early.**
 
 **5. Reads/writes are zero-copy.** `host_range` returns a validated pointer the
 device operates on *in place*: virtio-blk hands `req.buf = seg_ptr` straight to
@@ -525,7 +584,7 @@ to a stack buffer (alignment safety, since the guest controls the table address)
 **6. MSI-X** (`src/pci/msix.rs`). The capability + a table of
 `(addr_lo, addr_hi, data, ctrl)` entries + a pending-bit array. To raise a queue
 interrupt the device calls `transport.raise_queue_interrupt(qidx)`
-(`transport.rs:318`), which looks up the queue's vector and calls
+(`transport.rs:320`), which looks up the queue's vector and calls
 `msix.trigger(vector)`. `trigger` (`msix.rs:273`): if MSI-X or the vector is
 masked, latch the PBA bit and return; otherwise `do_inject` → `inject_msi(addr,
 data)`. Unmasking a pending vector replays it. Restoring the MSI-X table on
@@ -550,10 +609,16 @@ done. Build them in this order:
   overlaps `ReadFile`/`WriteFile` **directly into/out of guest RAM**. On
   completion the worker pushes the used element and raises the MSI-X vector.
 - **virtio-net** (`src/virtio/net.rs`, id 1) + a backend
-  (`NetBackend`: loopback / user-mode NAT / wintun). The NAT
+  (`NetBackend`: loopback / user-mode NAT / wintun). The device negotiates
+  checksum offload and TCPv4 segmentation offload (TSO4) in both directions plus
+  mergeable RX buffers (`net.rs:878`), and tells a backend to pause while the
+  guest's RX backlog is full (`net.rs:415` `rx_congested`). The NAT
   (`src/net/nat.rs`) is a slirp-style terminate-and-proxy stack (ARP, ICMP, UDP,
-  TCP via the `tcp-sans-io` crate) on a single IOCP worker — no admin rights, no
-  virtual adapter.
+  TCP via the `tcp-sans-io` crate) — no admin rights, no virtual adapter —
+  sharded over `--nat-workers` threads (default a quarter of the host's logical
+  CPUs, 1–4; `nat.rs:157`), each with its own IOCP and the flows it owns. A TCP
+  flow's SYN assigns it to the least-loaded worker; UDP goes by 4-tuple hash;
+  ARP, ICMP and IP fragments go to the first worker (`nat.rs:190`, `:228`).
 - **virtio-9p** (`src/virtio/p9.rs`, id 9) — a 9P2000.L file share with a worker
   pool. Note the **path-security** layer: every component is validated
   (reject `..`, control chars, Win32 metacharacters, reserved DOS names), `..` is
@@ -561,17 +626,18 @@ done. Build them in this order:
   (`README.md` §9).
 
 **The doorbell fast path** (`crates/whpsys/src/doorbell.rs`,
-`transport.rs:381`). A queue kick is a guest write to the notify register, which
+`transport.rs:383`). A queue kick is a guest write to the notify register, which
 normally takes a VM exit. For hot-path devices you can eliminate that exit
 entirely: `WHvRegisterPartitionDoorbellEvent` installs a write-match `(gpa,
 value, length)` so a matching store **signals an OS event instead of exiting**. A
 per-device **pump thread** waits on `{stop, per-queue doorbells}` and calls
-`notify_queue` off the event (`transport.rs:158`). tinyvmm enables doorbells for
+`notify_queue` off the event (`transport.rs:155`). tinyvmm enables doorbells for
 console/net/blk/9p (hot notify + downstream worker) and leaves them off for
-rng/input/gpu (low-rate, serviced inline). The pump waits `INFINITE` with no
-periodic sweep — the virtqueue's Acquire re-read of `avail.idx` plus the Release
-of `avail_event` closes the EVENT_IDX race, and any non-matching write still falls
-through to the MMIO handler as a backstop (`transport.rs:144`).
+rng/input/gpu (low-rate, serviced inline) and snd (its WASAPI threads pace the
+I/O). The pump waits `INFINITE` with no periodic sweep — the virtqueue's fenced
+re-check of `avail.idx` (M5) closes the EVENT_IDX race, and any non-matching
+write still falls through to the MMIO handler as a backstop
+(`transport.rs:143`).
 
 > **The performance philosophy** in one line: *optimize the number of VM exits,
 > not the handler code.* The VMM's own code is at noise level under profiling; the
@@ -600,9 +666,10 @@ These are optional and don't change the core, but each teaches one more piece:
   `VirtioDevice` hooks), and **guest RAM last**. The crucial discipline:
   **devices are constructed in a fixed order** (console=0, net*, rng, snd, blk*,
   input kbd+tablet, 9p*, gpu last) and save/restore must use the *same* order or
-  the `device_index` tags misalign (`transport.rs:1119` documents the restore
-  ordering). The trigger is a magic `CPUID(0x4000DE57)` from the guest, caught in
-  the run loop (`run_loop.rs:285`).
+  the `device_index` tags misalign (`src/main.rs:1519` assigns the tags;
+  `transport.rs:1122` documents the per-device restore steps). The trigger is a
+  magic `CPUID(0x4000DE57)` from the guest, caught in the run loop
+  (`run_loop.rs:285`).
 
 ---
 
@@ -610,9 +677,9 @@ These are optional and don't change the core, but each teaches one more piece:
 
 **Concurrency model.** Memory is preallocated, but locks still exist because
 **multiple host threads** touch shared device state: the vCPU threads, the
-per-device doorbell pumps, the per-disk IOCP workers, the 9p pool, the NAT worker,
-the display message pump, the watchdog. The locks serialize *host threads*, never
-the guest. The pattern:
+per-device doorbell pumps, the per-disk IOCP workers, the 9p pool, the NAT
+workers, the display message pump, the watchdog. The locks serialize *host
+threads*, never the guest. The pattern:
 
 - `Arc<T>` for everything shared across threads (guest RAM, vCPUs, devices,
   backends), `Weak<T>` to break the transport↔device cycle (the device's IRQ
@@ -647,7 +714,7 @@ request so the completion's `OVERLAPPED*` casts back to the request
 
 ## 5. The full bring-up sequence, annotated
 
-This is the exact order `run_pvh_run` (`src/main.rs:1312`) wires a machine — a
+This is the exact order `run_pvh_run` (`src/main.rs:1318`) wires a machine — a
 useful template because the ordering constraints are real:
 
 ```
@@ -656,43 +723,51 @@ useful template because the ordering constraints are real:
 3.  Partition::new(vcpus)
       enable_extended_exits(cpuid, msr)          // take CPUID+MSR exits
       set_cpuid_result_list(static overrides)
-      set_local_apic_emulation(X2Apic | None)    // hardware vs software LAPIC
+      set_local_apic_emulation(X2Apic)           // WHP emulates the LAPIC
       setup()                                     // <-- properties locked here
-4.  if software LAPIC: lapic::init(part, vp0, tsc_hz)
-5.  GuestMemory::new_split(ram, MMIO_WINDOW_BASE, HIGH_RAM_BASE)   // RAM + SLAT map
-6.  HvEnlightenment::new(ram, tsc_hz)             // Reference-TSC + MSRs
-7.  load_pvh(ram, vmlinux, cmdline, initrd)       // ELF + start_info + e820 + ACPI
-8.  for i in 0..vcpus: Vcpu::new(part, i)
-    setup_pvh_entry(vcpu0, load)                  // 32-bit PM entry on the BSP
-9.  build IO bus + MMIO bus
-    attach 8250 UART, 8254 PIT, CMOS/POST stubs, i8259 PIC
-10. PciBus::new(); add virtio devices in FIXED order:
+4.  GuestMemory::new_split(ram, MMIO_WINDOW_BASE, HIGH_RAM_BASE)   // RAM + SLAT map;
+                                                  // SLAT populate runs in the background
+5.  HvEnlightenment::new(ram, tsc_hz, interrupt_clock_hz())        // Reference-TSC + MSRs
+6.  load_pvh(ram, vmlinux, cmdline, initrd)       // ELF + start_info + e820 + ACPI
+7.  for i in 0..vcpus: Vcpu::new(part, i)
+    setup_pvh_entry(vcpu0, load)                  // 32-bit PM entry on the BSP;
+                                                  // APs wait for the guest's INIT/SIPI
+8.  build IO bus + MMIO bus
+    attach 8250 UART, 8254 PIT, CMOS/POST stubs,
+    i8259 PIC (notify = cancel the BSP's run)     // UART IRQ -> pic.raise
+9.  PciBus::new(); add virtio devices in FIXED order:
        console(0) → net* → rng → snd → blk* → input(kbd,tablet) → 9p* → gpu(last)
     each: PciTransport::new(...) → set IRQ callback (Weak) → pci_bus.add_device → start backend
-11. pci_bus.attach_io_bus(&mut io_bus)            // 0xCF8/0xCFC handlers
-12. one RunLoop per vCPU (sharing io_bus, mmio_bus, hv)
-13. spawn watchdog (optional), wire interactive console + shutdown sentinel
-14. arm snapshot trigger (if --save)
-15. BSP runs on the main thread; each AP runs on its own thread (CPU-pinned)
-16. teardown: stop_all → cancel + join APs → join watchdog
-       quiesce blk IOCP workers, net backends, 9p pool (BEFORE owners drop)
-       if snapshot armed+requested: write the file
-       print exit counters
+10. pci_bus.attach_io_bus(&mut io_bus)            // 0xCF8/0xCFC handlers
+11. one RunLoop per vCPU (sharing io_bus, mmio_bus, hv);
+    the BSP's also gets set_ext_int_source(pic)
+12. spawn watchdog (optional), wire interactive console + shutdown sentinel
+13. arm snapshot trigger (if --save)
+14. BSP runs on the main thread; each AP runs on its own thread (pinned per --cpu-affinity)
+15. teardown: stop_all → cancel + join APs → join watchdog → close the gpu window
+       stop the blk IOCP workers (BEFORE their BlockDevice owners drop)
+       if snapshot armed+requested: quiesce net backends + 9p pool, write the file
+       else: print device stats + exit counters
 ```
 
-The teardown ordering is not optional: **IOCP workers are quiesced before their
-owning devices drop**, or a completion lands on freed memory. RAII (`impl Drop`)
-releases every OS handle/mapping; `panic = "abort"` means there's no unwinding, so
-process-lifetime `OnceLock` statics (TSC Hz, CRC table, ETW metadata) are
-deliberately never freed.
+The teardown ordering is not optional: **the blk IOCP workers are stopped before
+their owning devices drop**, or a completion lands on freed memory. The NAT and
+9p workers aren't stopped on a normal exit — each NAT worker owns its flow state
+and reaches the device only through a `Weak<NetDevice>`, and each 9p worker holds
+a strong `Arc` to its device and lives for the process — but a snapshot quiesces
+them first, so no late frame or 9p reply mutates a ring or guest RAM after it
+has been captured. RAII (`impl Drop`) releases every OS handle/mapping;
+`panic = "abort"` means there's no unwinding, so process-lifetime `OnceLock`
+statics (TSC Hz, CRC table, ETW metadata) are deliberately never freed.
 
 ---
 
 ## 6. Porting away from WHP (KVM / Hypervisor.framework)
 
 Most of this guide is portable. The line from §2 is the porting map — only the
-left column changes. Concretely, to retarget the backend you rewrite `whpsys` and
-the Win32 half of `winsys`; the equivalents are:
+left column changes. Concretely, to retarget the backend you rewrite `whpsys`, the
+Win32 half of `winsys`, and the Windows-shaped spots in `src/` (§2); the
+equivalents are:
 
 | tinyvmm / WHP | KVM (Linux) | Hypervisor.framework (macOS) |
 |---|---|---|
@@ -701,16 +776,18 @@ the Win32 half of `winsys`; the equivalents are:
 | `WHvCreateVirtualProcessor` | `KVM_CREATE_VCPU` | `hv_vcpu_create` |
 | `WHvRunVirtualProcessor` + exit union | `KVM_RUN` + `struct kvm_run` | `hv_vcpu_run` + manual VMCS reads |
 | WHP instruction emulator (IO/MMIO) | KVM decodes for you; `KVM_EXIT_MMIO/IO` give the operand | you decode the instruction yourself |
-| `WHvRequestInterrupt` / `Set...InterruptControllerState` | `KVM_IRQ_LINE` / `KVM_SIGNAL_MSI` / in-kernel irqchip | `hv_vcpu_interrupt` + your own LAPIC |
+| `WHvRequestInterrupt` (MSI) / `WHvRegisterPendingEvent` (PIC ExtINT) | `KVM_SIGNAL_MSI` / `KVM_IRQ_LINE` with the in-kernel irqchip (or `KVM_INTERRUPT` without one) | your own LAPIC, injecting through the VMCS VM-entry interruption-information field; `hv_vcpu_interrupt` only forces an exit |
 | `WHvRegisterPartitionDoorbellEvent` | `KVM_IOEVENTFD` (the eventfd doorbell) | no equivalent — poll/own thread |
 | `CpuidResultList` | `KVM_SET_CPUID2` | trap `CPUID` exits |
-| software LAPIC (`lapic.rs`) | usually unnecessary (in-kernel irqchip) | **required** — HVF has no in-kernel APIC |
+| `LocalApicEmulationMode = X2Apic` (WHP's LAPIC) | in-kernel irqchip (`KVM_CREATE_IRQCHIP`, or a split irqchip) | **none** — HVF has no in-kernel APIC; emulate one yourself |
 
 The biggest single difference: **KVM decodes the faulting MMIO/IO instruction for
 you** (you just read `kvm_run.mmio`), whereas WHP and HVF make you run an
 instruction emulator. tinyvmm leans on WHP's; on HVF you'd port or vendor a
-decoder. Conversely, KVM's in-kernel irqchip + `ioeventfd` mean you may not need
-the software LAPIC or the doorbell pump at all.
+decoder. Conversely, KVM's in-kernel irqchip gives you what WHP's LAPIC emulation
+does, and `ioeventfd` replaces the doorbell + pump thread. On HVF you must write
+the LAPIC yourself; tinyvmm's old software x2APIC (`crates/whpsys/src/lapic.rs`,
+deleted in #10, still in git history) is a starting point.
 
 The PVH loader, ACPI builder, CPUID *policy*, virtqueue, PCI, MSI-X, and every
 device model are reusable as-is.
@@ -727,15 +804,19 @@ real debugging time in this project.
 2. **No legacy timer = no boot.** Without the Hyper-V frequency MSRs, Linux spins
    in `calibrate_delay()` forever — there's no IRQ0/HPET/PM-timer to fall back to.
    (§M3)
-3. **x2APIC must be pre-enabled.** If `IA32_APIC_BASE` doesn't come up with the
-   x2APIC bit, Linux stays in xAPIC and routes the LAPIC to unhandled MMIO; the
-   timer never arms and the first `msleep` hangs. (§M3)
-4. **Nested hosts need a software LAPIC.** No APICv → WHP can't preempt a running
-   or halted vCPU → a virtio completion never reaches an idle guest. Auto-detect
-   the host-is-a-VM case. (§M3)
-5. **Inject only when injectable.** `WHvRegisterPendingInterruption` over a
-   cleared IF / active interrupt shadow / already-pending event is an *invalid VM
-   entry* and faults WHP. Gate on all four. (§M3)
+3. **Tell the guest the LAPIC timer's real rate.** With TSC-deadline hidden,
+   Linux takes its LAPIC timer period from `HV_X64_MSR_APIC_FREQUENCY`. Report
+   WHP's interrupt clock (200 MHz), not the TSC (~3 GHz), or every timer the guest
+   arms runs ~16× long. (§M3)
+4. **Legacy PIC IRQs go in as ExtINT, never Fixed.** Linux EOIs 8259 IRQs only at
+   the PIC, so a Fixed LAPIC delivery leaves an ISR bit set forever and blocks
+   every MSI at or below its priority class — virtio stalls the first time the
+   UART interrupts. For a while this looked like "WHP's LAPIC can't deliver on
+   nested hosts"; it can. (§M3)
+5. **Inject only when injectable.** Queuing an event over a cleared IF, an active
+   interrupt shadow, or an already-pending interruption or event is an *invalid
+   VM entry* and faults WHP. Gate on all four, and when one fails, request an
+   interrupt-window exit rather than waiting for an unrelated exit. (§M3)
 6. **Don't stub `translate_gva`.** String I/O and RMW MMIO ask the emulator for a
    GVA→GPA walk; failing it closed turns a normal instruction into a
    VMM-terminating emulation error. Forward to `WHvTranslateGva`. (§M2)
@@ -748,13 +829,21 @@ real debugging time in this project.
    (§M5)
 10. **Wrap-safe bounds checks.** Use subtraction form (`len > size - off`), never
     `off + len > size`, which overflows for hostile addresses. (§M0)
-11. **Quiesce before drop.** Stop IOCP/worker threads before their owning device
-    is dropped, or a completion writes to freed memory. (§5)
+11. **Quiesce before drop.** Stop IOCP workers before the device that owns their
+    request memory is dropped (blk), or a completion writes to freed memory. (§5)
 12. **Snapshot device order is load-bearing.** Construct devices in the same fixed
     order on save and restore, or the per-device snapshot indices misalign. (§M7)
-13. **A microVM can't `poweroff` cleanly.** With no ACPI, Linux's `poweroff` falls
-    back to `STI;HLT` and produces no terminal exit; tinyvmm watches the hvc0
-    stream for a shutdown sentinel instead. (§5)
+13. **A microVM can't `poweroff` cleanly.** With no ACPI power management (no
+    FADT), Linux's `poweroff` falls back to `STI;HLT` and produces no terminal
+    exit; tinyvmm watches the hvc0 stream for a shutdown sentinel instead. (§5)
+14. **Release/Acquire isn't enough for EVENT_IDX.** The device's "store my index,
+    then load yours" handshakes need a full fence that pairs with the driver's
+    barrier; without it a kick or interrupt is occasionally lost and the queue
+    stalls. (§M5)
+15. **First touch of guest RAM is expensive.** WHP fills the SLAT lazily; each
+    first touch of a 4 KiB page faults into the root partition (~40 µs), which
+    made guest page-zeroing ~25× slower. Pre-populate with
+    `WHvAdviseGpaRange(Populate)` in the background. (§M0)
 
 ---
 
@@ -765,26 +854,29 @@ The minimum to boot an unmodified PVH Linux to a shell:
 - [ ] Partition: create, set processor count, **extended exits for CPUID+MSR**,
       CPUID result list, LAPIC mode, setup.
 - [ ] Guest RAM: one host allocation, mapped R/W/X; split around the PCI MMIO
-      hole; **one audited bounds-checked accessor** for all guest-RAM access.
+      hole; pre-populate the SLAT; **one audited bounds-checked accessor** for
+      all guest-RAM access.
 - [ ] vCPU: create, get/set registers (mind the alignment), run, decode exits,
       inject interrupts.
 - [ ] PVH loader: ELF parse + PHYS32 note, `PT_LOAD` copy, `hvm_start_info` +
       e820 + cmdline + GDT, 32-bit PM entry on the BSP.
 - [ ] ACPI: RSDP → XSDT → MADT (one x2APIC entry per vCPU).
-- [ ] Exit loop: HLT-park, IO/MMIO via an instruction emulator + device buses,
+- [ ] Exit loop: HLT, IO/MMIO via an instruction emulator + device buses,
       CPUID policy, MSR routing, `#GP` on unknown MSR.
 - [ ] Time: measure TSC Hz; CPUID leaves 1/6/0x15/0x16/0x80000007/0x40000000-06;
-      Hyper-V MSRs incl. the frequency MSRs and reference-TSC page.
-- [ ] Interrupts: hardware LAPIC + `WHvRequestInterrupt`, **and** a software LAPIC
-      + VM-entry injection for nested hosts; MSI message decode.
+      Hyper-V MSRs incl. the frequency MSRs (APIC = the interrupt clock) and
+      reference-TSC page.
+- [ ] Interrupts: the hypervisor's x2APIC (`LocalApicEmulationMode = X2Apic`);
+      MSI message decode into `WHvRequestInterrupt`; legacy PIC → ExtINT
+      injection gated on interruptibility, with interrupt-window exits.
 - [ ] Legacy: 8250 UART (→ stdout, IRQ4 via PIC), i8259 PIC, 8254 PIT counters,
       CMOS/POST stubs.
 - [ ] PCI: `0xCF8/0xCFC` mechanism, Type-0 config space, BAR sizing, COMMAND→map
       state machine, a BAR allocator.
 - [ ] virtio-PCI transport: capability chain, common-cfg state machine, notify,
       ISR, MSI-X table/PBA, optional doorbells.
-- [ ] virtqueue: split-ring pop/push, indirect descriptors, EVENT_IDX, **hostile
-      input bounds + a fuzz test.**
+- [ ] virtqueue: split-ring pop/push, indirect descriptors, EVENT_IDX (with full
+      fences), **hostile input bounds + a fuzz test.**
 - [ ] Devices: console + rng (inline), then blk/net/9p (async + doorbells).
 - [ ] Lifecycle: multi-vCPU launch/teardown, quiesce-before-drop, exit counters;
       optionally snapshot/restore.
@@ -803,9 +895,9 @@ The minimum to boot an unmodified PVH Linux to a shell:
    ...       | ... usable RAM ...                               |
 0xE000_0000  +-- PCI MMIO BAR window ---------------------------+   (3584 MiB)
    ...       | virtio device BARs (16 KiB each), MSI-X tables   |
-0xFEC0_0000  +-- IOAPIC region (window end) -------------------+
-0xFEE0_0000  +-- LAPIC (x2APIC; MADT advertises this) ---------+
-0x1_0000_0000+-- guest RAM (high half, only if RAM > 3584 MiB)-+   (4 GiB)
+0xFEC0_0000  +-- window end (IOAPIC addr; none emulated) -------+
+0xFEE0_0000  +-- LAPIC (x2APIC; MADT advertises this) ----------+
+0x1_0000_0000+-- guest RAM (high half, only if RAM > 3584 MiB) -+   (4 GiB)
 ```
 
 **Key constants:**
@@ -815,18 +907,19 @@ The minimum to boot an unmodified PVH Linux to a shell:
 | MMIO window base / end | `0xE000_0000` / `0xFEC0_0000` | `src/mem_layout.rs` |
 | High-RAM base | `0x1_0000_0000` | `src/mem_layout.rs` |
 | PVH magic / note type | `0x336ec578` / `18` ("Xen") | `src/boot/loader.rs` |
-| LAPIC base | `0xFEE0_0000` | `src/boot/acpi.rs`, `lapic.rs` |
+| LAPIC base | `0xFEE0_0000` | `src/boot/acpi.rs` (MADT) |
 | MAX_VCPUS | `32` | `src/boot/acpi.rs` |
 | virtio vendor ID | `0x1AF4` (Red Hat) | `src/main.rs` device wiring |
 | virtio BAR0 size | `0x4000` (16 KiB) | `src/virtio/transport.rs` |
 | Snapshot magic / trigger leaf | `"TVMMSAVE"` / `CPUID 0x4000DE57` | `src/whp/snapshot*.rs` |
 | TSC scale | `(10^7 << 64) / tsc_hz` | `src/whp/hv.rs` |
+| LAPIC timer rate told to the guest | WHP interrupt clock (200 MHz) | `src/whp/hv.rs` |
 
 **Where each subsystem lives:**
 
 ```
 crates/whpsys/   WHP FFI:  partition, memory, vcpu, emulator, msi, doorbell,
-                           lapic (software LAPIC), vpci (passthrough), regs
+                           vpci (passthrough), regs
 crates/winsys/   Win32 FFI: host (privilege/large-page/CNG rng), host/block_file
                            (async IOCP disk), host/mapped_file (mmap), sock
                            (Winsock+IOCP), etw, fs (9p), audio (WASAPI), wintun
