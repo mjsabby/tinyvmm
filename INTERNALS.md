@@ -885,6 +885,14 @@ real debugging time in this project.
     signal, host DPC, and readying the pump (often on a core in a deep C-state)
     take tens of microseconds; busy-poll the ring for a bounded, adaptive window
     after each request. (§M6)
+19. **A user-mode NAT shouldn't hold TIME_WAIT for 2·MSL.** When the host closes
+    a connection first, the guest-facing TCB is the active closer, and a TCP
+    stack keeps it for 60 s. With a fixed flow table (256 here), the guest's
+    `connect()`s were refused after 256 such connections in a minute. Over the
+    virtual link nothing is reordered, so TIME_WAIT only has to outlast a FIN
+    retransmit. Release the flow after a short hold, recycle the oldest
+    TIME_WAIT flow when the table is full, and let a new SYN on the same
+    4-tuple replace it. (§M6)
 
 ---
 

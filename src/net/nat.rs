@@ -96,6 +96,7 @@ const UDP_IDLE_MS: u64 = 60_000; // reap a UDP NAT entry idle this long
 const TCP_CONNECT_MS: u64 = 10_000; // abort if the host connect never completes
 const TCP_IDLE_MS: u64 = 10 * 60_000; // abort an established flow idle this long
 const TCP_HALF_CLOSE_MS: u64 = 30_000; // abort a half-closed flow idle this long
+const TCP_TIME_WAIT_MS: u64 = 2_000; // drop a finished flow in TIME_WAIT this long (TcpFlow::lingering)
 const EXPIRE_GATE_MS: u64 = 1_000; // how often the idle sweep runs
 
 // tcp-sans-io poll() event flags (mirror crate::tcb::events).
@@ -872,6 +873,32 @@ impl Drop for TcpFlow {
         if self.sock != INVALID_SOCKET {
             sys::close_sock(self.sock);
         }
+    }
+}
+
+impl TcpFlow {
+    /// Finished both ways, with only the guest-facing TIME_WAIT left: the
+    /// guest's FIN is acknowledged, every guest byte went to the host socket
+    /// before its send-side shutdown, and no host op is in flight, so the flow
+    /// can go at once without losing anything.
+    ///
+    /// tcp-sans-io holds TIME_WAIT for 2·MSL (60 s) to re-ACK a FIN whose ACK
+    /// was lost and to keep stale segments out of a reused 4-tuple. Over the
+    /// virtual link nothing is reordered, and the guest's first FIN retransmit
+    /// (~200 ms RTO) lands well inside [`TCP_TIME_WAIT_MS`]. The full 60 s
+    /// pinned a flow slot per connection the host closed first (HTTP/1.0,
+    /// `Connection: close`): after 256 of those in a minute, every further
+    /// guest connect() was refused.
+    fn lingering(&self) -> bool {
+        !self.dead
+            && self.shutdown_done
+            && !self.send_inflight
+            && !self.recv_pending
+            && self.pending_to_host.is_empty()
+            && self
+                .tcb
+                .as_ref()
+                .is_some_and(|t| t.state() == State::TimeWait && t.poll() & EV_READABLE == 0)
     }
 }
 
@@ -1846,6 +1873,15 @@ impl NatState {
             return;
         };
         let key = (ip.src, tcp.src_port, ip.dst, tcp.dst_port);
+        // A fresh SYN on a 4-tuple whose last connection is only lingering in
+        // TIME_WAIT opens a new connection (RFC 6191; Linux accepts it the
+        // same way). The TCB would challenge it instead, and the guest's
+        // connect() would wait out a 1 s SYN retransmit.
+        if tcp.flags & (TCP_SYN | TCP_ACK) == TCP_SYN
+            && self.tcp.get(&key).is_some_and(TcpFlow::lingering)
+        {
+            self.begin_teardown(key);
+        }
         if !self.tcp.contains_key(&key) {
             if tcp.flags & TCP_SYN == 0 {
                 return;
@@ -1858,9 +1894,7 @@ impl NatState {
             }
             // At capacity (or socket setup failed): refuse with a RST so the
             // guest's connect() fails fast instead of retrying for ~minutes.
-            if self.flows.tcp.load(Ordering::Relaxed) >= MAX_TCP_FLOWS
-                || self.new_tcp_flow(key).is_none()
-            {
+            if !self.make_room() || self.new_tcp_flow(key).is_none() {
                 build_tcp_rst_for_syn_into(
                     &mut self.l3_scratch,
                     ip.src,
@@ -2005,6 +2039,26 @@ impl NatState {
         self.shards == 1 || self.router.claim(key, self.shard)
     }
 
+    /// Whether the NAT has room for another TCP flow. When it is full, this
+    /// shard's longest-lingering TIME_WAIT flow gives up its slot (Linux
+    /// likewise skips TIME_WAIT past `tcp_max_tw_buckets`).
+    fn make_room(&mut self) -> bool {
+        if self.flows.tcp.load(Ordering::Relaxed) < MAX_TCP_FLOWS {
+            return true;
+        }
+        let oldest = self
+            .tcp
+            .iter()
+            .filter(|(_, f)| f.lingering())
+            .min_by_key(|(_, f)| f.last_activity)
+            .map(|(k, _)| *k);
+        let Some(key) = oldest else {
+            return false;
+        };
+        self.begin_teardown(key);
+        !self.tcp.contains_key(&key)
+    }
+
     /// Drop this shard's flow-router entry for a flow it no longer has.
     fn release_flow(&self, key: &FlowKey) {
         if self.shards > 1 {
@@ -2031,7 +2085,7 @@ impl NatState {
     /// from an outbound flow are tcb.connect() (vs listen) and that the host
     /// socket is already connected.
     fn new_inbound_flow(&mut self, host_sock: SOCKET, guest_ip: [u8; 4], guest_port: u16) {
-        if self.flows.tcp.load(Ordering::Relaxed) >= MAX_TCP_FLOWS {
+        if !self.make_room() {
             sys::close_sock(host_sock);
             return;
         }
@@ -2452,9 +2506,10 @@ impl NatState {
     }
 
     /// Periodic idle sweep (runs every EXPIRE_GATE_MS): reap idle UDP NAT
-    /// entries and abort stuck/dead TCP flows (connect-deadline, idle, and
-    /// half-close watchdogs). Mirrors the C++ backend's ExpireIdle + the TSI
-    /// engine's per-conn watchdogs.
+    /// entries, release TCP flows done lingering in TIME_WAIT, and abort
+    /// stuck/dead TCP flows (connect-deadline, idle, and half-close
+    /// watchdogs). Mirrors the C++ backend's ExpireIdle + the TSI engine's
+    /// per-conn watchdogs.
     fn expire_idle(&mut self, now: u64) {
         // UDP: reap entries idle longer than UDP_IDLE_MS. Marking dead +
         // closing the socket aborts the pending recv; on_udp_recv frees it.
@@ -2473,6 +2528,21 @@ impl NatState {
                     op.sock = INVALID_SOCKET;
                 }
             }
+        }
+
+        // TCP: flows done but for TIME_WAIT go once it has run its (short)
+        // course. No abort: both sides closed cleanly, so there is nothing to
+        // reset.
+        let finished: Vec<FlowKey> = self
+            .tcp
+            .iter()
+            .filter(|(_, f)| {
+                f.lingering() && now.saturating_sub(f.last_activity) > TCP_TIME_WAIT_MS
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        for k in finished {
+            self.begin_teardown(k);
         }
 
         // TCP: collect flows that tripped a watchdog, then tear them down.
@@ -2966,11 +3036,9 @@ mod tests {
         }) {}
     }
 
-    /// Host bytes land in the tcb's send ring as recvs complete (wrapping
-    /// around it as the guest drains it); when the host then closes, the guest
-    /// gets every byte, then the FIN.
-    #[test]
-    fn host_bytes_reach_the_guest_through_the_ring_then_fin() {
+    /// A NAT-side tcb (listening on 10.0.0.1:80) and a guest-side tcb,
+    /// handshaken to ESTABLISHED.
+    fn established_pair() -> (Box<dyn TcbDyn>, Box<dyn TcbDyn>) {
         let nat_end = Endpoint {
             ip: [10, 0, 0, 1],
             port: 80,
@@ -3003,10 +3071,12 @@ mod tests {
             shuttle(&mut *nat, &mut *guest);
         }
         assert_eq!(nat.state(), State::Established);
+        (nat, guest)
+    }
 
-        // The host sends three rings' worth, then closes.
-        let data: Vec<u8> = (0..3 * TIER_BUF[0] as u32).map(|i| (i * 7) as u8).collect();
-        let mut flow = TcpFlow {
+    /// A connected flow around `nat`, with no host socket or ops.
+    fn connected_flow(nat: Box<dyn TcbDyn>) -> TcpFlow {
+        TcpFlow {
             tcb: Some(nat),
             tier: 0,
             sock: INVALID_SOCKET,
@@ -3027,7 +3097,19 @@ mod tests {
             published: Losses::default(),
             rx_blocked: false,
             csum_offload: false,
-        };
+        }
+    }
+
+    /// Host bytes land in the tcb's send ring as recvs complete (wrapping
+    /// around it as the guest drains it); when the host then closes, the guest
+    /// gets every byte, then the FIN.
+    #[test]
+    fn host_bytes_reach_the_guest_through_the_ring_then_fin() {
+        let (nat, mut guest) = established_pair();
+
+        // The host sends three rings' worth, then closes.
+        let data: Vec<u8> = (0..3 * TIER_BUF[0] as u32).map(|i| (i * 7) as u8).collect();
+        let mut flow = connected_flow(nat);
 
         // Pump both ends, as `tcp_drive` and the guest would, completing a
         // host recv into the lent ring space whenever there is room.
@@ -3071,6 +3153,48 @@ mod tests {
         assert_eq!(got.len(), data.len());
         assert!(got == data);
         assert_ne!(guest.poll() & EV_PEER_CLOSED, 0, "the FIN follows the data");
+        flow.tcb.take();
+    }
+
+    /// When the host closes first, the NAT's tcb ends in TIME_WAIT. The flow
+    /// may give up its slot early only once the guest's last bytes have gone
+    /// to the host and the host send side is shut down.
+    #[test]
+    fn a_time_wait_flow_lingers_only_once_the_guest_bytes_are_out() {
+        let (nat, mut guest) = established_pair();
+        let mut flow = connected_flow(nat);
+        on_host_eof(&mut flow);
+        {
+            let nat = flow.tcb.as_mut().unwrap();
+            nat.tick().unwrap();
+            shuttle(&mut **nat, &mut *guest);
+            assert_ne!(guest.poll() & EV_PEER_CLOSED, 0);
+            // The guest answers with its last bytes, then closes too.
+            let (a, _) = guest.send_reserve(4).unwrap();
+            a[..4].copy_from_slice(b"bye\n");
+            assert_eq!(guest.send_commit(4), Ok(4));
+            guest.close().unwrap();
+            guest.tick().unwrap();
+            shuttle(&mut *guest, &mut **nat);
+            assert_eq!(nat.state(), State::TimeWait);
+        }
+        assert!(!flow.lingering(), "guest bytes still in the tcb");
+
+        // The worker drains them toward the host (as `tcp_drive` does)...
+        let mut rb = [0u8; 16];
+        let n = flow.tcb.as_mut().unwrap().recv(&mut rb).unwrap();
+        assert_eq!(&rb[..n], b"bye\n");
+        flow.pending_to_host.extend_from_slice(&rb[..n]);
+        flow.want_shutdown = true;
+        assert!(!flow.lingering(), "guest bytes queued for the host");
+        flow.pending_to_host.clear();
+        flow.send_inflight = true;
+        assert!(!flow.lingering(), "guest bytes in flight to the host");
+        flow.send_inflight = false;
+        // ...and, with the queue empty, shuts down the host send side.
+        assert!(pump_send(&mut flow));
+        assert!(flow.shutdown_done);
+        assert!(flow.lingering());
         flow.tcb.take();
     }
 }

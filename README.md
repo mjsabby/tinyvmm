@@ -510,7 +510,12 @@ axes).
   copied once into the guest's RX buffers. Each worker dequeues up to 16
   completions per `GetQueuedCompletionStatusEx` and interrupts the guest once
   for the TCP frames a batch delivered (sooner if 8 are waiting); ARP, ICMP and
-  UDP replies interrupt right away.
+  UDP replies interrupt right away. The NAT holds up to 256 TCP flows. When the
+  host side closes first (HTTP/1.0, `Connection: close`), the guest-facing TCB
+  ends in TIME_WAIT. Such a flow keeps its slot for 2 s instead of
+  `tcp-sans-io`'s 60 s, gives it up at once when the table is full, and is
+  replaced when a new SYN arrives on its 4-tuple. Holding the slot for 60 s
+  refused every guest `connect()` after 256 such connections in a minute.
 * **`wintun`** — bridges onto a real WinTun L3 adapter (`wintun.dll` loaded at
   runtime via `GetProcAddress`; requires elevation to create the adapter).
 
@@ -828,6 +833,7 @@ NIC/display protocol, not to the guest-memory-access layer.
 | virtio-net guest→host | 20 MB transfer at line rate with the pump's periodic sweep disabled |
 | NAT TCP host→guest (`tools\net_compare.py`, server on the same host, 1 vCPU) | ~14 Gbit/s one stream; across 16 streams ~11.7 Gbit/s with one NAT worker, ~23.5 with two, ~29 with three and ~33 with four (the guest's vCPU saturates) |
 | NAT TCP guest→host (same setup) | ~9 Gbit/s one stream |
+| NAT TCP connection churn (`net_compare.py --rr 3000`: guest `wget` per request, host closes first) | ~1 150 connect + request + response per second, all 3 000 succeed (connections 257 onward used to be refused for a minute) |
 
 ---
 
