@@ -1015,7 +1015,14 @@ The summary then also totals stalls of 3 ms or more:
 per GiB in each phase, TCP holes, duplicate segments and NIC RX drops during
 the download and retransmits during the upload. Non-zero holes, duplicates,
 drops or retransmits mean data was lost, dropped or duplicated between host
-and guest.
+and guest. Below the table it lists each phase's busiest VMM threads (CPU
+time from `GetThreadTimes`, as a percentage of one CPU, named by
+`GetThreadDescription`) and the host test server's own CPU, which shows
+which thread a workload saturates without a profiler:
+
+```text
+tinyvmm par: busiest threads (% of one CPU): nat-worker 95, main 65, (host server) 16, virtio-pci-net[0]-doorbell 12
+```
 
 ---
 
