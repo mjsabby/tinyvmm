@@ -816,8 +816,9 @@ impl GsoFrame {
 /// *last* contributing segment (so ack/window/flags are fresh); `seq` is the
 /// *first* segment's sequence number; `mss` is the original segment size
 /// (`gso_size`). Writes Eth+IP+TCP in front of the payload with correct
-/// checksums and delivers via `inject_rx_gso` with a TCPv4 GSO header so the
-/// guest's GRO path sees one skb.
+/// checksums and delivers via `inject_rx_gso_batched` with a TCPv4 GSO header
+/// so the guest's GRO path sees one skb (the worker interrupts the guest once
+/// per batch of completions).
 fn emit_gso_tcp(
     dev: &NetDevice,
     frame: &mut [u8],
@@ -885,7 +886,7 @@ fn emit_gso_tcp(
             ..Default::default()
         }
     };
-    dev.inject_rx_gso(eth, vhdr);
+    dev.inject_rx_gso_batched(eth, vhdr);
 }
 
 /// Push buffered host->guest bytes into the tcb send ring (as much as fits),
@@ -1274,11 +1275,21 @@ impl NatState {
         // enough to catch up after a hiccup, bounded so a completion flood
         // cannot starve the timers.
         const SWEEP_CATCHUP_MS: u64 = 10;
+        // Completions taken per dequeue (one syscall). The guest's interrupt
+        // for what they deliver waits for the whole batch, so this also bounds
+        // that wait; the catch-up below checks its budget between dequeues.
+        const IOCP_BATCH: usize = 16;
+        let mut batch: [sys::Completion; IOCP_BATCH] =
+            [(false, 0, 0, std::ptr::null_mut()); IOCP_BATCH];
         'run: loop {
-            let (ok, bytes, key, ov) = sys::get_ms(self.iocp, IDLE_MS);
-            if !self.dispatch(ok, bytes, key, ov) {
-                break;
+            let n = sys::get_many(self.iocp, &mut batch, IDLE_MS);
+            for &(ok, bytes, key, ov) in &batch[..n] {
+                if !self.dispatch(ok, bytes, key, ov) {
+                    break 'run;
+                }
             }
+            // One guest interrupt for the frames the whole batch delivered.
+            self.notify_guest();
             // Drive per-flow TCP timers (retransmit / delayed-ACK) on a coarse
             // cadence rather than on every completion: those timers are coarse
             // (>=200ms) and the flow that just completed was already driven
@@ -1291,14 +1302,17 @@ impl NatState {
                 // read that silence as a lost tail and probe every busy flow.
                 let mut queued = 0u64;
                 loop {
-                    let (ok, bytes, key, ov) = sys::get_ms(self.iocp, 0);
-                    if ov.is_null() && key == 0 {
+                    let n = sys::get_many(self.iocp, &mut batch, 0);
+                    if n == 0 {
                         break;
                     }
-                    queued += 1;
-                    if !self.dispatch(ok, bytes, key, ov) {
-                        break 'run;
+                    queued += n as u64;
+                    for &(ok, bytes, key, ov) in &batch[..n] {
+                        if !self.dispatch(ok, bytes, key, ov) {
+                            break 'run;
+                        }
                     }
+                    self.notify_guest();
                     if self.now().wrapping_sub(now) >= SWEEP_CATCHUP_MS {
                         break;
                     }
@@ -1327,8 +1341,19 @@ impl NatState {
                 self.last_expire = now;
                 self.expire_idle(now);
             }
+            // The sweep may have delivered retransmissions and ACKs.
+            self.notify_guest();
         }
+        self.notify_guest();
         self.shutdown();
+    }
+
+    /// Interrupt the guest, if it asked for one, for the frames delivered with
+    /// `inject_rx_gso_batched` since the last call. One atomic swap when none.
+    fn notify_guest(&self) {
+        if let Some(d) = self.net.upgrade() {
+            d.notify_rx();
+        }
     }
 
     /// Handle one IOCP dequeue (a timeout is a no-op). Returns false on stop.
@@ -2116,9 +2141,9 @@ impl NatState {
                                     csum_offset: 16,
                                     ..Default::default()
                                 };
-                                d.inject_rx_gso(&scratch, vhdr);
+                                d.inject_rx_gso_batched(&scratch, vhdr);
                             } else {
-                                d.inject_rx(&scratch);
+                                d.inject_rx_gso_batched(&scratch, RxHeader::default());
                             }
                         }
                     })

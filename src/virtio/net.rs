@@ -10,7 +10,7 @@ use crate::virtio::device::{
 use crate::virtio::queue::{PoppedChain, Virtqueue};
 use crate::whp::GuestMemory;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 const NET_F_CSUM: u64 = 1 << 0;
@@ -79,6 +79,11 @@ const RX_POOL_SLOTS: usize = 64;
 /// UDP); the hysteresis batches the wakes.
 const RX_BACKLOG_HIGH: usize = 32;
 const RX_BACKLOG_LOW: usize = 8;
+/// Most frames `inject_rx_gso_batched` publishes before checking whether the
+/// guest wants an interrupt, if the backend hasn't called `notify_rx` yet.
+/// Eight 64 KiB GSO frames take about half a 256-entry ring of 4 KiB
+/// mergeable buffers, so a sleeping guest wakes with buffers to spare.
+pub const RX_NOTIFY_BATCH: u32 = 8;
 
 pub const NET_RX_QUEUE: u32 = 0;
 pub const NET_TX_QUEUE: u32 = 1;
@@ -305,6 +310,9 @@ pub struct NetDevice {
     /// Interrupts this device asked its transport to raise, per queue.
     rx_irqs: AtomicU64,
     tx_irqs: AtomicU64,
+    /// Frames `inject_rx_gso_batched` published whose interrupt check waits
+    /// for `notify_rx`.
+    rx_unsignaled: AtomicU32,
     rx_ctr: RxCounters,
     /// `rx.pending.len()`, readable without the lock.
     rx_backlog: AtomicUsize,
@@ -333,6 +341,7 @@ impl NetDevice {
             rx_packets: AtomicU64::new(0),
             rx_irqs: AtomicU64::new(0),
             tx_irqs: AtomicU64::new(0),
+            rx_unsignaled: AtomicU32::new(0),
             rx_ctr: RxCounters::default(),
             rx_backlog: AtomicUsize::new(0),
             rx_wake: AtomicBool::new(false),
@@ -516,6 +525,35 @@ impl NetDevice {
     /// chain — skipping the ~64 KiB RxPool slot copy. The pool is only used
     /// when the guest hasn't replenished (backpressure).
     pub fn inject_rx_gso(&self, frame: &[u8], hdr: RxHeader) {
+        self.inject_rx_frame(frame, hdr, true);
+    }
+
+    /// Like [`Self::inject_rx_gso`], but the guest's interrupt waits for
+    /// [`Self::notify_rx`], so a backend delivering a burst interrupts the
+    /// guest once for all of it. The frame is published at once (a guest
+    /// that is polling takes it right away); only the interrupt waits, and
+    /// for at most [`RX_NOTIFY_BATCH`] frames, so a sleeping guest wakes
+    /// while its ring still has buffers.
+    pub fn inject_rx_gso_batched(&self, frame: &[u8], hdr: RxHeader) {
+        self.inject_rx_frame(frame, hdr, false);
+    }
+
+    /// Interrupt the guest for frames [`Self::inject_rx_gso_batched`]
+    /// published, if it asked for one (EVENT_IDX). One atomic swap when
+    /// nothing is waiting.
+    pub fn notify_rx(&self) {
+        // Swap before checking: a frame published after the swap is counted
+        // again, so it is never left without a later check.
+        if self.rx_unsignaled.swap(0, Ordering::AcqRel) == 0 {
+            return;
+        }
+        let irq = self.rxq.lock().unwrap().should_interrupt_driver();
+        if irq {
+            self.raise(NET_RX_QUEUE);
+        }
+    }
+
+    fn inject_rx_frame(&self, frame: &[u8], hdr: RxHeader, notify: bool) {
         let n = frame.len();
         if n == 0 || n > RX_FRAME_CAP {
             return;
@@ -535,11 +573,15 @@ impl NetDevice {
                 if deliver_frame(&mut rxq, &mut rxp.chain, frame, &hdr, mrg, &self.rx_ctr).is_some()
                 {
                     self.rx_packets.fetch_add(1, Ordering::Relaxed);
-                    let irq = rxq.should_interrupt_driver();
+                    let irq = notify && rxq.should_interrupt_driver();
                     drop(rxq);
                     drop(rx);
                     if irq {
                         self.raise(NET_RX_QUEUE);
+                    } else if !notify
+                        && self.rx_unsignaled.fetch_add(1, Ordering::AcqRel) + 1 >= RX_NOTIFY_BATCH
+                    {
+                        self.notify_rx();
                     }
                     return;
                 }
@@ -1202,5 +1244,83 @@ mod tests {
         );
         assert_eq!(wakes.0.load(Ordering::SeqCst), 1, "woken once");
         assert!(!dev.rx_congested());
+    }
+
+    /// Batched RX frames are published at once but interrupt the guest once:
+    /// at `notify_rx`, or at the `RX_NOTIFY_BATCH`-th frame if the backend
+    /// keeps going, and only if the guest asked (EVENT_IDX `used_event`).
+    #[test]
+    fn batched_rx_interrupts_once_per_burst() {
+        use crate::virtio::queue::VRING_DESC_F_WRITE;
+        const DESC: u64 = 0x1000;
+        const AVAIL: u64 = 0x2000;
+        const USED: u64 = 0x3000;
+        const BUF: u64 = 0x10000;
+        const BUF_LEN: u32 = 2048;
+        const QSIZE: u16 = 64;
+        let mem = Arc::new(GuestMemory::new_host_only(512 * 1024).unwrap());
+        let dev = NetDevice::new(mem.clone(), [2, 0, 0, 0, 0, 1]);
+        let irqs = Arc::new(AtomicUsize::new(0));
+        let seen = irqs.clone();
+        dev.set_irq_callback(Box::new(move |q| {
+            assert_eq!(q, NET_RX_QUEUE);
+            seen.fetch_add(1, Ordering::SeqCst);
+        }));
+        {
+            let mut q = dev.rxq.lock().unwrap();
+            q.set_size(QSIZE.into());
+            q.set_desc_gpa(DESC);
+            q.set_avail_gpa(AVAIL);
+            q.set_used_gpa(USED);
+            q.set_event_idx_enabled(true);
+            q.set_ready(true);
+        }
+        for i in 0..QSIZE {
+            let mut d = [0u8; 16];
+            d[0..8].copy_from_slice(&(BUF + u64::from(i) * u64::from(BUF_LEN)).to_le_bytes());
+            d[8..12].copy_from_slice(&BUF_LEN.to_le_bytes());
+            d[12..14].copy_from_slice(&VRING_DESC_F_WRITE.to_le_bytes());
+            mem.write_at(DESC + 16 * u64::from(i), &d).unwrap();
+            mem.write_at(AVAIL + 4 + 2 * u64::from(i), &i.to_le_bytes())
+                .unwrap();
+        }
+        mem.write_at(AVAIL + 2, &QSIZE.to_le_bytes()).unwrap();
+        let used_idx = || mem.read_u16(USED + 2).unwrap();
+        // An idle guest re-arms: interrupt me when the next entry is used.
+        let rearm = || {
+            let next = used_idx();
+            mem.write_at(AVAIL + 4 + 2 * u64::from(QSIZE), &next.to_le_bytes())
+                .unwrap();
+        };
+        let irq_count = || irqs.load(Ordering::SeqCst);
+        let frame = [0xab_u8; 100];
+
+        rearm();
+        for _ in 0..3 {
+            dev.inject_rx_gso_batched(&frame, RxHeader::default());
+        }
+        assert_eq!(used_idx(), 3, "published at once");
+        assert_eq!(irq_count(), 0, "the interrupt waits for notify_rx");
+        dev.notify_rx();
+        assert_eq!(irq_count(), 1, "one interrupt for the burst");
+        dev.notify_rx();
+        assert_eq!(irq_count(), 1, "nothing new since");
+
+        rearm();
+        for _ in 0..RX_NOTIFY_BATCH {
+            dev.inject_rx_gso_batched(&frame, RxHeader::default());
+        }
+        assert_eq!(irq_count(), 2, "a long burst interrupts without notify_rx");
+        dev.notify_rx();
+        assert_eq!(irq_count(), 2);
+
+        // The guest is still processing (no re-arm): no interrupt is owed.
+        dev.inject_rx_gso_batched(&frame, RxHeader::default());
+        dev.notify_rx();
+        assert_eq!(irq_count(), 2, "the guest did not ask");
+
+        rearm();
+        dev.inject_rx(&frame);
+        assert_eq!(irq_count(), 3, "unbatched frames interrupt right away");
     }
 }

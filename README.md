@@ -372,7 +372,10 @@ axes).
   ring, become segments built in place in the TCB's TX ring (TCP checksum left
   partial when the guest negotiated `VIRTIO_NET_F_GUEST_CSUM`), are appended to
   a GSO super-frame of up to 64 KiB built in place (`NEEDS_CSUM`), and are
-  copied once into the guest's RX buffers.
+  copied once into the guest's RX buffers. The worker dequeues up to 16
+  completions per `GetQueuedCompletionStatusEx` and interrupts the guest once
+  for the TCP frames a batch delivered (sooner if 8 are waiting); ARP, ICMP and
+  UDP replies interrupt right away.
 * **`wintun`** — bridges onto a real WinTun L3 adapter (`wintun.dll` loaded at
   runtime via `GetProcAddress`; requires elevation to create the adapter).
 
