@@ -127,6 +127,17 @@ is compiled without an embedded rootfs and can also run shell-only workloads.
 `-RootfsImage mcr.microsoft.com/dotnet/aspnet:TAG` and `-UpdateRootfs` select or
 refresh the pinned image as described in the tinyinit README.
 
+CI builds all three flavors and uploads their executables/PDBs in
+`tinyvmm-windows-x86_64`; main-branch releases publish the same files.
+A cached Ubuntu job builds Linux **7.3**, pinned to
+`c03c1a14507dfaf8b856c2608f9ac216021fc222`, using
+[`kernel/tinyvmm.config`](kernel/tinyvmm.config). Windows then cross-compiles
+tinyinit and packages the kernel; no WSL or nested virtualization is needed.
+The release also includes the corresponding kernel source archive, configuration,
+and build script. Inside its extracted `linux-7.3` directory, run
+`bash tinyvmm/build.sh .` with GCC, make, flex, bison, bc, Perl, libelf-dev,
+libssl-dev and dwarves installed to rebuild the kernel.
+
 Only the selected `.exe` is needed for appliance deployment: the generated
 `.cpio` files are build intermediates, and PDBs are optional diagnostics.
 Kernel and boot archive are siblings in the Windows PE image, not a rebuilt

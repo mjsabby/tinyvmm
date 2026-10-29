@@ -1,6 +1,6 @@
 name: CI
 
-# Build tinyvmm.exe and publish a GitHub Release on every push to main.
+# Build all three deployment flavors and publish releases on pushes to main.
 on:
   push:
     branches: [main]
@@ -11,8 +11,59 @@ permissions:
   contents: write
 
 jobs:
+  kernel:
+    name: Build appliance kernel (linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache kernel and corresponding source
+        id: kernel-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            out/kernel/vmlinux.tinyvmm
+            out/kernel/linux-7.3-tinyvmm-source.tar.gz
+          key: linux-7.3-${{ runner.arch }}-${{ hashFiles('kernel/**', '.github/workflows/ci.yml') }}
+
+      - name: Checkout Linux 7.3
+        if: steps.kernel-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: torvalds/linux
+          ref: c03c1a14507dfaf8b856c2608f9ac216021fc222
+          path: out/linux
+          persist-credentials: false
+
+      - name: Install kernel build dependencies
+        if: steps.kernel-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison bc libelf-dev libssl-dev dwarves
+
+      - name: Build PVH kernel and package corresponding source
+        if: steps.kernel-cache.outputs.cache-hit != 'true'
+        run: |
+          bash kernel/build.sh out/linux out/kernel
+          git -C out/linux archive --format=tar --prefix=linux-7.3/ HEAD > out/kernel/linux-7.3-tinyvmm-source.tar
+          mkdir -p out/kernel/source-overlay/linux-7.3/tinyvmm
+          cp kernel/build.sh kernel/tinyvmm.config out/kernel/source-overlay/linux-7.3/tinyvmm/
+          tar --append --file=out/kernel/linux-7.3-tinyvmm-source.tar -C out/kernel/source-overlay linux-7.3/tinyvmm
+          gzip -n out/kernel/linux-7.3-tinyvmm-source.tar
+
+      - name: Upload kernel and corresponding source
+        uses: actions/upload-artifact@v4
+        with:
+          name: tinyvmm-kernel
+          path: |
+            out/kernel/vmlinux.tinyvmm
+            out/kernel/linux-7.3-tinyvmm-source.tar.gz
+          if-no-files-found: error
+
   build:
     name: Build & release (windows)
+    needs: kernel
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -26,11 +77,33 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup component add rustfmt
+          rustup target add x86_64-unknown-linux-musl
           rustc --version
           cargo --version
 
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install Linux cross-build tools
+        shell: pwsh
+        run: |
+          python -m pip install cargo-zigbuild==0.24.0 ziglang==0.17.0
+          if ($LASTEXITCODE -ne 0) { throw 'Cross-build tool installation failed.' }
+          $zig = python -c "from pathlib import Path; import ziglang; print(Path(ziglang.__file__).parent / 'zig.exe')"
+          if ($LASTEXITCODE -ne 0) { throw 'Zig lookup failed.' }
+          "CARGO_ZIGBUILD_ZIG_PATH=$zig" >> $env:GITHUB_ENV
+          & $zig version
+          if ($LASTEXITCODE -ne 0) { throw 'Zig execution failed.' }
+
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        shell: pwsh
+        run: |
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'Workspace formatting failed.' }
+          cargo fmt --manifest-path tinyinit\Cargo.toml -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'tinyinit formatting failed.' }
 
       - name: Cache cargo registry and git deps
         uses: actions/cache@v4
@@ -42,19 +115,37 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Build tinyvmm.exe (release)
-        run: cargo build --release
-
       - name: Run tests
-        run: cargo test --workspace --release
+        shell: pwsh
+        run: |
+          cargo test --workspace --release
+          if ($LASTEXITCODE -ne 0) { throw 'Workspace tests failed.' }
+          python -m unittest discover -s tinyinit\tests -p test_rootfs.py
+          if ($LASTEXITCODE -ne 0) { throw 'Rootfs tests failed.' }
+
+      - name: Download appliance kernel
+        uses: actions/download-artifact@v4
+        with:
+          name: tinyvmm-kernel
+          path: out/kernel
+
+      - name: Cache verified rootfs downloads
+        uses: actions/cache@v4
+        with:
+          path: tinyinit/out/rootfs-cache
+          key: ${{ runner.os }}-rootfs-${{ hashFiles('tinyinit/rootfs.lock.json', 'tinyinit/fetch-rootfs.py') }}
+
+      - name: Build all deployment flavors (release)
+        shell: pwsh
+        run: .\build-appliance.ps1 -Flavor all -Kernel .\out\kernel\vmlinux.tinyvmm
 
       - name: Upload tinyvmm artifacts
         uses: actions/upload-artifact@v4
         with:
           name: tinyvmm-windows-x86_64
           path: |
-            target/release/tinyvmm.exe
-            target/release/tinyvmm.pdb
+            out/deploy/*.exe
+            out/deploy/*.pdb
           if-no-files-found: error
 
       # Publish a GitHub Release using the gh CLI (preinstalled on runners)
@@ -72,10 +163,25 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $false
           $tag = "build-$env:GITHUB_RUN_NUMBER"
           $title = "tinyvmm build $env:GITHUB_RUN_NUMBER"
-          $notes = "Automated build from commit $env:GITHUB_SHA on $env:GITHUB_REF_NAME."
+          $notes = @"
+          Automated build from commit $env:GITHUB_SHA on $env:GITHUB_REF_NAME.
+
+          tinyvmm.exe: plain VMM with external boot assets.
+          tinyvmm-init.exe: embedded Linux 7.3 kernel and minimal tinyinit; optional external rootfs.
+          tinyvmm-dotnet.exe: embedded kernel, tinyinit, and the pinned ASP.NET rootfs.
+
+          linux-7.3-tinyvmm-source.tar.gz contains the corresponding Linux source and
+          tinyvmm/build.sh + tinyvmm/tinyvmm.config. Extract it, enter linux-7.3,
+          then run: bash tinyvmm/build.sh .
+          Build prerequisites: gcc, make, flex, bison, bc, perl, libelf-dev, libssl-dev, dwarves.
+          "@
+          $assets = @(Get-ChildItem -Path .\out\deploy\*.exe, .\out\deploy\*.pdb -File |
+            ForEach-Object { $_.FullName })
+          $assets += (Resolve-Path .\out\kernel\linux-7.3-tinyvmm-source.tar.gz).ProviderPath
           # Make re-runs idempotent: drop any existing release+tag with this name.
           gh release delete $tag --yes --cleanup-tag 2>$null
-          gh release create $tag "target/release/tinyvmm.exe" "target/release/tinyvmm.pdb" `
+          gh release create $tag @assets `
             --title $title `
             --notes $notes `
             --target $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw 'Release creation failed.' }
