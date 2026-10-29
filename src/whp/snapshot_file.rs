@@ -753,7 +753,7 @@ impl SnapshotReader {
                 meta.resize(span.bitmap_at + bitmap_len as usize, 0);
                 read_exact_at(&file, &mut meta[span.bitmap_at..], pos + 16).map_err(io)?;
                 let chunks = span.chunks();
-                if chunks % 8 != 0 && meta[meta.len() - 1] >> (chunks % 8) != 0 {
+                if !chunks.is_multiple_of(8) && meta[meta.len() - 1] >> (chunks % 8) != 0 {
                     return Err(bad("bitmap marks chunks past the image"));
                 }
                 span.len = (0..chunks)
