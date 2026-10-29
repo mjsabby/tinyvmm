@@ -626,7 +626,9 @@ done. Build them in this order:
   sharded over `--nat-workers` threads (default a quarter of the host's logical
   CPUs, 1–4; `nat.rs:157`), each with its own IOCP and the flows it owns. A TCP
   flow's SYN assigns it to the least-loaded worker; UDP goes by 4-tuple hash;
-  ARP, ICMP and IP fragments go to the first worker (`nat.rs:190`, `:228`).
+  ARP, ICMP and IP fragments go to the first worker (`nat.rs:190`, `:228`). The
+  guest's SYN is answered only once the host connect succeeds, and every way a
+  flow ends reaches the guest as the far end would end it (gotcha 20).
 - **virtio-9p** (`src/virtio/p9.rs`, id 9) — a 9P2000.L file share with a worker
   pool. Note the **path-security** layer: every component is validated
   (reject `..`, control chars, Win32 metacharacters, reserved DOS names), `..` is
@@ -890,10 +892,17 @@ real debugging time in this project.
     a connection first, the guest-facing TCB is the active closer, and a TCP
     stack keeps it for 60 s. With a fixed flow table (256 here), the guest's
     `connect()`s were refused after 256 such connections in a minute. Over the
-    virtual link nothing is reordered, so TIME_WAIT only has to outlast a FIN
-    retransmit. Release the flow after a short hold, recycle the oldest
-    TIME_WAIT flow when the table is full, and let a new SYN on the same
-    4-tuple replace it. (§M6)
+    virtual link nothing is reordered, so release the flow as soon as only
+    TIME_WAIT is left, and answer anything the guest sends it afterwards (a
+    retransmitted FIN) with a RST. (§M6)
+20. **A terminating NAT must end connections the way the far end would.** It
+    owns a TCP stack on each side, so nothing forces the two to agree. Answer
+    the guest's SYN only after the host connect succeeds, or every `connect()`
+    succeeds, even to closed ports, and fails later with a reset. Turn a host
+    reset into a guest reset, not a FIN, which would make a cut-off stream look
+    complete. And when the NAT gives up on a flow (a watchdog, a failed host
+    send), send the guest a RST: a flow dropped silently leaves the guest
+    retransmitting into nothing until its own timeout, minutes later. (§M6)
 
 ---
 

@@ -213,6 +213,7 @@ repo root) and need WHP — bare metal or nested Hyper-V:
 | `python tools\irq_test.py` | interrupt delivery at 1 and 2 vCPUs: COM1 IRQs reach the guest as ExtINT (also waking an idle BSP), MSIs keep flowing afterwards, the LAPIC timer is calibrated to WHP's interrupt clock, and `sleep 2` takes 2 s of host time |
 | `python tools\irq_bench.py --tinyvmm base=<exe> --tinyvmm new=<exe>` | A/B interrupt-path latency: timer wake-up, virtio-blk QD1 round trip, cross-CPU wake-up, idle host CPU, VM exits |
 | `python tools\net_compare.py` | NAT networking vs OpenVMM |
+| `python tools\nat_test.py` | NAT connection semantics: refused connects, host resets, host-closed churn |
 
 ### Large pages
 
@@ -510,12 +511,23 @@ axes).
   copied once into the guest's RX buffers. Each worker dequeues up to 16
   completions per `GetQueuedCompletionStatusEx` and interrupts the guest once
   for the TCP frames a batch delivered (sooner if 8 are waiting); ARP, ICMP and
-  UDP replies interrupt right away. The NAT holds up to 256 TCP flows. When the
-  host side closes first (HTTP/1.0, `Connection: close`), the guest-facing TCB
-  ends in TIME_WAIT. Such a flow keeps its slot for 2 s instead of
-  `tcp-sans-io`'s 60 s, gives it up at once when the table is full, and is
-  replaced when a new SYN arrives on its 4-tuple. Holding the slot for 60 s
-  refused every guest `connect()` after 256 such connections in a minute.
+  UDP replies interrupt right away. The NAT holds up to 256 TCP flows and
+  ends connections the way a real network would:
+  * The guest's SYN is answered only once the host connect succeeds. A refused
+    or unreachable destination, or one that doesn't answer within 10 s, fails
+    the guest's `connect()` with ECONNREFUSED.
+  * A host-side reset reaches the guest as a reset, not a clean EOF that would
+    make a cut-off stream look complete.
+  * A flow the NAT gives up on is reset toward the guest. That happens when it
+    is idle for 2 h 4 min, or half-closed and idle for 4 min (RFC 5382's
+    minimums), or when a host send fails.
+  * Guest segments for a connection the NAT no longer has draw a RST.
+  * A flow whose guest-facing TCB has only TIME_WAIT left (the host closed
+    first: HTTP/1.0, `Connection: close`) is released at once instead of after
+    `tcp-sans-io`'s 60 s. Holding it refused every guest `connect()` after 256
+    such connections in a minute.
+
+  `tools\nat_test.py` checks the first two and the TIME_WAIT case.
 * **`wintun`** — bridges onto a real WinTun L3 adapter (`wintun.dll` loaded at
   runtime via `GetProcAddress`; requires elevation to create the adapter).
 
