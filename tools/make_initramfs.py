@@ -1621,12 +1621,10 @@ if grep -q 'tinyvmm.test=blk' /proc/cmdline 2>/dev/null; then
 
     # ---- Phase C: Concurrent queue-depth stress ----
     # 8 parallel dd writers, each writes 4 MiB at a distinct offset with
-    # conv=fsync. All 8 fsyncs land roughly together, so the host
-    # backend should see multiple in-flight FLUSH ops -- and the
-    # writeback ops behind them may also be concurrent. The host
-    # backend's max-outstanding-requests counter is logged at shutdown
-    # so the host harness can assert `max_inflight > 1` actually
-    # happened.
+    # conv=fsync. All 8 fsyncs land roughly together, so the device
+    # should see several requests outstanding at once. Its deepest queue
+    # is logged at shutdown so the host harness can assert
+    # `max_depth > 1` actually happened.
     log "+ phase C: concurrent writers (queue depth)"
     NPAR=8
     SLICE_MB=4

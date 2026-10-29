@@ -612,6 +612,10 @@ done. Build them in this order:
   `FILE_FLAG_OVERLAPPED`, bound to a per-disk **IOCP** with a worker thread, and
   overlaps `ReadFile`/`WriteFile` **directly into/out of guest RAM**. On
   completion the worker pushes the used element and raises the MSI-X vector.
+  Windows completes overlapped reads through a system worker and the IOCP even
+  on a page-cache hit, so a lone request (queue depth 1) is instead done
+  synchronously on the pump through a second, non-overlapped handle
+  (`BlockFile::submit_sync`).
 - **virtio-net** (`src/virtio/net.rs`, id 1) + a backend
   (`NetBackend`: loopback / user-mode NAT / wintun). The device negotiates
   checksum offload and TCPv4 segmentation offload (TSO4) in both directions plus
@@ -634,7 +638,11 @@ done. Build them in this order:
   `Tsetattr`, `Tlcreate` and `Tmkdir` write them (`NtSetEaFile`) and `Rgetattr`
   reads them back through `NtQueryInformationFile(FileStatLxInformation)`, NTFS's
   own decoder of those attributes (`crates/winsys/src/fs.rs`). Each fid
-  remembers its attacher's `n_uname`, the owner of what it creates.
+  remembers its attacher's `n_uname`, the owner of what it creates. Give files a
+  **non-zero `qid.version`** (here, as in QEMU, derived from the last write time
+  and size): Linux treats version 0 as a synthetic file and bypasses its page
+  cache for it whatever the mount's `cache=` mode, which turns a big read into
+  one Tread per guest page.
 
 **The doorbell fast path** (`crates/whpsys/src/doorbell.rs`,
 `transport.rs:383`). A queue kick is a guest write to the notify register, which
@@ -648,7 +656,12 @@ rng/input/gpu (low-rate, serviced inline) and snd (its WASAPI threads pace the
 I/O). The pump waits `INFINITE` with no periodic sweep — the virtqueue's fenced
 re-check of `avail.idx` (M5) closes the EVENT_IDX race, and any non-matching
 write still falls through to the MMIO handler as a backstop
-(`transport.rs:143`).
+(`transport.rs:143`). A doorbell's trip to the pump costs tens of microseconds
+(hypervisor signal, host DPC, thread wake-up), so after serving blk or 9p work
+the pump **busy-polls** the ring for an adaptive window (`PollWindow`, after
+KVM's halt polling: it grows while requests keep arriving back to back and
+decays to zero when they don't), and runs a lone request itself instead of
+handing it to a worker.
 
 > **The performance philosophy** in one line: *optimize the number of VM exits,
 > not the handler code.* The VMM's own code is at noise level under profiling; the
@@ -855,6 +868,23 @@ real debugging time in this project.
     first touch of a 4 KiB page faults into the root partition (~40 µs), which
     made guest page-zeroing ~25× slower. Pre-populate with
     `WHvAdviseGpaRange(Populate)` in the background. (§M0)
+16. **A 9p `qid.version` of 0 disables the guest's page cache.** Linux treats it
+    as a synthetic file and goes uncached whatever `cache=` says, and its
+    uncached virtio path pins one page per Tread: a 512 MiB read became 131 072
+    round trips (85 MB/s) instead of ~1 000 (1.7 GB/s). Derive the version from
+    the file's write time and size. (§M6)
+17. **Overlapped file I/O on Windows rarely completes inline.** Even a page-cache
+    hit on an overlapped handle goes through a system worker thread and the
+    IOCP, so `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` alone doesn't shorten the
+    path. For latency-bound (QD1) requests, a synchronous handle on the pump
+    thread is two hand-offs shorter. And don't add
+    `FILE_SKIP_SET_EVENT_ON_HANDLE` to a handle that also sees
+    `DeviceIoControl` without an `OVERLAPPED`: kernel32 waits on the handle
+    itself for one that pends, and that wait never ends. (§M6)
+18. **The doorbell wake is the latency floor of a QD1 request.** Hypervisor
+    signal, host DPC, and readying the pump (often on a core in a deep C-state)
+    take tens of microseconds; busy-poll the ring for a bounded, adaptive window
+    after each request. (§M6)
 
 ---
 

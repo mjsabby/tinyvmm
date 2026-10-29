@@ -271,6 +271,7 @@ Parsed in `parse_pvh_args` (`main.rs:590`). Defaults and clamps are exact.
 | `--input` | off | Add **two** virtio-input devices — a keyboard and an absolute tablet (pointer + scroll + buttons). With `--gpu`, the host source is the GPU window (1:1 pixel coordinates); otherwise it falls back to the interactive console. Needs a guest kernel with `CONFIG_VIRTIO_INPUT`. |
 | `--sound` | off | Add a virtio-snd sound card — one playback + one capture PCM stream (48 kHz / S16_LE / stereo) backed by Windows **WASAPI** (shared mode). Needs a guest kernel with `CONFIG_SND_VIRTIO`. On a host with no audio endpoint the card still appears but plays/records silence. |
 | `--cpu-affinity all\|p\|e\|p-physical` | `all` | Pin every vCPU thread to a CPU-set class (P/E cores via `EfficiencyClass`). |
+| `--poll-us <N>` | `50` | Ceiling, in µs, of the doorbell pumps' adaptive busy-poll (see [Doorbells](#doorbells--the-notify-without-a-vm-exit-path)); `0` disables it. **0–10000.** |
 | `--save <path>` | — | Arm snapshot-on-trigger: when the guest issues `CPUID(0x4000DE57)`, quiesce the machine, write `<path>`, and exit. |
 | `--unsafe-save-mutable-drive` | off | Allow `--save` with a *writable* `--drive` attached (otherwise refused — the disk is not part of the snapshot, so a mutated disk would diverge from restored RAM). |
 | `--watchdog-secs <N>` | `0` | `0` = run until stopped; else stop after N seconds, printing `io/cpuid/msr` exit counters each second. |
@@ -292,7 +293,7 @@ and accepts a small set of overrides:
 |------|-----------|
 | `--drive <path>[,ro\|rw]` | Re-attach disks (blk content is not in the snapshot, so the operator supplies the backing files in the same order). |
 | `--unsafe-restore-mutable-drive` | Permit re-attaching a writable disk whose size differs from save time. |
-| `--cpu-affinity …` / `--watchdog-secs N` | Same as `--pvh-run`. |
+| `--cpu-affinity …` / `--watchdog-secs N` / `--poll-us N` | Same as `--pvh-run`. |
 
 ### Examples
 
@@ -388,7 +389,13 @@ order they are created — that order is fixed (it is also the snapshot
 * **virtio-blk** — async backend: one Win32 file opened `FILE_FLAG_OVERLAPPED`,
   bound to a per-disk IOCP with one worker thread. READ / WRITE / FLUSH plus a RO
   feature bit and DISCARD / WRITE_ZEROES (via `FSCTL_SET_ZERO_DATA` on a sparse
-  NTFS file).
+  NTFS file). Windows completes overlapped reads asynchronously through a system
+  worker and the IOCP even when the host page cache holds the data, so a
+  request the guest is waiting on alone (nothing else queued or in flight) is
+  instead read or written synchronously on the doorbell pump through a second,
+  non-overlapped handle: two thread hand-offs fewer per QD1 round trip.
+  Concurrent requests stay asynchronous, so a host cache miss never stalls the
+  others.
 * **virtio-input** — `--input` adds two devices (`src/virtio/input.rs`): a
   **keyboard** and an **absolute tablet** (pointer motion, buttons, scroll
   wheel). Two queues each (`eventq=0`, `statusq=1`); the host injects events with
@@ -399,7 +406,16 @@ order they are created — that order is fixed (it is also the snapshot
   workers), backed by Win32 file APIs through `winsys::fs`. Every entry reports
   the share's `uid=`/`gid=` owner (default root) and a synthesized mode, or, on a
   `metadata` share, the per-file owner and mode WSL keeps in NTFS extended
-  attributes.
+  attributes. A request the guest is waiting on alone runs on the doorbell pump
+  itself; Tread/Twrite payloads move between the host file and the guest's
+  buffers directly, or through a reused bounce buffer when the buffers are
+  scattered pages. Files report a non-zero `qid.version` derived from the last
+  write time and size (as QEMU does), so the guest's cache modes work: Linux
+  treats version 0 as a synthetic file and bypasses its page cache for it. For
+  big sequential reads mount with `cache=readahead` (coherent at open) or
+  `cache=loose`: the default `cache=none` path in Linux 7.3 pins one page per
+  Tread, so every 4 KiB is a round trip, while the cached modes read up to
+  `msize` per Tread.
 * **virtio-gpu** — basic 2D scanout (`src/virtio/gpu.rs`). Two queues
   (`controlq=0`, `cursorq=1`); single scanout (`NUM_SCANOUTS=1`); 32-bpp
   resources. It handles `GET_DISPLAY_INFO`, `RESOURCE_CREATE_2D` / `UNREF`,
@@ -513,6 +529,17 @@ its store and the load that pairs with the driver's barrier (publish
 `avail_event`, fence, re-read `avail.idx` before treating the ring as empty;
 publish `used.idx`, fence, read `used_event` before deciding to interrupt), and
 any non-matching write still falls through to the MMIO handler as a backstop.
+
+The doorbell's trip to the pump — hypervisor signal, a DPC in the host,
+readying the pump, often on a sleeping core — costs tens of microseconds, about
+as much as serving a cached 4 KiB request. blk and 9p therefore let their pump
+**busy-poll** the ring after each piece of work (`PollWindow` in
+`transport.rs`, modelled on KVM's halt polling): when the guest's next request
+arrives within the window the pump takes it straight from guest memory. The
+window grows while the gap between requests stays under the `--poll-us`
+ceiling (default 50 µs) and decays to zero otherwise, so an idle or lightly
+used device never spins. Polling trades host CPU for latency only while
+requests come back to back: a QD1 4 KiB read loop costs about half a core more.
 
 ---
 
@@ -747,10 +774,12 @@ completion" discipline to TCP.
 
 The tax the safety model adds versus a C VMM that derefs guest pointers directly:
 
-* **Per queue kick (doorbell path):** an OS-event wake on the pump thread +
-  `ResetEvent` + **one `Mutex<Virtqueue>` lock/unlock** per drain (uncontested in
-  steady state, ~10–20 ns). The win dwarfs it: a kick costs **0 VM exits** instead
-  of one (microseconds of hypervisor round-trip).
+* **Per queue kick (doorbell path):** an OS-event wake on the pump thread (the
+  events are auto-reset, so no `ResetEvent`) + **one `Mutex<Virtqueue>`
+  lock/unlock** per drain (uncontested in steady state, ~10–20 ns). The win
+  dwarfs it: a kick costs **0 VM exits** instead of one (microseconds of
+  hypervisor round-trip). Back-to-back blk/9p requests skip even the wake: the
+  pump busy-polls the ring between them (see [Doorbells](#doorbells--the-notify-without-a-vm-exit-path)).
 * **Per descriptor decode (control-plane only):** a bounds check (2–3 branches in
   `host_range`) + a **16-byte** `copy_nonoverlapping` of the *descriptor itself*
   into a stack `[u8; 16]` — a const-generic local returned by value, **no heap
@@ -792,8 +821,10 @@ NIC/display protocol, not to the guest-memory-access layer.
 | Workload | Result |
 |----------|--------|
 | virtio-blk single-stream read | ~533 MB/s (guest pipelines ~14 requests in flight) |
-| virtio-9p single-stream read | ~16 MB/s (request-response latency-bound) |
-| virtio-9p concurrent (32 readers) | ~190 MB/s (ceiling = one submit pump + the per-queue `Mutex<Virtqueue>`) |
+| virtio-blk QD1 4 KiB read (`tools\irq_bench.py`, sparse scratch disk) | ~30 µs per request (was ~67–88 µs before the synchronous lone-request path and pump polling) |
+| virtio-9p single-stream read, `cache=loose` / `cache=readahead` (`tools\p9_bench.py`, 512 MiB file) | ~1.7 / ~1.6 GB/s (~500 KB per Tread) |
+| virtio-9p single-stream read, `cache=none` | ~165 MB/s (4 KiB per Tread, latency-bound; was ~85 MB/s) |
+| virtio-9p 4 concurrent readers, `cache=none` / `cache=loose` | ~620 MB/s / ~3 GB/s |
 | virtio-net guest→host | 20 MB transfer at line rate with the pump's periodic sweep disabled |
 | NAT TCP host→guest (`tools\net_compare.py`, server on the same host, 1 vCPU) | ~14 Gbit/s one stream; across 16 streams ~11.7 Gbit/s with one NAT worker, ~23.5 with two, ~29 with three and ~33 with four (the guest's vCPU saturates) |
 | NAT TCP guest→host (same setup) | ~9 Gbit/s one stream |
@@ -1146,6 +1177,31 @@ which thread a workload saturates without a profiler:
 ```text
 tinyvmm par: busiest threads (% of one CPU): nat-worker 95, main 65, (host server) 16, virtio-pci-net[0]-doorbell 12
 ```
+
+### Storage counters
+
+Each virtio-blk disk reports its backend's ops and the device's queue depth:
+
+```text
+[pvh-run] virtio-blk[0] stats: submitted=2637 completed=2637 errors=0 max_inflight=4
+  max_depth=39 (virtio in=2307 out=255 flush=75 discard=0 wz=0 err=0)
+```
+
+`max_depth` is the most requests the guest had outstanding at once (in flight
+at the device plus still waiting in the ring); `max_inflight` counts only the
+ops the host completed asynchronously, so it stays low when requests are served
+synchronously.
+
+Each 9p share reports its request mix:
+
+```text
+[9p] share0 requests=1103 rlerrors=0 msize=512000 reads=1058 read_bytes=536870912
+  (avg 507439) writes=0 write_bytes=0 (avg 0) msix=1103
+```
+
+The average Tread size shows how the guest sized its reads: about one page
+means it bypassed its page cache (`cache=none`, or a file reported with
+`qid.version` 0); about `msize` means readahead is batching them.
 
 ---
 

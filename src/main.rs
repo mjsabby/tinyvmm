@@ -161,7 +161,7 @@ fn print_usage() {
          \x20 tinyvmm --pci-selftest        host-side PCI host-bridge + BAR + sizing test\n\
          \x20 tinyvmm --pvh-info <vmlinux>\n\
          \x20 tinyvmm --pvh-run [--initrd <cpio>] [--ram-mb N] [--vcpus N] [--rng] [--input] [--sound]\n\
-         \x20              [--large-pages|--no-large-pages]\n\
+         \x20              [--large-pages|--no-large-pages] [--poll-us N]\n\
          \x20              [--net [--net-backend loopback|nat] [--portfwd H:G]... [--nat-workers N]]...\n\
          \x20              (repeat --net per NIC)\n\
          \x20              [--drive <path>[,readonly]]... [--cpu-affinity all|p|e|p-physical]\n\
@@ -171,7 +171,7 @@ fn print_usage() {
          \x20              [--watchdog-secs N] [--debug-boot] [vmlinux] [-- <cmdline>]\n\
          \x20              Kernel path is required in plain builds; appliance builds embed defaults.\n\
          \x20 tinyvmm --restore <path> [--drive <path>[,ro|rw]]... [--cpu-affinity all|p|e|p-physical]\n\
-         \x20              [--watchdog-secs N] [--unsafe-restore-mutable-drive]\n\
+         \x20              [--watchdog-secs N] [--unsafe-restore-mutable-drive] [--poll-us N]\n\
          \x20 tinyvmm --dda-probe <PnpInstanceId>   probe a host PCI device for Discrete Device\n\
          \x20              Assignment (no VM boot): dump IDs/BARs/MSI-X, test direct MMIO mapping.\n\
          \x20              Get the id from Device Manager (Details -> Device instance path) or\n\
@@ -567,7 +567,7 @@ fn pci_cfg_write(io: &IoBus, dev: u8, off: u32, size: u16, value: u32) {
 ///   1. 24 concurrent 3-segment WRITEs (72 segment I/Os) submitted before a
 ///      single notify, then 24 concurrent READs that verify every byte —
 ///      exercises the parallel submit_request/submit_seg/on_seg_complete path at
-///      depth and asserts the backend reached `max_inflight > 1`.
+///      depth and asserts the device reached `max_depth > 1`.
 ///   2. A read whose segment is past EOF -> BLK_S_IOERR (the bounds-fail path).
 ///   3. A batch submitted then immediately `reset()` (racing in-flight I/O),
 ///      then a fresh queue must recover — covers reset-while-in-flight.
@@ -719,8 +719,8 @@ fn run_blk_stresstest() -> Result<i32> {
         wstat.iter().all(|&s| getb(s) == 0),
         "a concurrent write returned non-OK",
     );
-    let maxq = backend.max_inflight();
-    fail(maxq > 1, &format!("max_inflight={maxq}, expected >1"));
+    let maxq = dev.max_depth();
+    fail(maxq > 1, &format!("max_depth={maxq}, expected >1"));
     fail(dev.ops_err() == 0, "ops_err != 0 after writes");
 
     // ---- Phase 2: read everything back and verify ----
@@ -829,7 +829,7 @@ fn run_blk_stresstest() -> Result<i32> {
     if ok {
         println!(
             "[blk-stress] PASS: {N}x{SEGS}-seg concurrent writes+reads verified, \
-             max_inflight={maxq} (>1), out-of-range->IOERR, reset-in-flight recovered \
+             max_depth={maxq} (>1), out-of-range->IOERR, reset-in-flight recovered \
              (ops_err={final_err})"
         );
         Ok(0)
@@ -964,6 +964,13 @@ fn parse_wxh(s: &str) -> Option<(u32, u32)> {
         return None;
     }
     Some((w, h))
+}
+
+/// `--poll-us N`: ceiling of the doorbell pumps' adaptive busy-poll, 0 = off.
+fn parse_poll_us(v: Option<&String>) -> Result<u64> {
+    v.and_then(|s| s.parse::<u64>().ok())
+        .filter(|&us| us <= 10_000)
+        .ok_or_else(|| Error::msg("--poll-us wants microseconds in 0..=10000 (0 disables)"))
 }
 
 fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
@@ -1118,6 +1125,10 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
             "--input" => with_input = true,
             "--large-pages" => large_pages = true,
             "--no-large-pages" => large_pages = false,
+            "--poll-us" => {
+                i += 1;
+                virtio::transport::set_poll_max_us(parse_poll_us(args.get(i))?);
+            }
             "--sound" => with_sound = true,
             "--cpu-affinity" => {
                 i += 1;
@@ -1802,6 +1813,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     // The guest mounts via:
     //   mount -t 9p -o trans=virtio,version=9p2000.L <tag> /mnt/...
     let mut p9_devices: Vec<Arc<P9Device>> = Vec::with_capacity(cfg.p9_shares.len());
+    let mut p9_transports: Vec<Arc<PciTransport>> = Vec::with_capacity(cfg.p9_shares.len());
     for (i, s) in cfg.p9_shares.iter().enumerate() {
         let p9 = P9Device::new(ram.clone(), s.tag.clone(), s.host_root.clone(), s.options());
         let p9_dev: Arc<dyn VirtioDevice> = p9.clone();
@@ -1830,6 +1842,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         let pfunc: Arc<dyn PciFunction> = pt.clone();
         let pbdf = pci_bus.add_device(pfunc);
         transports.push(pt.clone());
+        p9_transports.push(pt.clone());
         p9_devices.push(p9.clone());
         println!(
             "[pvh-run] virtio-9p[{}] on PCI 00:{:02x}.0 tag={} host={} owner={}:{}{}{}",
@@ -2113,8 +2126,9 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
 
     // Quiesce every virtio-blk IOCP worker before its BlockDevice owner is
     // dropped, so no completion lands on freed memory. Then print the per-disk
-    // shutdown summary (max_inflight > 1 proves the concurrent-writer phase
-    // reached real queue depth from the backend's view).
+    // shutdown summary (max_depth > 1 proves the concurrent-writer phase
+    // reached real queue depth; max_inflight counts only the ops the host
+    // completed asynchronously, i.e. page-cache misses and flushes).
     for b in &blk_backends {
         b.stop();
     }
@@ -2162,12 +2176,13 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     for (i, (b, d)) in blk_backends.iter().zip(blk_devices.iter()).enumerate() {
         println!(
             "[pvh-run] virtio-blk[{}] stats: submitted={} completed={} errors={} \
-             max_inflight={} (virtio in={} out={} flush={} discard={} wz={} err={})",
+             max_inflight={} max_depth={} (virtio in={} out={} flush={} discard={} wz={} err={})",
             i,
             b.submitted(),
             b.completed(),
             b.errors(),
             b.max_inflight(),
+            d.max_depth(),
             d.ops_in(),
             d.ops_out(),
             d.ops_flush(),
@@ -2224,6 +2239,12 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     // path). TINYVMM_NET_DIAG adds live stall/loss lines during the run.
     for (i, (nd, nt)) in net_devices.iter().zip(&net_transports).enumerate() {
         println!("[net] nic{i} {}", nd.diag_summary(nt.msix_injected_count()));
+    }
+    for (i, (pd, pt)) in p9_devices.iter().zip(&p9_transports).enumerate() {
+        println!(
+            "[9p] share{i} {}",
+            pd.diag_summary(pt.msix_injected_count())
+        );
     }
 
     // TINYVMM_DIAG: per-vCPU exit breakdown + a guest-RAM dump for post-mortem.
@@ -2642,10 +2663,14 @@ fn run_restore(args: &[String]) -> Result<i32> {
                         .ok_or_else(|| Error::msg("--watchdog-secs wants an integer"))?;
                 }
                 "--unsafe-restore-mutable-drive" => unsafe_restore_mutable_drive = true,
+                "--poll-us" => {
+                    i += 1;
+                    virtio::transport::set_poll_max_us(parse_poll_us(args.get(i))?);
+                }
                 other => {
                     return Err(Error::msg(format!(
                         "--restore: unknown flag '{other}' (want --drive, --cpu-affinity, \
-                         --watchdog-secs, --unsafe-restore-mutable-drive)"
+                         --watchdog-secs, --unsafe-restore-mutable-drive, --poll-us)"
                     )));
                 }
             }
