@@ -547,8 +547,10 @@ starts once the encoder is ready:
 * **Video, constant frame rate.** A present hands its frame to the recorder by
   swapping buffers with a single latest-frame slot (no copy), so the vCPU never
   waits on the encoder. At each tick (`k / fps`) the encoder swaps out the newest
-  frame, converts it to NV12 (BT.709 limited range, 2×2 chroma averaging, in
-  safe Rust) and encodes it at that timestamp, or, if the guest hasn't flushed
+  frame, converts it to NV12 (BT.709 limited range, 2×2 chroma averaging; AVX2,
+  ~3 ms for a 4K frame, with a bit-identical scalar fallback; Media
+  Foundation's own converters default to BT.601 and cost ~4× the CPU) and
+  encodes it at that timestamp, or, if the guest hasn't flushed
   since (a static desktop), queues the previous picture again (its buffer is
   resubmitted, not copied). Frames presented between two ticks are dropped.
   Every tick is one sample exactly one frame period long: some hardware encoders
