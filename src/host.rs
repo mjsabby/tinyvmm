@@ -9,6 +9,10 @@ pub mod audio {
     pub use winsys::audio::*;
 }
 
+pub mod media {
+    pub use winsys::media::*;
+}
+
 pub mod block_file {
     pub use winsys::host::block_file::*;
 }

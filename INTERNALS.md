@@ -120,7 +120,8 @@ safely:
   instruction-completion callbacks), `msi`, `doorbell`, `regs`, `vpci` (the
   undocumented passthrough APIs).
 - **`crates/winsys/`** — every *other* Win32 call: async disk IOCP, mmap loader,
-  Winsock, CNG random, ETW, 9p file ops, WASAPI audio, the wintun loader.
+  Winsock, CNG random, ETW, 9p file ops, WASAPI audio, Media Foundation encoding,
+  the wintun loader.
 
 The binary (`src/`) keeps thin facades that re-export from these. Most `unsafe`
 lives in the two crates; the rest sits in a short list of audited hot-path files
@@ -701,6 +702,17 @@ These are optional and don't change the core, but each teaches one more piece:
   axes).
 - **virtio-snd** (`src/virtio/snd.rs`, id 25) — a PCM sound card over WASAPI
   shared mode; two worker threads pace render/capture off the buffer-ready event.
+  Playback switches to a QPC-paced 10 ms timer (exactly 48 000 frames/s) when
+  there is no endpoint or a recorder taps the stream.
+- **Recording** (`src/record.rs`, `--record`) — tees the GPU present hook and the
+  snd playback tap into an encoder thread that writes H.264 + AAC to a fragmented
+  MP4 via a Media Foundation sink writer (`crates/winsys/src/media.rs`). Video is
+  constant frame rate (the latest frame each tick, one nominal-length sample per
+  tick: hardware encoders may rewrite durations); audio chunks carry exact
+  48 kHz positions, so the two tracks share one timeline. A late encoder catches
+  up by repeating the previous picture; a stall over 2 s is cut from both tracks.
+  Keep the streams interleaved: the sink writer stalls a stream that runs far
+  ahead, so audio is committed only up to the video written so far.
 - **Save / restore** (`src/whp/snapshot*.rs`, README §13). A self-describing file
   (`"TVMMSAVE"` header + JSON machine description + typed sections + CRC32) holding
   per-vCPU register/XSAVE/APIC state, the HV MSR cache, the legacy devices, every
@@ -1001,7 +1013,8 @@ crates/whpsys/   WHP FFI:  partition, memory, vcpu, emulator, msi, doorbell,
                            vpci (passthrough), regs
 crates/winsys/   Win32 FFI: host (privilege/large-page/CNG rng), host/block_file
                            (async IOCP disk), host/mapped_file (mmap), sock
-                           (Winsock+IOCP), etw, fs (9p), audio (WASAPI), wintun
+                           (Winsock+IOCP), etw, fs (9p), audio (WASAPI), wintun,
+                           media (Media Foundation MP4 writer)
 src/whp/         run_loop, cpuid (policy), hv (Hyper-V MSRs), snapshot*
 src/boot/        loader (PVH ELF + start_info + e820), acpi (RSDP/XSDT/MADT),
                  bzimage (Linux boot protocol), KernelLoad (picks one)
@@ -1012,6 +1025,7 @@ src/virtio/      device (trait), transport (virtio-pci), queue (virtqueue),
                  console, net, rng, blk, p9, input, gpu, snd
 src/net/         wire (parse/build), nat (user-mode NAT), dhcp, wintun, sys
 src/display.rs   Win32 GDI window for virtio-gpu + host-input seam
+src/record.rs    --record: GPU frames + snd playback -> H.264/AAC MP4
 src/main.rs      CLI dispatch, the full machine wiring, save/restore driver
 ```
 

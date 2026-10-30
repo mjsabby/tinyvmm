@@ -86,7 +86,16 @@ const GPU_SNAP_VERSION_NO_RECT: u8 = 1;
 
 pub type IrqFn = Box<dyn Fn(u32) + Send + Sync>;
 /// Present a BGRA (top-down, `stride == width*4`) frame of `width`x`height`.
-pub type PresentFn = Box<dyn Fn(&[u8], u32, u32) + Send + Sync>;
+/// The callee may keep the frame by swapping another buffer (of any length)
+/// into the `Vec`: the device resizes and fully rewrites it before the next
+/// present.
+pub type PresentFn = Box<dyn Fn(&mut Vec<u8>, u32, u32) + Send + Sync>;
+
+/// The display size a device asked for `width`x`height` advertises (clamped to
+/// what it supports).
+pub fn display_size(width: u32, height: u32) -> (u32, u32) {
+    (width.clamp(64, MAX_DIM), height.clamp(64, MAX_DIM))
+}
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct Resource2d {
@@ -136,7 +145,8 @@ struct GpuState {
     /// the resource: Mesa's llvmpipe pads buffer heights to 64-row tiles, so a
     /// 1600x900 mode scans out of a 1600x960 resource.
     scanout_rect: Rect,
-    /// Reusable BGRA scratch handed to the present callback.
+    /// Reusable BGRA scratch handed to the present callback, which may swap it
+    /// for another buffer.
     present_buf: Vec<u8>,
     /// Reusable gather buffer for the current control request (alloc-free hot
     /// path: cleared + refilled per command, capacity persists across kicks).
@@ -166,8 +176,7 @@ pub struct GpuDevice {
 
 impl GpuDevice {
     pub fn new(mem: Arc<GuestMemory>, width: u32, height: u32) -> Arc<Self> {
-        let width = width.clamp(64, MAX_DIM);
-        let height = height.clamp(64, MAX_DIM);
+        let (width, height) = display_size(width, height);
         Arc::new(GpuDevice {
             controlq: Mutex::new(Virtqueue::new(mem.clone(), GPU_QUEUE_MAX)),
             cursorq: Mutex::new(Virtqueue::new(mem.clone(), GPU_QUEUE_MAX)),
@@ -509,7 +518,7 @@ impl GpuDevice {
         }
         crop_to_bgra(res, rect, &mut st.present_buf);
         if let Some(p) = self.present.get() {
-            p(&st.present_buf, w, h);
+            p(&mut st.present_buf, w, h);
         }
         self.frames.fetch_add(1, Ordering::Relaxed);
         if etw::enabled(etw::VERBOSE, etw::kw::VIRTIO) {
@@ -1160,14 +1169,17 @@ mod tests {
 
     type Presented = Arc<Mutex<Option<(Vec<u8>, u32, u32)>>>;
 
-    /// A GPU on host-only memory whose present callback records the last frame.
+    /// A GPU on host-only memory whose present callback takes each frame the
+    /// way the recorder does: it swaps in a junk buffer of the wrong size, which
+    /// the device must fully rewrite before its next present.
     fn gpu_with_capture() -> (Arc<GpuDevice>, Presented) {
         let mem = Arc::new(GuestMemory::new_host_only(4096).expect("host memory"));
         let gpu = GpuDevice::new(mem, 64, 64);
         let last: Presented = Arc::new(Mutex::new(None));
         let sink = last.clone();
         gpu.set_present_callback(Box::new(move |bgra, w, h| {
-            *sink.lock().unwrap() = Some((bgra.to_vec(), w, h));
+            let frame = std::mem::replace(bgra, vec![0xAA; 7]);
+            *sink.lock().unwrap() = Some((frame, w, h));
         }));
         (gpu, last)
     }
@@ -1233,6 +1245,9 @@ mod tests {
         );
         let (frame, w, h) = last.lock().unwrap().take().expect("presented");
         assert_eq!((w, h), (2, 3));
+        // The junk buffer the callback left behind was resized and rewritten.
+        assert_eq!(frame.len(), 2 * 3 * 4);
+        assert!(!frame.contains(&0xAA), "{frame:?}");
         assert_eq!(blues(&frame), [9, 10, 13, 14, 17, 18]);
     }
 

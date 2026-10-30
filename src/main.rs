@@ -19,6 +19,7 @@ mod host;
 mod mem_layout;
 mod net;
 mod pci;
+mod record;
 mod virtio;
 mod whp;
 
@@ -33,10 +34,11 @@ use crate::error::{Error, Result, check_hr};
 use crate::host::block_file::BlockFile;
 use crate::net::nat::{NatBackend, NatOptions, PortForward};
 use crate::pci::{PciBus, PciFunction};
+use crate::record::{RecordSpec, Recorder};
 use crate::virtio::blk::BlockDevice;
 use crate::virtio::console::ConsoleDevice;
 use crate::virtio::device::VirtioDevice;
-use crate::virtio::gpu::GpuDevice;
+use crate::virtio::gpu::{GpuDevice, PresentFn};
 use crate::virtio::input::{InputDevice, InputEvent};
 use crate::virtio::net::{LoopbackBackend, NetDevice};
 use crate::virtio::p9::P9Device;
@@ -169,6 +171,8 @@ fn print_usage() {
          \x20              (default p: P-cores only on a hybrid CPU)\n\
          \x20              [--virtio-9p-share <tag>=<host_path>[,ro][,uid=N][,gid=N][,metadata]]...\n\
          \x20              [--gpu [WxH]]  (virtio-gpu 2D scanout to a window; default 1280x800)\n\
+         \x20              [--record <file.mp4>[,fps=N][,kbps=N]]  (needs --gpu; records the\n\
+         \x20              display + --sound playback to a fragmented H.264/AAC MP4; default 30 fps)\n\
          \x20              [--save <path> [--unsafe-save-mutable-drive]]\n\
          \x20              [--watchdog-secs N] [--debug-boot] [vmlinux] [-- <cmdline>]\n\
          \x20              Kernel path is required in plain builds; appliance builds embed defaults.\n\
@@ -177,6 +181,7 @@ fn print_usage() {
          \x20              Boot a live/install ISO's default GRUB entry; the ISO becomes drive 0.\n\
          \x20 tinyvmm --restore <path> [--drive <path>[,ro|rw]]... [--cpu-affinity p|p-physical|e|all]\n\
          \x20              [--watchdog-secs N] [--unsafe-restore-mutable-drive] [--poll-us N]\n\
+         \x20              [--record <file.mp4>[,fps=N][,kbps=N]]\n\
          \x20 tinyvmm --dda-probe <PnpInstanceId>   probe a host PCI device for Discrete Device\n\
          \x20              Assignment (no VM boot): dump IDs/BARs/MSI-X, test direct MMIO mapping.\n\
          \x20              Get the id from Device Manager (Details -> Device instance path) or\n\
@@ -983,6 +988,8 @@ struct PvhArgs {
     with_input: bool,
     with_sound: bool,
     large_pages: bool,
+    /// `--record`: tee the GPU scanout (+ sound) into an MP4.
+    record: Option<RecordSpec>,
 }
 
 /// Parse a `--portfwd HOSTPORT:GUESTPORT` rule. The host side binds 127.0.0.1
@@ -1048,6 +1055,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
     let mut unsafe_save_mutable_drive = false;
     let mut with_input = false;
     let mut with_sound = false;
+    let mut record: Option<RecordSpec> = None;
     // A failed or fragmented large-page allocation can stall startup for
     // hundreds of milliseconds, so latency-oriented appliance builds opt in.
     let mut large_pages = !boot::payload::BUNDLED;
@@ -1191,6 +1199,13 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
                 virtio::transport::set_poll_max_us(parse_poll_us(args.get(i))?);
             }
             "--sound" => with_sound = true,
+            "--record" => {
+                i += 1;
+                let spec = args
+                    .get(i)
+                    .ok_or_else(|| Error::msg("--record wants <path.mp4>[,fps=N][,kbps=N]"))?;
+                record = Some(RecordSpec::parse(spec)?);
+            }
             "--cpu-affinity" => {
                 i += 1;
                 let m = args
@@ -1336,6 +1351,11 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
     if iso.is_some() && initrd.is_some() {
         return Err(Error::msg("--iso supplies the initrd; drop --initrd"));
     }
+    if record.is_some() && !with_gpu {
+        return Err(Error::msg(
+            "--record captures the virtio-gpu display: add --gpu (and --sound for audio)",
+        ));
+    }
 
     // Everything after a bare "--" is the kernel cmdline. With --iso it is
     // appended to the default cmdline and the ISO's own arguments instead.
@@ -1414,6 +1434,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
         with_input,
         with_sound,
         large_pages,
+        record,
     })
 }
 
@@ -1481,6 +1502,60 @@ fn dump_guest_ram(ram: &GuestMemory, path: &str) {
             n / (1024 * 1024)
         ),
         Err(e) => eprintln!("[pvh-run] WARN: guest RAM dump to {path} failed: {e}"),
+    }
+}
+
+/// Start the `--record` recorder (if requested) for the GPU display size the
+/// device will advertise, with an audio track when the VM has sound.
+fn start_recorder(
+    spec: Option<&RecordSpec>,
+    gpu_width: u32,
+    gpu_height: u32,
+    sound: bool,
+    tag: &str,
+) -> Result<Option<Arc<Recorder>>> {
+    let Some(spec) = spec else {
+        return Ok(None);
+    };
+    let (width, height) = virtio::gpu::display_size(gpu_width, gpu_height);
+    let recorder = Recorder::start(spec, width, height, sound)?;
+    println!("[{tag}] recording {}", recorder.description);
+    Ok(Some(recorder))
+}
+
+/// The GPU present hook: the window and/or the recorder (`None` if neither).
+/// The window copies the frame; the recorder, last, takes the buffer itself.
+fn present_hook(
+    display: Option<Arc<Display>>,
+    recorder: Option<Arc<Recorder>>,
+) -> Option<PresentFn> {
+    if display.is_none() && recorder.is_none() {
+        return None;
+    }
+    Some(Box::new(move |bgra: &mut Vec<u8>, w, h| {
+        if let Some(d) = &display {
+            d.present(bgra, w, h);
+        }
+        if let Some(r) = &recorder {
+            r.video_frame(bgra, w, h);
+        }
+    }))
+}
+
+/// Tee virtio-snd playback into the recorder, if recording.
+fn tap_sound(snd: &SndDevice, recorder: Option<&Arc<Recorder>>) {
+    if let Some(r) = recorder {
+        let r = r.clone();
+        snd.set_playback_tap(Box::new(move |epoch, offset, pcm| {
+            r.audio_pcm(epoch, offset, pcm)
+        }));
+    }
+}
+
+/// Finalize the recording, if any, and report it.
+fn finish_recording(recorder: Option<&Arc<Recorder>>, tag: &str) {
+    if let Some(summary) = recorder.and_then(|r| r.finish()) {
+        println!("[{tag}] recorded {summary}");
     }
 }
 
@@ -1807,6 +1882,16 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         );
     }
 
+    // --- --record: start the encoder before any device can produce output, so
+    // the recording's timeline covers the whole run. ---
+    let recorder = start_recorder(
+        cfg.record.as_ref(),
+        cfg.gpu_width,
+        cfg.gpu_height,
+        cfg.with_sound,
+        "pvh-run",
+    )?;
+
     // --- virtio-snd (optional, --sound): one playback + one capture PCM
     // stream over WASAPI (shared mode). The device manages its own audio worker
     // threads, so no transport doorbells are installed. ---
@@ -1838,10 +1923,16 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         let sfunc: Arc<dyn PciFunction> = st.clone();
         let sbdf = pci_bus.add_device(sfunc);
         transports.push(st.clone());
+        tap_sound(&snd, recorder.as_ref());
         snd.start_audio();
         println!(
-            "[pvh-run] virtio-snd on PCI 00:{:02x}.0 (1 playback + 1 capture, WASAPI)",
-            sbdf.device
+            "[pvh-run] virtio-snd on PCI 00:{:02x}.0 (1 playback + 1 capture, WASAPI{})",
+            sbdf.device,
+            if recorder.is_some() {
+                "; playback recorded"
+            } else {
+                ""
+            }
         );
     }
 
@@ -1988,20 +2079,18 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         let gpu_dev: Arc<dyn VirtioDevice> = gpu.clone();
 
         // Spawn the display window. If it can't be created we still expose the
-        // device (so the guest's GPU probe succeeds); present then no-ops.
-        match Display::new(
+        // device (so the guest's GPU probe succeeds); present then only feeds
+        // the recorder, if any.
+        display = Display::new(
             &format!("tinyvmm - virtio-gpu {}x{}", cfg.gpu_width, cfg.gpu_height),
             cfg.gpu_width,
             cfg.gpu_height,
-        ) {
-            Some(d) => {
-                let dd = d.clone();
-                gpu.set_present_callback(Box::new(move |bgra, w, h| dd.present(bgra, w, h)));
-                display = Some(d);
-            }
-            None => {
-                eprintln!("[pvh-run] WARN: virtio-gpu window creation failed; running headless");
-            }
+        );
+        if display.is_none() {
+            eprintln!("[pvh-run] WARN: virtio-gpu window creation failed; running headless");
+        }
+        if let Some(hook) = present_hook(display.clone(), recorder.clone()) {
+            gpu.set_present_callback(hook);
         }
 
         let gopts = transport::Options {
@@ -2218,6 +2307,8 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
             g.frames()
         );
     }
+    // Finalize the recording now that the guest has stopped producing output.
+    finish_recording(recorder.as_ref(), "pvh-run");
 
     // Quiesce every virtio-blk IOCP worker before its BlockDevice owner is
     // dropped, so no completion lands on freed memory. Then print the per-disk
@@ -2759,6 +2850,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
     let mut affinity_mode = AffinityMode::PCore;
     let mut watchdog_secs = 0u32;
     let mut unsafe_restore_mutable_drive = false;
+    let mut record: Option<RecordSpec> = None;
     {
         let mut i = 3;
         while i < args.len() {
@@ -2793,10 +2885,17 @@ fn run_restore(args: &[String]) -> Result<i32> {
                     i += 1;
                     virtio::transport::set_poll_max_us(parse_poll_us(args.get(i))?);
                 }
+                "--record" => {
+                    i += 1;
+                    let spec = args
+                        .get(i)
+                        .ok_or_else(|| Error::msg("--record wants <path.mp4>[,fps=N][,kbps=N]"))?;
+                    record = Some(RecordSpec::parse(spec)?);
+                }
                 other => {
                     return Err(Error::msg(format!(
                         "--restore: unknown flag '{other}' (want --drive, --cpu-affinity, \
-                         --watchdog-secs, --unsafe-restore-mutable-drive, --poll-us)"
+                         --watchdog-secs, --unsafe-restore-mutable-drive, --poll-us, --record)"
                     )));
                 }
             }
@@ -2843,6 +2942,11 @@ fn run_restore(args: &[String]) -> Result<i32> {
     let gpu_width = jr.get_u64("gpu_width").unwrap_or(1280) as u32;
     let gpu_height = jr.get_u64("gpu_height").unwrap_or(800) as u32;
     let with_input = jr.get_bool("with_input").unwrap_or(false);
+    if record.is_some() && !with_gpu {
+        return Err(Error::msg(
+            "--record captures the virtio-gpu display, but this snapshot has no GPU",
+        ));
+    }
     let drive_count = jr.get_u64("drive_count").unwrap_or(0) as usize;
     let p9_count = jr.get_u64("p9_count").unwrap_or(0) as usize;
     // Reconstruct the per-NIC specs (backend + port-forwards) and MACs from the
@@ -3020,6 +3124,16 @@ fn run_restore(args: &[String]) -> Result<i32> {
         transports.push(rt.clone());
     }
 
+    // --record: start the encoder before any device can produce output (the
+    // GPU re-presents the restored frame as its state is applied).
+    let recorder = start_recorder(
+        record.as_ref(),
+        gpu_width,
+        gpu_height,
+        with_sound,
+        "restore",
+    )?;
+
     if with_sound {
         let snd = SndDevice::new(ram.clone());
         let snd_dev: Arc<dyn VirtioDevice> = snd.clone();
@@ -3047,6 +3161,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
         }));
         pci_bus.add_device(st.clone() as Arc<dyn PciFunction>);
         transports.push(st.clone());
+        tap_sound(&snd, recorder.as_ref());
         snd.start_audio();
     }
 
@@ -3204,19 +3319,16 @@ fn run_restore(args: &[String]) -> Result<i32> {
     if with_gpu {
         let gpu = GpuDevice::new(ram.clone(), gpu_width, gpu_height);
         let gpu_dev: Arc<dyn VirtioDevice> = gpu.clone();
-        match Display::new(
+        display = Display::new(
             &format!("tinyvmm - virtio-gpu {gpu_width}x{gpu_height}"),
             gpu_width,
             gpu_height,
-        ) {
-            Some(d) => {
-                let dd = d.clone();
-                gpu.set_present_callback(Box::new(move |bgra, w, h| dd.present(bgra, w, h)));
-                display = Some(d);
-            }
-            None => {
-                eprintln!("[restore] WARN: virtio-gpu window creation failed; running headless");
-            }
+        );
+        if display.is_none() {
+            eprintln!("[restore] WARN: virtio-gpu window creation failed; running headless");
+        }
+        if let Some(hook) = present_hook(display.clone(), recorder.clone()) {
+            gpu.set_present_callback(hook);
         }
         let gopts = transport::Options {
             vendor_id: 0x1AF4,
@@ -3580,6 +3692,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
             g.frames()
         );
     }
+    finish_recording(recorder.as_ref(), "restore");
 
     println!(
         "[restore] stopped: reason={:?} uart_tx={}",

@@ -303,6 +303,7 @@ Parsed in `parse_pvh_args` (`main.rs:590`). Defaults and clamps are exact.
 | `--gpu [WxH]` | off | Add a virtio-gpu 2D device and open a Win32 window showing its scanout (CPU blit). Optional `WxH` (e.g. `--gpu 1024x768`) sets the preferred size (default **1280×800**). Dropping `nofb nomodeset` from the default cmdline so the guest DRM driver mode-sets. With `--input`, the window is also the host input source. |
 | `--input` | off | Add **two** virtio-input devices — a keyboard and an absolute tablet (pointer + scroll + buttons). With `--gpu`, the host source is the GPU window (1:1 pixel coordinates); otherwise it falls back to the interactive console. Needs a guest kernel with `CONFIG_VIRTIO_INPUT`. |
 | `--sound` | off | Add a virtio-snd sound card — one playback + one capture PCM stream (48 kHz / S16_LE / stereo) backed by Windows **WASAPI** (shared mode). Needs a guest kernel with `CONFIG_SND_VIRTIO`. On a host with no audio endpoint the card still appears but plays/records silence. |
+| `--record <file.mp4>[,fps=N][,kbps=N]` | off | Record the VM, in real time, to a **fragmented MP4** through Windows **Media Foundation**: the virtio-gpu display as H.264 at a constant `fps` (default **30**, max 60; static screens repeat the last frame) and, with `--sound`, the guest's playback stream as AAC-LC (48 kHz stereo, 192 kbps). Needs `--gpu`; the video has the display size, and frames from a different guest mode are scaled to fit (letterboxed). A hardware H.264 encoder is used when one accepts the stream, else Microsoft's software encoder. `kbps` sets the mean video bitrate (default 0.15 bit/pixel/frame, e.g. 4.6 Mbps at 1280×800@30). The file is playable while it grows and, up to its last fragment, if tinyvmm is killed. See [Recording](#recording---record-srcrecordrs). |
 | `--cpu-affinity p\|p-physical\|e\|all` | `p` | Which cores tinyvmm runs on, by CPU-set `EfficiencyClass`. On a hybrid CPU, `p` confines the whole process (vCPUs, doorbell pumps, NAT and 9p workers) to the P-cores, and `e` to the E-cores. `p-physical` also limits the vCPU threads to one logical processor per P-core (no SMT sharing). `all` lets Windows place threads anywhere. On a non-hybrid CPU, `p` and `e` change nothing. See [CPU placement](#cpu-placement). |
 | `--poll-us <N>` | `50` | Ceiling, in µs, of the doorbell pumps' adaptive busy-poll (see [Doorbells](#doorbells--the-notify-without-a-vm-exit-path)); `0` disables it. **0–10000.** |
 | `--save <path>` | — | Arm snapshot-on-trigger: when the guest issues `CPUID(0x4000DE57)`, quiesce the machine, write `<path>`, and exit. |
@@ -327,6 +328,7 @@ and accepts a small set of overrides:
 | `--drive <path>[,ro\|rw]` | Re-attach disks (blk content is not in the snapshot, so the operator supplies the backing files in the same order). |
 | `--unsafe-restore-mutable-drive` | Permit re-attaching a writable disk whose size differs from save time. |
 | `--cpu-affinity …` / `--watchdog-secs N` / `--poll-us N` | Same as `--pvh-run`. |
+| `--record <file.mp4>[,fps=N][,kbps=N]` | Record the restored VM, as with `--pvh-run` (the snapshot must include a GPU). Recording starts with the restored frame. |
 
 ### Examples
 
@@ -345,6 +347,10 @@ tinyvmm --restore vm.snap --drive disk.img,ro
 :: a distribution's live ISO in a GPU window, installing onto a raw disk (/dev/vdb)
 tinyvmm --pvh-run --iso ubuntu-26.04.1-desktop-amd64.iso --drive disk.img ^
     --vcpus 8 --ram-mb 8192 --rng --net --gpu 1600x900 --input
+
+:: the same desktop with sound, recorded (picture + guest audio) to an MP4
+tinyvmm --pvh-run --iso ubuntu-26.04.1-desktop-amd64.iso --vcpus 8 --ram-mb 8192 ^
+    --rng --net --gpu 1600x900 --input --sound --record session.mp4,fps=60
 ```
 
 The text console forwards raw stdin to the virtio-console RX queue; **Ctrl+A then
@@ -471,12 +477,19 @@ order they are created — that order is fixed (it is also the snapshot
   resamples/reformats to the device mix format and the guest PCM and the WASAPI
   buffer share a byte layout: the data path is a plain `copy_from_slice` with **no
   per-period allocation** and no software DSP. Two dedicated worker threads own the
-  WASAPI render/capture clients and pace I/O off the buffer-ready event; on
-  `RELEASE` the device completes all pending I/O messages so the guest's
-  `sync_stop()` drains (spec §5.14). With no usable endpoint (a headless host) the
-  card still enumerates and the workers fall back to a period timer — playback is
-  discarded and capture yields silence — so the guest audio pipeline keeps
-  flowing. All COM/WASAPI `unsafe` lives in `crates/winsys/src/audio.rs`:
+  WASAPI render/capture clients. Playback is **device-paced** by default: the
+  render endpoint's buffer-ready event pulls guest PCM straight into the WASAPI
+  buffer. It is **clock-paced** instead when there is no endpoint (a headless
+  host: the audio is discarded), when the endpoint disappears mid-stream, and
+  whenever `--record` taps the stream: a 10 ms high-resolution waitable timer
+  consumes exactly 48 000 frames per second of guest PCM, measured on QPC, so
+  every chunk has an exact position on a drift-free timeline. A recorded VM still
+  plays locally: the endpoint becomes a *monitor* fed behind a 40 ms silence
+  cushion, so the speaker clock drifting against QPC costs an occasional local
+  glitch, never a skewed recording. Capture paces off the capture event, or
+  completes silent periods on a period timer with no endpoint. On `RELEASE` the
+  device completes all pending I/O messages so the guest's `sync_stop()` drains
+  (spec §5.14). All COM/WASAPI `unsafe` lives in `crates/winsys/src/audio.rs`:
   `windows-sys` ships the WASAPI constants/structs/CLSIDs but **no COM interface
   vtables**, so `IMMDeviceEnumerator` / `IMMDevice` / `IAudioClient` /
   `IAudioRenderClient` / `IAudioCaptureClient` are hand-rolled and called through
@@ -521,6 +534,65 @@ into a `WindowEvent` enum delivered through an installable
 are present, `wire_window_input` routes those events into the keyboard/tablet
 virtio-input devices (pointer pixels map straight onto the tablet's absolute
 axes).
+
+### Recording (`--record`, `src/record.rs`)
+
+`--record` captures what the guest *produces*, not the host window: the GPU's
+present hook fans out to the window (if any) and the recorder, and virtio-snd
+tees its playback stream to the recorder (`SndDevice::set_playback_tap`). It
+works headless too. A dedicated encoder thread owns a Media Foundation sink
+writer (`crates/winsys/src/media.rs`) and puts everything on one timeline that
+starts once the encoder is ready:
+
+* **Video, constant frame rate.** A present hands its frame to the recorder by
+  swapping buffers with a single latest-frame slot (no copy), so the vCPU never
+  waits on the encoder. At each tick (`k / fps`) the encoder swaps out the newest
+  frame, converts it to NV12 (BT.709 limited range, 2×2 chroma averaging, in
+  safe Rust) and encodes it at that timestamp, or, if the guest hasn't flushed
+  since (a static desktop), queues the previous picture again (its buffer is
+  resubmitted, not copied). Frames presented between two ticks are dropped.
+  Every tick is one sample exactly one frame period long: some hardware encoders
+  replace sample durations with the nominal period, so a longer sample would
+  shorten the video track. The video size is the `--gpu` display size; frames
+  from a different guest mode are scaled to fit, letterboxed.
+* **Falling behind.** If the encoder stalls, it catches up by repeating the
+  previous picture for each tick it missed, and takes a new frame only for the
+  tick it was presented in, so no picture is shown early and the tracks stay
+  aligned. A stall longer than 2 s (the host suspended, say) is cut from both
+  tracks instead: the video jumps to the current frame, audio from inside the gap
+  is dropped, and the shutdown line reports `N s skipped`. Stopping during a
+  stall still ends both tracks where tinyvmm stopped.
+* **Audio, sample-exact.** While tapped, playback is clock-paced (above), so
+  each PCM chunk arrives as `(run epoch, frame offset)` on an exact 48 kHz clock.
+  The recorder places it on the AAC track at `(epoch − t0) × 48 kHz + offset`
+  (less any time cut) and fills gaps (the guest not playing, a skipped host
+  stall) with silence. Each tick commits audio up to the end of the video
+  written so far, padding silence to 200 ms behind real time, because the sink
+  writer stalls a stream that runs far ahead of the other: writing 3 s of video
+  before any audio blocked for ~20 s in testing. Silence is generated a tick at a
+  time; PCM queued for the encoder is capped at 2 s and PCM staged on the track
+  at 4 s.
+* **Encoding.** Media Foundation is loaded at run time (`LoadLibraryExW`,
+  System32 only), so hosts without it (Windows N, Server Core) still run
+  everything except `--record`. The output is H.264 High (a keyframe every 2 s,
+  no B-frames, VBR at the mean bitrate) plus AAC-LC 192 kbps. The sink writer
+  tries hardware encoders first (`MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS`) and
+  falls back to Microsoft's software encoder. The container is fragmented MP4, so
+  the file plays while it grows and survives tinyvmm being killed.
+
+Startup and shutdown each log one line, for example:
+
+```
+[pvh-run] recording 1280x800 @ 30 fps, 4608 kbps H.264 (Intel hardware H.264 encoder) + AAC 192 kbps -> rec.mp4 (fragmented MP4)
+[pvh-run] recorded rec.mp4: 120.4 s, 3613 frames @ 30 fps (389 new of 419 guest presents, 0 late), audio 120.4 s
+```
+
+Measured on the reference machine with the Ubuntu 26.04 live desktop
+(GStreamer playing a clip with a white flash and a beep every second): the
+recording's beeps are 1.000 s apart, and measured A/V offsets stayed within about
+35 ms at 30 fps. The encoder (Intel Quick Sync) never fell
+behind, and the two-minute file, mostly a static desktop, averaged ~0.6 Mbps
+including the audio track.
 
 ### virtio-net backends (`--net-backend`)
 
@@ -617,7 +689,8 @@ crates/
     error, host (privilege + large-page + CNG random), host/block_file (async
     IOCP disk), host/mapped_file (mmap loader), sock (Winsock + IOCP), etw
     (hand-rolled TraceLogging), fs (9p file ops), cpu_affinity, wintun
-    (wintun.dll loader), qpc (QueryPerformanceCounter), ptr (SharedPtr)
+    (wintun.dll loader), qpc (QueryPerformanceCounter), ptr (SharedPtr),
+    audio (WASAPI + waitable timers), media (Media Foundation MP4 writer)
   whpsys/      Windows Hypervisor Platform FFI ONLY:
     partition, memory (GuestMemory + typed accessors), vcpu (run loop + decoded
     exits + XSAVE/APIC save-restore), regs, msi, emulator (WHvEmulator* +
@@ -625,6 +698,7 @@ crates/
 src/
   main.rs      CLI dispatch, device wiring, interactive console, save/restore
   display.rs   Win32 GDI window host for virtio-gpu + host-input seam
+  record.rs    --record: GPU frames + sound playback -> MP4 encoder thread
   boot/        acpi (RSDP/XSDT/MADT), loader (PVH ELF + hvm_start_info + e820),
                bzimage (Linux boot protocol: zero page + 32-bit entry)
   convenience/ iso9660 (read-only ISO reader), grub_cfg (default menuentry),
@@ -632,7 +706,7 @@ src/
   devices/     io_bus, mmio_bus, serial(8250), pic(i8259), pit(8254), legacy
   pci/         config (Type-0 space), bus (0xCF8/0xCFC), msix
   virtio/      queue, device(trait), transport(virtio-pci modern),
-               console, net, rng, blk, p9, input, gpu
+               console, net, rng, blk, p9, input, gpu, snd
   net/         wire (parse/build), nat (user-mode NAT), dhcp (the NAT's DHCP
                server), wintun, sys (facade)
   whp/         run_loop, cpuid, hv (Hyper-V enlightenment),
@@ -873,7 +947,10 @@ The tax the safety model adds versus a C VMM that derefs guest pointers directly
   stream allocates nothing after warm-up; one IRQ per `submit_frame`.
 * **Per gpu flush:** swizzle the bound resource into the reused `present_buf` BGRA
   shadow, then a single CPU blit (`StretchDIBits`) on the window thread — no
-  per-frame allocation.
+  per-frame allocation. With `--record`, the recorder takes the frame by swapping
+  `present_buf` with its latest-frame slot (O(1) under its mutex, no copy; the
+  device rewrites whatever buffer it gets back), and a static screen's ticks
+  resubmit the last encoded picture's buffer.
 
 **Honest summary:** guest *data* is zero-copy — disk bytes DMA directly in/out of
 guest RAM and rng/status writes land in place. The only fixed memcpy the safety
@@ -1015,8 +1092,8 @@ A systems programmer sees "preallocated, partitioned buffers" and rightly asks
 *why are there locks at all?* Because **multiple host threads** touch shared
 device state: the vCPU threads (one per `--vcpus`), the per-device **doorbell
 pump** threads, the per-disk **IOCP worker** threads, the **9p worker pool**, the
-NAT workers + their ICMP helpers, the **display window** message-pump thread, and the
-watchdog. The locks serialize *host-thread* access; they are **not** about the
+NAT workers + their ICMP helpers, the **display window** message-pump thread, the
+**recorder**'s encoder thread, and the watchdog. The locks serialize *host-thread* access; they are **not** about the
 guest. Where single-ownership can be proven instead, there is no lock (the Treiber
 free-list, the `OnceLock` callbacks, the `UnsafeCell` slot bodies).
 
@@ -1031,6 +1108,7 @@ free-list, the `OnceLock` callbacks, the `UnsafeCell` slot bodies).
 | gpu `Mutex<GpuState>` + queue/scratch mutexes | resources map, scanout, present shadow | the vCPU draining controlq vs the present path | resource table + scanout mutate together |
 | input `Mutex<Virtqueue>` + `Mutex<ChainScratch>` (event/status) | eventq/statusq + reused scratch | the window thread injecting vs the vCPU | host-event injection vs guest kicks |
 | display `Mutex<Frame>` + `Mutex<Option<InputSink>>` | the shared BGRA frame; the installed input sink | `present()` (vCPU/gpu) vs the window thread's `WM_PAINT` | the frame buffer is produced and consumed on different threads |
+| recorder `Mutex<Frame>` + `Mutex<AudioQueue>` (`--record`) | the latest presented frame; PCM chunks awaiting the encoder | the vCPU (gpu present) and the snd playback worker vs the encoder thread | both sides only swap buffers under the frame lock (O(1)); the encoder converts/encodes outside it |
 | NAT `Mutex<VecDeque<IcmpJob>>` + `Condvar` | the bounded ping handoff queue | the vCPU enqueues, helper threads dequeue | classic bounded producer/consumer |
 | NAT `RwLock<HashMap<FlowKey, usize>>` (`FlowRouter`, 2+ workers only) | which worker owns each TCP flow | the guest TX path reads it per TCP frame; a SYN, or a worker creating or ending a flow, writes it | a map keyed by 4-tuple; writes only at flow start and end, so reads rarely wait |
 | `RwLock<Vec<Entry>>` (MMIO bus) | the GPA→device dispatch table | written once at setup, read on every MMIO | read-mostly; readers never block readers |
@@ -1067,6 +1145,14 @@ the locking story above.
   length before parsing; `read_backing()` fails if the SG list does not fully cover
   the transfer. Malformed commands are answered with an error response, not a
   panic.
+* **Recorder (`src/record.rs`, `--record`):** guest output only ever reaches it
+  through bounded buffers: one latest-frame slot (sized by the GPU's own
+  resource caps) and a PCM queue capped at 2 s, beyond which new PCM is dropped
+  and counted. A frame whose length doesn't match its dimensions is skipped, and
+  any frame size is scaled to fit the fixed output. PCM staged on the audio track
+  is capped at 4 s and silence is generated a tick at a time; a stall longer than
+  2 s (a host suspend, a blocked encoder) is cut from the recording, so no gap
+  turns into an allocation or an unbounded catch-up.
 * **virtio-input (`src/virtio/input.rs`):** config select/subselect indices are
   range-checked; `InputEvent::decode` is only fed the fixed 8-byte records the
   driver path produces; the host-event hot path bounds the absolute axes to
