@@ -974,7 +974,7 @@ struct PvhArgs {
 }
 
 /// Parse a `--portfwd HOSTPORT:GUESTPORT` rule. The host side binds 127.0.0.1
-/// and the guest side targets the standard guest IP 10.0.0.2.
+/// and the guest side targets the standard guest IP (`net::GUEST_IP`).
 fn parse_portfwd(s: &str) -> Result<PortForward> {
     let parts: Vec<&str> = s.split(':').collect();
     let [hp, gp] = parts.as_slice() else {
@@ -989,7 +989,7 @@ fn parse_portfwd(s: &str) -> Result<PortForward> {
     Ok(PortForward {
         host_addr: [127, 0, 0, 1],
         host_port,
-        guest_ip: [10, 0, 0, 2],
+        guest_ip: net::GUEST_IP,
         guest_port,
     })
 }
@@ -1117,7 +1117,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
                 i += 1;
                 let s = args
                     .get(i)
-                    .ok_or_else(|| Error::msg("--wintun-host wants an IPv4 (e.g. 10.0.0.1)"))?;
+                    .ok_or_else(|| Error::msg("--wintun-host wants an IPv4 (e.g. 172.29.255.1)"))?;
                 let ip = parse_ipv4(s)
                     .ok_or_else(|| Error::msg(format!("--wintun-host: bad IPv4 '{s}'")))?;
                 if nics.is_empty() {
@@ -2393,13 +2393,14 @@ fn wire_net_backend(net: &Arc<NetDevice>, nic: &NicSpec) -> Result<String> {
             };
             net.set_backend(NatBackend::new(net, opts));
             format!(
-                "nat gw={}, dhcp {}/24, dns {dns}",
+                "nat gw={}, dhcp {}/{}, dns {dns}",
                 ip(lease.server),
-                ip(lease.client)
+                ip(lease.client),
+                net::PREFIX_LEN
             )
         }
         NetBackendKind::Wintun => {
-            let host = nic.wintun_host.unwrap_or([10, 0, 0, 1]);
+            let host = nic.wintun_host.unwrap_or(net::GATEWAY_IP);
             let name = nic
                 .wintun_name
                 .clone()
@@ -2555,7 +2556,7 @@ fn write_snapshot(
                 .wintun_name
                 .clone()
                 .unwrap_or_else(|| "tinyvmm".to_string());
-            let host = nic.wintun_host.unwrap_or([10, 0, 0, 1]);
+            let host = nic.wintun_host.unwrap_or(net::GATEWAY_IP);
             jw.str(&format!("nic{i}_wintun_name"), &name).str(
                 &format!("nic{i}_wintun_host"),
                 &format!("{}.{}.{}.{}", host[0], host[1], host[2], host[3]),

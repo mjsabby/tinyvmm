@@ -60,8 +60,8 @@ ECHO_RE = re.compile(r"^/echo/(\d+)$")
 def discover_host_ipv4(explicit: str | None) -> str:
     """Find a non-loopback IPv4 the guest can connect to.
 
-    The Linux guest routes anything outside its 10.0.0.0/24 subnet via
-    the usernet gateway (10.0.0.1 -> tinyvmm engine), so the engine
+    The Linux guest routes anything outside its own subnet via
+    the usernet gateway (-> tinyvmm engine), so the engine
     sees a packet with dst=<host_ip>. The engine Winsock-connect()s to
     that IP, which the host kernel routes to the bound HTTP server (we
     bind 0.0.0.0:<port> so it accepts on all interfaces).

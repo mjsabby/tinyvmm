@@ -2,8 +2,8 @@
 """Check how the user-mode NAT (`--net-backend nat`) ends TCP connections.
 
 Boots the `tinyvmm.test=nat` initramfs mode against a host server on
-127.0.0.1 (the guest's gateway, 10.0.0.1) and asserts all three guest phases
-pass (`NATTEST SUMMARY: 3/3`):
+127.0.0.1 (reached at the guest's gateway, 172.29.255.1) and asserts all
+three guest phases pass (`NATTEST SUMMARY: 3/3`):
 
   A  connect() to a host port with nothing listening is refused
      (ECONNREFUSED), not accepted and then reset;
