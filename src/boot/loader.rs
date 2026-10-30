@@ -15,14 +15,17 @@ use windows_sys::Win32::System::Hypervisor::{
 use crate::boot::acpi;
 use crate::mem_layout::{HIGH_RAM_BASE, MMIO_WINDOW_BASE};
 
-// Low-memory staging layout (mirrors pvh_loader.cpp).
-const GDT_GPA: u64 = 0x1000;
+// Low-memory staging layout (mirrors pvh_loader.cpp). The e820 map reserves
+// everything below `BOOT_ARTIFACT_END`; the bzImage loader stages its zero page
+// there too.
+pub(super) const GDT_GPA: u64 = 0x1000;
 const START_INFO_GPA: u64 = 0x2000;
 const MEMMAP_GPA: u64 = 0x2100;
 const MODLIST_GPA: u64 = 0x2400;
-const CMDLINE_GPA: u64 = 0x2800;
-const CMDLINE_MAX: usize = 0x800;
+pub(super) const CMDLINE_GPA: u64 = 0x2800;
+pub(super) const CMDLINE_MAX: usize = 0x800;
 const ACPI_GPA: u64 = 0x3000;
+const BOOT_ARTIFACT_END: u64 = 0x10000;
 
 // PVH protocol constants.
 const HVM_START_MAGIC: u32 = 0x336e_c578;
@@ -81,7 +84,7 @@ fn align_up(v: u64, a: u64) -> u64 {
 /// Copy a boot image into guest RAM on several threads. The copy is dominated
 /// by first-touch faults on the mapped source pages rather than by memcpy, and
 /// Windows resolves faults on distinct pages concurrently.
-fn copy_to_guest(ram: &GuestMemory, gpa: u64, src: &[u8]) -> Result<()> {
+pub(super) fn copy_to_guest(ram: &GuestMemory, gpa: u64, src: &[u8]) -> Result<()> {
     const CHUNK: usize = 4 << 20;
     const MAX_THREADS: usize = 8;
     let threads = std::thread::available_parallelism()
@@ -336,55 +339,17 @@ pub fn load_pvh(
     gdt[16..24].copy_from_slice(&GDT_DATA32.to_le_bytes());
     ram.write_at(GDT_GPA, &gdt)?;
 
-    // cmdline.
-    let cmd = cmdline.as_bytes();
-    if cmd.len() + 1 > CMDLINE_MAX {
-        return Err(Error::msg("cmdline too long"));
-    }
-    let mut cbuf = vec![0u8; cmd.len() + 1];
-    cbuf[..cmd.len()].copy_from_slice(cmd);
-    ram.write_at(CMDLINE_GPA, &cbuf)?;
+    write_cmdline(ram, cmdline)?;
+    let rsdp_gpa = write_acpi(ram, vcpu_count)?;
 
-    // ACPI tables.
-    let acpi_buf = acpi::build(ACPI_GPA, vcpu_count);
-    ram.write_at(ACPI_GPA, &acpi_buf)?;
-    let rsdp_gpa = ACPI_GPA;
-
-    // e820 memmap.
-    const BOOT_ARTIFACT_END: u64 = 0x10000;
-    const ISA_HOLE_START: u64 = 0xa0000;
-    const ISA_HOLE_END: u64 = 0x100000;
-    let mut mm: Vec<[u8; 24]> = Vec::new();
-    let mk = |addr: u64, size: u64, ty: u32| -> [u8; 24] {
-        let mut e = [0u8; 24];
-        e[0..8].copy_from_slice(&addr.to_le_bytes());
-        e[8..16].copy_from_slice(&size.to_le_bytes());
-        e[16..20].copy_from_slice(&ty.to_le_bytes());
-        e
-    };
-    mm.push(mk(0, BOOT_ARTIFACT_END, E820_RESERVED));
-    mm.push(mk(
-        BOOT_ARTIFACT_END,
-        ISA_HOLE_START - BOOT_ARTIFACT_END,
-        E820_RAM,
-    ));
-    mm.push(mk(
-        ISA_HOLE_START,
-        ISA_HOLE_END - ISA_HOLE_START,
-        E820_RESERVED,
-    ));
-    // Low RAM stops at the PCI MMIO window; RAM beyond it is relocated above
-    // 4 GiB (see `mem_layout`), leaving the window free for device BARs.
-    let low_top = ram_bytes.min(MMIO_WINDOW_BASE);
-    if low_top > ISA_HOLE_END {
-        mm.push(mk(ISA_HOLE_END, low_top - ISA_HOLE_END, E820_RAM));
-    }
-    if ram_bytes > MMIO_WINDOW_BASE {
-        mm.push(mk(HIGH_RAM_BASE, ram_bytes - MMIO_WINDOW_BASE, E820_RAM));
-    }
+    // e820 memmap: hvm_memmap_table_entry is the e820 entry plus 4 reserved bytes.
+    let mm = e820_map(ram_bytes);
     let mut mm_bytes = Vec::with_capacity(mm.len() * 24);
-    for e in &mm {
-        mm_bytes.extend_from_slice(e);
+    for &(addr, size, ty) in &mm {
+        mm_bytes.extend_from_slice(&addr.to_le_bytes());
+        mm_bytes.extend_from_slice(&size.to_le_bytes());
+        mm_bytes.extend_from_slice(&ty.to_le_bytes());
+        mm_bytes.extend_from_slice(&0u32.to_le_bytes());
     }
     ram.write_at(MEMMAP_GPA, &mm_bytes)?;
 
@@ -410,6 +375,48 @@ pub fn load_pvh(
         initramfs_gpa,
         initramfs_size,
     })
+}
+
+/// Write the NUL-terminated kernel command line at `CMDLINE_GPA`.
+pub(super) fn write_cmdline(ram: &GuestMemory, cmdline: &str) -> Result<()> {
+    let cmd = cmdline.as_bytes();
+    if cmd.len() + 1 > CMDLINE_MAX {
+        return Err(Error::msg("cmdline too long"));
+    }
+    let mut cbuf = vec![0u8; cmd.len() + 1];
+    cbuf[..cmd.len()].copy_from_slice(cmd);
+    ram.write_at(CMDLINE_GPA, &cbuf)
+}
+
+/// Write the ACPI tables and return the RSDP's guest-physical address.
+pub(super) fn write_acpi(ram: &GuestMemory, vcpu_count: u32) -> Result<u64> {
+    ram.write_at(ACPI_GPA, &acpi::build(ACPI_GPA, vcpu_count))?;
+    Ok(ACPI_GPA)
+}
+
+/// The guest's e820 memory map as `(address, size, type)`.
+pub(super) fn e820_map(ram_bytes: u64) -> Vec<(u64, u64, u32)> {
+    const ISA_HOLE_START: u64 = 0xa0000;
+    const ISA_HOLE_END: u64 = 0x100000;
+    let mut mm = vec![
+        (0, BOOT_ARTIFACT_END, E820_RESERVED),
+        (
+            BOOT_ARTIFACT_END,
+            ISA_HOLE_START - BOOT_ARTIFACT_END,
+            E820_RAM,
+        ),
+        (ISA_HOLE_START, ISA_HOLE_END - ISA_HOLE_START, E820_RESERVED),
+    ];
+    // Low RAM stops at the PCI MMIO window; RAM beyond it is relocated above
+    // 4 GiB (see `mem_layout`), leaving the window free for device BARs.
+    let low_top = ram_bytes.min(MMIO_WINDOW_BASE);
+    if low_top > ISA_HOLE_END {
+        mm.push((ISA_HOLE_END, low_top - ISA_HOLE_END, E820_RAM));
+    }
+    if ram_bytes > MMIO_WINDOW_BASE {
+        mm.push((HIGH_RAM_BASE, ram_bytes - MMIO_WINDOW_BASE, E820_RAM));
+    }
+    mm
 }
 
 /// Program the BSP for 32-bit PVH entry: flat-32 segments, GDTR, CR0.PE=1,

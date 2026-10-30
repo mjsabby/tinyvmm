@@ -6,6 +6,8 @@ pub const BUNDLED: bool = cfg!(any(feature = "embedded-init", feature = "embedde
 
 pub enum Image {
     File(MappedFile),
+    /// Read into memory, e.g. from inside an ISO (`--iso`).
+    Owned(Vec<u8>),
     #[cfg(any(feature = "embedded-init", feature = "embedded-dotnet"))]
     Embedded(&'static [u8]),
 }
@@ -14,6 +16,7 @@ impl Image {
     pub fn bytes(&self) -> &[u8] {
         match self {
             Self::File(file) => file.bytes(),
+            Self::Owned(bytes) => bytes,
             #[cfg(any(feature = "embedded-init", feature = "embedded-dotnet"))]
             Self::Embedded(bytes) => bytes,
         }
@@ -93,5 +96,40 @@ mod tests {
         assert_eq!(parse(&[]), !BUNDLED);
         assert!(parse(&["--large-pages"]));
         assert!(!parse(&["--no-large-pages"]));
+    }
+
+    #[test]
+    fn iso_supplies_kernel_and_first_drive_and_appends_args() {
+        let config = parse_pvh_args(&args(&[
+            "tinyvmm",
+            "--pvh-run",
+            "--drive",
+            "disk.img",
+            "--iso",
+            "live.iso",
+            "--",
+            "debug",
+            "x=1",
+        ]))
+        .unwrap();
+        assert_eq!(config.iso.as_deref(), Some("live.iso"));
+        assert!(config.vmlinux.is_none());
+        let drives: Vec<_> = config
+            .drives
+            .iter()
+            .map(|d| (d.path.as_str(), d.readonly))
+            .collect();
+        assert_eq!(drives, [("live.iso", true), ("disk.img", false)]);
+        assert_eq!(config.iso_extra_args, "debug x=1");
+        assert!(config.cmdline.starts_with("console=hvc0 "));
+
+        for conflicting in [
+            &["--iso", "a.iso", "vmlinux"][..],
+            &["--iso", "a.iso", "--initrd", "i"],
+        ] {
+            let mut parts = vec!["tinyvmm", "--pvh-run"];
+            parts.extend_from_slice(conflicting);
+            assert!(parse_pvh_args(&args(&parts)).is_err(), "{conflicting:?}");
+        }
     }
 }

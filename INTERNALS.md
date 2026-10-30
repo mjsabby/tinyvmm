@@ -53,7 +53,7 @@ The feature set, framed as capabilities you must provide:
 |---|---|---|
 | **CPU virtualization** | Create vCPUs, run them, field the exits they take (IO/MMIO/CPUID/MSR/HLT) | `crates/whpsys/src/vcpu.rs`, `src/whp/run_loop.rs` |
 | **Guest physical memory** | A flat slab of host RAM mapped into the guest's physical address space | `crates/whpsys/src/memory.rs` |
-| **Boot protocol** | Get a kernel image into RAM and the CPU pointed at its entry point with the right machine state | `src/boot/loader.rs` (PVH) |
+| **Boot protocol** | Get a kernel image into RAM and the CPU pointed at its entry point with the right machine state | `src/boot/loader.rs` (PVH), `src/boot/bzimage.rs` (bzImage) |
 | **Firmware tables** | The minimal ACPI a modern Linux expects (so it finds the LAPIC) | `src/boot/acpi.rs` |
 | **A clock & invariant TSC** | The guest must be able to calibrate time without legacy timers | `src/whp/cpuid.rs`, `src/whp/hv.rs` |
 | **An interrupt controller** | Deliver device interrupts to the guest (x2APIC + MSI, plus the legacy PIC) | WHP's in-hypervisor LAPIC, `crates/whpsys/src/msi.rs`, `src/devices/pic.rs` |
@@ -282,6 +282,20 @@ This map and the GPA split from M0 must agree exactly.
 **4. Program the BSP for PVH entry** (`loader.rs:377` `setup_pvh_entry`): flat
 32-bit code/data segments, `GDTR` → your GDT, `CR0 = PE|ET`, `RFLAGS = 0x2`,
 `RBX = start_info_gpa`, `RIP = entry_point`. Run, and the kernel takes over.
+
+**Compressed kernels (`bzImage`).** Distributions ship `vmlinuz`, a bzImage, not
+an ELF. `src/boot/bzimage.rs` boots those through the Linux/x86 boot protocol
+instead (Documentation/arch/x86/boot.rst), picked by content in `boot::KernelLoad`.
+It copies the protected-mode code (after the `setup_sects` real-mode sectors) to
+`pref_address`, puts the initramfs as high as `initrd_addr_max` allows above the
+`init_size` decompression area, and fills the zero page (`boot_params` at
+`0x4000`): the copied setup header, `type_of_loader`, ramdisk and cmdline
+pointers, the same e820 map, and `acpi_rsdp_addr`. The BSP enters at the 32-bit
+entry with flat segments at `__BOOT_CS`/`__BOOT_DS` (`0x10`/`0x18`) and
+`ESI` = the zero page; the kernel's own decompressor runs from there, so no
+decompression happens on the host and `CONFIG_PVH` isn't needed. `--iso`
+(`src/convenience/`) builds on it: it reads a live ISO's GRUB entry with a small
+ISO 9660 reader and boots that kernel and initrd straight from memory.
 
 To *see* it, you need M2's serial port: add the default cmdline
 `console=hvc0 ...` (or `--debug-boot` to prepend `earlyprintk=ttyS0,115200` so the
@@ -954,6 +968,7 @@ The minimum to boot an unmodified PVH Linux to a shell:
 0x0000_0000  +-- guest RAM (low) -------------------------------+
 0x0000_1000  | GDT                                              |
 0x0000_2000  | hvm_start_info / e820 / modlist / cmdline / ACPI |
+0x0000_4000  | bzImage zero page (boot_params)                  |
 0x0010_0000  | kernel image (PT_LOAD by p_paddr), initramfs     |
    ...       | ... usable RAM ...                               |
 0xE000_0000  +-- PCI MMIO BAR window ---------------------------+   (3584 MiB)
@@ -987,7 +1002,9 @@ crates/winsys/   Win32 FFI: host (privilege/large-page/CNG rng), host/block_file
                            (async IOCP disk), host/mapped_file (mmap), sock
                            (Winsock+IOCP), etw, fs (9p), audio (WASAPI), wintun
 src/whp/         run_loop, cpuid (policy), hv (Hyper-V MSRs), snapshot*
-src/boot/        loader (PVH ELF + start_info + e820), acpi (RSDP/XSDT/MADT)
+src/boot/        loader (PVH ELF + start_info + e820), acpi (RSDP/XSDT/MADT),
+                 bzimage (Linux boot protocol), KernelLoad (picks one)
+src/convenience/ iso9660, grub_cfg, iso_boot (--iso: boot a live ISO)
 src/devices/     io_bus, mmio_bus, serial (8250), pic (i8259), pit (8254), legacy
 src/pci/         mod (CF8/CFC), bus, config (Type-0 + BAR), msix, passthrough
 src/virtio/      device (trait), transport (virtio-pci), queue (virtqueue),
