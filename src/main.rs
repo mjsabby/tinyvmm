@@ -2444,10 +2444,36 @@ fn wire_net_backend(net: &Arc<NetDevice>, nic: &NicSpec) -> Result<String> {
                 workers: nic
                     .nat_workers
                     .unwrap_or_else(crate::net::nat::default_workers),
+                dns_servers: crate::net::sys::dns_servers(),
                 ..NatOptions::default()
             };
+            let lease = opts.dhcp_lease();
+            let ip = |a: [u8; 4]| format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3]);
+            let dns = if lease.dns.is_empty() {
+                eprintln!(
+                    "[nat] WARN: none of the host's DNS servers ({}) is reachable from the \
+                     guest; DHCP offers no DNS server",
+                    opts.dns_servers
+                        .iter()
+                        .map(|&a| ip(a))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                "none".to_string()
+            } else {
+                lease
+                    .dns
+                    .iter()
+                    .map(|&a| ip(a))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
             net.set_backend(NatBackend::new(net, opts));
-            "nat gw=10.0.0.1".to_string()
+            format!(
+                "nat gw={}, dhcp {}/24, dns {dns}",
+                ip(lease.server),
+                ip(lease.client)
+            )
         }
         NetBackendKind::Wintun => {
             let host = nic.wintun_host.unwrap_or([10, 0, 0, 1]);

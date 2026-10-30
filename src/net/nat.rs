@@ -2,6 +2,7 @@
 //! L2/L3 inside tinyvmm and translates flows to Windows host sockets via IOCP.
 //!
 //! Topology (matching the initramfs): gateway 10.0.0.1, guest 10.0.0.2.
+//! Guests that ask for it get that configuration by DHCP (see [`dhcp`]).
 //!
 //! Concurrency model (per the agreed design): a single precreated worker
 //! thread owns ALL NAT state and the IOCP. The vCPU thread never touches NAT
@@ -9,11 +10,13 @@
 //! the worker is the sole accessor of the flow tables (lock-free by
 //! single-threading). Host socket completions arrive on the same IOCP.
 //! Implemented: ARP, ICMP echo (local gateway reply + proxied via
-//! `IcmpSendEcho`), UDP NAT, and TCP terminate-and-proxy (guest-facing TCB in
-//! `tcp-sans-io`, host socket via `ConnectEx`), plus inbound `--portfwd`.
+//! `IcmpSendEcho`), UDP NAT, TCP terminate-and-proxy (guest-facing TCB in
+//! `tcp-sans-io`, host socket via `ConnectEx`), inbound `--portfwd`, and a
+//! DHCP server answering on the gateway.
 
 use crate::diag::etw;
 use crate::host;
+use crate::net::dhcp;
 use crate::net::sys::{self, Iocp};
 use crate::net::wire::*;
 use crate::virtio::net::{
@@ -121,6 +124,11 @@ pub struct PortForward {
 pub struct NatOptions {
     pub gateway_ip: [u8; 4],
     pub gateway_mac: [u8; 6],
+    /// The address DHCP hands the guest (in the gateway's /24).
+    pub guest_ip: [u8; 4],
+    /// DNS servers DHCP offers; those the guest can't reach are dropped (see
+    /// [`dhcp::usable_dns`]). Usually the host's (`sys::dns_servers`).
+    pub dns_servers: Vec<[u8; 4]>,
     pub port_forwards: Vec<PortForward>,
     /// Per-tier count of Tcbs to preallocate at startup (warm pool). Pools
     /// still grow on demand up to the flow cap and recycle thereafter, so this
@@ -143,11 +151,28 @@ impl Default for NatOptions {
         NatOptions {
             gateway_ip: [10, 0, 0, 1],
             gateway_mac: [0x02, 0x53, 0x54, 0x00, 0x00, 0x01],
+            guest_ip: [10, 0, 0, 2],
+            dns_servers: Vec::new(),
             port_forwards: Vec::new(),
             tcb_warm: DEFAULT_TCB_WARM,
             default_tier: DEFAULT_TIER,
             tcb_port_tier: Vec::new(),
             workers: default_workers(),
+        }
+    }
+}
+
+impl NatOptions {
+    /// What the NAT's DHCP server hands out: the guest address in the
+    /// gateway's /24, routed through the gateway.
+    pub fn dhcp_lease(&self) -> dhcp::Lease {
+        let netmask = [255, 255, 255, 0];
+        dhcp::Lease {
+            server: self.gateway_ip,
+            client: self.guest_ip,
+            netmask,
+            dns: dhcp::usable_dns(&self.dns_servers, self.gateway_ip, netmask),
+            lease_secs: 24 * 60 * 60,
         }
     }
 }
@@ -1408,6 +1433,8 @@ struct NatState {
     gw_ip: [u8; 4],
     gw_mac: [u8; 6],
     guest_mac: [u8; 6],
+    /// What DHCP answers (identical on every shard).
+    dhcp: Arc<dhcp::Lease>,
     udp: HashMap<FlowKey, UdpFlow>,
     tcp: HashMap<FlowKey, TcpFlow>,
     icmp: Arc<IcmpPool>,
@@ -1776,11 +1803,49 @@ impl NatState {
         let Some(udp) = parse_udp(ip.payload) else {
             return;
         };
+        if udp.dst_port == dhcp::SERVER_PORT
+            && (ip.dst == dhcp::BROADCAST_IP || ip.dst == self.gw_ip)
+        {
+            self.handle_dhcp(udp.payload);
+            return;
+        }
         if let Some(sock) = self.ensure_udp_flow(ip.src, udp.src_port, ip.dst, udp.dst_port) {
             // Synchronous is fine for UDP (see wsa_send): datagram sends don't
             // block on peer flow-control, so this can't stall the worker.
             sys::wsa_send(sock, udp.payload);
         }
+    }
+
+    /// Answer a DHCP client from the gateway. Rare control-plane traffic, so
+    /// the reply's payload buffer is allocated per message.
+    fn handle_dhcp(&mut self, msg: &[u8]) {
+        let mut payload = Vec::new();
+        let Some(to) = dhcp::reply(msg, &self.dhcp, &mut payload) else {
+            return;
+        };
+        build_udp_into(
+            &mut self.l3_scratch,
+            self.gw_ip,
+            to.ip,
+            dhcp::SERVER_PORT,
+            dhcp::CLIENT_PORT,
+            &payload,
+        );
+        build_ipv4_into(
+            &mut self.tx_scratch,
+            self.gw_ip,
+            to.ip,
+            IP_PROTO_UDP,
+            &self.l3_scratch,
+        );
+        build_eth_into(
+            &mut self.l3_scratch,
+            to.mac,
+            self.gw_mac,
+            ETHERTYPE_IPV4,
+            &self.tx_scratch,
+        );
+        self.inject(&self.l3_scratch);
     }
 
     fn ensure_udp_flow(
@@ -2818,6 +2883,7 @@ impl NatBackend {
         if !host::random_fill(&mut tcb_secret) {
             panic!("nat: BCryptGenRandom failed (Tcb secret)");
         }
+        let lease = Arc::new(opts.dhcp_lease());
         let flows = Arc::new(FlowCounts::default());
         let router = Arc::new(FlowRouter::new(n));
         let mut shards = Vec::with_capacity(n);
@@ -2841,6 +2907,7 @@ impl NatBackend {
                 gw_ip: opts.gateway_ip,
                 gw_mac: opts.gateway_mac,
                 guest_mac: net.mac(),
+                dhcp: lease.clone(),
                 udp: HashMap::new(),
                 tcp: HashMap::new(),
                 icmp: icmp.clone(),

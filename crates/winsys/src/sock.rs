@@ -1,9 +1,10 @@
 //! Thin wrappers over the Winsock + IOCP FFI used by the NAT backend. Kept
 //! small and explicit; all the unsafe is funnelled here.
 
-use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    ICMP_ECHO_REPLY, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho,
+    FIXED_INFO_W2KSP1, GetNetworkParams, ICMP_ECHO_REPLY, IP_ADDR_STRING, IcmpCloseHandle,
+    IcmpCreateFile, IcmpSendEcho,
 };
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, FIONBIO, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IPPROTO_TCP, IPPROTO_UDP, SD_SEND,
@@ -427,4 +428,47 @@ pub fn icmp_echo(h: HANDLE, dst: [u8; 4], data: &[u8], timeout_ms: u32) -> bool 
         )
     };
     n > 0
+}
+
+// ---------------------------------------------------------------------------
+// Host DNS configuration (iphlpapi) -- what the NAT's DHCP hands the guest.
+// ---------------------------------------------------------------------------
+
+/// The host's IPv4 DNS servers in preference order; empty if unavailable.
+pub fn dns_servers() -> Vec<[u8; 4]> {
+    const MAX_SERVERS: usize = 16;
+    let mut len: u32 = 0;
+    // Sizing call: fails with ERROR_BUFFER_OVERFLOW and sets `len`.
+    // SAFETY: a null buffer with a zero length is the documented sizing form.
+    unsafe { GetNetworkParams(std::ptr::null_mut(), &mut len) };
+    if (len as usize) < core::mem::size_of::<FIXED_INFO_W2KSP1>() {
+        return Vec::new();
+    }
+    // u64 backing keeps the FIXED_INFO and its list nodes pointer-aligned.
+    let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+    let info = buf.as_mut_ptr() as *mut FIXED_INFO_W2KSP1;
+    // SAFETY: `buf` holds at least `len` bytes, as the call requires.
+    if unsafe { GetNetworkParams(info, &mut len) } != ERROR_SUCCESS {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    // SAFETY: on success `buf` holds a FIXED_INFO whose DnsServerList chain is
+    // null-terminated and lives inside `buf`, which outlives this walk.
+    let mut node: *const IP_ADDR_STRING = unsafe { &(*info).DnsServerList };
+    while !node.is_null() && out.len() < MAX_SERVERS {
+        let raw = unsafe { (*node).IpAddress.String };
+        let text: Vec<u8> = raw
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        if let Some(ip) = std::str::from_utf8(&text)
+            .ok()
+            .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok())
+        {
+            out.push(ip.octets());
+        }
+        node = unsafe { (*node).Next };
+    }
+    out
 }

@@ -636,7 +636,8 @@ done. Build them in this order:
   mergeable RX buffers (`net.rs:878`), and tells a backend to pause while the
   guest's RX backlog is full (`net.rs:415` `rx_congested`). The NAT
   (`src/net/nat.rs`) is a slirp-style terminate-and-proxy stack (ARP, ICMP, UDP,
-  TCP via the `tcp-sans-io` crate) — no admin rights, no virtual adapter —
+  TCP via the `tcp-sans-io` crate, and a DHCP server in `src/net/dhcp.rs` that
+  hands every client the one fixed lease) — no admin rights, no virtual adapter —
   sharded over `--nat-workers` threads (default a quarter of the host's logical
   CPUs, 1–4; `nat.rs:157`), each with its own IOCP and the flows it owns. A TCP
   flow's SYN assigns it to the least-loaded worker; UDP goes by 4-tuple hash;
@@ -1009,7 +1010,7 @@ src/devices/     io_bus, mmio_bus, serial (8250), pic (i8259), pit (8254), legac
 src/pci/         mod (CF8/CFC), bus, config (Type-0 + BAR), msix, passthrough
 src/virtio/      device (trait), transport (virtio-pci), queue (virtqueue),
                  console, net, rng, blk, p9, input, gpu, snd
-src/net/         wire (parse/build), nat (user-mode NAT), wintun, sys
+src/net/         wire (parse/build), nat (user-mode NAT), dhcp, wintun, sys
 src/display.rs   Win32 GDI window for virtio-gpu + host-input seam
 src/main.rs      CLI dispatch, the full machine wiring, save/restore driver
 ```
