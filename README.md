@@ -517,7 +517,11 @@ axes).
 * **`nat`** (default) — a **slirp-style user-mode NAT** in `src/net/nat.rs`: guest
   `10.0.0.2/24`, gateway `10.0.0.1` (MAC `02:53:54:00:00:01`). No admin rights, no
   virtual adapter. Implements **ARP**, local + proxied **ICMP echo** (`ping`
-  works via an `IcmpSendEcho` helper-thread pool), **UDP** NAT (one connected host
+  works via an `IcmpSendEcho` helper-thread pool), a **DHCP** server on the
+  gateway (`src/net/dhcp.rs`: hands out `10.0.0.2/24`, router `10.0.0.1` and up to
+  three of the host's DNS servers that the guest can reach, so a stock
+  distribution configures itself; the lease is the same for every client, so
+  there is no lease state), **UDP** NAT (one connected host
   socket per 4-tuple), and **TCP** terminate-and-proxy (the guest-facing TCB is
   the `tcp-sans-io` crate; the host side dials out with `ConnectEx`). `--portfwd`
   adds inbound forwarding — the VMM originates a SYN toward the guest.
@@ -611,7 +615,8 @@ src/
   pci/         config (Type-0 space), bus (0xCF8/0xCFC), msix
   virtio/      queue, device(trait), transport(virtio-pci modern),
                console, net, rng, blk, p9, input, gpu
-  net/         wire (parse/build), nat (user-mode NAT), wintun, sys (facade)
+  net/         wire (parse/build), nat (user-mode NAT), dhcp (the NAT's DHCP
+               server), wintun, sys (facade)
   whp/         run_loop, cpuid, hv (Hyper-V enlightenment),
                snapshot + snapshot_file + vcpu_state (save/restore)
   diag/        boot_timer, etw (facade), alloc_trace (global-allocator ETW shim)
@@ -766,7 +771,7 @@ malloc-free hot path never stalls.
 | Boot / device setup | Allocates freely (`Vec`/`String`/`Box`). One-time. |
 | Kernel + initramfs load | **Memory-mapped** (`MapViewOfFile`) and copied straight into guest RAM via `GuestMemory::write_at` — *no* read-into-`Vec`. The mappings are dropped right after (`src/boot/loader.rs`, wired at `main.rs:980`). |
 | virtio TX/RX, blk submit+complete, 9p dispatch, input frames, gpu present | **Zero heap allocation on the steady-state hot path** — preallocated pools and reused scratch buffers (below). |
-| NAT cold paths (ARP, ICMP/ping, RST, new-flow creation) | Still allocate (`Box<UdpOp>`, `Box<TcpOp>`, `Box<dyn TcbDyn>`, an ICMP `to_vec()`). Rare, not worth pooling. |
+| NAT cold paths (ARP, ICMP/ping, DHCP, RST, new-flow creation) | Still allocate (`Box<UdpOp>`, `Box<TcpOp>`, `Box<dyn TcbDyn>`, an ICMP `to_vec()`, a DHCP reply `Vec`). Rare, not worth pooling. |
 | gpu resource lifecycle (`RESOURCE_CREATE_2D`, attach-backing) | Allocates the per-resource pixel store + SG list once per resource (a control-plane op), not per frame. |
 
 ### The preallocated pools (the "partitioned memory" a systems programmer expects)
