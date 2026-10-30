@@ -22,7 +22,8 @@ use windows_sys::Win32::System::Com::{
     CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, ResetEvent, SetEvent, WaitForMultipleObjects,
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateEventW, CreateWaitableTimerExW, ResetEvent,
+    SetEvent, SetWaitableTimer, TIMER_ALL_ACCESS, WaitForMultipleObjects,
 };
 use windows_sys::core::{GUID, HRESULT};
 
@@ -187,10 +188,15 @@ fn wave_format() -> WAVEFORMATEX {
 }
 
 /// Open the default endpoint for `data_flow` and activate its `IAudioClient`,
-/// initialised in shared event-driven mode with auto-conversion. Returns the
-/// initialised client pointer + its buffer size in frames. `unsafe` internally;
-/// returns `None` on any failure (caller falls back to silent mode).
-fn open_audio_client(data_flow: i32, event: HANDLE) -> Option<(*mut IAudioClient, u32)> {
+/// initialised in shared event-driven mode with auto-conversion and a buffer of
+/// `buffer_hns` (100-ns units). Returns the initialised client pointer + its
+/// buffer size in frames. `unsafe` internally; returns `None` on any failure
+/// (caller falls back to silent mode).
+fn open_audio_client(
+    data_flow: i32,
+    event: HANDLE,
+    buffer_hns: i64,
+) -> Option<(*mut IAudioClient, u32)> {
     unsafe {
         let mut enumerator: *mut IMMDeviceEnumerator = core::ptr::null_mut();
         let hr = CoCreateInstance(
@@ -237,7 +243,7 @@ fn open_audio_client(data_flow: i32, event: HANDLE) -> Option<(*mut IAudioClient
             client.cast(),
             AUDCLNT_SHAREMODE_SHARED,
             flags,
-            BUFFER_DURATION_HNS,
+            buffer_hns,
             0,
             &fmt,
             core::ptr::null(),
@@ -276,7 +282,13 @@ impl RenderClient {
     /// Open the default render endpoint, signalling `event` when the engine
     /// needs more data. `None` if no endpoint is available.
     pub fn open(event: &Event) -> Option<RenderClient> {
-        let (client, buffer_frames) = open_audio_client(E_RENDER, event.handle())?;
+        Self::open_with_buffer(event, BUFFER_DURATION_HNS)
+    }
+
+    /// [`Self::open`] with a `buffer_hns` (100-ns units) endpoint buffer
+    /// request; the engine may round it (read back via [`Self::buffer_frames`]).
+    pub fn open_with_buffer(event: &Event, buffer_hns: i64) -> Option<RenderClient> {
+        let (client, buffer_frames) = open_audio_client(E_RENDER, event.handle(), buffer_hns)?;
         unsafe {
             let mut render: *mut IAudioRenderClient = core::ptr::null_mut();
             let hr = ((*(*client).vtbl).get_service)(
@@ -388,7 +400,7 @@ impl CaptureClient {
     /// Open the default capture endpoint, signalling `event` when data is
     /// available. `None` if no endpoint is available.
     pub fn open(event: &Event) -> Option<CaptureClient> {
-        let (client, _frames) = open_audio_client(E_CAPTURE, event.handle())?;
+        let (client, _frames) = open_audio_client(E_CAPTURE, event.handle(), BUFFER_DURATION_HNS)?;
         unsafe {
             let mut capture: *mut IAudioCaptureClient = core::ptr::null_mut();
             let hr = ((*(*client).vtbl).get_service)(
@@ -487,7 +499,8 @@ impl Drop for CaptureClient {
 
 /// A Win32 event handle (RAII). Auto-reset events are used for the WASAPI
 /// buffer notification and the per-worker wake; a manual-reset event is used for
-/// the broadcast stop signal.
+/// the broadcast stop signal; [`Event::timer`] makes a waitable timer that
+/// paces workers without an audio endpoint.
 pub struct Event {
     handle: HANDLE,
 }
@@ -520,6 +533,41 @@ impl Event {
         unsafe {
             let _ = ResetEvent(self.handle);
         }
+    }
+
+    /// Create an auto-reset waitable timer: waitable through [`wait_any`] like
+    /// an event and armed with [`Self::arm_timer`] (`set`/`reset` don't apply).
+    /// High resolution (sub-millisecond) where the OS supports
+    /// `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` (Windows 10 1803+); otherwise the
+    /// system tick (~15.6 ms).
+    pub fn timer() -> Option<Event> {
+        let create = |flags: u32| unsafe {
+            CreateWaitableTimerExW(
+                core::ptr::null(),
+                core::ptr::null(),
+                flags,
+                TIMER_ALL_ACCESS,
+            )
+        };
+        let mut handle = create(CREATE_WAITABLE_TIMER_HIGH_RESOLUTION);
+        if handle.is_null() {
+            handle = create(0);
+        }
+        if handle.is_null() {
+            None
+        } else {
+            Some(Event { handle })
+        }
+    }
+
+    /// Arm a timer from [`Self::timer`]: first expiry `delay_hns` (100-ns units)
+    /// from now, then every `period_ms` milliseconds (0 = one-shot). Re-arming
+    /// replaces the previous schedule. Returns false on failure.
+    pub fn arm_timer(&self, delay_hns: i64, period_ms: u32) -> bool {
+        // A negative due time is relative to now.
+        let due = -delay_hns.max(1);
+        let period = i32::try_from(period_ms).unwrap_or(i32::MAX);
+        unsafe { SetWaitableTimer(self.handle, &due, period, None, core::ptr::null(), 0) != 0 }
     }
 
     fn handle(&self) -> HANDLE {
@@ -630,5 +678,29 @@ mod tests {
         // Nothing signalled now (auto-reset `a` never set, `b` reset).
         b.reset();
         assert!(matches!(wait_any(&[&a, &b], 0), WaitOutcome::Timeout));
+    }
+
+    /// A one-shot timer fires once; a periodic timer keeps firing; both wake
+    /// `wait_any` alongside ordinary events.
+    #[test]
+    fn timer_one_shot_and_periodic() {
+        let stop = Event::new(true).expect("event");
+        let t = Event::timer().expect("timer");
+        // Unarmed: never signalled.
+        assert!(matches!(wait_any(&[&stop, &t], 0), WaitOutcome::Timeout));
+        assert!(t.arm_timer(20_000, 0)); // 2 ms one-shot
+        assert!(matches!(
+            wait_any(&[&stop, &t], 2_000),
+            WaitOutcome::Signaled(1)
+        ));
+        // Auto-reset, one-shot: consumed by the wait above.
+        assert!(matches!(wait_any(&[&stop, &t], 30), WaitOutcome::Timeout));
+        assert!(t.arm_timer(10_000, 2)); // every 2 ms
+        for _ in 0..3 {
+            assert!(matches!(
+                wait_any(&[&stop, &t], 2_000),
+                WaitOutcome::Signaled(1)
+            ));
+        }
     }
 }

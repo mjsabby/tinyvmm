@@ -2,9 +2,10 @@
 //!
 //! This crate exists to CONCENTRATE the host-FFI `unsafe` into one small,
 //! separately-auditable place: overlapped/IOCP file I/O, memory-mapped files,
-//! token privileges, large-page sizing, CNG randomness, ETW, CPU affinity, and
-//! the Winsock/IOCP socket primitives. The main binary consumes the safe APIs
-//! and stays (near) `unsafe`-free for host I/O.
+//! token privileges, large-page sizing, CNG randomness, ETW, CPU affinity,
+//! WASAPI audio, Media Foundation MP4 encoding, and the Winsock/IOCP socket
+//! primitives. The main binary consumes the safe APIs and stays (near)
+//! `unsafe`-free for host I/O.
 //!
 //! Several socket/IOCP/ICMP primitives take Win32 `HANDLE` / `OVERLAPPED` /
 //! `SOCKET` values, which are raw-pointer-typed but are *opaque OS tokens*, not
@@ -20,6 +21,7 @@ pub mod error;
 pub mod etw;
 pub mod fs;
 pub mod host;
+pub mod media;
 pub mod ptr;
 pub mod qpc;
 pub mod sock;

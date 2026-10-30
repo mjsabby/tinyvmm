@@ -88,6 +88,12 @@ pub type IrqFn = Box<dyn Fn(u32) + Send + Sync>;
 /// Present a BGRA (top-down, `stride == width*4`) frame of `width`x`height`.
 pub type PresentFn = Box<dyn Fn(&[u8], u32, u32) + Send + Sync>;
 
+/// The display size a device asked for `width`x`height` advertises (clamped to
+/// what it supports).
+pub fn display_size(width: u32, height: u32) -> (u32, u32) {
+    (width.clamp(64, MAX_DIM), height.clamp(64, MAX_DIM))
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct Resource2d {
     width: u32,
@@ -166,8 +172,7 @@ pub struct GpuDevice {
 
 impl GpuDevice {
     pub fn new(mem: Arc<GuestMemory>, width: u32, height: u32) -> Arc<Self> {
-        let width = width.clamp(64, MAX_DIM);
-        let height = height.clamp(64, MAX_DIM);
+        let (width, height) = display_size(width, height);
         Arc::new(GpuDevice {
             controlq: Mutex::new(Virtqueue::new(mem.clone(), GPU_QUEUE_MAX)),
             cursorq: Mutex::new(Virtqueue::new(mem.clone(), GPU_QUEUE_MAX)),

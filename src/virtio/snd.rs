@@ -18,14 +18,26 @@
 //!
 //! # Threading
 //! Two dedicated worker threads (one per direction) own the WASAPI client
-//! lifecycle and run the event-driven audio clock. The control queue only flips
-//! per-stream `running` flags and signals the workers; the workers pull/produce
-//! PCM paced by the WASAPI buffer-ready event. If no endpoint can be opened (a
-//! headless host), a worker falls back to completing I/O buffers on a period
-//! timer so the guest's audio pipeline still flows (playback discarded, capture
-//! silent). All Win32/COM `unsafe` lives in `winsys::audio`; this device is
-//! `unsafe`-free except for the `Send` assertion on its reused popped chains
-//! (the same one virtio-net makes).
+//! lifecycle and run the audio clock. The control queue only flips per-stream
+//! `running` flags and signals the workers.
+//!
+//! Playback runs in one of two pacings, chosen each time the guest starts the
+//! stream:
+//!   * device-paced: the WASAPI buffer-ready event pulls guest PCM straight into
+//!     the endpoint buffer (the default when a host speaker is available);
+//!   * clock-paced: a 10 ms high-resolution timer consumes exactly 48 000
+//!     frames per second of guest PCM (measured on QPC). Used with no host
+//!     endpoint (the audio is then discarded), when the endpoint is lost, and
+//!     whenever a playback tap ([`SndDevice::set_playback_tap`], the A/V
+//!     recorder) is attached: its chunks then sit on a drift-free timeline. The
+//!     endpoint, if any, becomes a monitor fed with a small silence cushion, so
+//!     device-vs-QPC clock drift costs an occasional local glitch instead of
+//!     skewing the recording.
+//!
+//! Capture is paced by the WASAPI capture event, or completes silent buffers on
+//! a period timer with no endpoint. All Win32/COM `unsafe` lives in
+//! `winsys::audio`; this device is `unsafe`-free except for the `Send`
+//! assertion on its reused popped chains (the same one virtio-net makes).
 
 use crate::diag::etw;
 use crate::host::audio::{
@@ -39,6 +51,7 @@ use crate::whp::GuestMemory;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 pub const SND_CONTROL_QUEUE: u32 = 0;
 pub const SND_EVENT_QUEUE: u32 = 1;
@@ -94,6 +107,27 @@ const DEFCONF_MIC: u32 = 0x00A0_0000;
 
 pub type IrqFn = Box<dyn Fn(u32) + Send + Sync>;
 
+/// Receives the guest's playback PCM (S16LE stereo, 48 kHz) as the device
+/// consumes it, on the playback worker thread: `(epoch, offset, pcm)`, where
+/// `epoch` is when the current playback run's 48 kHz clock started and
+/// `offset` is the frame index of `pcm`'s first frame on that clock. A run's
+/// chunks are contiguous unless a host stall forced a skip; each run has a new
+/// epoch.
+pub type PcmTapFn = Box<dyn Fn(Instant, u64, &[u8]) + Send + Sync>;
+
+/// Clock-paced playback tick.
+const PACE_MS: u32 = 10;
+/// Clock-paced catch-up bound: after a longer host stall, skip ahead rather
+/// than draining the guest's whole ring in one burst.
+const MAX_CATCHUP_FRAMES: u64 = audio::SAMPLE_RATE as u64 / 4;
+/// Largest chunk handed out per fill (one scratch buffer).
+const CHUNK_FRAMES: usize = audio::SAMPLE_RATE as usize / 20;
+/// Monitor endpoint (clock-paced local playback): buffer request, the silence
+/// cushion queued ahead of the data, and the low-water mark that re-cushions.
+const MONITOR_BUFFER_HNS: i64 = 1_000_000;
+const MONITOR_CUSHION_FRAMES: u32 = audio::SAMPLE_RATE / 25;
+const MONITOR_LOW_FRAMES: u32 = audio::SAMPLE_RATE / 100;
+
 /// One PCM direction's virtqueue plus the in-flight chain being filled/drained
 /// across worker iterations (so a guest period can span several WASAPI ticks
 /// without ever re-popping it). The reused `PoppedChain` holds raw guest
@@ -133,10 +167,10 @@ pub struct SndDevice {
     driver_ok: AtomicBool,
     acked_features: AtomicU64,
     irq: OnceLock<IrqFn>,
+    tap: OnceLock<PcmTapFn>,
 
     play_running: AtomicBool,
     cap_running: AtomicBool,
-    play_period_bytes: AtomicU32,
     cap_period_bytes: AtomicU32,
 
     stop_evt: Arc<Event>,
@@ -163,9 +197,9 @@ impl SndDevice {
             driver_ok: AtomicBool::new(false),
             acked_features: AtomicU64::new(0),
             irq: OnceLock::new(),
+            tap: OnceLock::new(),
             play_running: AtomicBool::new(false),
             cap_running: AtomicBool::new(false),
-            play_period_bytes: AtomicU32::new(0),
             cap_period_bytes: AtomicU32::new(0),
             stop_evt: Arc::new(Event::new(true).expect("create snd stop event")),
             wake_play: Arc::new(Event::new(false).expect("create snd play wake event")),
@@ -210,6 +244,13 @@ impl SndDevice {
         let _ = self.irq.set(f);
     }
 
+    /// Tee every consumed playback frame to `f` (see [`PcmTapFn`]); playback is
+    /// clock-paced from then on. Set before the guest starts playing (in
+    /// practice, before the VM runs); only the first tap is kept.
+    pub fn set_playback_tap(&self, f: PcmTapFn) {
+        let _ = self.tap.set(f);
+    }
+
     pub fn tx_periods(&self) -> u64 {
         self.tx_periods.load(Ordering::Relaxed)
     }
@@ -229,9 +270,6 @@ impl SndDevice {
         }
     }
 
-    fn play_period_ms(&self) -> u32 {
-        period_bytes_to_ms(self.play_period_bytes.load(Ordering::Relaxed))
-    }
     fn cap_period_ms(&self) -> u32 {
         period_bytes_to_ms(self.cap_period_bytes.load(Ordering::Relaxed))
     }
@@ -293,28 +331,6 @@ impl SndDevice {
             trace_pcm("SndPlay", completed, bytes);
         }
         ((written / frame_bytes) as u32, irq)
-    }
-
-    /// Silent-fallback playback: complete one pending period (audio discarded),
-    /// paced by the caller's period timer. Returns whether to raise txq.
-    fn drain_playback_discard(&self) -> bool {
-        let irq = {
-            let mut g = self.play.lock().unwrap();
-            let io = &mut *g;
-            if !io.q.ready() {
-                return false;
-            }
-            if !io.cur_valid && !io.q.pop_into(&mut io.cur) {
-                return false;
-            }
-            write_status(&mut io.cur, S_OK, 0);
-            let head = io.cur.head_index;
-            io.q.push(head, STATUS_BYTES as u32);
-            io.cur_valid = false;
-            io.q.should_interrupt_driver()
-        };
-        self.tx_periods.fetch_add(1, Ordering::Relaxed);
-        irq
     }
 
     // ---- hot path: capture (rxq) ----
@@ -532,10 +548,9 @@ impl SndDevice {
             && format == FMT_S16
             && rate == RATE_48000;
         if supported {
-            if stream == STREAM_OUTPUT {
-                self.play_period_bytes
-                    .store(period_bytes, Ordering::Relaxed);
-            } else {
+            // The playback period needs no bookkeeping: both pacings consume
+            // by frame count. Capture's silent fallback completes per period.
+            if stream == STREAM_INPUT {
                 self.cap_period_bytes.store(period_bytes, Ordering::Relaxed);
             }
             etw_ctrl("SndSetParams", stream, period_bytes);
@@ -843,104 +858,228 @@ fn etw_ctrl(name: &str, stream: u32, period_bytes: u32) {
 // Worker threads.
 // ---------------------------------------------------------------------------
 
+/// How a playback run ended.
+enum RunEnd {
+    /// The guest stopped (or released) the stream: wait for the next start.
+    Stopped,
+    /// Device teardown: exit the worker.
+    Shutdown,
+    /// The host endpoint went away mid-run (e.g. unplugged).
+    DeviceLost,
+}
+
+/// A host render endpoint plus the buffer event it signals (kept alive with it).
+struct Endpoint {
+    client: RenderClient,
+    event: Event,
+}
+
+impl Endpoint {
+    /// Open the default render endpoint: the standard buffer for device-paced
+    /// playback, or the larger [`MONITOR_BUFFER_HNS`] one for monitoring.
+    fn open(monitor: bool) -> Option<Endpoint> {
+        let event = Event::new(false)?;
+        let client = if monitor {
+            RenderClient::open_with_buffer(&event, MONITOR_BUFFER_HNS)?
+        } else {
+            RenderClient::open(&event)?
+        };
+        Some(Endpoint { client, event })
+    }
+
+    /// Frames queued in the endpoint buffer, or `None` if the device is gone.
+    fn queued(&self) -> Option<u32> {
+        let avail = self.client.available_frames()?;
+        Some(self.client.buffer_frames().saturating_sub(avail))
+    }
+
+    /// Monitor mode: queue silence up to the cushion. `false` if the device is
+    /// gone.
+    fn cushion(&mut self) -> bool {
+        let Some(queued) = self.queued() else {
+            return false;
+        };
+        let n = MONITOR_CUSHION_FRAMES.saturating_sub(queued);
+        // `begin(0)` is `None`: nothing to queue when already cushioned.
+        if let Some(dst) = self.client.begin(n) {
+            dst.fill(0);
+            self.client.commit(n, true);
+        }
+        true
+    }
+
+    /// Monitor mode: queue `pcm`, re-cushioning first if the device clock ran
+    /// ahead and drained the buffer below the low-water mark. What doesn't fit
+    /// (the device clock runs behind) is dropped. `false` if the device is gone.
+    fn monitor(&mut self, pcm: &[u8]) -> bool {
+        match self.queued() {
+            None => return false,
+            Some(q) if q < MONITOR_LOW_FRAMES && !self.cushion() => return false,
+            Some(_) => {}
+        }
+        let Some(avail) = self.client.available_frames() else {
+            return false;
+        };
+        let n = ((pcm.len() / audio::FRAME_BYTES as usize) as u32).min(avail);
+        if let Some(dst) = self.client.begin(n) {
+            let len = dst.len();
+            dst.copy_from_slice(&pcm[..len]);
+            self.client.commit(n, false);
+        }
+        true
+    }
+}
+
 fn play_worker(dev: Weak<SndDevice>, stop: Arc<Event>, wake: Arc<Event>) {
     let _com = ComInit::mta();
-    let mut client: Option<RenderClient> = None;
-    let mut wasapi_evt: Option<Arc<Event>> = None;
-    let mut prev_running = false;
-    let mut open_failed = false;
-
+    let mut scratch = vec![0u8; CHUNK_FRAMES * audio::FRAME_BYTES as usize];
     loop {
         let Some(d) = dev.upgrade() else { break };
         let running = d.play_running.load(Ordering::Acquire);
-        if running && !prev_running {
-            open_failed = false;
-        }
-        if !running && prev_running {
-            if let Some(c) = client.take() {
-                c.stop();
-            }
-            wasapi_evt = None;
-        }
-        prev_running = running;
-
+        let tapped = d.tap.get().is_some();
+        drop(d);
         if !running {
-            drop(d);
             match wait_any(&[&*stop, &*wake], INFINITE) {
                 WaitOutcome::Signaled(0) => break,
                 _ => continue,
             }
         }
-
-        if client.is_none() && !open_failed {
-            if let Some(ev) = Event::new(false) {
-                let ev = Arc::new(ev);
-                if let Some(mut c) = RenderClient::open(&ev) {
-                    // Pre-roll the endpoint buffer before starting the clock.
-                    let bf = c.buffer_frames();
-                    if let Some(dst) = c.begin(bf) {
-                        let (filled, _irq) = d.fill_playback(dst);
-                        c.commit(bf, filled == 0);
-                    }
-                    c.start();
-                    client = Some(c);
-                    wasapi_evt = Some(ev);
-                } else {
-                    open_failed = true;
-                }
-            } else {
-                open_failed = true;
-            }
-        }
-
-        let period_ms = d.play_period_ms();
-        let evt = wasapi_evt.clone();
-        drop(d);
-
-        let mut invalidate = false;
-        if let (Some(c), Some(ev)) = (client.as_mut(), evt) {
-            if let WaitOutcome::Signaled(0) = wait_any(&[&*stop, &*wake, &*ev], INFINITE) {
-                break;
-            }
-            let Some(d) = dev.upgrade() else { break };
-            if d.play_running.load(Ordering::Acquire) {
-                match c.available_frames() {
-                    Some(avail) if avail > 0 => {
-                        if let Some(dst) = c.begin(avail) {
-                            let (filled, irq) = d.fill_playback(dst);
-                            c.commit(avail, filled == 0);
-                            if irq {
-                                d.raise(SND_TX_QUEUE);
-                            }
-                        }
-                    }
-                    Some(_) => {}
-                    None => invalidate = true,
-                }
-            }
+        // Each run opens the endpoint afresh, so a speaker plugged in (or
+        // replaced) since the last run is picked up.
+        let end = if tapped {
+            play_clock_paced(&dev, &stop, &wake, Endpoint::open(true), &mut scratch)
         } else {
-            // No endpoint: pace buffer completion on a period timer.
-            if let WaitOutcome::Signaled(0) = wait_any(&[&*stop, &*wake], period_ms) {
-                break;
+            match Endpoint::open(false) {
+                Some(out) => match play_device_paced(&dev, &stop, &wake, out) {
+                    RunEnd::DeviceLost => play_clock_paced(&dev, &stop, &wake, None, &mut scratch),
+                    end => end,
+                },
+                None => play_clock_paced(&dev, &stop, &wake, None, &mut scratch),
             }
-            let Some(d) = dev.upgrade() else { break };
-            if d.play_running.load(Ordering::Acquire) && d.drain_playback_discard() {
-                d.raise(SND_TX_QUEUE);
-            }
+        };
+        if let RunEnd::Shutdown = end {
+            break;
         }
-        if invalidate {
-            if let Some(c) = client.take() {
-                c.stop();
-            }
-            wasapi_evt = None;
-            open_failed = true;
-        }
-    }
-    if let Some(c) = client.take() {
-        c.stop();
     }
 }
 
+/// Device-paced run: the endpoint's buffer-ready event pulls guest PCM straight
+/// into the WASAPI buffer.
+fn play_device_paced(
+    dev: &Weak<SndDevice>,
+    stop: &Event,
+    wake: &Event,
+    mut out: Endpoint,
+) -> RunEnd {
+    {
+        let Some(d) = dev.upgrade() else {
+            return RunEnd::Shutdown;
+        };
+        // Pre-roll the endpoint buffer before starting the clock.
+        let frames = out.client.buffer_frames();
+        if let Some(dst) = out.client.begin(frames) {
+            let (filled, irq) = d.fill_playback(dst);
+            out.client.commit(frames, filled == 0);
+            if irq {
+                d.raise(SND_TX_QUEUE);
+            }
+        }
+    }
+    out.client.start();
+    loop {
+        if let WaitOutcome::Signaled(0) = wait_any(&[stop, wake, &out.event], INFINITE) {
+            return RunEnd::Shutdown;
+        }
+        let Some(d) = dev.upgrade() else {
+            return RunEnd::Shutdown;
+        };
+        if !d.play_running.load(Ordering::Acquire) {
+            return RunEnd::Stopped;
+        }
+        match out.client.available_frames() {
+            Some(0) => {}
+            Some(avail) => {
+                if let Some(dst) = out.client.begin(avail) {
+                    let (filled, irq) = d.fill_playback(dst);
+                    out.client.commit(avail, filled == 0);
+                    if irq {
+                        d.raise(SND_TX_QUEUE);
+                    }
+                }
+            }
+            None => return RunEnd::DeviceLost,
+        }
+    }
+}
+
+/// Clock-paced run: every [`PACE_MS`], hand out exactly the frames a 48 kHz
+/// clock (on QPC) has advanced since the run started, to the tap and to the
+/// monitor endpoint if there is one (else the audio is discarded). A guest that
+/// underruns yields silence, as on real hardware.
+fn play_clock_paced(
+    dev: &Weak<SndDevice>,
+    stop: &Event,
+    wake: &Event,
+    monitor: Option<Endpoint>,
+    scratch: &mut [u8],
+) -> RunEnd {
+    let timer = Event::timer();
+    if let Some(t) = &timer {
+        t.arm_timer(PACE_MS as i64 * 10_000, PACE_MS);
+    }
+    let mut monitor = monitor.and_then(|mut m| (m.cushion() && m.client.start()).then_some(m));
+    let chunk_frames = scratch.len() / audio::FRAME_BYTES as usize;
+    let epoch = Instant::now();
+    let mut consumed = 0u64;
+    loop {
+        let outcome = match &timer {
+            Some(t) => wait_any(&[stop, wake, t], INFINITE),
+            None => wait_any(&[stop, wake], PACE_MS),
+        };
+        if let WaitOutcome::Signaled(0) = outcome {
+            return RunEnd::Shutdown;
+        }
+        let Some(d) = dev.upgrade() else {
+            return RunEnd::Shutdown;
+        };
+        if !d.play_running.load(Ordering::Acquire) {
+            return RunEnd::Stopped;
+        }
+        let (mut at, due) = clock_due(epoch.elapsed(), consumed);
+        let end = at + due;
+        let mut irq = false;
+        while at < end {
+            let n = ((end - at) as usize).min(chunk_frames);
+            let pcm = &mut scratch[..n * audio::FRAME_BYTES as usize];
+            irq |= d.fill_playback(pcm).1;
+            if let Some(tap) = d.tap.get() {
+                tap(epoch, at, pcm);
+            }
+            if monitor.as_mut().is_some_and(|m| !m.monitor(pcm)) {
+                monitor = None;
+            }
+            at += n as u64;
+        }
+        consumed = end;
+        if irq {
+            d.raise(SND_TX_QUEUE);
+        }
+    }
+}
+
+/// Whole frames of a 48 kHz clock in `elapsed`.
+fn clock_frames(elapsed: Duration) -> u64 {
+    (elapsed.as_nanos() * audio::SAMPLE_RATE as u128 / 1_000_000_000) as u64
+}
+
+/// This tick's clock-paced fill: `(first, count)` frames on the run's clock,
+/// given `consumed` frames handed out so far. A gap longer than
+/// [`MAX_CATCHUP_FRAMES`] (a host stall) is skipped, not drained.
+fn clock_due(elapsed: Duration, consumed: u64) -> (u64, u64) {
+    let now = clock_frames(elapsed);
+    let first = consumed.max(now.saturating_sub(MAX_CATCHUP_FRAMES));
+    (first, now.saturating_sub(first))
+}
 fn cap_worker(dev: Weak<SndDevice>, stop: Arc<Event>, wake: Arc<Event>) {
     let _com = ComInit::mta();
     let mut client: Option<CaptureClient> = None;
@@ -1349,5 +1488,33 @@ mod tests {
         // 48 kHz stereo S16: 192 bytes/ms. 4096 bytes ~= 21 ms.
         assert_eq!(period_bytes_to_ms(4096), 4096 / 192);
         assert!(period_bytes_to_ms(64) >= 1); // never zero
+    }
+
+    /// The clock-paced fill hands out exactly 48 000 frames per second however
+    /// the ticks fall, and skips (rather than bursts through) a long stall.
+    #[test]
+    fn clock_paced_fill() {
+        assert_eq!(clock_frames(Duration::from_secs(1)), 48_000);
+        assert_eq!(clock_frames(Duration::from_millis(10)), 480);
+        assert_eq!(clock_frames(Duration::from_nanos(20_833)), 0); // < 1 frame
+        // Irregular ticks (each gap under the catch-up bound) still sum to the
+        // exact elapsed frame count.
+        let mut consumed = 0u64;
+        for ms in [3u64, 10, 21, 22, 40, 250, 490, 730, 970, 1000] {
+            let (first, n) = clock_due(Duration::from_millis(ms), consumed);
+            assert_eq!(first, consumed);
+            consumed = first + n;
+        }
+        assert_eq!(consumed, 48_000);
+        // A 2 s stall: only the last MAX_CATCHUP_FRAMES are handed out, starting
+        // where the skipped gap ends.
+        let (first, n) = clock_due(Duration::from_secs(3), consumed);
+        assert_eq!(n, MAX_CATCHUP_FRAMES);
+        assert_eq!(first, 3 * 48_000 - MAX_CATCHUP_FRAMES);
+        // No time passed: nothing due.
+        assert_eq!(
+            clock_due(Duration::from_secs(3), 3 * 48_000),
+            (3 * 48_000, 0)
+        );
     }
 }
