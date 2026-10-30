@@ -250,8 +250,8 @@ pub fn set_lx_metadata(h: HANDLE, md: LxMetadata) -> Result<(), u32> {
     }
     // The kernel checks the entries' alignment, so hand it u32-aligned memory.
     let mut buf = vec![0u32; bytes.len() / 4];
-    for (word, chunk) in buf.iter_mut().zip(bytes.chunks_exact(4)) {
-        *word = u32::from_le_bytes(chunk.try_into().unwrap());
+    for (word, chunk) in buf.iter_mut().zip(bytes.as_chunks::<4>().0) {
+        *word = u32::from_le_bytes(*chunk);
     }
     let mut iosb: IO_STATUS_BLOCK = unsafe { core::mem::zeroed() };
     nt_result(unsafe {

@@ -877,7 +877,7 @@ impl BlockDevice {
             let p = unsafe { &*parent };
             let _ = p
                 .total_done
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
                     Some(t.saturating_add(bytes))
                 });
         }
