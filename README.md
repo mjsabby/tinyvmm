@@ -447,9 +447,10 @@ order they are created — that order is fixed (it is also the snapshot
   (`controlq=0`, `cursorq=1`); single scanout (`NUM_SCANOUTS=1`); 32-bpp
   resources. It handles `GET_DISPLAY_INFO`, `RESOURCE_CREATE_2D` / `UNREF`,
   `SET_SCANOUT`, `RESOURCE_ATTACH`/`DETACH_BACKING`, `TRANSFER_TO_HOST_2D`, and
-  `RESOURCE_FLUSH`; on flush it swizzles the bound resource to BGRA into a reused
-  shadow buffer and presents it to a **Win32 GDI window** (`src/display.rs`) via a
-  CPU blit.
+  `RESOURCE_FLUSH`; on flush it swizzles the scanout rectangle of the bound
+  resource (`SET_SCANOUT`'s rect, which can be smaller than the resource, e.g.
+  llvmpipe pads heights to 64-row tiles) to BGRA into a reused shadow buffer and
+  presents it to a **Win32 GDI window** (`src/display.rs`) via a CPU blit.
 * **virtio-snd** — sound card (`src/virtio/snd.rs`) with one playback and one
   capture PCM stream, plus one jack and one channel-map per direction. Four queues
   (`controlq=0`, `eventq=1`, `txq=2`, `rxq=3`); the control queue (PCM/jack/chmap
@@ -1365,8 +1366,10 @@ What is and isn't snapshottable:
   config select, LED state, last absolute position) round-trip, so the pointer
   resumes where it was.
 * **virtio-gpu IS snapshot-aware:** `capture_device_state` serializes a `"GPU1"`
-  blob — driver flags, the scanout, and **every resource** (geometry + backing SG
-  list + the host pixel shadow); restore re-presents the bound scanout. The GPU is
+  blob (version 2) — driver flags, the scanout and its rectangle, and **every
+  resource** (geometry + backing SG list + the host pixel shadow); restore
+  re-presents the bound scanout. Version-1 blobs (no rectangle) still restore,
+  showing the whole resource. The GPU is
   added **last** in PCI order specifically so its device_index doesn't perturb the
   others.
 * The Hyper-V hypercall + Reference-TSC pages live *inside* guest RAM, so they
