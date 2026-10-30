@@ -169,7 +169,7 @@ impl GuestMemory {
             size: alloc_size,
             large_pages: large,
             split: None,
-            populate: populate,
+            populate,
         })
     }
 
@@ -253,7 +253,7 @@ impl GuestMemory {
                 low_size: low_limit,
                 high_gpa,
             }),
-            populate: populate,
+            populate,
         })
     }
 

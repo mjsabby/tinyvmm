@@ -797,10 +797,10 @@ impl Drop for UdpFlow {
         );
         // The host socket lives inside the op; if the op is still resident
         // (un-reaped), close it so the handle can't leak in release builds.
-        if let Some(op) = self.op.as_ref() {
-            if op.sock != INVALID_SOCKET {
-                sys::close_sock(op.sock);
-            }
+        if let Some(op) = self.op.as_ref()
+            && op.sock != INVALID_SOCKET
+        {
+            sys::close_sock(op.sock);
         }
     }
 }
@@ -1048,7 +1048,7 @@ fn emit_gso_tcp(
     let eth = &mut frame[GSO_HDR_ROOM - ETH_HDR - ihl - thl..];
     eth[..6].copy_from_slice(&dst_mac);
     eth[6..12].copy_from_slice(&src_mac);
-    eth[12..ETH_HDR].copy_from_slice(&(ETHERTYPE_IPV4 as u16).to_be_bytes());
+    eth[12..ETH_HDR].copy_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
     eth[ETH_HDR..ETH_HDR + ihl + thl].copy_from_slice(hdr_tmpl);
 
     // Patch IP: total_len + recompute header checksum.
@@ -1665,10 +1665,10 @@ impl NatState {
             }
         }
         for (_, mut f) in self.udp.drain() {
-            if let Some(op) = f.op.take() {
-                if op.sock != INVALID_SOCKET {
-                    sys::close_sock(op.sock);
-                }
+            if let Some(op) = f.op.take()
+                && op.sock != INVALID_SOCKET
+            {
+                sys::close_sock(op.sock);
             }
         }
     }
@@ -2126,12 +2126,11 @@ impl NatState {
     /// was malformed or refused, or another shard owns its key) must not keep
     /// a router entry, or the table would grow with every such SYN.
     fn settle_route(&self, frame: &[u8]) {
-        if self.shards > 1 {
-            if let (_, Some((key, true))) = shard_of_frame(frame, self.shards) {
-                if !self.tcp.contains_key(&key) {
-                    self.router.release(&key, self.shard);
-                }
-            }
+        if self.shards > 1
+            && let (_, Some((key, true))) = shard_of_frame(frame, self.shards)
+            && !self.tcp.contains_key(&key)
+        {
+            self.router.release(&key, self.shard);
         }
     }
 
@@ -2585,13 +2584,13 @@ impl NatState {
     /// TcpFlow (and its op buffers) stay alive until every outstanding op has
     /// completed, so the kernel never touches freed memory.
     fn begin_teardown(&mut self, key: FlowKey) {
-        if let Some(flow) = self.tcp.get_mut(&key) {
-            if !flow.dead {
-                flow.dead = true;
-                if flow.sock != INVALID_SOCKET {
-                    sys::close_sock(flow.sock);
-                    flow.sock = INVALID_SOCKET;
-                }
+        if let Some(flow) = self.tcp.get_mut(&key)
+            && !flow.dead
+        {
+            flow.dead = true;
+            if flow.sock != INVALID_SOCKET {
+                sys::close_sock(flow.sock);
+                flow.sock = INVALID_SOCKET;
             }
         }
         self.reap_if_idle(key);
@@ -2603,34 +2602,32 @@ impl NatState {
             .get(&key)
             .map(|f| f.dead && !f.recv_pending && !f.send_inflight && !f.connect_pending)
             .unwrap_or(false);
-        if reap {
-            if let Some(mut f) = self.tcp.remove(&key) {
-                self.flows.tcp.fetch_sub(1, Ordering::Relaxed);
-                self.release_flow(&key);
-                // The socket was already closed by begin_teardown and all ops
-                // have drained, so recycle the pooled Tcb (into its size-tier)
-                // and the overlapped op buffers via take(); TcpFlow::drop then
-                // closes the socket (a no-op — already INVALID) and the Drop-bomb
-                // confirms every box was reclaimed.
-                let tier = f.tier;
-                publish_tcb_stats(&mut f, &self.stats);
-                if crate::diag::net_enabled() && f.published != Losses::default() {
-                    let rtt = f.tcb.as_ref().map_or(0, |t| t.stats().min_rtt_ms);
-                    eprintln!(
-                        "[nat] {} closed (min rtt {rtt} ms): {:?}",
-                        fmt_flow(key),
-                        f.published
-                    );
-                }
-                if let Some(tcb) = f.tcb.take() {
-                    self.tcb_pools[tier].release(tcb);
-                }
-                if let Some(op) = f.op.take() {
-                    self.tcp_op_pool.release(op);
-                }
-                if let Some(send_op) = f.send_op.take() {
-                    self.tcp_send_op_pool.release(send_op);
-                }
+        if reap && let Some(mut f) = self.tcp.remove(&key) {
+            self.flows.tcp.fetch_sub(1, Ordering::Relaxed);
+            self.release_flow(&key);
+            // The socket was already closed by begin_teardown and all ops
+            // have drained, so recycle the pooled Tcb (into its size-tier)
+            // and the overlapped op buffers via take(); TcpFlow::drop then
+            // closes the socket (a no-op — already INVALID) and the Drop-bomb
+            // confirms every box was reclaimed.
+            let tier = f.tier;
+            publish_tcb_stats(&mut f, &self.stats);
+            if crate::diag::net_enabled() && f.published != Losses::default() {
+                let rtt = f.tcb.as_ref().map_or(0, |t| t.stats().min_rtt_ms);
+                eprintln!(
+                    "[nat] {} closed (min rtt {rtt} ms): {:?}",
+                    fmt_flow(key),
+                    f.published
+                );
+            }
+            if let Some(tcb) = f.tcb.take() {
+                self.tcb_pools[tier].release(tcb);
+            }
+            if let Some(op) = f.op.take() {
+                self.tcp_op_pool.release(op);
+            }
+            if let Some(send_op) = f.send_op.take() {
+                self.tcp_send_op_pool.release(send_op);
             }
         }
     }
@@ -2703,13 +2700,13 @@ impl NatState {
         keys.extend(self.tcp.keys().copied());
         for &key in &keys {
             let mut tick = false;
-            if let Some(flow) = self.tcp.get_mut(&key) {
-                if !flow.dead {
-                    flow.tcb.as_mut().unwrap().set_now(now);
-                    let _ = flow.tcb.as_mut().unwrap().tick();
-                    publish_tcb_stats(flow, &self.stats);
-                    tick = true;
-                }
+            if let Some(flow) = self.tcp.get_mut(&key)
+                && !flow.dead
+            {
+                flow.tcb.as_mut().unwrap().set_now(now);
+                let _ = flow.tcb.as_mut().unwrap().tick();
+                publish_tcb_stats(flow, &self.stats);
+                tick = true;
             }
             if tick {
                 self.tcp_drive(key);

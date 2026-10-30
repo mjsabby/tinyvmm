@@ -742,9 +742,7 @@ fn decode_state(bytes: &[u8]) -> Option<(bool, u64, u32, HashMap<u32, Resource2d
         if width == 0 || height == 0 || width > MAX_DIM || height > MAX_DIM {
             return None;
         }
-        if channel_indices(format).is_none() {
-            return None;
-        }
+        channel_indices(format)?;
         if host.len() != (width as usize) * (height as usize) * BPP as usize {
             return None;
         }

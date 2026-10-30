@@ -164,19 +164,59 @@ fn print_usage() {
          \x20              [--large-pages|--no-large-pages] [--poll-us N]\n\
          \x20              [--net [--net-backend loopback|nat] [--portfwd H:G]... [--nat-workers N]]...\n\
          \x20              (repeat --net per NIC)\n\
-         \x20              [--drive <path>[,readonly]]... [--cpu-affinity all|p|e|p-physical]\n\
+         \x20              [--drive <path>[,readonly]]... [--cpu-affinity p|p-physical|e|all]\n\
+         \x20              (default p: P-cores only on a hybrid CPU)\n\
          \x20              [--virtio-9p-share <tag>=<host_path>[,ro][,uid=N][,gid=N][,metadata]]...\n\
          \x20              [--gpu [WxH]]  (virtio-gpu 2D scanout to a window; default 1280x800)\n\
          \x20              [--save <path> [--unsafe-save-mutable-drive]]\n\
          \x20              [--watchdog-secs N] [--debug-boot] [vmlinux] [-- <cmdline>]\n\
          \x20              Kernel path is required in plain builds; appliance builds embed defaults.\n\
-         \x20 tinyvmm --restore <path> [--drive <path>[,ro|rw]]... [--cpu-affinity all|p|e|p-physical]\n\
+         \x20 tinyvmm --restore <path> [--drive <path>[,ro|rw]]... [--cpu-affinity p|p-physical|e|all]\n\
          \x20              [--watchdog-secs N] [--unsafe-restore-mutable-drive] [--poll-us N]\n\
          \x20 tinyvmm --dda-probe <PnpInstanceId>   probe a host PCI device for Discrete Device\n\
          \x20              Assignment (no VM boot): dump IDs/BARs/MSI-X, test direct MMIO mapping.\n\
          \x20              Get the id from Device Manager (Details -> Device instance path) or\n\
          \x20              `Get-PnpDevice`. Dismount it first: Dismount-VMHostAssignableDevice.\n"
     );
+}
+
+/// Confine tinyvmm to the cores `mode` selects. Call before any thread is
+/// spawned: the whole process goes to the mode's core class (P- or E-cores on a
+/// hybrid host), and the returned CPU sets are what each vCPU thread pins
+/// itself to (empty = no pinning).
+fn place_on_cores(mode: AffinityMode, vcpus: u32) -> Arc<Vec<u32>> {
+    let process = cpu_affinity::process_cpu_set_ids(mode);
+    let vcpu = cpu_affinity::resolve_cpu_set_ids(mode);
+    let name = cpu_affinity::affinity_mode_name(mode);
+    if !process.is_empty() || !vcpu.is_empty() {
+        let applied = cpu_affinity::restrict_process(&process);
+        let top = cpu_affinity::topology();
+        println!(
+            "[cpu-affinity] mode={name}: process on {}, vCPUs on {} CPU set(s) (host: {} logical, \
+             {} P-logical, {} P-physical, {} E-logical, hybrid={})",
+            if process.is_empty() || !applied {
+                "every".to_string()
+            } else {
+                process.len().to_string()
+            },
+            vcpu.len(),
+            top.total_logical,
+            top.p_logical,
+            top.p_physical,
+            top.e_logical,
+            top.hybrid
+        );
+        if !vcpu.is_empty() && vcpus as usize > vcpu.len() {
+            eprintln!(
+                "[cpu-affinity] WARN: {vcpus} vCPUs share {} logical processors (mode={name}); \
+                 --cpu-affinity all spreads them over every core",
+                vcpu.len()
+            );
+        }
+    } else if mode == AffinityMode::ECore {
+        eprintln!("[cpu-affinity] WARN: mode 'e', but this host has no E-cores; running unpinned");
+    }
+    Arc::new(vcpu)
 }
 
 fn check_whp_available() -> Result<()> {
@@ -989,7 +1029,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
     let mut gpu_width = 1280u32;
     let mut gpu_height = 800u32;
     let mut drives: Vec<DriveSpec> = Vec::new();
-    let mut affinity_mode = AffinityMode::All;
+    let mut affinity_mode = AffinityMode::PCore;
     let mut p9_shares: Vec<P9ShareSpec> = Vec::new();
     let mut save_path: Option<String> = None;
     let mut unsafe_save_mutable_drive = false;
@@ -1415,6 +1455,8 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
 
     let mut btimer = diag::boot_timer::BootTimer::new();
     btimer.mark("pvh-run start");
+    // Before any thread starts, so every thread inherits the placement.
+    let cpu_set_ids = place_on_cores(cfg.affinity_mode, cfg.vcpus);
 
     check_whp_available()?;
     println!("[pvh-run] WHP available");
@@ -2026,31 +2068,6 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     }
 
     println!("[pvh-run] running ({} vCPU(s))", cfg.vcpus);
-
-    // CPU-affinity policy: resolve the CPU-set IDs once, then each vCPU thread
-    // pins itself just before entering its run loop. Empty = no pinning.
-    let cpu_set_ids = Arc::new(cpu_affinity::resolve_cpu_set_ids(cfg.affinity_mode));
-    if cfg.affinity_mode != AffinityMode::All {
-        let top = cpu_affinity::topology();
-        println!(
-            "[cpu-affinity] mode={} -> {} CPU-set(s) (host: {} logical, {} P-logical, \
-             {} P-physical, {} E-logical, hybrid={})",
-            cpu_affinity::affinity_mode_name(cfg.affinity_mode),
-            cpu_set_ids.len(),
-            top.total_logical,
-            top.p_logical,
-            top.p_physical,
-            top.e_logical,
-            top.hybrid
-        );
-        if cpu_set_ids.is_empty() {
-            eprintln!(
-                "[cpu-affinity] WARN: mode '{}' resolved to no CPU sets on this host; \
-                 running unpinned",
-                cpu_affinity::affinity_mode_name(cfg.affinity_mode)
-            );
-        }
-    }
     btimer.mark("entering guest");
 
     // Arm the snapshot trigger so the guest's CPUID(0x4000DE57) is caught by the
@@ -2401,10 +2418,10 @@ fn parse_restore_nic(
     let mut port_forwards = Vec::new();
     let pf_count = jr.get_u64(&format!("{prefix}_portfwd_count")).unwrap_or(0) as usize;
     for j in 0..pf_count {
-        if let Ok(s) = jr.get_str(&format!("{prefix}_portfwd{j}")) {
-            if let Some(pf) = decode_portfwd(&s) {
-                port_forwards.push(pf);
-            }
+        if let Ok(s) = jr.get_str(&format!("{prefix}_portfwd{j}"))
+            && let Some(pf) = decode_portfwd(&s)
+        {
+            port_forwards.push(pf);
         }
     }
     let mac = match jr.get_u64(&format!("{prefix}_mac")) {
@@ -2635,7 +2652,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
     // Restore-time overrides (parity with the C++ --restore flags). Drives are
     // overridden positionally (the i-th --drive overrides saved drive i).
     let mut drive_overrides: Vec<(String, Option<bool>)> = Vec::new();
-    let mut affinity_mode = AffinityMode::All;
+    let mut affinity_mode = AffinityMode::PCore;
     let mut watchdog_secs = 0u32;
     let mut unsafe_restore_mutable_drive = false;
     {
@@ -2702,6 +2719,8 @@ fn run_restore(args: &[String]) -> Result<i32> {
             "restore: vcpu_count {vcpu_count} out of range (1..={MAX_VCPUS})"
         )));
     }
+    // Before any thread starts, so every thread inherits the placement.
+    let cpu_set_ids = place_on_cores(affinity_mode, vcpu_count);
     let ram_size = jr.get_u64("ram_size_bytes")? as usize;
     // Bound a corrupt/hostile header before it feeds GuestMemory's alignment and
     // pointer math (4 TiB is far above any real microVM, far below the
@@ -3405,31 +3424,6 @@ fn run_restore(args: &[String]) -> Result<i32> {
     } else {
         None
     };
-
-    // CPU-affinity: resolve the CPU-set IDs once; each vCPU thread pins itself
-    // just before entering its run loop. Empty = no pinning.
-    let cpu_set_ids = Arc::new(cpu_affinity::resolve_cpu_set_ids(affinity_mode));
-    if affinity_mode != AffinityMode::All {
-        let top = cpu_affinity::topology();
-        println!(
-            "[cpu-affinity] mode={} -> {} CPU-set(s) (host: {} logical, {} P-logical, \
-             {} P-physical, {} E-logical, hybrid={})",
-            cpu_affinity::affinity_mode_name(affinity_mode),
-            cpu_set_ids.len(),
-            top.total_logical,
-            top.p_logical,
-            top.p_physical,
-            top.e_logical,
-            top.hybrid
-        );
-        if cpu_set_ids.is_empty() {
-            eprintln!(
-                "[cpu-affinity] WARN: mode '{}' resolved to no CPU sets on this host; \
-                 running unpinned",
-                cpu_affinity::affinity_mode_name(affinity_mode)
-            );
-        }
-    }
 
     btimer.mark("entering guest");
     println!("[restore] resuming {vcpu_count} vCPU(s)");

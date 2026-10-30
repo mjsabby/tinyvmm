@@ -741,7 +741,7 @@ request so the completion's `OVERLAPPED*` casts back to the request
 
 ## 5. The full bring-up sequence, annotated
 
-This is the exact order `run_pvh_run` (`src/main.rs:1318`) wires a machine — a
+This is the exact order `run_pvh_run` (`src/main.rs:1434`) wires a machine — a
 useful template because the ordering constraints are real:
 
 ```
@@ -770,7 +770,9 @@ useful template because the ordering constraints are real:
     the BSP's also gets set_ext_int_source(pic)
 12. spawn watchdog (optional), wire interactive console + shutdown sentinel
 13. arm snapshot trigger (if --save)
-14. BSP runs on the main thread; each AP runs on its own thread (pinned per --cpu-affinity)
+14. BSP runs on the main thread; each AP runs on its own thread (pinned per --cpu-affinity;
+       the whole process was confined to the mode's core class before step 3, so every
+       thread it starts inherits that)
 15. teardown: stop_all → cancel + join APs → join watchdog → close the gpu window
        stop the blk IOCP workers (BEFORE their BlockDevice owners drop)
        if snapshot armed+requested: quiesce net backends + 9p pool, write the file

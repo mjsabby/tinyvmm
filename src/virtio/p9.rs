@@ -2268,15 +2268,15 @@ impl P9Device {
             existing.as_ref().unwrap().get()
         };
 
-        if valid & SETATTR_SIZE != 0 {
-            if let Err(e) = fs::set_end_of_file(h, sz) {
-                let e = errno_from_win32(e);
-                if opened_here != INVALID_HANDLE_VALUE {
-                    fs::close(opened_here);
-                }
-                build_rlerror(reply, tag, e);
-                return;
+        if valid & SETATTR_SIZE != 0
+            && let Err(e) = fs::set_end_of_file(h, sz)
+        {
+            let e = errno_from_win32(e);
+            if opened_here != INVALID_HANDLE_VALUE {
+                fs::close(opened_here);
             }
+            build_rlerror(reply, tag, e);
+            return;
         }
         if valid & (SETATTR_ATIME | SETATTR_MTIME) != 0 {
             let mut pa: Option<u64> = None;
@@ -2375,13 +2375,13 @@ impl P9Device {
             };
             e.handle.clone()
         };
-        if let Some(a) = &h {
-            if let Err(err) = fs::flush(a.get()) {
-                if err != ERROR_ACCESS_DENIED && err != ERROR_INVALID_HANDLE {
-                    build_rlerror(reply, tag, errno_from_win32(err));
-                    return;
-                }
-            }
+        if let Some(a) = &h
+            && let Err(err) = fs::flush(a.get())
+            && err != ERROR_ACCESS_DENIED
+            && err != ERROR_INVALID_HANDLE
+        {
+            build_rlerror(reply, tag, errno_from_win32(err));
+            return;
         }
         build_header_only(reply, R_FSYNC, tag);
     }

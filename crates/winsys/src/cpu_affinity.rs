@@ -1,13 +1,19 @@
-//! CPU-affinity policy applied to the BSP and every AP thread just before its
-//! run loop starts. Port of src/whp/cpu_affinity.cpp.
+//! CPU placement: which cores tinyvmm runs on. Port of
+//! src/whp/cpu_affinity.cpp.
 //!
-//! On hybrid Intel hosts (Alder/Raptor Lake), vCPU threads bouncing across the
-//! P-core / E-core boundary trip Linux's `clocksource_watchdog` into marking
-//! TSC unstable (silently demoting `clock_gettime` to a slower clocksource for
-//! the rest of boot). Pinning all vCPU threads to either the P-core set OR the
-//! E-core set keeps RDTSC consistent across vCPUs without giving up cross-core
-//! scheduling within that set. Uses CPU Sets (`SetThreadSelectedCpuSets`,
-//! W10 1709+), which cooperate with the scheduler rather than hard-binding.
+//! On hybrid hosts (Intel Alder/Raptor Lake and later), `--cpu-affinity`
+//! (default `p`) confines the whole process to one core class with
+//! `SetProcessDefaultCpuSets`: the vCPUs and every VMM thread (doorbell pumps,
+//! NAT and 9p workers, threads created later) run only on P-cores, or only on
+//! E-cores. vCPU threads also pin themselves to the mode's own set
+//! (`SetThreadSelectedCpuSets`), which for `p-physical` keeps one logical
+//! processor per P-core.
+//!
+//! Keeping vCPUs in one class also keeps RDTSC consistent: threads bouncing
+//! across the P/E boundary trip Linux's `clocksource_watchdog` into marking
+//! the TSC unstable. CPU Sets (W10 1709+) cooperate with the scheduler rather
+//! than hard-binding. Kernel work done for the process (interrupts and DPCs,
+//! file system worker threads) is not confined.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
@@ -17,18 +23,20 @@ use windows_sys::Win32::System::SystemInformation::{
     CpuSetInformation, GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentThread, SetThreadSelectedCpuSets,
+    GetCurrentProcess, GetCurrentThread, SetProcessDefaultCpuSets, SetThreadSelectedCpuSets,
 };
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AffinityMode {
-    /// No pinning (default).
+    /// No restriction.
     All,
-    /// All P-core logical processors (including SMT siblings).
+    /// P-cores, all their logical processors (default). Every core on a
+    /// non-hybrid host.
     PCore,
-    /// P-cores, one logical processor per physical core (no SMT).
+    /// P-cores; vCPU threads use one logical processor per physical core (no
+    /// SMT sharing), the rest of the process every P-core logical processor.
     PCorePhysical,
-    /// All E-core logical processors (E-cores have no SMT).
+    /// E-cores.
     ECore,
 }
 
@@ -83,8 +91,6 @@ fn db() -> &'static CpuSetDb {
         let stride = core::mem::size_of::<SYSTEM_CPU_SET_INFORMATION>();
         let total = needed as usize;
         let mut off = 0usize;
-        let mut first = true;
-        let mut first_eff = 0u8;
         while off + stride <= total {
             let p = unsafe { &*(buf.as_ptr().add(off) as *const SYSTEM_CPU_SET_INFORMATION) };
             let size = p.Size as usize;
@@ -93,25 +99,75 @@ fn db() -> &'static CpuSetDb {
             }
             if p.Type == CpuSetInformation {
                 let cs = unsafe { p.Anonymous.CpuSet };
-                let e = CpuSetEntry {
+                db.entries.push(CpuSetEntry {
                     id: cs.Id,
                     group: cs.Group,
                     logical_processor_index: cs.LogicalProcessorIndex,
                     core_index: cs.CoreIndex,
                     efficiency_class: cs.EfficiencyClass,
-                };
-                if first {
-                    first_eff = e.efficiency_class;
-                    first = false;
-                } else if e.efficiency_class != first_eff {
-                    db.hybrid = true;
-                }
-                db.entries.push(e);
+                });
             }
             off += size;
         }
+        db.hybrid = is_hybrid(&db.entries);
         db
     })
+}
+
+fn is_hybrid(entries: &[CpuSetEntry]) -> bool {
+    entries
+        .iter()
+        .any(|e| e.efficiency_class != entries[0].efficiency_class)
+}
+
+/// P-cores are the highest `EfficiencyClass` present; every lower class
+/// counts as E-cores.
+fn p_class(entries: &[CpuSetEntry]) -> u8 {
+    entries
+        .iter()
+        .map(|e| e.efficiency_class)
+        .max()
+        .unwrap_or(0)
+}
+
+/// The CPU sets `mode` confines a thread to: the mode's core class for the
+/// whole process (`vcpu` false), the mode's own set for a vCPU thread. Empty
+/// means unrestricted: mode `all`, or a class that covers every processor
+/// (P-cores on a non-hybrid host) or none (E-cores on one).
+fn select(entries: &[CpuSetEntry], mode: AffinityMode, vcpu: bool) -> Vec<u32> {
+    let hybrid = is_hybrid(entries);
+    let p = p_class(entries);
+    let mut out: Vec<u32> = match mode {
+        AffinityMode::All => return Vec::new(),
+        AffinityMode::ECore if !hybrid => return Vec::new(),
+        AffinityMode::ECore => entries
+            .iter()
+            .filter(|e| e.efficiency_class < p)
+            .map(|e| e.id)
+            .collect(),
+        AffinityMode::PCorePhysical if vcpu => {
+            // One entry (the lowest LogicalProcessorIndex) per physical
+            // P-core, dropping SMT siblings.
+            let mut by_core: BTreeMap<(u16, u8), CpuSetEntry> = BTreeMap::new();
+            for e in entries.iter().filter(|e| e.efficiency_class == p) {
+                match by_core.get(&(e.group, e.core_index)) {
+                    Some(cur) if cur.logical_processor_index <= e.logical_processor_index => {}
+                    _ => {
+                        by_core.insert((e.group, e.core_index), *e);
+                    }
+                }
+            }
+            by_core.values().map(|e| e.id).collect()
+        }
+        AffinityMode::PCore | AffinityMode::PCorePhysical if !hybrid => return Vec::new(),
+        AffinityMode::PCore | AffinityMode::PCorePhysical => entries
+            .iter()
+            .filter(|e| e.efficiency_class == p)
+            .map(|e| e.id)
+            .collect(),
+    };
+    out.sort_unstable();
+    out
 }
 
 /// Topology summary derived from `GetSystemCpuSetInformation` (cached).
@@ -127,6 +183,7 @@ pub fn topology() -> &'static HostTopology {
     static TOP: OnceLock<HostTopology> = OnceLock::new();
     TOP.get_or_init(|| {
         let db = db();
+        let p = p_class(&db.entries);
         let mut top = HostTopology {
             total_logical: db.entries.len() as u32,
             p_logical: 0,
@@ -136,8 +193,7 @@ pub fn topology() -> &'static HostTopology {
         };
         let mut p_cores: BTreeSet<(u16, u8)> = BTreeSet::new();
         for e in &db.entries {
-            let is_e = db.hybrid && e.efficiency_class == 0;
-            if is_e {
+            if e.efficiency_class < p {
                 top.e_logical += 1;
             } else {
                 top.p_logical += 1;
@@ -149,62 +205,40 @@ pub fn topology() -> &'static HostTopology {
     })
 }
 
-/// Resolve the CPU-set IDs for `mode`. Empty = "no pinning" (also returned for
-/// `ECore` on a non-hybrid host, where there are no E-cores to pin to).
+/// The CPU-set IDs a vCPU thread pins itself to under `mode`. Empty = no
+/// pinning.
 pub fn resolve_cpu_set_ids(mode: AffinityMode) -> Vec<u32> {
-    if mode == AffinityMode::All {
-        return Vec::new();
-    }
-    let db = db();
-    if db.entries.is_empty() {
-        return Vec::new();
-    }
-    // On non-hybrid hosts, every core counts as a P-core.
-    let is_p = |e: &CpuSetEntry| !db.hybrid || e.efficiency_class >= 1;
+    select(&db().entries, mode, true)
+}
 
-    let mut out: Vec<u32> = Vec::new();
-    match mode {
-        AffinityMode::PCore => {
-            for e in &db.entries {
-                if is_p(e) {
-                    out.push(e.id);
-                }
-            }
-        }
-        AffinityMode::ECore => {
-            if !db.hybrid {
-                return Vec::new();
-            }
-            for e in &db.entries {
-                if e.efficiency_class == 0 {
-                    out.push(e.id);
-                }
-            }
-        }
-        AffinityMode::PCorePhysical => {
-            // Keep one entry (smallest LogicalProcessorIndex) per physical
-            // P-core, dropping SMT siblings.
-            let mut by_core: BTreeMap<(u16, u8), CpuSetEntry> = BTreeMap::new();
-            for e in &db.entries {
-                if !is_p(e) {
-                    continue;
-                }
-                let key = (e.group, e.core_index);
-                match by_core.get(&key) {
-                    Some(cur) if cur.logical_processor_index <= e.logical_processor_index => {}
-                    _ => {
-                        by_core.insert(key, *e);
-                    }
-                }
-            }
-            for (_, e) in by_core {
-                out.push(e.id);
-            }
-        }
-        AffinityMode::All => {}
+/// The CPU-set IDs the whole process is confined to under `mode` (its core
+/// class). Empty = unrestricted.
+pub fn process_cpu_set_ids(mode: AffinityMode) -> Vec<u32> {
+    select(&db().entries, mode, false)
+}
+
+/// Confine every thread of this process that has no CPU sets of its own,
+/// including threads created later, to `cpu_set_ids`
+/// (`SetProcessDefaultCpuSets`). Returns true on success or on empty input.
+pub fn restrict_process(cpu_set_ids: &[u32]) -> bool {
+    if cpu_set_ids.is_empty() {
+        return true;
     }
-    out.sort_unstable();
-    out
+    let ok = unsafe {
+        SetProcessDefaultCpuSets(
+            GetCurrentProcess(),
+            cpu_set_ids.as_ptr(),
+            cpu_set_ids.len() as u32,
+        )
+    };
+    if ok == 0 {
+        eprintln!(
+            "[cpu-affinity] SetProcessDefaultCpuSets failed: error={}",
+            unsafe { GetLastError() }
+        );
+        return false;
+    }
+    true
 }
 
 /// Pin the calling thread to `cpu_set_ids` via `SetThreadSelectedCpuSets`.
@@ -248,5 +282,59 @@ pub fn affinity_mode_name(m: AffinityMode) -> &'static str {
         AffinityMode::PCore => "p",
         AffinityMode::PCorePhysical => "p-physical",
         AffinityMode::ECore => "e",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `cores` physical cores of `smt` logical processors each, numbered from
+    /// `first_lp`; the CPU-set id is 100 + the logical processor index.
+    fn cores(first_lp: u8, cores: u8, smt: u8, class: u8) -> Vec<CpuSetEntry> {
+        (0..cores * smt)
+            .map(|i| CpuSetEntry {
+                id: 100 + u32::from(first_lp + i),
+                group: 0,
+                logical_processor_index: first_lp + i,
+                core_index: first_lp + i / smt * smt,
+                efficiency_class: class,
+            })
+            .collect()
+    }
+
+    /// On a hybrid host the process gets its core class, and vCPUs the mode's
+    /// own set; on a non-hybrid host only `p-physical` pins anything (its
+    /// vCPUs, one per core).
+    #[test]
+    fn modes_confine_the_process_to_a_core_class() {
+        // Two P-cores with SMT (LPs 0-3), four E-cores (LPs 4-7).
+        let mut hybrid = cores(0, 2, 2, 1);
+        hybrid.extend(cores(4, 4, 1, 0));
+        let p = vec![100, 101, 102, 103];
+        let e = vec![104, 105, 106, 107];
+        for (mode, process, vcpu) in [
+            (AffinityMode::All, vec![], vec![]),
+            (AffinityMode::PCore, p.clone(), p.clone()),
+            (AffinityMode::PCorePhysical, p.clone(), vec![100, 102]),
+            (AffinityMode::ECore, e.clone(), e.clone()),
+        ] {
+            assert_eq!(select(&hybrid, mode, false), process, "{mode:?} process");
+            assert_eq!(select(&hybrid, mode, true), vcpu, "{mode:?} vCPU");
+        }
+
+        let uniform = cores(0, 4, 2, 0);
+        for mode in [AffinityMode::All, AffinityMode::PCore, AffinityMode::ECore] {
+            assert_eq!(select(&uniform, mode, false), Vec::<u32>::new(), "{mode:?}");
+            assert_eq!(select(&uniform, mode, true), Vec::<u32>::new(), "{mode:?}");
+        }
+        assert_eq!(
+            select(&uniform, AffinityMode::PCorePhysical, false),
+            Vec::<u32>::new()
+        );
+        assert_eq!(
+            select(&uniform, AffinityMode::PCorePhysical, true),
+            vec![100, 102, 104, 106]
+        );
     }
 }

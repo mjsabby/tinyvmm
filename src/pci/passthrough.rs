@@ -208,7 +208,7 @@ mod tests {
         bars.write_dword(4, 0x0000_C005);
         assert_eq!(bars.read_dword(4), 0x0000_C001);
         let m = bars.mappings();
-        assert_eq!(m[0].is_io, true);
+        assert!(m[0].is_io);
         assert_eq!(m[0].base, 0x0000_C000);
         assert_eq!(m[0].size, 0x100);
     }

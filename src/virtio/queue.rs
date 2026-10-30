@@ -591,7 +591,7 @@ mod tests {
         let mut spins = 0u32;
         while gate.load(Ordering::SeqCst) < 2 * (phase + 1) {
             spins += 1;
-            if spins % 1024 == 0 {
+            if spins.is_multiple_of(1024) {
                 std::thread::yield_now();
             } else {
                 std::hint::spin_loop();

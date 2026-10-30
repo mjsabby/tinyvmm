@@ -234,6 +234,32 @@ and pre-builds SLAT entries on background threads while the guest boots.
 Appliance builds therefore default to 4 KiB pages for predictable startup.
 Use `--large-pages` or `--no-large-pages` to override either default.
 
+### CPU placement
+
+On a hybrid CPU (Intel Alder Lake and later), Windows picks a P-core or an E-core
+for each thread, and it often put tinyvmm's vCPUs on E-cores. On the reference
+host (8 P-cores, 16 E-cores), with `--cpu-affinity all` (Windows' placement):
+- the two vCPU threads of a 2-vCPU guest ran 65% and 55% of their time on
+  E-cores;
+- a 600 MiB `dd | md5sum` in the guest took 2.8–3.7 s (3.35 s on average),
+  depending on where the vCPUs landed.
+
+By default (`--cpu-affinity p`), tinyvmm confines the whole process to the
+P-cores (`SetProcessDefaultCpuSets`) before it starts any thread, so the vCPUs and
+every VMM thread inherit that; the vCPU threads also pin themselves
+(`SetThreadSelectedCpuSets`). With the same build:
+- every thread ran on P-cores;
+- the same task took 2.7–2.8 s every time (2.80 s on average);
+- TCP request/response p99 through the NAT fell from 398 to 327 µs.
+
+Keeping the vCPUs in one core class also keeps the guest's TSC consistent: vCPUs
+that move between P- and E-cores can make Linux's clocksource watchdog mark the
+TSC unstable. Kernel work done for tinyvmm (interrupts, DPCs, file-system worker
+threads) is not bound by a process's CPU sets. If a guest has more vCPUs than the
+P-cores have logical processors, they take turns on them and tinyvmm warns. Use
+`--cpu-affinity all` for such a guest, or whenever Windows should place the
+threads; `e` runs everything on the E-cores instead.
+
 ---
 
 ## 2. Feature set & full CLI reference
@@ -271,7 +297,7 @@ Parsed in `parse_pvh_args` (`main.rs:590`). Defaults and clamps are exact.
 | `--gpu [WxH]` | off | Add a virtio-gpu 2D device and open a Win32 window showing its scanout (CPU blit). Optional `WxH` (e.g. `--gpu 1024x768`) sets the preferred size (default **1280×800**). Dropping `nofb nomodeset` from the default cmdline so the guest DRM driver mode-sets. With `--input`, the window is also the host input source. |
 | `--input` | off | Add **two** virtio-input devices — a keyboard and an absolute tablet (pointer + scroll + buttons). With `--gpu`, the host source is the GPU window (1:1 pixel coordinates); otherwise it falls back to the interactive console. Needs a guest kernel with `CONFIG_VIRTIO_INPUT`. |
 | `--sound` | off | Add a virtio-snd sound card — one playback + one capture PCM stream (48 kHz / S16_LE / stereo) backed by Windows **WASAPI** (shared mode). Needs a guest kernel with `CONFIG_SND_VIRTIO`. On a host with no audio endpoint the card still appears but plays/records silence. |
-| `--cpu-affinity all\|p\|e\|p-physical` | `all` | Pin every vCPU thread to a CPU-set class (P/E cores via `EfficiencyClass`). |
+| `--cpu-affinity p\|p-physical\|e\|all` | `p` | Which cores tinyvmm runs on, by CPU-set `EfficiencyClass`. On a hybrid CPU, `p` confines the whole process (vCPUs, doorbell pumps, NAT and 9p workers) to the P-cores, and `e` to the E-cores. `p-physical` also limits the vCPU threads to one logical processor per P-core (no SMT sharing). `all` lets Windows place threads anywhere. On a non-hybrid CPU, `p` and `e` change nothing. See [CPU placement](#cpu-placement). |
 | `--poll-us <N>` | `50` | Ceiling, in µs, of the doorbell pumps' adaptive busy-poll (see [Doorbells](#doorbells--the-notify-without-a-vm-exit-path)); `0` disables it. **0–10000.** |
 | `--save <path>` | — | Arm snapshot-on-trigger: when the guest issues `CPUID(0x4000DE57)`, quiesce the machine, write `<path>`, and exit. |
 | `--unsafe-save-mutable-drive` | off | Allow `--save` with a *writable* `--drive` attached (otherwise refused — the disk is not part of the snapshot, so a mutated disk would diverge from restored RAM). |

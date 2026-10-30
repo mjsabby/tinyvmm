@@ -128,12 +128,11 @@ thread_local! {
 /// Malformed or unsupported requests are dropped.
 pub fn tx_offload_software(frame: &mut [u8], hdr: &TxHeader, emit: &mut dyn FnMut(&[u8])) {
     match hdr.gso_type {
-        HDR_GSO_NONE => {
-            if hdr.flags & HDR_F_NEEDS_CSUM == 0
-                || complete_csum(frame, hdr.csum_start, hdr.csum_offset)
-            {
-                emit(frame);
-            }
+        HDR_GSO_NONE
+            if (hdr.flags & HDR_F_NEEDS_CSUM == 0
+                || complete_csum(frame, hdr.csum_start, hdr.csum_offset)) =>
+        {
+            emit(frame);
         }
         HDR_GSO_TCPV4 => {
             TSO_SCRATCH.with(|s| tso4_segment(frame, hdr.gso_size, &mut s.borrow_mut(), emit))
@@ -435,10 +434,10 @@ impl NetDevice {
         {
             return;
         }
-        if !self.backend_detached.load(Ordering::Acquire) {
-            if let Some(b) = self.backend.get() {
-                b.on_rx_space();
-            }
+        if !self.backend_detached.load(Ordering::Acquire)
+            && let Some(b) = self.backend.get()
+        {
+            b.on_rx_space();
         }
     }
 
