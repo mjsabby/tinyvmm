@@ -1,8 +1,8 @@
 //! Slirp-style user-mode NAT backend for virtio-net. Terminates the guest's
 //! L2/L3 inside tinyvmm and translates flows to Windows host sockets via IOCP.
 //!
-//! Topology (matching the initramfs): gateway 10.0.0.1, guest 10.0.0.2.
-//! Guests that ask for it get that configuration by DHCP (see [`dhcp`]).
+//! Topology (matching the initramfs): gateway 172.29.255.1, guest 172.29.255.2,
+//! a /29 (see `crate::net`). Guests that ask get it by DHCP (see [`dhcp`]).
 //!
 //! Concurrency model (per the agreed design): a single precreated worker
 //! thread owns ALL NAT state and the IOCP. The vCPU thread never touches NAT
@@ -124,7 +124,7 @@ pub struct PortForward {
 pub struct NatOptions {
     pub gateway_ip: [u8; 4],
     pub gateway_mac: [u8; 6],
-    /// The address DHCP hands the guest (in the gateway's /24).
+    /// The address DHCP hands the guest (in the gateway's /29).
     pub guest_ip: [u8; 4],
     /// DNS servers DHCP offers; those the guest can't reach are dropped (see
     /// [`dhcp::usable_dns`]). Usually the host's (`sys::dns_servers`).
@@ -149,9 +149,9 @@ pub struct NatOptions {
 impl Default for NatOptions {
     fn default() -> Self {
         NatOptions {
-            gateway_ip: [10, 0, 0, 1],
+            gateway_ip: crate::net::GATEWAY_IP,
             gateway_mac: [0x02, 0x53, 0x54, 0x00, 0x00, 0x01],
-            guest_ip: [10, 0, 0, 2],
+            guest_ip: crate::net::GUEST_IP,
             dns_servers: Vec::new(),
             port_forwards: Vec::new(),
             tcb_warm: DEFAULT_TCB_WARM,
@@ -163,10 +163,10 @@ impl Default for NatOptions {
 }
 
 impl NatOptions {
-    /// What the NAT's DHCP server hands out: the guest address in the
-    /// gateway's /24, routed through the gateway.
+    /// What the NAT's DHCP server hands out: the guest address on the
+    /// gateway's network (`crate::net::NETMASK`), routed through the gateway.
     pub fn dhcp_lease(&self) -> dhcp::Lease {
-        let netmask = [255, 255, 255, 0];
+        let netmask = crate::net::NETMASK;
         dhcp::Lease {
             server: self.gateway_ip,
             client: self.guest_ip,
@@ -2111,7 +2111,7 @@ impl NatState {
         send_op.buf[..syn.len()].copy_from_slice(syn);
         let ovl = &mut op.overlapped as *mut OVERLAPPED;
         // Slirp convention: connections to the gateway IP target the host
-        // loopback (so the guest can reach host-local services at 10.0.0.1:*).
+        // loopback (so the guest can reach host-local services at the gateway).
         // The remap applies ONLY to the host-side ConnectEx — the guest-facing
         // Tcb keeps the original `dip` so its packets carry the address the
         // guest expects.

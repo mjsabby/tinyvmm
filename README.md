@@ -295,7 +295,7 @@ Parsed in `parse_pvh_args` (`main.rs:590`). Defaults and clamps are exact.
 | `--rng` | off | Add a virtio-rng device (`/dev/hwrng`). |
 | `--net` | off | Add a virtio-net NIC. **Repeatable** — each `--net` appends a NIC; the NIC-scoped flags below modify the *most recent* NIC. |
 | `--net-backend loopback\|nat\|wintun` | `nat` | Backend for the current NIC (see [§3](#3-devices-in-detail)). |
-| `--portfwd HOSTPORT:GUESTPORT` | — | Forward `127.0.0.1:HOSTPORT` (host) → `10.0.0.2:GUESTPORT` (guest). NAT only. Repeatable per NIC. |
+| `--portfwd HOSTPORT:GUESTPORT` | — | Forward `127.0.0.1:HOSTPORT` (host) → `172.29.255.2:GUESTPORT` (guest). NAT only. Repeatable per NIC. |
 | `--nat-workers <N>` | a quarter of the host's logical CPUs, 1–4 | NAT worker threads for the current NIC, **1–16**. Each owns the TCP flows assigned to it; one flow never spans workers, so this scales many-flow traffic, not a single stream (see [§3](#3-devices-in-detail)). Kept across `--save`/`--restore`. |
 | `--wintun-name <adapter>` / `--wintun-host <ipv4>` | — | WinTun adapter name / host-side gateway IPv4 (wintun backend). |
 | `--drive <path>[,readonly\|ro]` | — | Add a virtio-blk disk. **Repeatable up to 8** (`/dev/vda`, `/dev/vdb`, …). |
@@ -526,13 +526,17 @@ axes).
 
 * **`loopback`** — TX frames echoed straight back as RX. No host networking.
 * **`nat`** (default) — a **slirp-style user-mode NAT** in `src/net/nat.rs`: guest
-  `10.0.0.2/24`, gateway `10.0.0.1` (MAC `02:53:54:00:00:01`). No admin rights, no
-  virtual adapter. Implements **ARP**, local + proxied **ICMP echo** (`ping`
+  `172.29.255.2/29`, gateway `172.29.255.1` (MAC `02:53:54:00:00:01`). That
+  network lives only inside the guest, so it can't clash with Hyper-V's or WSL's
+  host networks, which take a random /20 of 172.16.0.0/12 each boot; an overlap
+  could only hide those eight addresses from the guest (`src/net/mod.rs` says
+  why this /29). No admin rights, no virtual adapter. Implements **ARP**,
+  local + proxied **ICMP echo** (`ping`
   works via an `IcmpSendEcho` helper-thread pool), a **DHCP** server on the
-  gateway (`src/net/dhcp.rs`: hands out `10.0.0.2/24`, router `10.0.0.1` and up to
-  three of the host's DNS servers that the guest can reach, so a stock
-  distribution configures itself; the lease is the same for every client, so
-  there is no lease state), **UDP** NAT (one connected host
+  gateway (`src/net/dhcp.rs`: hands out `172.29.255.2/29`, router
+  `172.29.255.1` and up to three of the host's DNS servers that the guest can
+  reach, so a stock distribution configures itself; the lease is the same for
+  every client, so there is no lease state), **UDP** NAT (one connected host
   socket per 4-tuple), and **TCP** terminate-and-proxy (the guest-facing TCB is
   the `tcp-sans-io` crate; the host side dials out with `ConnectEx`). `--portfwd`
   adds inbound forwarding — the VMM originates a SYN toward the guest.
