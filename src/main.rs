@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 mod boot;
+mod convenience;
 mod devices;
 mod diag;
 mod display;
@@ -159,7 +160,7 @@ fn print_usage() {
          \x20 tinyvmm --blk-selftest        host-side virtio-blk DISCARD/WRITE_ZEROES test\n\
          \x20 tinyvmm --blk-stress          host-side virtio-blk concurrency stress + failure-path test\n\
          \x20 tinyvmm --pci-selftest        host-side PCI host-bridge + BAR + sizing test\n\
-         \x20 tinyvmm --pvh-info <vmlinux>\n\
+         \x20 tinyvmm --pvh-info <vmlinux|bzImage>\n\
          \x20 tinyvmm --pvh-run [--initrd <cpio>] [--ram-mb N] [--vcpus N] [--rng] [--input] [--sound]\n\
          \x20              [--large-pages|--no-large-pages] [--poll-us N]\n\
          \x20              [--net [--net-backend loopback|nat] [--portfwd H:G]... [--nat-workers N]]...\n\
@@ -171,6 +172,9 @@ fn print_usage() {
          \x20              [--save <path> [--unsafe-save-mutable-drive]]\n\
          \x20              [--watchdog-secs N] [--debug-boot] [vmlinux] [-- <cmdline>]\n\
          \x20              Kernel path is required in plain builds; appliance builds embed defaults.\n\
+         \x20              The kernel may be a PVH ELF vmlinux or a bzImage (vmlinuz).\n\
+         \x20 tinyvmm --pvh-run --iso <image> [flags as above] [-- <extra kernel args>]\n\
+         \x20              Boot a live/install ISO's default GRUB entry; the ISO becomes drive 0.\n\
          \x20 tinyvmm --restore <path> [--drive <path>[,ro|rw]]... [--cpu-affinity p|p-physical|e|all]\n\
          \x20              [--watchdog-secs N] [--unsafe-restore-mutable-drive] [--poll-us N]\n\
          \x20 tinyvmm --dda-probe <PnpInstanceId>   probe a host PCI device for Discrete Device\n\
@@ -947,7 +951,11 @@ fn run_pvh_info(args: &[String]) -> Result<i32> {
         .ok_or_else(|| Error::msg("--pvh-info: expected path to vmlinux"))?;
     let bytes = std::fs::read(path).map_err(|e| Error::msg(format!("read {path}: {e}")))?;
     println!("[pvh] path={path}");
-    boot::loader::print_pvh_info(&bytes)?;
+    if boot::bzimage::is_bzimage(&bytes) {
+        boot::bzimage::print_info(&bytes)?;
+    } else {
+        boot::loader::print_pvh_info(&bytes)?;
+    }
     Ok(0)
 }
 
@@ -955,6 +963,10 @@ struct PvhArgs {
     vmlinux: Option<String>,
     cmdline: String,
     initrd: Option<String>,
+    /// `--iso`: boot this ISO's default GRUB entry; the ISO is also drive 0.
+    iso: Option<String>,
+    /// With `--iso`, the arguments after `--`, appended to the ISO's own.
+    iso_extra_args: String,
     ram_mb: u32,
     vcpus: u32,
     watchdog_secs: u32,
@@ -1015,6 +1027,7 @@ fn parse_poll_us(v: Option<&String>) -> Result<u64> {
 
 fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
     let mut initrd = None;
+    let mut iso: Option<String> = None;
     let mut ram_mb = if boot::payload::BUNDLED {
         1024u32
     } else {
@@ -1047,6 +1060,14 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
                 initrd = Some(
                     args.get(i)
                         .ok_or_else(|| Error::msg("--initrd wants a path"))?
+                        .clone(),
+                );
+            }
+            "--iso" => {
+                i += 1;
+                iso = Some(
+                    args.get(i)
+                        .ok_or_else(|| Error::msg("--iso wants a path to an ISO image"))?
                         .clone(),
                 );
             }
@@ -1298,19 +1319,49 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
     }
 
     let vmlinux = if let Some(path) = args.get(i).filter(|path| path.as_str() != "--") {
+        if iso.is_some() {
+            return Err(Error::msg(
+                "--iso boots the ISO's own kernel; drop the kernel path",
+            ));
+        }
         i += 1;
         Some(path.clone())
-    } else if boot::payload::BUNDLED {
+    } else if boot::payload::BUNDLED || iso.is_some() {
         None
     } else {
-        return Err(Error::msg("--pvh-run: expected path to vmlinux"));
+        return Err(Error::msg(
+            "--pvh-run: expected path to vmlinux (or --iso <image>)",
+        ));
     };
+    if iso.is_some() && initrd.is_some() {
+        return Err(Error::msg("--iso supplies the initrd; drop --initrd"));
+    }
 
-    // Everything after a bare "--" is the kernel cmdline.
+    // Everything after a bare "--" is the kernel cmdline. With --iso it is
+    // appended to the default cmdline and the ISO's own arguments instead.
     let mut cmdline = String::new();
     if i < args.len() && args[i] == "--" {
         i += 1;
         cmdline = args[i..].join(" ");
+    }
+    let iso_extra_args = if iso.is_some() {
+        std::mem::take(&mut cmdline)
+    } else {
+        String::new()
+    };
+    if let Some(path) = &iso {
+        if drives.len() >= 8 {
+            return Err(Error::msg(
+                "--iso takes a drive slot: at most 7 --drive with --iso",
+            ));
+        }
+        drives.insert(
+            0,
+            DriveSpec {
+                path: path.clone(),
+                readonly: true,
+            },
+        );
     }
     if cmdline.is_empty() {
         // Phase 2 default: route the kernel console to the virtio-console
@@ -1345,6 +1396,8 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
         vmlinux,
         cmdline,
         initrd,
+        iso,
+        iso_extra_args,
         ram_mb,
         vcpus: vcpus.clamp(1, MAX_VCPUS),
         watchdog_secs,
@@ -1463,7 +1516,13 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     btimer.mark("WHP probe done");
 
     diag::etw::Event::new("VmStart", diag::etw::INFO, diag::etw::kw::LIFECYCLE)
-        .str("kernel", cfg.vmlinux.as_deref().unwrap_or("<embedded>"))
+        .str(
+            "kernel",
+            cfg.iso
+                .as_deref()
+                .or(cfg.vmlinux.as_deref())
+                .unwrap_or("<embedded>"),
+        )
         .u64("ram_mb", cfg.ram_mb as u64)
         .u32("vcpus", cfg.vcpus)
         .u32("nics", cfg.nics.len() as u32)
@@ -1539,42 +1598,60 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     );
     btimer.mark("guest RAM mapped");
 
-    // Both file mappings and embedded PE data are borrowed, without a payload Vec.
-    // The loader still copies into writable, reclaimable guest RAM.
+    // File mappings and embedded PE data are borrowed, without a payload Vec;
+    // --iso reads the kernel and initrd out of the image. The loader copies
+    // into writable, reclaimable guest RAM.
+    let mut cmdline = cfg.cmdline.clone();
     let load = {
-        let vmlinux = boot::payload::kernel(cfg.vmlinux.as_deref())?;
-        let initramfs = boot::payload::initrd(cfg.initrd.as_deref())?;
+        let (kernel_name, vmlinux, initrd_name, initramfs) = if let Some(iso) = &cfg.iso {
+            let found = convenience::iso_boot::resolve(iso)?;
+            println!(
+                "[iso] {iso}: booting \"{}\" from {}",
+                found.title, found.config
+            );
+            for args in [found.args.as_str(), cfg.iso_extra_args.as_str()] {
+                if !args.is_empty() {
+                    cmdline.push(' ');
+                    cmdline.push_str(args);
+                }
+            }
+            (
+                format!("{iso}:{}", found.kernel_path),
+                boot::payload::Image::Owned(found.kernel),
+                found.initrd_paths.join(" "),
+                found.initrd.map(boot::payload::Image::Owned),
+            )
+        } else {
+            let vmlinux = boot::payload::kernel(cfg.vmlinux.as_deref())?;
+            let initramfs = boot::payload::initrd(cfg.initrd.as_deref())?;
+            let initrd_name = match (&cfg.initrd, &initramfs) {
+                (Some(path), _) => path.clone(),
+                (None, Some(_)) => "<embedded>".to_string(),
+                (None, None) => "<none>".to_string(),
+            };
+            let kernel_name = cfg.vmlinux.as_deref().unwrap_or("<embedded>").to_string();
+            (kernel_name, vmlinux, initrd_name, initramfs)
+        };
         println!(
-            "[pvh-run] kernel={} bytes={} initramfs={} bytes={}",
-            cfg.vmlinux.as_deref().unwrap_or("<embedded>"),
+            "[pvh-run] kernel={kernel_name} bytes={} initramfs={initrd_name} bytes={}",
             vmlinux.bytes().len(),
-            cfg.initrd.as_deref().unwrap_or(if initramfs.is_some() {
-                "<embedded>"
-            } else {
-                "<none>"
-            }),
             initramfs.as_ref().map_or(0, |image| image.bytes().len()),
         );
-        boot::loader::load_pvh(
+        boot::KernelLoad::load(
             &ram,
             vmlinux.bytes(),
-            &cfg.cmdline,
+            &cmdline,
             ram.size() as u64,
             initramfs.as_ref().map(|m| m.bytes()),
             cfg.vcpus,
         )?
     };
-    println!(
-        "[pvh-run] loaded {} bytes; entry=0x{:08x} start_info_gpa=0x{:x}",
-        load.bytes_loaded, load.entry_point, load.start_info_gpa
-    );
-    if load.initramfs_size > 0 {
-        println!(
-            "[pvh-run] initramfs: {} bytes at GPA 0x{:x}",
-            load.initramfs_size, load.initramfs_gpa
-        );
+    println!("[pvh-run] {}", load.describe());
+    let (initramfs_gpa, initramfs_size) = load.initramfs();
+    if initramfs_size > 0 {
+        println!("[pvh-run] initramfs: {initramfs_size} bytes at GPA 0x{initramfs_gpa:x}");
     }
-    println!("[pvh-run] cmdline: \"{}\"", cfg.cmdline);
+    println!("[pvh-run] cmdline: \"{cmdline}\"");
     btimer.mark("vmlinux+initramfs loaded");
 
     // --- vCPUs ---
@@ -1582,7 +1659,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     for i in 0..cfg.vcpus {
         vcpus.push(Arc::new(Vcpu::new(part_handle, i)?));
     }
-    boot::loader::setup_pvh_entry(&vcpus[0], &load)?;
+    load.setup_entry(&vcpus[0])?;
 
     // --- Device model ---
     let mut io_bus = IoBus::new();

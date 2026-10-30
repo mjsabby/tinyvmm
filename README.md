@@ -22,7 +22,10 @@ microVM needs *that* and nothing more — that is what "opinionated" means here.
 
 * **Host:** Windows 11 / Server 2022 with the *Windows Hypervisor Platform*
   feature enabled. Builds with stable Rust.
-* **Guest:** an unmodified PVH-capable `vmlinux` (`CONFIG_PVH=y`) + an initramfs.
+* **Guest:** an unmodified PVH-capable `vmlinux` (`CONFIG_PVH=y`) or a compressed
+  `bzImage`/`vmlinuz` (Linux boot protocol), plus an initramfs; or a
+  distribution's live/install ISO, booted straight from its GRUB entry with
+  `--iso`.
 * **External dependencies:** `windows-sys` (which only pulls `windows-link`) and
   `tcp-sans-io` (a git dependency, `github.com/mjsabby/tcp-sans-io`) that supplies
   the NAT's TCP state machine. No tokio, no async runtime, no other third-party
@@ -95,7 +98,8 @@ There are four self-tests that need **no guest kernel**:
 * `--pci-selftest` — exercise the PCI host-bridge config mechanism, BAR sizing,
   and 64-bit BAR assignment against a synthetic `PciFunction`.
 * `--blk-selftest` — drive virtio-blk DISCARD / WRITE_ZEROES against a temp file.
-* `--pvh-info <vmlinux>` — parse and print a kernel's PVH ELF-Note entry point.
+* `--pvh-info <vmlinux|bzImage>` — parse and print a kernel's PVH ELF-Note entry
+  point, or a bzImage's boot protocol header.
 
 Boot a kernel:
 
@@ -271,8 +275,9 @@ The first argument selects a **mode** (`main.rs:3500`):
 | `--smoke` | Probe WHP; create a throwaway partition + 16 MiB RAM + 1 vCPU and run to `HLT`. |
 | `--pci-selftest` | Host-side PCI host-bridge + BAR-sizing self-test (no guest). |
 | `--blk-selftest` | Host-side virtio-blk DISCARD/WRITE_ZEROES self-test (no guest). |
-| `--pvh-info <vmlinux>` | Parse and print a kernel's PVH ELF-Note entry point. |
-| `--pvh-run [flags] <vmlinux> [-- <cmdline>]` | Boot a microVM (the main mode). |
+| `--pvh-info <vmlinux\|bzImage>` | Parse and print a kernel's PVH ELF-Note entry point, or a bzImage's boot protocol header. |
+| `--pvh-run [flags] <kernel> [-- <cmdline>]` | Boot a microVM (the main mode). The kernel is a PVH ELF `vmlinux` or a `bzImage`, detected by content. |
+| `--pvh-run --iso <image> [flags] [-- <args>]` | Boot a distribution's live/install ISO (see `--iso` below). |
 | `--restore <path> [flags]` | Resume a microVM from a snapshot file (instant resume). |
 | `--dda-probe <PnpInstanceId>` | **Experimental** — probe a host PCI device for Discrete Device Assignment (PCI passthrough): allocate the WHP VPCI resource, dump IDs/BARs/MSI-X/ECAM, and test direct guest MMIO mapping. Boots no VM. |
 
@@ -283,6 +288,7 @@ Parsed in `parse_pvh_args` (`main.rs:590`). Defaults and clamps are exact.
 | Flag | Default | Range / behaviour |
 |------|---------|-------------------|
 | `--initrd <cpio>` | none | initramfs; memory-mapped and copied into guest RAM. |
+| `--iso <image>` | — | Boot a live/install ISO with no extraction step: read its GRUB configuration (`boot/grub/grub.cfg`, `boot/grub2/grub.cfg`, `EFI/BOOT/grub.cfg` or `boot/grub/loopback.cfg`) in memory, take the first `menuentry` with a `linux` line, and load that kernel (a bzImage, via the Linux boot protocol) and its initrds from the ISO. The ISO is attached read-only as the first disk (`/dev/vda`), where the initrd finds the live system; `--drive`s follow. The cmdline is the default one plus the entry's arguments, plus anything after `--`. Conflicts with a kernel path and `--initrd`. Code in `src/convenience/`. |
 | `--ram-mb <N>` | `256` | **Minimum 128 MiB; no hard upper bound** (limited only by what the host can allocate). RAM up to the 3584 MiB PCI MMIO window (`0xE000_0000`) stays at GPA 0; anything larger is split so the remainder is mapped above 4 GiB (`0x1_0000_0000`), leaving the window free for device BARs. |
 | `--vcpus <N>` | `1` | **Clamped to 1–32.** BSP runs on the main thread; each AP gets its own host thread. |
 | `--large-pages` / `--no-large-pages` | on (plain), off (appliance) | Attempt or skip 2 MiB `MEM_LARGE_PAGES` guest-RAM backing; see [Large pages](#large-pages). |
@@ -303,7 +309,7 @@ Parsed in `parse_pvh_args` (`main.rs:590`). Defaults and clamps are exact.
 | `--unsafe-save-mutable-drive` | off | Allow `--save` with a *writable* `--drive` attached (otherwise refused — the disk is not part of the snapshot, so a mutated disk would diverge from restored RAM). |
 | `--watchdog-secs <N>` | `0` | `0` = run until stopped; else stop after N seconds, printing `io/cpuid/msr` exit counters each second. |
 | `--debug-boot` | off | Prepend `earlyprintk=ttyS0,115200` so early boot streams to the 8250 UART before hvc0 is up. |
-| `-- <cmdline>` | see below | Everything after a bare `--` becomes the kernel command line. |
+| `-- <cmdline>` | see below | Everything after a bare `--` becomes the kernel command line (with `--iso`, it is appended instead). |
 
 **Default kernel cmdline** (`main.rs:842`): `console=hvc0 pci=conf1,nocrs,lastbus=0
 nofb nomodeset` — routes the console to virtio-console (hvc0) so `/init` lands an
@@ -335,6 +341,10 @@ tinyvmm --pvh-run --vcpus 4 --ram-mb 1024 --rng ^
 :: snapshot on guest trigger, then instant-resume (disk re-attached read-only)
 tinyvmm --pvh-run --save vm.snap --drive disk.img,ro --initrd initramfs.cpio vmlinux
 tinyvmm --restore vm.snap --drive disk.img,ro
+
+:: a distribution's live ISO in a GPU window, installing onto a raw disk (/dev/vdb)
+tinyvmm --pvh-run --iso ubuntu-26.04.1-desktop-amd64.iso --drive disk.img ^
+    --vcpus 8 --ram-mb 8192 --rng --net --gpu 1600x900 --input
 ```
 
 The text console forwards raw stdin to the virtio-console RX queue; **Ctrl+A then
@@ -606,7 +616,10 @@ crates/
 src/
   main.rs      CLI dispatch, device wiring, interactive console, save/restore
   display.rs   Win32 GDI window host for virtio-gpu + host-input seam
-  boot/        acpi (RSDP/XSDT/MADT), loader (PVH ELF + hvm_start_info + e820)
+  boot/        acpi (RSDP/XSDT/MADT), loader (PVH ELF + hvm_start_info + e820),
+               bzimage (Linux boot protocol: zero page + 32-bit entry)
+  convenience/ iso9660 (read-only ISO reader), grub_cfg (default menuentry),
+               iso_boot (`--iso`); nothing here is needed to run a VM
   devices/     io_bus, mmio_bus, serial(8250), pic(i8259), pit(8254), legacy
   pci/         config (Type-0 space), bus (0xCF8/0xCFC), msix
   virtio/      queue, device(trait), transport(virtio-pci modern),
@@ -764,7 +777,7 @@ malloc-free hot path never stalls.
 | Path | Allocation behaviour |
 |------|----------------------|
 | Boot / device setup | Allocates freely (`Vec`/`String`/`Box`). One-time. |
-| Kernel + initramfs load | **Memory-mapped** (`MapViewOfFile`) and copied straight into guest RAM via `GuestMemory::write_at` — *no* read-into-`Vec`. The mappings are dropped right after (`src/boot/loader.rs`, wired at `main.rs:980`). |
+| Kernel + initramfs load | **Memory-mapped** (`MapViewOfFile`) and copied straight into guest RAM via `GuestMemory::write_at` — *no* read-into-`Vec`. The mappings are dropped right after (`src/boot/loader.rs`, wired at `main.rs:980`). With `--iso` they are read out of the image into `Vec`s first (`src/convenience/iso_boot.rs`), freed once copied. |
 | virtio TX/RX, blk submit+complete, 9p dispatch, input frames, gpu present | **Zero heap allocation on the steady-state hot path** — preallocated pools and reused scratch buffers (below). |
 | NAT cold paths (ARP, ICMP/ping, RST, new-flow creation) | Still allocate (`Box<UdpOp>`, `Box<TcpOp>`, `Box<dyn TcbDyn>`, an ICMP `to_vec()`). Rare, not worth pooling. |
 | gpu resource lifecycle (`RESOURCE_CREATE_2D`, attach-backing) | Allocates the per-resource pixel store + SG list once per resource (a control-plane op), not per frame. |
