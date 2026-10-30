@@ -677,8 +677,9 @@ These are optional and don't change the core, but each teaches one more piece:
 
 - **virtio-gpu** (`src/virtio/gpu.rs`, id 16) — 2D scanout. Control queue handles
   `RESOURCE_CREATE_2D`, `SET_SCANOUT`, `TRANSFER_TO_HOST_2D`, `RESOURCE_FLUSH`; on
-  flush it swizzles the bound resource to BGRA in a reused shadow buffer and blits
-  to a Win32 GDI window on its own message-pump thread (`src/display.rs`).
+  flush it swizzles the scanout rectangle of the bound resource to BGRA in a
+  reused shadow buffer and blits to a Win32 GDI window on its own message-pump
+  thread (`src/display.rs`).
 - **virtio-input** (`src/virtio/input.rs`, id 18) — a keyboard + an absolute
   tablet; the host injects event frames (`EV_*` + `SYN_REPORT`) and raises one IRQ
   per frame. With `--gpu`, the window is the input source (pixel coords → absolute

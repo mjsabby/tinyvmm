@@ -78,9 +78,11 @@ const FLAG_FENCE: u32 = 1 << 0;
 const CTRL_HDR_LEN: usize = 24;
 const DISPLAY_ONE_LEN: usize = 24; // rect(16) + enabled(4) + flags(4)
 
-// Device-state snapshot blob header (see capture_device_state).
+// Device-state snapshot blob header (see capture_device_state). Version 2
+// added the scanout rectangle; version 1 blobs still restore (full resource).
 const GPU_SNAP_MAGIC: &[u8; 4] = b"GPU1";
-const GPU_SNAP_VERSION: u8 = 1;
+const GPU_SNAP_VERSION: u8 = 2;
+const GPU_SNAP_VERSION_NO_RECT: u8 = 1;
 
 pub type IrqFn = Box<dyn Fn(u32) + Send + Sync>;
 /// Present a BGRA (top-down, `stride == width*4`) frame of `width`x`height`.
@@ -98,10 +100,42 @@ struct Resource2d {
     backing: Vec<(u64, u64)>,
 }
 
+/// A `virtio_gpu_rect`: the part of a resource that a scanout shows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct Rect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+impl Rect {
+    fn full(res: &Resource2d) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width: res.width,
+            height: res.height,
+        }
+    }
+
+    /// Non-empty and entirely inside `res`.
+    fn fits(&self, res: &Resource2d) -> bool {
+        self.width != 0
+            && self.height != 0
+            && self.x as u64 + self.width as u64 <= res.width as u64
+            && self.y as u64 + self.height as u64 <= res.height as u64
+    }
+}
+
 struct GpuState {
     resources: HashMap<u32, Resource2d>,
     /// Resource bound to scanout 0 (0 == none / disabled).
     scanout_resource: u32,
+    /// The part of `scanout_resource` that is displayed. It can be smaller than
+    /// the resource: Mesa's llvmpipe pads buffer heights to 64-row tiles, so a
+    /// 1600x900 mode scans out of a 1600x960 resource.
+    scanout_rect: Rect,
     /// Reusable BGRA scratch handed to the present callback.
     present_buf: Vec<u8>,
     /// Reusable gather buffer for the current control request (alloc-free hot
@@ -143,6 +177,7 @@ impl GpuDevice {
             state: Mutex::new(GpuState {
                 resources: HashMap::new(),
                 scanout_resource: 0,
+                scanout_rect: Rect::default(),
                 present_buf: Vec::new(),
                 req: Vec::new(),
                 resp: Vec::new(),
@@ -340,6 +375,12 @@ impl GpuDevice {
     }
 
     fn cmd_set_scanout(&self, st: &mut GpuState) -> u32 {
+        let rect = Rect {
+            x: rd_u32(&st.req, 24),
+            y: rd_u32(&st.req, 28),
+            width: rd_u32(&st.req, 32),
+            height: rd_u32(&st.req, 36),
+        };
         let scanout = rd_u32(&st.req, 40);
         let res_id = rd_u32(&st.req, 44);
         if scanout >= NUM_SCANOUTS {
@@ -349,10 +390,14 @@ impl GpuDevice {
             st.scanout_resource = 0; // detach / blank
             return RESP_OK_NODATA;
         }
-        if !st.resources.contains_key(&res_id) {
+        let Some(res) = st.resources.get(&res_id) else {
             return RESP_ERR_INVALID_RESOURCE_ID;
+        };
+        if !rect.fits(res) {
+            return RESP_ERR_INVALID_PARAMETER;
         }
         st.scanout_resource = res_id;
+        st.scanout_rect = rect;
         RESP_OK_NODATA
     }
 
@@ -446,22 +491,23 @@ impl GpuDevice {
         RESP_OK_NODATA
     }
 
-    /// Swizzle the bound resource to BGRA and hand it to the present callback.
+    /// Swizzle the scanout rectangle of the bound resource to BGRA and hand it
+    /// to the present callback.
     fn present_resource(&self, st: &mut GpuState, id: u32) {
-        let (w, h, fmt) = match st.resources.get(&id) {
-            Some(r) => (r.width, r.height, r.format),
-            None => return,
+        let rect = st.scanout_rect;
+        // Disjoint field borrows: read `resources`, write `present_buf`.
+        let Some(res) = st.resources.get(&id) else {
+            return;
         };
-        let need = (w as usize) * (h as usize) * BPP as usize;
-        if need == 0 {
+        if !rect.fits(res) {
             return;
         }
+        let (w, h) = (rect.width, rect.height);
+        let need = (w as usize) * (h as usize) * BPP as usize;
         if st.present_buf.len() != need {
             st.present_buf.resize(need, 0);
         }
-        // Disjoint field borrows: read `host`, write `present_buf`.
-        let res = st.resources.get(&id).unwrap();
-        swizzle_to_bgra(fmt, &res.host, &mut st.present_buf);
+        crop_to_bgra(res, rect, &mut st.present_buf);
         if let Some(p) = self.present.get() {
             p(&st.present_buf, w, h);
         }
@@ -553,6 +599,7 @@ impl VirtioDevice for GpuDevice {
         let mut st = self.state.lock().unwrap();
         st.resources.clear();
         st.scanout_resource = 0;
+        st.scanout_rect = Rect::default();
     }
 
     fn read_config(&self, offset: u32, size: u32) -> u32 {
@@ -598,12 +645,13 @@ impl VirtioDevice for GpuDevice {
             self.driver_ok.load(Ordering::Relaxed),
             self.acked_features.load(Ordering::Relaxed),
             st.scanout_resource,
+            st.scanout_rect,
             &st.resources,
         )
     }
 
     fn apply_device_state(&self, bytes: &[u8]) {
-        let Some((driver_ok, acked, scanout, resources)) = decode_state(bytes) else {
+        let Some((driver_ok, acked, scanout, rect, resources)) = decode_state(bytes) else {
             return; // unknown/truncated/legacy blob: nothing to restore
         };
         self.driver_ok.store(driver_ok, Ordering::Relaxed);
@@ -612,6 +660,7 @@ impl VirtioDevice for GpuDevice {
             let mut st = self.state.lock().unwrap();
             st.resources = resources;
             st.scanout_resource = scanout;
+            st.scanout_rect = rect;
         }
         // Re-present the bound scanout so the restored window shows the saved
         // image immediately (before the guest issues any new commands).
@@ -675,6 +724,7 @@ fn encode_state(
     driver_ok: bool,
     acked: u64,
     scanout: u32,
+    rect: Rect,
     resources: &HashMap<u32, Resource2d>,
 ) -> Vec<u8> {
     let mut w = Vec::new();
@@ -683,6 +733,9 @@ fn encode_state(
     w.push(driver_ok as u8);
     w.extend_from_slice(&acked.to_le_bytes());
     w.extend_from_slice(&scanout.to_le_bytes());
+    for v in [rect.x, rect.y, rect.width, rect.height] {
+        w.extend_from_slice(&v.to_le_bytes());
+    }
     w.extend_from_slice(&(resources.len() as u32).to_le_bytes());
     for (&id, res) in resources {
         w.extend_from_slice(&id.to_le_bytes());
@@ -700,21 +753,33 @@ fn encode_state(
     w
 }
 
-/// Inverse of [`encode_state`]. Returns `None` on a foreign magic, version
-/// mismatch, or any truncation (leaving the caller's state untouched).
+/// Inverse of [`encode_state`]. Returns `None` on a foreign magic, unknown
+/// version, invalid scanout rectangle, or any truncation (leaving the caller's
+/// state untouched). A version-1 blob has no rectangle; its scanout shows the
+/// whole resource, as it did when it was saved.
 #[allow(clippy::type_complexity)]
-fn decode_state(bytes: &[u8]) -> Option<(bool, u64, u32, HashMap<u32, Resource2d>)> {
+fn decode_state(bytes: &[u8]) -> Option<(bool, u64, u32, Rect, HashMap<u32, Resource2d>)> {
     let mut r = Rdr::new(bytes);
     if r.take(4)? != GPU_SNAP_MAGIC {
         return None;
     }
     let version = r.u8()?;
-    if version != GPU_SNAP_VERSION {
+    if version != GPU_SNAP_VERSION && version != GPU_SNAP_VERSION_NO_RECT {
         return None;
     }
     let driver_ok = r.u8()? != 0;
     let acked = r.u64()?;
     let scanout = r.u32()?;
+    let saved_rect = if version == GPU_SNAP_VERSION {
+        Some(Rect {
+            x: r.u32()?,
+            y: r.u32()?,
+            width: r.u32()?,
+            height: r.u32()?,
+        })
+    } else {
+        None
+    };
     let count = r.u32()?;
     let mut resources = HashMap::new();
     let mut total_bytes: usize = 0;
@@ -764,7 +829,17 @@ fn decode_state(bytes: &[u8]) -> Option<(bool, u64, u32, HashMap<u32, Resource2d
             },
         );
     }
-    Some((driver_ok, acked, scanout, resources))
+    let mut rect = saved_rect.unwrap_or_default();
+    if scanout != 0
+        && let Some(res) = resources.get(&scanout)
+    {
+        match saved_rect {
+            Some(saved) if !saved.fits(res) => return None,
+            Some(_) => {}
+            None => rect = Rect::full(res),
+        }
+    }
+    Some((driver_ok, acked, scanout, rect, resources))
 }
 
 /// Write a 24-byte virtio_gpu_ctrl_hdr response (echoing the request's fence)
@@ -835,6 +910,25 @@ fn channel_indices(format: u32) -> Option<(usize, usize, usize)> {
         67 | 134 => Some((2, 1, 0)), // R8G8B8A8 / R8G8B8X8: mem [R,G,B,_]
         68 | 121 => Some((1, 2, 3)), // X8B8G8R8 / A8B8G8R8: mem [_,B,G,R]
         _ => None,
+    }
+}
+
+/// Convert the `rect` part of `res` (it must fit, see [`Rect::fits`]) to tightly
+/// packed GDI BGRA in `dst`, which holds `rect.width * rect.height` pixels.
+fn crop_to_bgra(res: &Resource2d, rect: Rect, dst: &mut [u8]) {
+    let bpp = BPP as usize;
+    let stride = res.width as usize * bpp;
+    let row = rect.width as usize * bpp;
+    let first = rect.y as usize * stride + rect.x as usize * bpp;
+    if row == stride {
+        // Full-width rows are contiguous, so convert them in one pass.
+        let len = row * rect.height as usize;
+        swizzle_to_bgra(res.format, &res.host[first..first + len], dst);
+        return;
+    }
+    for (i, out) in dst.chunks_exact_mut(row).enumerate() {
+        let start = first + i * stride;
+        swizzle_to_bgra(res.format, &res.host[start..start + row], out);
     }
 }
 
@@ -1007,17 +1101,42 @@ mod tests {
     #[test]
     fn device_state_roundtrips() {
         let res = sample_resources();
-        let blob = encode_state(true, 0x1_0000_0001, 7, &res);
-        let (driver_ok, acked, scanout, decoded) = decode_state(&blob).expect("decode");
+        let rect = Rect {
+            x: 1,
+            y: 0,
+            width: 3,
+            height: 1,
+        };
+        let blob = encode_state(true, 0x1_0000_0001, 7, rect, &res);
+        let (driver_ok, acked, scanout, decoded_rect, decoded) =
+            decode_state(&blob).expect("decode");
         assert!(driver_ok);
         assert_eq!(acked, 0x1_0000_0001);
         assert_eq!(scanout, 7);
+        assert_eq!(decoded_rect, rect);
         assert_eq!(decoded, res); // resources (incl. host pixels + backing) preserved
     }
 
     #[test]
+    fn device_state_scanout_rect_compat_and_validation() {
+        let res = sample_resources(); // resource 7 is 4x2
+        let full = Rect::full(&res[&7]);
+        let blob = encode_state(true, 0, 7, full, &res);
+        // A version-1 blob has no rectangle (bytes 18..34 here); it restores
+        // showing the whole bound resource.
+        let mut v1 = [&blob[..18], &blob[34..]].concat();
+        v1[4] = GPU_SNAP_VERSION_NO_RECT;
+        let (_, _, scanout, rect, decoded) = decode_state(&v1).expect("decode v1");
+        assert_eq!((scanout, rect), (7, full));
+        assert_eq!(decoded, res);
+        // A rectangle that doesn't fit the bound resource is rejected.
+        let tall = Rect { height: 3, ..full };
+        assert!(decode_state(&encode_state(true, 0, 7, tall, &res)).is_none());
+    }
+
+    #[test]
     fn device_state_rejects_truncation_and_bad_magic() {
-        let blob = encode_state(false, 0, 0, &sample_resources());
+        let blob = encode_state(false, 0, 0, Rect::default(), &sample_resources());
         // Truncations at every length must fail cleanly (None), never panic.
         for n in 0..blob.len() {
             assert!(decode_state(&blob[..n]).is_none(), "len {n} should fail");
@@ -1031,11 +1150,109 @@ mod tests {
     #[test]
     fn device_state_empty_resources_roundtrips() {
         let empty = HashMap::new();
-        let blob = encode_state(false, 0, 0, &empty);
-        let (driver_ok, acked, scanout, decoded) = decode_state(&blob).expect("decode");
+        let blob = encode_state(false, 0, 0, Rect::default(), &empty);
+        let (driver_ok, acked, scanout, _, decoded) = decode_state(&blob).expect("decode");
         assert!(!driver_ok);
         assert_eq!(acked, 0);
         assert_eq!(scanout, 0);
         assert!(decoded.is_empty());
+    }
+
+    type Presented = Arc<Mutex<Option<(Vec<u8>, u32, u32)>>>;
+
+    /// A GPU on host-only memory whose present callback records the last frame.
+    fn gpu_with_capture() -> (Arc<GpuDevice>, Presented) {
+        let mem = Arc::new(GuestMemory::new_host_only(4096).expect("host memory"));
+        let gpu = GpuDevice::new(mem, 64, 64);
+        let last: Presented = Arc::new(Mutex::new(None));
+        let sink = last.clone();
+        gpu.set_present_callback(Box::new(move |bgra, w, h| {
+            *sink.lock().unwrap() = Some((bgra.to_vec(), w, h));
+        }));
+        (gpu, last)
+    }
+
+    /// Run one control command (24-byte header + `body` u32s); returns its status.
+    fn run(gpu: &GpuDevice, cmd: u32, body: &[u32]) -> u32 {
+        let mut st = gpu.state.lock().unwrap();
+        st.req.clear();
+        st.req.extend_from_slice(&cmd.to_le_bytes());
+        st.req.extend_from_slice(&[0u8; 20]);
+        for v in body {
+            st.req.extend_from_slice(&v.to_le_bytes());
+        }
+        gpu.dispatch(&mut st);
+        rd_u32(&st.resp, 0)
+    }
+
+    /// Create B8G8R8X8 resource 1 (4 wide, 6 tall) whose pixel i holds bytes
+    /// [i, 0, 0, 0], so a presented BGRA pixel's blue byte names its source.
+    fn create_numbered_resource(gpu: &GpuDevice) {
+        assert_eq!(
+            run(gpu, CMD_RESOURCE_CREATE_2D, &[1, 2, 4, 6]),
+            RESP_OK_NODATA
+        );
+        let mut st = gpu.state.lock().unwrap();
+        let res = st.resources.get_mut(&1).unwrap();
+        for (i, px) in res.host.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            *px = [i as u8, 0, 0, 0];
+        }
+    }
+
+    fn blues(frame: &[u8]) -> Vec<u8> {
+        frame.as_chunks::<4>().0.iter().map(|px| px[0]).collect()
+    }
+
+    #[test]
+    fn flush_presents_only_the_scanout_rect() {
+        let (gpu, last) = gpu_with_capture();
+        create_numbered_resource(&gpu);
+        // Full-width rect over the top 4 of 6 rows (the llvmpipe-padding case):
+        // set_scanout body = rect x, y, w, h, scanout_id, resource_id.
+        assert_eq!(
+            run(&gpu, CMD_SET_SCANOUT, &[0, 0, 4, 4, 0, 1]),
+            RESP_OK_NODATA
+        );
+        // flush body = rect x, y, w, h, resource_id, padding.
+        assert_eq!(
+            run(&gpu, CMD_RESOURCE_FLUSH, &[0, 0, 4, 4, 1, 0]),
+            RESP_OK_NODATA
+        );
+        let (frame, w, h) = last.lock().unwrap().take().expect("presented");
+        assert_eq!((w, h), (4, 4));
+        assert_eq!(blues(&frame), (0..16).collect::<Vec<u8>>());
+
+        // An interior rect: 2x3 starting at (1, 2).
+        assert_eq!(
+            run(&gpu, CMD_SET_SCANOUT, &[1, 2, 2, 3, 0, 1]),
+            RESP_OK_NODATA
+        );
+        assert_eq!(
+            run(&gpu, CMD_RESOURCE_FLUSH, &[0, 0, 4, 6, 1, 0]),
+            RESP_OK_NODATA
+        );
+        let (frame, w, h) = last.lock().unwrap().take().expect("presented");
+        assert_eq!((w, h), (2, 3));
+        assert_eq!(blues(&frame), [9, 10, 13, 14, 17, 18]);
+    }
+
+    #[test]
+    fn set_scanout_rejects_rects_outside_the_resource() {
+        let (gpu, _) = gpu_with_capture();
+        create_numbered_resource(&gpu);
+        for rect in [
+            [0, 0, 5, 6],        // wider than the resource
+            [0, 1, 4, 6],        // runs past the bottom
+            [0, 0, 0, 6],        // empty
+            [u32::MAX, 0, 2, 6], // x + width overflows u32
+        ] {
+            let body = [rect[0], rect[1], rect[2], rect[3], 0, 1];
+            assert_eq!(
+                run(&gpu, CMD_SET_SCANOUT, &body),
+                RESP_ERR_INVALID_PARAMETER,
+                "{rect:?}"
+            );
+        }
+        assert_eq!(gpu.state.lock().unwrap().scanout_resource, 0);
     }
 }
