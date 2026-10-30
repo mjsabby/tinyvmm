@@ -210,7 +210,7 @@ def report(log: str, size_bytes: int, ping_count: int) -> bool:
     p50  = percentile(rtts, 50) if rtts else 0.0
     p95  = percentile(rtts, 95) if rtts else 0.0
     p99  = percentile(rtts, 99) if rtts else 0.0
-    print(f"\nPing latency (gateway 10.0.0.1, {len(rtts)}/{ping_count} replies)")
+    print(f"\nPing latency (gateway, {len(rtts)}/{ping_count} replies)")
     print(f"  busybox min/avg/max : {bb_min:.3f} / {bb_avg:.3f} / "
           f"{bb_max:.3f} ms")
     print(f"  driver p50/p95/p99  : {p50:.3f} / {p95:.3f} / "

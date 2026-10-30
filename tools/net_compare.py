@@ -3,8 +3,9 @@
 (`--virtio-net consomme`).
 
 Both VMMs boot the SAME vmlinux + initramfs with a virtio-net NIC whose
-backend is the VMM's slirp-style user-mode NAT (guest 10.0.0.2/24, gateway
-10.0.0.1 in both). The guest runs the `tinyvmm.test=netcmp` /init mode
+backend is the VMM's slirp-style user-mode NAT; each hands the guest its
+address by DHCP (172.29.255.2/29 from tinyvmm, 10.0.0.2/24 from consomme).
+The guest runs the `tinyvmm.test=netcmp` /init mode
 (tools/make_initramfs.py) against a host server bound to the host's LAN IP,
 so every byte traverses the VMM's virtio-net device + NAT + host TCP stack.
 

@@ -129,20 +129,22 @@ log "$(ls /sys/bus/virtio/devices 2>/dev/kmsg)"
 ip link set lo up        2>/dev/kmsg
 if [ -e /sys/class/net/eth0 ]; then
     ip link set eth0 up                       2>/dev/kmsg
-    # WinTun backend (host=10.0.0.1, M16, local only).
-    ip addr add 10.0.0.2/24  dev eth0         2>/dev/kmsg
-    # Default route via the gateway. Both wintun (host=10.0.0.1) and
-    # usernet (synthetic gateway=10.0.0.1) sit at .1, so this works
-    # for both backends.
-    ip route add default via 10.0.0.1         2>/dev/kmsg
+    # DHCP: tinyvmm's NAT and OpenVMM's consomme both serve it, each with its
+    # own network. WinTun has no DHCP server: fall back to the static address
+    # its host adapter expects (gateway 172.29.255.1, see src/net/mod.rs).
+    if ! udhcpc -i eth0 -n -q -t 3 -T 1 -s /etc/udhcpc.script >/dev/kmsg 2>&1; then
+        ip addr add 172.29.255.2/29 dev eth0  2>/dev/kmsg
+        ip route add default via 172.29.255.1 2>/dev/kmsg
+        echo 'nameserver 1.1.1.1' > /etc/resolv.conf
+        echo 'nameserver 8.8.8.8' >> /etc/resolv.conf
+    fi
     log "eth0 up: $(ip -4 addr show eth0 | tr -d '\\n')"
-    # Best-effort DNS for any outbound traffic (NAT'd if the host has
-    # a New-NetNat rule, see README).
-    echo 'nameserver 1.1.1.1' > /etc/resolv.conf
-    echo 'nameserver 8.8.8.8' >> /etc/resolv.conf
 else
     log "no eth0 (virtio-net driver did not bind)"
 fi
+# The gateway, which the test modes below talk to (TCP to it reaches the
+# host's loopback through tinyvmm's NAT).
+gw=$(ip route | awk '/^default/ { print $3; exit }')
 
 # --- entropy from virtio-rng (sanity) -----------------------------------
 if [ -c /dev/hwrng ]; then
@@ -159,8 +161,8 @@ log "=== init complete; dropping to shell on hvc0 ==="
 if grep -qE 'tinyvmm.test=net( |$)' /proc/cmdline 2>/dev/null; then
     log "--- NETTEST start ---"
 
-    log "+ ping -c 2 -W 2 10.0.0.1 (gateway)"
-    ping -c 2 -W 2 10.0.0.1 2>&1 | while IFS= read -r line; do log "  $line"; done
+    log "+ ping -c 2 -W 2 ${gw} (gateway)"
+    ping -c 2 -W 2 "${gw}" 2>&1 | while IFS= read -r line; do log "  $line"; done
 
     log "+ ping -c 2 -W 4 8.8.8.8 (real)"
     ping -c 2 -W 4 8.8.8.8 2>&1 | while IFS= read -r line; do log "  $line"; done
@@ -308,8 +310,8 @@ fi
 # Enabled via kernel cmdline marker `tinyvmm.test=netcmp`. Driven by
 # tools/net_compare.py, which boots this same kernel + initramfs under
 # tinyvmm and OpenVMM (consomme) and times throughput host-side (the guest's
-# /proc/uptime only has 10 ms resolution). VMM-agnostic: only needs eth0 at
-# 10.0.0.2/24 via gateway 10.0.0.1, which both user-mode NATs use. Prints a
+# /proc/uptime only has 10 ms resolution). VMM-agnostic: eth0 comes up by
+# DHCP, which both user-mode NATs serve. Prints a
 # `NETCMP DONE` marker, then the tinyvmm shutdown sentinel, and halts; the
 # driver kills any VMM still running 5 s after the marker.
 # Cmdline vars: NETCMP_HOST, NETCMP_PORT, NETCMP_SIZE (bytes per stream),
@@ -415,19 +417,19 @@ fi
 # --- optional NAT connection-semantics test -----------------------------
 # Enabled via kernel cmdline marker `tinyvmm.test=nat`, driven by
 # tools/nat_test.py, whose host server is on 127.0.0.1:NATTEST_PORT (the
-# gateway, 10.0.0.1, here). NATTEST_CLOSED_PORT has nothing listening.
+# gateway, here). NATTEST_CLOSED_PORT has nothing listening.
 #   A   connect to a closed port      refused, as on a real network
 #   B   server resets mid-response    an error, not a complete download
 #   C   300 connections, host closes  all succeed (each leaves the NAT's TCB
 #       first                         in TIME_WAIT)
 if grep -qE 'tinyvmm.test=nat( |$)' /proc/cmdline 2>/dev/null; then
     arg() { tr ' ' '\\n' < /proc/cmdline | grep "^$1=" | cut -d= -f2; }
-    base="http://10.0.0.1:$(arg NATTEST_PORT)"
+    base="http://${gw}:$(arg NATTEST_PORT)"
     pass=0
     total=0
 
     total=$((total + 1))
-    out=$(wget -q -O /dev/null -T 10 -t 1 "http://10.0.0.1:$(arg NATTEST_CLOSED_PORT)/" 2>&1)
+    out=$(wget -q -O /dev/null -T 10 -t 1 "http://${gw}:$(arg NATTEST_CLOSED_PORT)/" 2>&1)
     case "${out}" in
         *"Connection refused"*) log "NATTEST A: closed port refused OK"; pass=$((pass + 1)) ;;
         *) log "NATTEST A: closed port FAIL (${out})" ;;
@@ -464,7 +466,7 @@ fi
 # Enabled via kernel cmdline marker `tinyvmm.test=usernet-bench`.
 # Driven by tools/usernet_bench.py. Three measurements per run:
 #   1. Ping latency: busybox ping -c N -i 0.01 against the gateway
-#      (10.0.0.1, terminated by the usernet ARP responder). Reports
+#      (terminated by the usernet ARP responder). Reports
 #      min/avg/max round-trip; computes p99 from the per-packet lines.
 #   2. TCP single-stream throughput: 3 back-to-back wget downloads of
 #      a synthetic /bytes/SIZE endpoint on the host's Python bench
@@ -498,7 +500,7 @@ if grep -q 'tinyvmm.test=usernet-bench' /proc/cmdline 2>/dev/null; then
     # plus a final "min/avg/max" summary line.
     log "BENCH PING start (count=${pingcount})"
     ping_log=/tmp/bench_ping.log
-    ping -c "${pingcount}" -i 0.01 10.0.0.1 > "${ping_log}" 2>&1
+    ping -c "${pingcount}" -i 0.01 "${gw}" > "${ping_log}" 2>&1
     # Forward per-packet RTT lines + summary so the host driver can
     # compute p99 (busybox doesn't).
     grep 'time=' "${ping_log}" | while IFS= read -r line; do
@@ -1898,6 +1900,28 @@ done
 """
 
 
+# udhcpc hook (`udhcpc -s`): apply a lease to the interface.
+UDHCPC_SCRIPT = b"""#!/bin/busybox sh
+case "$1" in
+deconfig)
+    ip addr flush dev "$interface"
+    ;;
+bound|renew)
+    ip addr flush dev "$interface"
+    ip addr add "$ip/${mask:-24}" dev "$interface"
+    for r in $router; do
+        ip route add default via "$r" dev "$interface"
+        break
+    done
+    : > /etc/resolv.conf
+    for d in $dns; do
+        echo "nameserver $d" >> /etc/resolv.conf
+    done
+    ;;
+esac
+"""
+
+
 BUSYBOX_APPLETS = [
     "sh", "ash", "ls", "cat", "echo", "mount", "umount", "uname", "dmesg",
     "ip", "ping", "ifconfig", "hostname", "sleep", "usleep", "true", "false",
@@ -2081,6 +2105,7 @@ def main() -> int:
                 mode=0o755)
 
     cb.add_file("init", INIT_SCRIPT, mode=0o755)
+    cb.add_file("etc/udhcpc.script", UDHCPC_SCRIPT, mode=0o755)
 
     cpio_blob = cb.finalize()
     print(f"[make_initramfs] cpio archive: {len(cpio_blob)} bytes")

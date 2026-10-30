@@ -50,7 +50,7 @@ $auto     = ''
 switch ($Workload) {
   'idle' { $auto = 'sh' }                                           # boot to shell, sit idle
   'net'  { $devFlags += '--net','--net-backend','nat'
-           $auto = 'iperf3 -c 10.0.0.1 -t 40 -R; iperf3 -c 10.0.0.1 -t 40' }
+           $auto = 'iperf3 -c 172.29.255.1 -t 40 -R; iperf3 -c 172.29.255.1 -t 40' }
   'blk'  { if (-not $Disk) { throw "-Disk required for blk workload" }
            $devFlags += '--drive', $Disk
            $auto = 'fio --name=r --filename=/dev/vda --rw=randread --bs=4k --iodepth=32 --runtime=40 --time_based --ioengine=libaio --direct=1' }

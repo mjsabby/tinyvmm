@@ -43,8 +43,8 @@ impl Default for WintunOptions {
     fn default() -> Self {
         WintunOptions {
             adapter_name: "tinyvmm".to_string(),
-            host_ipv4: [10, 0, 0, 1],
-            prefix_len: 24,
+            host_ipv4: crate::net::GATEWAY_IP,
+            prefix_len: crate::net::PREFIX_LEN,
             backend_mac: [0x02, 0x53, 0x54, 0x00, 0x00, 0x01],
             ring_capacity: 4 * 1024 * 1024,
         }

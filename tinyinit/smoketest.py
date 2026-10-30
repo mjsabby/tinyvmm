@@ -161,7 +161,7 @@ def configuration(args):
         "mounts": [{"tag": "apps", "target": "/mnt/apps", "readonly": True},
                    {"tag": "data", "target": "/srv/data", "readonly": False}],
         "users": [{"name": "app", "uid": 1000, "gid": 1000, "home": "/home/app"}],
-        "network": {"interface": "eth0", "address": "10.0.0.2/24", "gateway": "10.0.0.1", "dns": ["1.1.1.1"]},
+        "network": {"interface": "eth0", "address": "172.29.255.2/29", "gateway": "172.29.255.1", "dns": ["1.1.1.1"]},
         "apps": apps,
         "ssh": {"logins": [
             {"user": "root", "public_keys_file": "/mnt/bootstrap/caller.pub"},

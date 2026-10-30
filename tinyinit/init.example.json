@@ -16,8 +16,8 @@
   ],
   "network": {
     "interface": "eth0",
-    "address": "10.0.0.2/24",
-    "gateway": "10.0.0.1",
+    "address": "172.29.255.2/29",
+    "gateway": "172.29.255.1",
     "dns": ["1.1.1.1"]
   },
   "apps": [
