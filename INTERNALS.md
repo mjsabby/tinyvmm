@@ -707,9 +707,12 @@ These are optional and don't change the core, but each teaches one more piece:
 - **Recording** (`src/record.rs`, `--record`) — tees the GPU present hook and the
   snd playback tap into an encoder thread that writes H.264 + AAC to a fragmented
   MP4 via a Media Foundation sink writer (`crates/winsys/src/media.rs`). Video is
-  constant frame rate (the latest frame each tick); audio chunks carry exact
-  48 kHz positions, so the two tracks share one timeline. Keep the streams
-  interleaved: the sink writer stalls a stream that runs far ahead.
+  constant frame rate (the latest frame each tick, one nominal-length sample per
+  tick: hardware encoders may rewrite durations); audio chunks carry exact
+  48 kHz positions, so the two tracks share one timeline. A late encoder catches
+  up by repeating the previous picture; a stall over 2 s is cut from both tracks.
+  Keep the streams interleaved: the sink writer stalls a stream that runs far
+  ahead, so audio is committed only up to the video written so far.
 - **Save / restore** (`src/whp/snapshot*.rs`, README §13). A self-describing file
   (`"TVMMSAVE"` header + JSON machine description + typed sections + CRC32) holding
   per-vCPU register/XSAVE/APIC state, the HV MSR cache, the legacy devices, every

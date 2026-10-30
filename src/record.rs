@@ -4,20 +4,33 @@
 //!
 //! Everything lands on one timeline that starts when the recorder starts (`t0`,
 //! QPC via [`Instant`]):
-//!   * Video is constant frame rate. At tick `k` (time `k / fps`) the encoder
-//!     takes the most recently presented frame, repeating the previous one when
-//!     the guest hasn't flushed since (a static desktop), and encodes it with
-//!     that timestamp. A present only copies into a single latest-frame slot, so
-//!     the vCPU never waits on the encoder; frames presented between two ticks
-//!     are dropped. A frame whose size differs from the recording's (a guest
-//!     mode change) is scaled to fit and letterboxed. If the encoder falls
-//!     behind, the ticks it missed are folded into one longer frame.
+//!   * Video is constant frame rate: tick `k` (time `k / fps`) is one sample one
+//!     frame period long. Never a longer one: some hardware encoders replace
+//!     sample durations with the nominal period, which would shorten the video
+//!     track. At each tick the encoder takes the most recently presented frame,
+//!     or queues the previous picture again when the guest hasn't flushed since
+//!     (a static desktop; the encoder resubmits that picture's buffer, no copy).
+//!     A present only swaps its buffer into a single latest-frame slot, so the
+//!     vCPU neither copies a frame nor waits on the encoder; frames presented
+//!     between two ticks are dropped. A frame whose size differs from the
+//!     recording's (a guest mode change) is scaled to fit and letterboxed.
+//!   * If the encoder falls behind, it catches up by repeating the previous
+//!     picture for each tick it missed, and takes a new frame only for the tick
+//!     the present falls in, so no frame is shown before it was presented. A
+//!     stall longer than [`MAX_BACKLOG`] (the host suspended, a long encoder
+//!     block) is cut from both tracks instead: the next tick shows the current
+//!     frame, audio from inside the gap is dropped, the summary reports the time
+//!     skipped, and the tracks stay in sync.
 //!   * Audio: while tapped, virtio-snd playback is clock-paced, so every PCM
 //!     chunk carries its exact position on a 48 kHz clock. The recorder places
-//!     it on the track at `(epoch - t0) * 48 kHz + offset` and fills gaps (the
-//!     guest not playing, a skipped host stall) with silence. Silence is also
-//!     written up to `now - AUDIO_LAG` so the streams stay interleaved: the
-//!     sink writer stalls a stream that runs far ahead of the other.
+//!     it on the track at `(epoch - t0) * 48 kHz + offset` (less any time cut)
+//!     and fills gaps (the guest not playing, a skipped host stall) with
+//!     silence. Each tick commits audio up to the end of the video written so
+//!     far, padding silence up to `now - AUDIO_LAG`: the streams stay
+//!     interleaved (the sink writer stalls a stream that runs far ahead of the
+//!     other), silence is generated a tick at a time, and staged PCM is capped.
+//!   * [`Recorder::finish`] ends both tracks at the tick showing the moment it
+//!     was called, even if the encoder was stalled then.
 //!
 //! The output is a fragmented MP4, playable while it grows and still playable
 //! (up to the last fragment) if tinyvmm dies before finalizing it.
@@ -26,8 +39,8 @@ use crate::error::{Error, Result};
 use crate::host::audio::{Event, INFINITE, SAMPLE_RATE, WaitOutcome, wait_any};
 use crate::host::media::{Mp4Options, Mp4Writer, VideoFormat};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -38,11 +51,15 @@ const PCM_FRAME: usize = 4;
 /// How far behind real time the audio track is padded with silence while the
 /// guest isn't playing. PCM arriving later than this is dropped (counted).
 const AUDIO_LAG_FRAMES: i64 = SAMPLE_RATE as i64 / 5;
-/// Cap on PCM queued for the encoder (2 s); beyond it new PCM is dropped.
-const AUDIO_QUEUE_MAX_BYTES: usize = 2 * SAMPLE_RATE as usize * PCM_FRAME;
-/// Ticks the encoder may run behind before the missed ones are folded into a
-/// single longer frame.
-const MAX_LATE_TICKS: u64 = 2;
+/// How far the encoder may fall behind before the gap is cut rather than
+/// caught up. Also the PCM queued for the encoder: beyond it, new PCM is
+/// dropped (counted).
+const MAX_BACKLOG: Duration = Duration::from_secs(2);
+const AUDIO_QUEUE_MAX_BYTES: usize =
+    MAX_BACKLOG.as_secs() as usize * SAMPLE_RATE as usize * PCM_FRAME;
+/// Cap on PCM staged on the track ahead of what was committed: twice what the
+/// backlog can leave there. PCM that would stage beyond it is dropped (counted).
+const MAX_STAGED_FRAMES: i64 = 2 * MAX_BACKLOG.as_secs() as i64 * SAMPLE_RATE as i64;
 /// 100-ns units per second (Media Foundation timestamps).
 const HNS_PER_SEC: u128 = 10_000_000;
 
@@ -112,7 +129,8 @@ struct Shared {
     t0: Instant,
     video: Mutex<Frame>,
     audio: Mutex<AudioQueue>,
-    stopping: AtomicBool,
+    /// When [`Recorder::finish`] was called: the recording ends there.
+    stop_at: OnceLock<Instant>,
     wake: Event,
     presents: AtomicU64,
     audio_overflow_frames: AtomicU64,
@@ -128,11 +146,36 @@ impl Shared {
                 data: Vec::with_capacity(AUDIO_QUEUE_MAX_BYTES / 4),
                 chunks: Vec::with_capacity(256),
             }),
-            stopping: AtomicBool::new(false),
+            stop_at: OnceLock::new(),
             wake: Event::new(false)?,
             presents: AtomicU64::new(0),
             audio_overflow_frames: AtomicU64::new(0),
         }))
+    }
+
+    /// See [`Recorder::video_frame`].
+    fn present(&self, bgra: &mut Vec<u8>, width: u32, height: u32) {
+        {
+            let mut slot = self.video.lock().unwrap();
+            std::mem::swap(&mut slot.buf, bgra);
+            slot.width = width;
+            slot.height = height;
+            slot.seq += 1;
+        }
+        self.presents.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// See [`Recorder::audio_pcm`].
+    fn queue_pcm(&self, epoch: Instant, offset: u64, pcm: &[u8]) {
+        let pos = frames_since(self.t0, epoch) + offset as i64;
+        let mut q = self.audio.lock().unwrap();
+        if q.data.len() + pcm.len() > AUDIO_QUEUE_MAX_BYTES {
+            self.audio_overflow_frames
+                .fetch_add((pcm.len() / PCM_FRAME) as u64, Ordering::Relaxed);
+            return;
+        }
+        q.data.extend_from_slice(pcm);
+        q.chunks.push((pos, pcm.len()));
     }
 }
 
@@ -141,12 +184,15 @@ impl Shared {
 pub struct Summary {
     path: PathBuf,
     fps: u32,
-    /// Video ticks covered (frame count at the nominal rate).
+    /// Video ticks written (frame count at the nominal rate).
     ticks: u64,
     /// Ticks that showed a newly presented frame (vs a repeat).
     new_frames: u64,
-    /// Ticks folded into a longer frame because the encoder fell behind.
+    /// Ticks written behind schedule, repeating the previous picture, while
+    /// the encoder caught up.
     late_ticks: u64,
+    /// Time cut from both tracks at stalls longer than [`MAX_BACKLOG`].
+    skipped: Duration,
     presents: u64,
     audio: bool,
     audio_frames: u64,
@@ -160,7 +206,7 @@ impl std::fmt::Display for Summary {
         let secs = self.ticks as f64 / self.fps.max(1) as f64;
         write!(
             f,
-            "{}: {:.1} s, {} frames @ {} fps ({} new of {} guest presents, {} late)",
+            "{}: {:.1} s, {} frames @ {} fps ({} new of {} guest presents, {} late",
             self.path.display(),
             secs,
             self.ticks,
@@ -169,6 +215,10 @@ impl std::fmt::Display for Summary {
             self.presents,
             self.late_ticks
         )?;
+        if !self.skipped.is_zero() {
+            write!(f, ", {:.1} s skipped", self.skipped.as_secs_f64())?;
+        }
+        f.write_str(")")?;
         if self.audio {
             write!(
                 f,
@@ -277,38 +327,25 @@ impl Recorder {
         }))
     }
 
-    /// GPU present hook: copy the frame into the latest-frame slot. Runs on the
-    /// vCPU thread under the GPU lock, so it only copies (allocating only when
-    /// the frame grows).
-    pub fn video_frame(&self, bgra: &[u8], width: u32, height: u32) {
-        let mut slot = self.shared.video.lock().unwrap();
-        slot.buf.clear();
-        slot.buf.extend_from_slice(bgra);
-        slot.width = width;
-        slot.height = height;
-        slot.seq += 1;
-        self.shared.presents.fetch_add(1, Ordering::Relaxed);
+    /// GPU present hook: take the frame by swapping `bgra` with the latest-frame
+    /// slot's buffer (the device rewrites whatever it gets back before its next
+    /// present). Runs on the vCPU thread under the GPU lock, so it neither
+    /// copies nor allocates.
+    pub fn video_frame(&self, bgra: &mut Vec<u8>, width: u32, height: u32) {
+        self.shared.present(bgra, width, height);
     }
 
     /// virtio-snd playback tap: queue `pcm`, which sits `offset` frames into
     /// the playback run whose 48 kHz clock started at `epoch`.
     pub fn audio_pcm(&self, epoch: Instant, offset: u64, pcm: &[u8]) {
-        let pos = frames_since(self.shared.t0, epoch) + offset as i64;
-        let mut q = self.shared.audio.lock().unwrap();
-        if q.data.len() + pcm.len() > AUDIO_QUEUE_MAX_BYTES {
-            self.shared
-                .audio_overflow_frames
-                .fetch_add((pcm.len() / PCM_FRAME) as u64, Ordering::Relaxed);
-            return;
-        }
-        q.data.extend_from_slice(pcm);
-        q.chunks.push((pos, pcm.len()));
+        self.shared.queue_pcm(epoch, offset, pcm);
     }
 
-    /// Stop recording, finalize the file and report. Later calls return `None`.
+    /// Stop recording now, finalize the file and report. Both tracks end at the
+    /// tick showing this moment. Later calls return `None`.
     pub fn finish(&self) -> Option<Summary> {
         let worker = self.worker.lock().unwrap().take()?;
-        self.shared.stopping.store(true, Ordering::Release);
+        let _ = self.shared.stop_at.set(Instant::now());
         self.shared.wake.set();
         worker.join().ok()
     }
@@ -346,85 +383,211 @@ fn audio_hns(n: u64) -> i64 {
     (n as u128 * HNS_PER_SEC / SAMPLE_RATE as u128) as i64
 }
 
-/// The encoder thread: one video frame per tick, audio up to the tick's
-/// horizon, until [`Recorder::finish`].
+/// Audio track frames (48 kHz) before video tick `k`.
+fn tick_frames(k: u64, fps: u32) -> i64 {
+    (k as u128 * SAMPLE_RATE as u128 / fps as u128) as i64
+}
+
+/// Where the encoder sends samples (times and durations in 100-ns units): the
+/// MP4 writer, or a fake in tests.
+trait Sink {
+    /// A new picture (NV12).
+    fn video(&mut self, nv12: &[u8], time: i64, duration: i64) -> Result<()>;
+    /// The previous picture again.
+    fn repeat_video(&mut self, time: i64, duration: i64) -> Result<()>;
+    fn audio(&mut self, pcm: &[u8], time: i64, duration: i64) -> Result<()>;
+}
+
+impl Sink for Mp4Writer {
+    fn video(&mut self, nv12: &[u8], time: i64, duration: i64) -> Result<()> {
+        self.write_video(nv12, time, duration)
+    }
+    fn repeat_video(&mut self, time: i64, duration: i64) -> Result<()> {
+        Mp4Writer::repeat_video(self, time, duration)
+    }
+    fn audio(&mut self, pcm: &[u8], time: i64, duration: i64) -> Result<()> {
+        self.write_audio(pcm, time, duration)
+    }
+}
+
+/// The encoder thread's timeline: the video clock and current picture, plus
+/// the audio track.
+struct Encoder {
+    t0: Instant,
+    fmt: VideoFormat,
+    /// When tick 0 was due: `t0` plus the time cut from the recording so far.
+    base: Instant,
+    /// The next tick to write.
+    next: u64,
+    /// The current picture, and whether the sink has it (so later ticks can
+    /// repeat it).
+    nv12: Vec<u8>,
+    pictured: bool,
+    frame: Frame,
+    fit: Fit,
+    /// `None` without an audio stream.
+    track: Option<AudioTrack>,
+    new_frames: u64,
+    late_ticks: u64,
+    skipped: Duration,
+}
+
+impl Encoder {
+    fn new(t0: Instant, fmt: VideoFormat, audio: bool) -> Encoder {
+        let mut nv12 = vec![0u8; fmt.nv12_len()];
+        let luma = fmt.width as usize * fmt.height as usize;
+        nv12[..luma].fill(16); // black until the guest presents
+        nv12[luma..].fill(128);
+        Encoder {
+            t0,
+            fmt,
+            base: t0,
+            next: 0,
+            nv12,
+            pictured: false,
+            frame: Frame::default(),
+            fit: Fit::default(),
+            track: audio.then(AudioTrack::default),
+            new_frames: 0,
+            late_ticks: 0,
+            skipped: Duration::ZERO,
+        }
+    }
+
+    /// When the next tick is due.
+    fn due(&self) -> Instant {
+        let ns = self.next as u128 * 1_000_000_000 / self.fmt.fps as u128;
+        self.base + Duration::from_nanos(ns as u64)
+    }
+
+    /// The tick whose period contains `t`.
+    fn tick_at(&self, t: Instant) -> u64 {
+        let ns = t.saturating_duration_since(self.base).as_nanos();
+        (ns * self.fmt.fps as u128 / 1_000_000_000) as u64
+    }
+
+    /// Write the next tick, which is due at or before `now`, then commit audio
+    /// up to the end of the video.
+    fn tick(&mut self, shared: &Shared, sink: &mut impl Sink, now: Instant) -> Result<()> {
+        let late = now.saturating_duration_since(self.due());
+        if late > MAX_BACKLOG {
+            self.cut(shared, now, late);
+        }
+        let (k, fps) = (self.next, self.fmt.fps);
+        let (t, end) = (tick_hns(k, fps), tick_hns(k + 1, fps));
+        // Behind schedule, repeat the previous picture: a frame presented by
+        // now belongs to a later tick, not this past one.
+        let behind = self.tick_at(now) > k;
+        let new = !behind
+            && take_frame(shared, &mut self.frame)
+            && convert(&self.frame, &self.fmt, &mut self.fit, &mut self.nv12);
+        if new || !self.pictured {
+            sink.video(&self.nv12, t, end - t)?;
+            self.pictured = true;
+        } else {
+            sink.repeat_video(t, end - t)?;
+        }
+        self.next = k + 1;
+        self.new_frames += u64::from(new);
+        self.late_ticks += u64::from(behind);
+        let video_end = tick_frames(self.next, fps);
+        let pad = (frames_since(self.base, now) - AUDIO_LAG_FRAMES).min(video_end);
+        if let Some(track) = &mut self.track {
+            track.take(shared);
+            track.commit(pad, video_end, |pcm, t, d| sink.audio(pcm, t, d))?;
+        }
+        Ok(())
+    }
+
+    /// Cut the `late` stretch before `now` from both tracks: the next tick is
+    /// shown from `now`, and PCM from inside the gap is dropped.
+    fn cut(&mut self, shared: &Shared, now: Instant, late: Duration) {
+        self.base += late;
+        self.skipped += late;
+        let at = tick_frames(self.next, self.fmt.fps);
+        let wall_end = frames_since(self.t0, now);
+        let shift = frames_since(self.t0, self.base);
+        if let Some(track) = &mut self.track {
+            // Place what the tap queued before the gap (still at the old
+            // offset); what that stages past the cut point is from the gap, and
+            // so is whatever the full queue turned away since the last take.
+            let seen = track.tap_overflow;
+            track.take(shared);
+            track.cut_overflow += track.tap_overflow - seen;
+            track.cut(at, wall_end, shift);
+        }
+    }
+
+    /// End the recording at `stop`: write the ticks through the one showing it
+    /// (catching up, or cutting a long gap, as while recording), then end the
+    /// audio exactly where the video ends.
+    fn finish(&mut self, shared: &Shared, sink: &mut impl Sink, stop: Instant) -> Result<()> {
+        while self.due() <= stop {
+            self.tick(shared, sink, stop)?;
+        }
+        let end = tick_frames(self.next, self.fmt.fps);
+        if let Some(track) = &mut self.track {
+            track.take(shared);
+            track.truncate(end);
+            track.commit(end, end, |pcm, t, d| sink.audio(pcm, t, d))?;
+        }
+        Ok(())
+    }
+
+    /// The shutdown report.
+    fn summary(&self, shared: &Shared, path: PathBuf) -> Summary {
+        let track = self.track.as_ref();
+        let tap_overflow = shared.audio_overflow_frames.load(Ordering::Relaxed);
+        Summary {
+            path,
+            fps: self.fmt.fps,
+            ticks: self.next,
+            new_frames: self.new_frames,
+            late_ticks: self.late_ticks,
+            skipped: self.skipped,
+            presents: shared.presents.load(Ordering::Relaxed),
+            audio: track.is_some(),
+            audio_frames: track.map_or(0, |t| t.written),
+            late_audio_frames: track.map_or(0, |t| t.late),
+            overflow_audio_frames: track
+                .map_or(tap_overflow, |t| tap_overflow - t.cut_overflow + t.overflow),
+            error: None,
+        }
+    }
+}
+
+/// The encoder thread: one video sample per tick, audio alongside, until
+/// [`Recorder::finish`].
 fn encode(shared: &Shared, mut writer: Mp4Writer, fmt: &VideoFormat, path: PathBuf) -> Summary {
-    let fps = fmt.fps;
-    let tick_ns = |k: u64| Duration::from_nanos((k as u128 * 1_000_000_000 / fps as u128) as u64);
-    let ticks_at = |t: Instant| {
-        (t.saturating_duration_since(shared.t0).as_nanos() * fps as u128 / 1_000_000_000) as u64
-    };
+    let mut enc = Encoder::new(shared.t0, *fmt, writer.has_audio());
     let timer = Event::timer();
-    let mut nv12 = vec![0u8; fmt.nv12_len()];
-    let luma = fmt.width as usize * fmt.height as usize;
-    nv12[..luma].fill(16); // black until the guest presents
-    nv12[luma..].fill(128);
-    let mut frame = Frame::default();
-    let mut fit = Fit::default();
-    let mut track = AudioTrack::default();
-    let mut s = Summary {
-        path,
-        fps,
-        audio: writer.has_audio(),
-        ..Summary::default()
-    };
-    let mut k = 0u64;
-    while !shared.stopping.load(Ordering::Acquire) {
-        let due = shared.t0 + tick_ns(k);
+    let result = loop {
+        if let Some(&stop) = shared.stop_at.get() {
+            break enc.finish(shared, &mut writer, stop);
+        }
         let now = Instant::now();
+        let due = enc.due();
         if now < due {
             let wait = due - now;
-            let stop = match &timer {
+            let outcome = match &timer {
                 Some(t) if t.arm_timer((wait.as_nanos() / 100) as i64, 0) => {
                     wait_any(&[&shared.wake, t], INFINITE)
                 }
                 _ => wait_any(&[&shared.wake], (wait.as_millis() as u32).max(1)),
             };
-            if let WaitOutcome::Failed = stop {
-                s.error = Some("recorder wait failed".into());
-                break;
+            if let WaitOutcome::Failed = outcome {
+                break Err(Error::msg("recorder wait failed"));
             }
             continue;
         }
-        // This sample covers ticks k..=last; a stall folds the missed ticks in.
-        let current = ticks_at(now);
-        let last = if current > k + MAX_LATE_TICKS {
-            current
-        } else {
-            k
-        };
-        if take_frame(shared, &mut frame) && convert(&frame, fmt, &mut fit, &mut nv12) {
-            s.new_frames += 1;
+        if let Err(e) = enc.tick(shared, &mut writer, now) {
+            break Err(e);
         }
-        let (t, end) = (tick_hns(k, fps), tick_hns(last + 1, fps));
-        if let Err(e) = writer.write_video(&nv12, t, end - t) {
-            s.error = Some(e.to_string());
-            break;
-        }
-        s.late_ticks += last - k;
-        k = last + 1;
-        if writer.has_audio() {
-            track.take(shared);
-            track.pad_to(frames_since(shared.t0, now) - AUDIO_LAG_FRAMES);
-            if let Err(e) = track.flush(|pcm, t, d| writer.write_audio(pcm, t, d)) {
-                s.error = Some(e.to_string());
-                break;
-            }
-        }
+    };
+    let mut s = enc.summary(shared, path);
+    if let Err(e) = result {
+        s.error = Some(e.to_string());
     }
-    s.ticks = k;
-    if writer.has_audio() && s.error.is_none() {
-        // End the audio with the video.
-        track.take(shared);
-        track.pad_to((k as u128 * SAMPLE_RATE as u128 / fps as u128) as i64);
-        if let Err(e) = track.flush(|pcm, t, d| writer.write_audio(pcm, t, d)) {
-            s.error = Some(e.to_string());
-        }
-    }
-    s.audio_frames = track.written;
-    s.late_audio_frames = track.late;
-    s.overflow_audio_frames = shared.audio_overflow_frames.load(Ordering::Relaxed);
-    s.presents = shared.presents.load(Ordering::Relaxed);
     if let Err(e) = writer.finalize() {
         s.error.get_or_insert(e.to_string());
     }
@@ -535,12 +698,25 @@ impl Fit {
 }
 
 /// The AAC track's PCM timeline: frames committed to the encoder, plus PCM
-/// staged after them for the next write.
+/// staged after them for later commits. The tap queues chunks at wall-clock
+/// positions (48 kHz frames since `t0`); the track maps them past any time cut
+/// from the recording.
 #[derive(Default)]
 struct AudioTrack {
     written: u64,
     staged: Vec<u8>,
+    /// A chunk at wall position `p` lands at track frame `p - shift`.
+    shift: i64,
+    /// Wall positions before this aren't part of the recording (before `t0`,
+    /// or cut).
+    floor: i64,
     late: u64,
+    /// PCM dropped by the [`MAX_STAGED_FRAMES`] cap.
+    overflow: u64,
+    /// The tap's queue-overflow count at the last [`Self::take`], and how much
+    /// of it fell inside cuts (the queue only fills while the encoder stalls).
+    tap_overflow: u64,
+    cut_overflow: u64,
     queue: AudioQueue,
 }
 
@@ -555,11 +731,13 @@ impl AudioTrack {
         {
             let mut q = shared.audio.lock().unwrap();
             std::mem::swap(&mut *q, &mut self.queue);
+            // The tap counts overflow under this lock.
+            self.tap_overflow = shared.audio_overflow_frames.load(Ordering::Relaxed);
         }
         let mut off = 0;
         let queue = std::mem::take(&mut self.queue);
         for &(pos, len) in &queue.chunks {
-            self.place(pos, &queue.data[off..off + len]);
+            self.add(pos, &queue.data[off..off + len]);
             off += len;
         }
         // Hand the (cleared) buffers back for reuse by the next swap.
@@ -568,41 +746,81 @@ impl AudioTrack {
         self.queue.chunks.clear();
     }
 
+    /// Put a chunk queued at wall position `pos` on the track, less any part
+    /// before `floor`.
+    fn add(&mut self, pos: i64, pcm: &[u8]) {
+        let frames = (pcm.len() / PCM_FRAME) as i64;
+        let skip = (self.floor - pos).clamp(0, frames);
+        if skip < frames {
+            let pcm = &pcm[skip as usize * PCM_FRAME..frames as usize * PCM_FRAME];
+            self.place(pos + skip - self.shift, pcm);
+        }
+    }
+
     /// Put `pcm` at track frame `pos`: silence fills a gap before it; the part
-    /// that overlaps what is already on the track (late, or before `t0`) is
-    /// dropped.
+    /// that overlaps what is already on the track (late) is dropped, and so is
+    /// any part that would stage more than [`MAX_STAGED_FRAMES`].
     fn place(&mut self, pos: i64, pcm: &[u8]) {
         let frames = (pcm.len() / PCM_FRAME) as i64;
         let skip = (self.end() - pos).clamp(0, frames);
         self.late += skip as u64;
-        if skip == frames {
+        let start = pos + skip;
+        let keep = (self.written as i64 + MAX_STAGED_FRAMES - start).clamp(0, frames - skip);
+        self.overflow += (frames - skip - keep) as u64;
+        if keep == 0 {
             return;
         }
-        self.pad_to(pos);
+        self.pad_to(start);
         self.staged
-            .extend_from_slice(&pcm[skip as usize * PCM_FRAME..frames as usize * PCM_FRAME]);
+            .extend_from_slice(&pcm[skip as usize * PCM_FRAME..(skip + keep) as usize * PCM_FRAME]);
     }
 
-    /// Extend the track with silence up to frame `pos`.
+    /// Extend the track with silence up to frame `pos`, staging at most
+    /// [`MAX_STAGED_FRAMES`].
     fn pad_to(&mut self, pos: i64) {
-        let gap = pos - self.end();
+        let gap = pos.min(self.written as i64 + MAX_STAGED_FRAMES) - self.end();
         if gap > 0 {
             let len = self.staged.len() + gap as usize * PCM_FRAME;
             self.staged.resize(len, 0);
         }
     }
 
-    /// Commit the staged PCM through `write(pcm, time, duration)`.
-    fn flush(&mut self, write: impl FnOnce(&[u8], i64, i64) -> Result<()>) -> Result<()> {
-        if self.staged.is_empty() {
-            return Ok(());
+    /// Drop the track after frame `at` (never what was committed).
+    fn truncate(&mut self, at: i64) {
+        let keep = (at - self.written as i64).max(0) as usize;
+        self.staged.truncate(keep * PCM_FRAME);
+    }
+
+    /// The recording jumps from track frame `at` to wall position `wall_end`:
+    /// drop what is staged after `at` and PCM queued from before `wall_end`;
+    /// later PCM lands at `wall - shift` (`wall_end - shift` is `at`).
+    fn cut(&mut self, at: i64, wall_end: i64, shift: i64) {
+        self.truncate(at);
+        self.floor = wall_end;
+        self.shift = shift;
+    }
+
+    /// Commit the track through frame `limit` with `write(pcm, time,
+    /// duration)`, first padding it with silence up to `pad`. Writes pieces of
+    /// at most [`MAX_STAGED_FRAMES`]; PCM staged after `limit` stays.
+    fn commit(
+        &mut self,
+        pad: i64,
+        limit: i64,
+        mut write: impl FnMut(&[u8], i64, i64) -> Result<()>,
+    ) -> Result<()> {
+        loop {
+            self.pad_to(pad);
+            let n = self.end().min(limit) - self.written as i64;
+            if n <= 0 {
+                return Ok(());
+            }
+            let bytes = n as usize * PCM_FRAME;
+            let (t, end) = (audio_hns(self.written), audio_hns(self.written + n as u64));
+            write(&self.staged[..bytes], t, end - t)?;
+            self.written += n as u64;
+            self.staged.drain(..bytes);
         }
-        let frames = (self.staged.len() / PCM_FRAME) as u64;
-        let (t, end) = (audio_hns(self.written), audio_hns(self.written + frames));
-        write(&self.staged, t, end - t)?;
-        self.written += frames;
-        self.staged.clear();
-        Ok(())
     }
 }
 
@@ -718,7 +936,7 @@ mod tests {
         // Overlapping chunk: the first 5 frames are late, the rest append.
         t.place(1005, &pcm(10, 4));
         assert_eq!((t.end(), t.late), (1015, 5));
-        // Entirely late (and pre-t0) chunks are dropped.
+        // Entirely late chunks are dropped.
         t.place(0, &pcm(10, 5));
         t.place(-100, &pcm(10, 5));
         assert_eq!((t.end(), t.late), (1015, 25));
@@ -729,22 +947,213 @@ mod tests {
         assert_eq!(t.end(), 1100);
 
         let mut writes = Vec::new();
-        t.flush(|pcm, time, dur| {
+        let mut log = |pcm: &[u8], time: i64, dur: i64| -> Result<()> {
             writes.push((pcm.len(), time, dur));
             Ok(())
-        })
-        .unwrap();
+        };
+        t.commit(1100, 1100, &mut log).unwrap();
         t.place(1100, &pcm(48, 6));
-        t.flush(|pcm, time, dur| {
-            writes.push((pcm.len(), time, dur));
-            Ok(())
-        })
-        .unwrap();
+        // A commit stops at its limit; the rest stays staged.
+        t.commit(0, 1120, &mut log).unwrap();
+        assert_eq!((t.written, t.end()), (1120, 1148));
+        t.commit(0, 1148, &mut log).unwrap();
         // Timestamps are contiguous in 100-ns units.
         assert_eq!(writes[0], (1100 * 4, 0, audio_hns(1100)));
-        assert_eq!(writes[1].1, audio_hns(1100));
-        assert_eq!(writes[1].1 + writes[1].2, audio_hns(1148));
+        assert_eq!(
+            writes[1],
+            (20 * 4, audio_hns(1100), audio_hns(1120) - audio_hns(1100))
+        );
+        assert_eq!(writes[2].1 + writes[2].2, audio_hns(1148));
         assert_eq!(t.written, 1148);
+    }
+
+    /// Staging is capped: a chunk far past the track is dropped (counted)
+    /// rather than padded up to, and long silence is committed in capped
+    /// pieces.
+    #[test]
+    fn audio_staging_is_bounded() {
+        let mut t = AudioTrack::default();
+        t.place(0, &pcm(10, 1));
+        t.place(10 + MAX_STAGED_FRAMES, &pcm(10, 2));
+        assert_eq!((t.end(), t.overflow), (10, 10));
+        t.pad_to(3 * MAX_STAGED_FRAMES);
+        assert_eq!(t.end(), MAX_STAGED_FRAMES);
+        let mut sizes = Vec::new();
+        let far = 3 * MAX_STAGED_FRAMES;
+        t.commit(far, far, |pcm: &[u8], _, _| -> Result<()> {
+            sizes.push(pcm.len());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(t.written, far as u64);
+        let cap = MAX_STAGED_FRAMES as usize * PCM_FRAME;
+        assert!(sizes.iter().all(|&n| n <= cap), "{sizes:?}");
+    }
+
+    /// Records what the encoder sends, checking that audio never runs ahead
+    /// of the video already written.
+    #[derive(Default)]
+    struct FakeSink {
+        /// `(time, duration, luma of pixel 0)`, `None` for a repeat.
+        video: Vec<(i64, i64, Option<u8>)>,
+        audio: Vec<(i64, i64, Vec<u8>)>,
+    }
+
+    impl Sink for FakeSink {
+        fn video(&mut self, nv12: &[u8], time: i64, duration: i64) -> Result<()> {
+            self.video.push((time, duration, Some(nv12[0])));
+            Ok(())
+        }
+        fn repeat_video(&mut self, time: i64, duration: i64) -> Result<()> {
+            self.video.push((time, duration, None));
+            Ok(())
+        }
+        fn audio(&mut self, pcm: &[u8], time: i64, duration: i64) -> Result<()> {
+            let video_end = self.video.last().map_or(0, |v| v.0 + v.1);
+            assert!(time + duration <= video_end, "audio ahead of video");
+            self.audio.push((time, duration, pcm.to_vec()));
+            Ok(())
+        }
+    }
+
+    impl FakeSink {
+        /// One nominal-length sample per tick, from 0.
+        fn assert_cfr(&self) {
+            for (k, v) in (0u64..).zip(&self.video) {
+                let t = tick_hns(k, FPS);
+                assert_eq!((v.0, v.1), (t, tick_hns(k + 1, FPS) - t), "tick {k}");
+            }
+        }
+
+        /// The pictures in tick order (`None` = repeat).
+        fn pictures(&self) -> Vec<Option<u8>> {
+            self.video.iter().map(|v| v.2).collect()
+        }
+
+        /// The audio track, checking the writes are contiguous from 0.
+        fn track(&self) -> Vec<u8> {
+            let mut next = 0;
+            let mut out = Vec::new();
+            for (time, duration, pcm) in &self.audio {
+                assert_eq!(*time, next);
+                next = time + duration;
+                out.extend_from_slice(pcm);
+            }
+            out
+        }
+    }
+
+    const FPS: u32 = 10;
+    const WHITE: u8 = 235;
+    const RED: u8 = 63;
+    const GREEN: u8 = 173;
+
+    /// A 4x2 encoder at 10 fps, its shared state, and a fake sink.
+    fn test_encoder(audio: bool) -> (Arc<Shared>, Encoder, FakeSink) {
+        let shared = Shared::new().expect("event");
+        let fmt = VideoFormat {
+            width: 4,
+            height: 2,
+            fps: FPS,
+            bitrate: 500_000,
+        };
+        let enc = Encoder::new(shared.t0, fmt, audio);
+        (shared, enc, FakeSink::default())
+    }
+
+    fn solid(rgb: [u8; 3]) -> Vec<u8> {
+        bgra(&[rgb; 8])
+    }
+
+    /// Frame `n`'s first byte on an audio track.
+    fn sample(track: &[u8], n: usize) -> u8 {
+        track[n * PCM_FRAME]
+    }
+
+    /// An encoder that falls behind writes one nominal-length sample per tick
+    /// it missed, repeating the previous picture, and shows a new frame only
+    /// on the tick it arrived in.
+    #[test]
+    fn stall_catches_up_one_sample_per_tick() {
+        let (shared, mut enc, mut sink) = test_encoder(false);
+        let at = |ms| shared.t0 + Duration::from_millis(ms);
+        shared.present(&mut solid([255, 255, 255]), 4, 2);
+        enc.tick(&shared, &mut sink, at(0)).unwrap();
+        // The encoder stalls until 450 ms; a red frame arrives meanwhile.
+        shared.present(&mut solid([255, 0, 0]), 4, 2);
+        while enc.due() <= at(450) {
+            enc.tick(&shared, &mut sink, at(450)).unwrap();
+        }
+        sink.assert_cfr();
+        assert_eq!(sink.pictures(), [Some(WHITE), None, None, None, Some(RED)]);
+        assert_eq!((enc.late_ticks, enc.new_frames), (3, 2));
+        assert!(enc.skipped.is_zero());
+    }
+
+    /// A stall longer than MAX_BACKLOG is cut from both tracks: the next tick
+    /// shows the current frame, PCM from inside the gap is dropped, and PCM
+    /// after it lands where the video resumes.
+    #[test]
+    fn long_stall_is_cut_from_both_tracks() {
+        let (shared, mut enc, mut sink) = test_encoder(true);
+        let at = |ms| shared.t0 + Duration::from_millis(ms);
+        shared.present(&mut solid([255, 255, 255]), 4, 2);
+        enc.tick(&shared, &mut sink, at(0)).unwrap();
+        shared.queue_pcm(at(0), 0, &pcm(2400, 1));
+        // The host sleeps for 5 s. PCM from inside the gap is still queued (more
+        // than the queue holds), and a green frame arrives as it wakes.
+        shared.queue_pcm(at(1000), 0, &pcm(480, 2));
+        shared.queue_pcm(at(1010), 0, &pcm(96_000, 2));
+        shared.present(&mut solid([0, 255, 0]), 4, 2);
+        enc.tick(&shared, &mut sink, at(5000)).unwrap();
+        assert_eq!(enc.skipped, Duration::from_millis(4900));
+        // Playback after the gap lands on tick 1 (100 ms), with the green frame.
+        shared.queue_pcm(at(5000), 0, &pcm(480, 3));
+        enc.tick(&shared, &mut sink, at(5100)).unwrap();
+        enc.finish(&shared, &mut sink, at(5150)).unwrap();
+
+        sink.assert_cfr();
+        assert_eq!(sink.pictures(), [Some(WHITE), Some(GREEN), None]);
+        let track = sink.track();
+        assert_eq!(track.len(), tick_frames(3, FPS) as usize * PCM_FRAME);
+        assert!((0..2400).all(|n| sample(&track, n) == 1));
+        assert!((2400..4800).all(|n| sample(&track, n) == 0));
+        assert!((4800..5280).all(|n| sample(&track, n) == 3));
+        assert!((5280..14_400).all(|n| sample(&track, n) == 0));
+        // PCM from the gap, including what the full queue turned away, went with
+        // the cut: none of it counts as dropped.
+        let t = enc.track.as_ref().unwrap();
+        assert_eq!((t.late, t.overflow), (0, 0));
+        let summary = enc.summary(&shared, PathBuf::new());
+        assert_eq!(summary.overflow_audio_frames, 0);
+    }
+
+    /// Stopping while the encoder is stalled still ends both tracks at the
+    /// stop: the missed ticks repeat, the last frame lands on the tick showing
+    /// the stop, and PCM past the end of the video is dropped.
+    #[test]
+    fn finish_during_stall_ends_both_tracks_at_the_stop() {
+        let (shared, mut enc, mut sink) = test_encoder(true);
+        let at = |ms| shared.t0 + Duration::from_millis(ms);
+        shared.present(&mut solid([255, 255, 255]), 4, 2);
+        enc.tick(&shared, &mut sink, at(0)).unwrap();
+        // While the encoder is stalled the guest plays 1.5 s and presents red;
+        // then the VM stops at 1.3 s.
+        shared.queue_pcm(at(0), 0, &pcm(48_000, 1));
+        shared.queue_pcm(at(1000), 0, &pcm(24_000, 2));
+        shared.present(&mut solid([255, 0, 0]), 4, 2);
+        enc.finish(&shared, &mut sink, at(1300)).unwrap();
+
+        sink.assert_cfr();
+        // Ticks 0..=13 cover 0..1.4 s; red shows from tick 13 (1.3 s).
+        let mut want = vec![None; 14];
+        (want[0], want[13]) = (Some(WHITE), Some(RED));
+        assert_eq!(sink.pictures(), want);
+        assert_eq!(enc.late_ticks, 12);
+        let track = sink.track();
+        assert_eq!(track.len(), tick_frames(14, FPS) as usize * PCM_FRAME);
+        assert!((0..48_000).all(|n| sample(&track, n) == 1));
+        assert!((48_000..67_200).all(|n| sample(&track, n) == 2));
     }
 
     #[test]
@@ -754,6 +1163,7 @@ mod tests {
         assert_eq!(frames_since(t0 + Duration::from_secs(1), t0), -48_000);
         assert_eq!(tick_hns(30, 30), 10_000_000);
         assert_eq!(tick_hns(1, 30), 333_333);
+        assert_eq!(tick_frames(1, 30), 1600);
         assert_eq!(audio_hns(48_000), 10_000_000);
         assert_eq!(default_bitrate(1280, 800, 30), 4_608_000);
         assert_eq!(default_bitrate(64, 64, 1), 500_000);

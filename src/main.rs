@@ -1524,6 +1524,7 @@ fn start_recorder(
 }
 
 /// The GPU present hook: the window and/or the recorder (`None` if neither).
+/// The window copies the frame; the recorder, last, takes the buffer itself.
 fn present_hook(
     display: Option<Arc<Display>>,
     recorder: Option<Arc<Recorder>>,
@@ -1531,7 +1532,7 @@ fn present_hook(
     if display.is_none() && recorder.is_none() {
         return None;
     }
-    Some(Box::new(move |bgra, w, h| {
+    Some(Box::new(move |bgra: &mut Vec<u8>, w, h| {
         if let Some(d) = &display {
             d.present(bgra, w, h);
         }

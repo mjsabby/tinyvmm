@@ -544,22 +544,34 @@ works headless too. A dedicated encoder thread owns a Media Foundation sink
 writer (`crates/winsys/src/media.rs`) and puts everything on one timeline that
 starts once the encoder is ready:
 
-* **Video, constant frame rate.** A present only copies the frame into a single
-  latest-frame slot, so the vCPU never waits on the encoder. At each tick
-  (`k / fps`) the encoder swaps out the newest frame, or repeats the last one if
-  the guest hasn't flushed since (a static desktop), converts it to NV12
-  (BT.709 limited range, 2×2 chroma averaging, in safe Rust) and encodes it at
-  that timestamp. Frames presented between two ticks are dropped. If the encoder
-  falls behind, the ticks it missed fold into one longer frame. The video size
-  is the `--gpu` display size; frames from a different guest mode are scaled to
-  fit, letterboxed.
+* **Video, constant frame rate.** A present hands its frame to the recorder by
+  swapping buffers with a single latest-frame slot (no copy), so the vCPU never
+  waits on the encoder. At each tick (`k / fps`) the encoder swaps out the newest
+  frame, converts it to NV12 (BT.709 limited range, 2×2 chroma averaging, in
+  safe Rust) and encodes it at that timestamp, or, if the guest hasn't flushed
+  since (a static desktop), queues the previous picture again (its buffer is
+  resubmitted, not copied). Frames presented between two ticks are dropped.
+  Every tick is one sample exactly one frame period long: some hardware encoders
+  replace sample durations with the nominal period, so a longer sample would
+  shorten the video track. The video size is the `--gpu` display size; frames
+  from a different guest mode are scaled to fit, letterboxed.
+* **Falling behind.** If the encoder stalls, it catches up by repeating the
+  previous picture for each tick it missed, and takes a new frame only for the
+  tick it was presented in, so no picture is shown early and the tracks stay
+  aligned. A stall longer than 2 s (the host suspended, say) is cut from both
+  tracks instead: the video jumps to the current frame, audio from inside the gap
+  is dropped, and the shutdown line reports `N s skipped`. Stopping during a
+  stall still ends both tracks where tinyvmm stopped.
 * **Audio, sample-exact.** While tapped, playback is clock-paced (above), so
   each PCM chunk arrives as `(run epoch, frame offset)` on an exact 48 kHz clock.
   The recorder places it on the AAC track at `(epoch − t0) × 48 kHz + offset`
-  and fills gaps (the guest not playing, a skipped host stall) with silence. The
-  track is also padded with silence to 200 ms behind real time, because the sink
+  (less any time cut) and fills gaps (the guest not playing, a skipped host
+  stall) with silence. Each tick commits audio up to the end of the video
+  written so far, padding silence to 200 ms behind real time, because the sink
   writer stalls a stream that runs far ahead of the other: writing 3 s of video
-  before any audio blocked for ~20 s in testing.
+  before any audio blocked for ~20 s in testing. Silence is generated a tick at a
+  time; PCM queued for the encoder is capped at 2 s and PCM staged on the track
+  at 4 s.
 * **Encoding.** Media Foundation is loaded at run time (`LoadLibraryExW`,
   System32 only), so hosts without it (Windows N, Server Core) still run
   everything except `--record`. The output is H.264 High (a keyframe every 2 s,
@@ -935,8 +947,10 @@ The tax the safety model adds versus a C VMM that derefs guest pointers directly
   stream allocates nothing after warm-up; one IRQ per `submit_frame`.
 * **Per gpu flush:** swizzle the bound resource into the reused `present_buf` BGRA
   shadow, then a single CPU blit (`StretchDIBits`) on the window thread — no
-  per-frame allocation. With `--record`, the present hook also copies the frame
-  into the recorder's reused latest-frame slot (one memcpy under its mutex).
+  per-frame allocation. With `--record`, the recorder takes the frame by swapping
+  `present_buf` with its latest-frame slot (O(1) under its mutex, no copy; the
+  device rewrites whatever buffer it gets back), and a static screen's ticks
+  resubmit the last encoded picture's buffer.
 
 **Honest summary:** guest *data* is zero-copy — disk bytes DMA directly in/out of
 guest RAM and rng/status writes land in place. The only fixed memcpy the safety
@@ -1094,7 +1108,7 @@ free-list, the `OnceLock` callbacks, the `UnsafeCell` slot bodies).
 | gpu `Mutex<GpuState>` + queue/scratch mutexes | resources map, scanout, present shadow | the vCPU draining controlq vs the present path | resource table + scanout mutate together |
 | input `Mutex<Virtqueue>` + `Mutex<ChainScratch>` (event/status) | eventq/statusq + reused scratch | the window thread injecting vs the vCPU | host-event injection vs guest kicks |
 | display `Mutex<Frame>` + `Mutex<Option<InputSink>>` | the shared BGRA frame; the installed input sink | `present()` (vCPU/gpu) vs the window thread's `WM_PAINT` | the frame buffer is produced and consumed on different threads |
-| recorder `Mutex<Frame>` + `Mutex<AudioQueue>` (`--record`) | the latest presented frame; PCM chunks awaiting the encoder | the vCPU (gpu present) and the snd playback worker vs the encoder thread | the encoder only swaps buffers under each lock (O(1)) and converts/encodes outside it |
+| recorder `Mutex<Frame>` + `Mutex<AudioQueue>` (`--record`) | the latest presented frame; PCM chunks awaiting the encoder | the vCPU (gpu present) and the snd playback worker vs the encoder thread | both sides only swap buffers under the frame lock (O(1)); the encoder converts/encodes outside it |
 | NAT `Mutex<VecDeque<IcmpJob>>` + `Condvar` | the bounded ping handoff queue | the vCPU enqueues, helper threads dequeue | classic bounded producer/consumer |
 | NAT `RwLock<HashMap<FlowKey, usize>>` (`FlowRouter`, 2+ workers only) | which worker owns each TCP flow | the guest TX path reads it per TCP frame; a SYN, or a worker creating or ending a flow, writes it | a map keyed by 4-tuple; writes only at flow start and end, so reads rarely wait |
 | `RwLock<Vec<Entry>>` (MMIO bus) | the GPA→device dispatch table | written once at setup, read on every MMIO | read-mostly; readers never block readers |
@@ -1135,7 +1149,10 @@ the locking story above.
   through bounded buffers: one latest-frame slot (sized by the GPU's own
   resource caps) and a PCM queue capped at 2 s, beyond which new PCM is dropped
   and counted. A frame whose length doesn't match its dimensions is skipped, and
-  any frame size is scaled to fit the fixed output.
+  any frame size is scaled to fit the fixed output. PCM staged on the audio track
+  is capped at 4 s and silence is generated a tick at a time; a stall longer than
+  2 s (a host suspend, a blocked encoder) is cut from the recording, so no gap
+  turns into an allocation or an unbounded catch-up.
 * **virtio-input (`src/virtio/input.rs`):** config select/subselect indices are
   range-checked; `InputEvent::decode` is only fed the fixed 8-byte records the
   driver path produces; the host-event hot path bounds the absolute axes to

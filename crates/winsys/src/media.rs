@@ -553,9 +553,12 @@ pub struct Mp4Options {
 /// the fixed 48 kHz / S16LE / stereo PCM contract. Used from the thread that
 /// created it (it owns that thread's COM + Media Foundation references).
 pub struct Mp4Writer {
-    // Field order is drop order: release the writer before MFShutdown and
-    // CoUninitialize.
+    // Field order is drop order: release the writer and the last frame before
+    // MFShutdown and CoUninitialize.
     writer: Com<IMFSinkWriterVtbl>,
+    /// The buffer of the last [`Self::write_video`] frame, which
+    /// [`Self::repeat_video`] queues again. Never written after it was filled.
+    last_video: Option<Com<IMFMediaBufferVtbl>>,
     _mf: MfRuntime,
     _com: ComInit,
     api: &'static MfApi,
@@ -595,6 +598,7 @@ impl Mp4Writer {
                     let encoder = probe_encoder(&writer, video_stream);
                     return Ok(Mp4Writer {
                         writer,
+                        last_video: None,
                         _mf: mf,
                         _com: com,
                         api,
@@ -633,7 +637,20 @@ impl Mp4Writer {
                 self.video.height
             )));
         }
-        self.write(self.video_stream, nv12, time, duration)
+        let buffer = self.buffer(nv12)?;
+        self.submit(self.video_stream, &buffer, time, duration)?;
+        self.last_video = Some(buffer);
+        Ok(())
+    }
+
+    /// Queue the last [`Self::write_video`] frame again, shown from `time` for
+    /// `duration`. Nothing is copied: the new sample shares the frame's buffer,
+    /// which no one writes once it is filled.
+    pub fn repeat_video(&mut self, time: i64, duration: i64) -> Result<()> {
+        let Some(buffer) = &self.last_video else {
+            return Err(Error::msg("repeat_video: no frame written yet"));
+        };
+        self.submit(self.video_stream, buffer, time, duration)
     }
 
     /// Queue S16LE stereo PCM starting at `time` (100-ns units). See
@@ -645,13 +662,15 @@ impl Mp4Writer {
         if !pcm.len().is_multiple_of(FRAME_BYTES as usize) {
             return Err(Error::msg("write_audio: partial PCM frame"));
         }
-        self.write(stream, pcm, time, duration)
-    }
-
-    fn write(&mut self, stream: u32, data: &[u8], time: i64, duration: i64) -> Result<()> {
-        if data.is_empty() {
+        if pcm.is_empty() {
             return Ok(());
         }
+        let buffer = self.buffer(pcm)?;
+        self.submit(stream, &buffer, time, duration)
+    }
+
+    /// A new memory buffer holding a copy of `data`.
+    fn buffer(&self, data: &[u8]) -> Result<Com<IMFMediaBufferVtbl>> {
         let len = u32::try_from(data.len()).map_err(|_| Error::msg("sample too large"))?;
         let api = self.api;
         // SAFETY: plain creation call with a valid out-pointer.
@@ -678,6 +697,19 @@ impl Mp4Writer {
                 "IMFMediaBuffer::SetCurrentLength",
             )?;
         }
+        Ok(buffer)
+    }
+
+    /// Queue `buffer` on `stream` as one sample shown from `time` for
+    /// `duration` (100-ns units).
+    fn submit(
+        &self,
+        stream: u32,
+        buffer: &Com<IMFMediaBufferVtbl>,
+        time: i64,
+        duration: i64,
+    ) -> Result<()> {
+        let api = self.api;
         // SAFETY: plain creation call with a valid out-pointer.
         let sample: Com<IMFSampleVtbl> =
             Com::create("MFCreateSample", |p| unsafe { (api.create_sample)(p) })?;
@@ -915,14 +947,21 @@ mod tests {
         let mut frame = vec![0u8; fmt.nv12_len()];
         let luma = (fmt.width * fmt.height) as usize;
         let mut pcm = vec![0u8; 1600 * FRAME_BYTES as usize];
+        assert!(w.repeat_video(0, 1).is_err(), "nothing to repeat yet");
         for k in 0..30i64 {
-            for (i, px) in frame[..luma].iter_mut().enumerate() {
-                *px = ((i as i64 + k * 8) % 220 + 16) as u8;
-            }
-            frame[luma..].fill(128);
             let t = k * 10_000_000 / 30;
             let next = (k + 1) * 10_000_000 / 30;
-            w.write_video(&frame, t, next - t).expect("write video");
+            // A new frame every third tick; the ticks between repeat it, so
+            // several queued samples share one buffer.
+            if k % 3 == 0 {
+                for (i, px) in frame[..luma].iter_mut().enumerate() {
+                    *px = ((i as i64 + k * 8) % 220 + 16) as u8;
+                }
+                frame[luma..].fill(128);
+                w.write_video(&frame, t, next - t).expect("write video");
+            } else {
+                w.repeat_video(t, next - t).expect("repeat video");
+            }
             // Interleave: the sink writer stalls a stream that runs far ahead.
             if opts.audio {
                 for (n, f) in pcm.as_chunks_mut::<4>().0.iter_mut().enumerate() {
