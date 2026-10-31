@@ -33,7 +33,7 @@ impl Area {
     }
 
     /// The smallest area holding both.
-    fn union(self, other: Area) -> Area {
+    pub fn union(self, other: Area) -> Area {
         let x = self.x.min(other.x);
         let y = self.y.min(other.y);
         Area {

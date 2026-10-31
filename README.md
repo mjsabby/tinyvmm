@@ -463,11 +463,13 @@ order they are created — that order is fixed (it is also the snapshot
   (`controlq=0`, `cursorq=1`); single scanout (`NUM_SCANOUTS=1`); 32-bpp
   resources. It handles `GET_DISPLAY_INFO`, `RESOURCE_CREATE_2D` / `UNREF`,
   `SET_SCANOUT`, `RESOURCE_ATTACH`/`DETACH_BACKING`, `TRANSFER_TO_HOST_2D`, and
-  `RESOURCE_FLUSH`; on flush it swizzles the flushed part of the scanout
+  `RESOURCE_FLUSH`; on flush it swizzles what changed of the scanout
   rectangle of the bound resource (`SET_SCANOUT`'s rect, which can be smaller
-  than the resource, e.g. llvmpipe pads heights to 64-row tiles) to BGRA in a
-  new picture of the scanout (`src/scanout.rs`), which a **Win32 GDI window**
-  (`src/display.rs`) shows via a CPU blit and `--record` encodes.
+  than the resource, e.g. llvmpipe pads heights to 64-row tiles): the flushed
+  part, plus anything transferred to it since the last flush. The result is a
+  new BGRA picture of the scanout (`src/scanout.rs`), byte for byte the whole
+  rectangle converted, which a **Win32 GDI window** (`src/display.rs`) shows
+  via a CPU blit and `--record` encodes.
 * **virtio-snd** — sound card (`src/virtio/snd.rs`) with one playback and one
   capture PCM stream, plus one jack and one channel-map per direction. Four queues
   (`controlq=0`, `eventq=1`, `txq=2`, `rxq=3`); the control queue (PCM/jack/chmap
@@ -528,12 +530,13 @@ surface (RSDP / XSDT / MADT with one x2APIC entry per vCPU, LAPIC at
 (`WNDCLASSW` + `CreateWindowExW`, non-resizable, client area == scanout, 1:1
 pixel mapping). Each GPU flush publishes a new BGRA picture of the scanout
 (`src/scanout.rs`): the vCPU draws it in a spare buffer no reader is using,
-copying in only the flushed area (plus whatever that buffer missed since it
-was last shown), then makes it the latest. `Display::frame_ready()` posts a
+copying in only what changed (plus whatever that buffer missed since it was
+last shown), then makes it the latest. `Display::frame_ready()` posts a
 coalesced `WM_APP_PAINT`; the window thread resizes the window if the mode
 changed, invalidates just what changed, and `WM_PAINT` blits the latest picture
-with `StretchDIBits` from a top-down DIB, holding it by reference meanwhile. So
-the window keeps no copy of its own and a paint never holds up the guest. The
+with `StretchDIBits` from a top-down DIB, holding it by reference meanwhile
+(black until the guest's first flush). So the window keeps no copy of its own
+and a paint never holds up the guest. The
 window translates Win32 input messages
 (`WM_KEYDOWN/UP`, `WM_MOUSEMOVE`, the button + wheel messages, focus/resize/close)
 into a `WindowEvent` enum delivered through an installable
@@ -965,9 +968,11 @@ The tax the safety model adds versus a C VMM that derefs guest pointers directly
 * **Per host input event (gpu+input):** the window's `InputSink` runs on the
   message-pump thread and reuses the device's `event_scratch`, so a steady input
   stream allocates nothing after warm-up; one IRQ per `submit_frame`.
-* **Per gpu flush:** swizzle the flushed area of the bound resource into a
+* **Per gpu flush:** swizzle what changed of the bound resource (the flushed
+  area, plus anything transferred to the scanout since the last flush) into a
   spare BGRA picture buffer (plus the area that buffer missed since it was last
-  shown) and publish it: the flush's one copy, on the vCPU. The window blits
+  shown) and publish it: the flush's one copy, on the vCPU. Each picture is
+  byte for byte what converting the whole scanout would give. The window blits
   the latest picture (`StretchDIBits`) and the recorder converts it to NV12,
   each on its own thread straight from the shared buffer, which later flushes
   leave alone while it's held; a static screen's ticks resubmit the last

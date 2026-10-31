@@ -34,8 +34,8 @@ use crate::scanout::Scanout;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, COLORONCOLOR, DIB_RGB_COLORS, EndPaint,
-    InvalidateRect, PAINTSTRUCT, SRCCOPY, SetStretchBltMode, StretchDIBits,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLACKNESS, BeginPaint, COLORONCOLOR, DIB_RGB_COLORS,
+    EndPaint, InvalidateRect, PAINTSTRUCT, PatBlt, SRCCOPY, SetStretchBltMode, StretchDIBits,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
@@ -436,6 +436,17 @@ unsafe extern "system" fn wnd_proc(
                         DIB_RGB_COLORS,
                         SRCCOPY,
                     );
+                } else if !hdc.is_null() {
+                    // No picture yet: black, as a zeroed frame would show.
+                    let r = ps.rcPaint;
+                    PatBlt(
+                        hdc,
+                        r.left,
+                        r.top,
+                        r.right - r.left,
+                        r.bottom - r.top,
+                        BLACKNESS,
+                    );
                 }
                 EndPaint(hwnd, &ps);
                 0
@@ -564,8 +575,9 @@ unsafe extern "system" fn wnd_proc(
 mod tests {
     use super::*;
 
-    /// Runtime smoke test for the Win32 window pipeline: a whole frame, then a
-    /// partial flush, reach the window's pixels. Opt-in (it spawns a real,
+    /// Runtime smoke test for the Win32 window pipeline: black before any
+    /// frame, then a whole frame, then a partial flush, reach the window's
+    /// pixels. Opt-in (it spawns a real,
     /// briefly-visible window) so plain `cargo test` / CI never pops a window:
     /// run with `TINYVMM_DISPLAY_SELFTEST=1 cargo test display`.
     #[test]
@@ -589,6 +601,9 @@ mod tests {
             ReleaseDC(hwnd, dc);
             c
         };
+        // Black until the guest shows something.
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        assert_eq!((pixel(3, 3), pixel(200, 100)), (0, 0));
         let mut buf = vec![0u8; (w * h * 4) as usize];
         for y in 0..h {
             for x in 0..w {

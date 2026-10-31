@@ -5,8 +5,10 @@
 //! (`RESOURCE_ATTACH_BACKING`), copies pixels guest->host
 //! (`TRANSFER_TO_HOST_2D`), binds a resource to scanout 0 (`SET_SCANOUT`) and
 //! asks the host to display it (`RESOURCE_FLUSH`). A flush publishes a new BGRA
-//! picture of the scanout ([`crate::scanout`]), swizzling in only the part of
-//! the bound resource it names, and calls a present callback, which tells the
+//! picture of the scanout ([`crate::scanout`]), swizzling in only what changed
+//! (the part of the bound resource it names, and anything transferred to the
+//! scanout since the last one), so each picture is byte for byte the whole
+//! scanout converted. It then calls a present callback, which tells the
 //! Win32 window (see [`crate::display`]) and the recorder to show it. No
 //! 3D/virgl, blob resources, EDID, multi-scanout, or hardware cursor — the
 //! cursor queue is drained and acked so the guest's software cursor path works.
@@ -164,6 +166,10 @@ struct GpuState {
     /// The next present copies the whole scanout, not just the flushed part:
     /// the scanout's latest picture shows another binding (or nothing).
     present_all: bool,
+    /// What transfers have changed of the scanout since its last present, in
+    /// scanout coordinates. The next present copies it too, even if its flush
+    /// names less, so every picture equals the whole scanout redrawn.
+    transferred: Option<Area>,
     /// Reusable gather buffer for the current control request (alloc-free hot
     /// path: cleared + refilled per command, capacity persists across kicks).
     req: Vec<u8>,
@@ -205,6 +211,7 @@ impl GpuDevice {
                 scanout_resource: 0,
                 scanout_rect: Rect::default(),
                 present_all: true,
+                transferred: None,
                 req: Vec::new(),
                 resp: Vec::new(),
             }),
@@ -487,6 +494,19 @@ impl GpuDevice {
             }
             ok
         };
+        // Note what changed of the scanout (rows read before a failure count
+        // too), for the next present to show.
+        if id == st.scanout_resource {
+            let moved = Rect {
+                x: rx,
+                y: ry,
+                width: rw,
+                height: rh,
+            };
+            if let Some(area) = moved.within(st.scanout_rect) {
+                st.transferred = Some(st.transferred.map_or(area, |t| t.union(area)));
+            }
+        }
         if ok { RESP_OK_NODATA } else { RESP_ERR_UNSPEC }
     }
 
@@ -525,10 +545,12 @@ impl GpuDevice {
         RESP_OK_NODATA
     }
 
-    /// Publish what a flush changed of the bound scanout (`flushed`, in
-    /// resource coordinates; `None` for all of it) as a new BGRA picture, and
-    /// tell the window and the recorder. A flush that misses the scanout
-    /// changes nothing shown.
+    /// Publish what changed of the bound scanout as a new BGRA picture, and
+    /// tell the window and the recorder. What changed is the part `flushed`
+    /// names (in resource coordinates; `None` for all of it) and whatever
+    /// transfers changed since the last present, so the picture is exactly the
+    /// whole scanout redrawn. A flush that changes nothing shown publishes
+    /// nothing.
     fn present_resource(&self, st: &mut GpuState, id: u32, flushed: Option<Rect>) {
         let rect = st.scanout_rect;
         let Some(res) = st.resources.get(&id) else {
@@ -537,11 +559,13 @@ impl GpuDevice {
         if !rect.fits(res) {
             return;
         }
-        let damage = match flushed {
-            Some(f) if !st.present_all => match f.within(rect) {
-                Some(area) => area,
-                None => return,
-            },
+        let changed = [flushed.and_then(|f| f.within(rect)), st.transferred.take()]
+            .into_iter()
+            .flatten()
+            .reduce(Area::union);
+        let damage = match (flushed, changed) {
+            (Some(_), Some(area)) if !st.present_all => area,
+            (Some(_), None) if !st.present_all => return,
             _ => Area::full(rect.width, rect.height),
         };
         st.present_all = false;
@@ -641,6 +665,7 @@ impl VirtioDevice for GpuDevice {
         st.scanout_resource = 0;
         st.scanout_rect = Rect::default();
         st.present_all = true;
+        st.transferred = None;
     }
 
     fn read_config(&self, offset: u32, size: u32) -> u32 {
@@ -702,6 +727,8 @@ impl VirtioDevice for GpuDevice {
             st.resources = resources;
             st.scanout_resource = scanout;
             st.scanout_rect = rect;
+            st.present_all = true;
+            st.transferred = None;
         }
         // Re-present the bound scanout so the restored window shows the saved
         // image immediately (before the guest issues any new commands).
@@ -1295,7 +1322,9 @@ mod tests {
 
     /// Once the scanout is shown, a flush copies only the part of it that the
     /// flush names (clipped to the scanout); one outside it shows nothing new.
-    /// Binding the scanout again copies it whole at the next flush.
+    /// Binding the scanout again copies it whole at the next flush. (The test
+    /// rewrites the host pixels directly, which a guest can only do through a
+    /// transfer, to see exactly which pixels a present copies.)
     #[test]
     fn flush_copies_only_its_rect() {
         let (gpu, scanout, presents) = gpu_with_capture();
@@ -1346,6 +1375,142 @@ mod tests {
             RESP_OK_NODATA
         );
         assert_eq!(blues(&shown(&scanout).0), vec![100; 16]);
+    }
+
+    /// Every picture published is byte for byte the whole scanout redrawn from
+    /// the resource, which is what each flush showed before the scanout kept
+    /// pictures. Random guest commands: drawing into guest memory, transfers
+    /// of any part (flushed exactly, in part, or not at all), flushes of any
+    /// rect, binding and unbinding the scanout, recreated resources, every
+    /// pixel format, and readers holding pictures meanwhile.
+    #[test]
+    fn pictures_match_a_full_redraw() {
+        struct Lcg(u32);
+        impl Lcg {
+            fn below(&mut self, n: u32) -> u32 {
+                self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (self.0 >> 8) % n
+            }
+            /// A non-empty rect inside `w`x`h`, as `[x, y, width, height]`.
+            fn rect_in(&mut self, w: u32, h: u32) -> [u32; 4] {
+                let (x, y) = (self.below(w), self.below(h));
+                [x, y, 1 + self.below(w - x), 1 + self.below(h - y)]
+            }
+        }
+        /// The scanout converted pixel by pixel from the resource.
+        fn redraw(res: &Resource2d, rect: Rect) -> Vec<u8> {
+            let (b, g, r) = channel_indices(res.format).unwrap();
+            let mut out = Vec::new();
+            for y in rect.y..rect.y + rect.height {
+                for x in rect.x..rect.x + rect.width {
+                    let at = ((y * res.width + x) * 4) as usize;
+                    let p = &res.host[at..at + 4];
+                    let a = if (b, g, r) == (0, 1, 2) { p[3] } else { 0xFF };
+                    out.extend_from_slice(&[p[b], p[g], p[r], a]);
+                }
+            }
+            out
+        }
+        const FORMATS: [u32; 5] = [1, 2, 4, 67, 121];
+        let mem = Arc::new(GuestMemory::new_host_only(0x4000).expect("host memory"));
+        let gpu = GpuDevice::new(mem.clone(), 64, 64);
+        let scanout = Arc::new(Scanout::default());
+        gpu.set_present(scanout.clone(), Box::new(|| {}));
+        let mut rng = Lcg(0x9E37_79B9);
+        // Resource `id` (1 to 3) lives in guest memory at `id * 0x1000`.
+        let create = |rng: &mut Lcg, id: u32| {
+            let (w, h) = (1 + rng.below(8), 1 + rng.below(8));
+            let format = FORMATS[rng.below(5) as usize];
+            let body = [id, format, w, h];
+            assert_eq!(run(&gpu, CMD_RESOURCE_CREATE_2D, &body), RESP_OK_NODATA);
+            let body = [id, 1, id * 0x1000, 0, w * h * 4, 0];
+            assert_eq!(
+                run(&gpu, CMD_RESOURCE_ATTACH_BACKING, &body),
+                RESP_OK_NODATA
+            );
+            (w, h)
+        };
+        let mut size = [(0, 0); 4];
+        for id in 1..=3 {
+            size[id as usize] = create(&mut rng, id);
+        }
+        let mut transferred: [Option<[u32; 4]>; 4] = [None; 4];
+        let mut want: Option<(u32, u32, Vec<u8>)> = None;
+        let mut held = Vec::new();
+        let (mut presents, mut partial) = (0, 0);
+        for step in 0..10_000 {
+            let id = 1 + rng.below(3);
+            let (w, h) = size[id as usize];
+            match rng.below(10) {
+                // The guest draws into its framebuffer...
+                0 | 1 => {
+                    let px: Vec<u8> = (0..w * h * 4).map(|_| rng.below(256) as u8).collect();
+                    assert!(mem.write_bytes(u64::from(id) * 0x1000, &px));
+                }
+                // ... uploads some of it ...
+                2..=4 => {
+                    let r = rng.rect_in(w, h);
+                    let offset = (r[1] * w + r[0]) * 4;
+                    let body = [r[0], r[1], r[2], r[3], offset, 0, id, 0];
+                    assert_eq!(run(&gpu, CMD_TRANSFER_TO_HOST_2D, &body), RESP_OK_NODATA);
+                    transferred[id as usize] = Some(r);
+                }
+                // ... and flushes what it uploaded, or any other rect.
+                5..=7 => {
+                    let r = match (rng.below(3), transferred[id as usize]) {
+                        (0, Some(r)) => r,
+                        (1, _) => rng.rect_in(w, h),
+                        _ => [0; 4].map(|_| rng.below(10)),
+                    };
+                    let body = [r[0], r[1], r[2], r[3], id, 0];
+                    assert_eq!(run(&gpu, CMD_RESOURCE_FLUSH, &body), RESP_OK_NODATA);
+                    let st = gpu.state.lock().unwrap();
+                    if st.scanout_resource == id {
+                        let rect = st.scanout_rect;
+                        let named = Rect {
+                            x: r[0],
+                            y: r[1],
+                            width: r[2],
+                            height: r[3],
+                        };
+                        let all = Area::full(rect.width, rect.height);
+                        partial += usize::from(named.within(rect) != Some(all));
+                        presents += 1;
+                        want = Some((rect.width, rect.height, redraw(&st.resources[&id], rect)));
+                    }
+                }
+                // Bind a resource (or nothing) to the scanout.
+                8 => {
+                    let r = rng.rect_in(w, h);
+                    let bind = if rng.below(8) == 0 { 0 } else { id };
+                    let body = [r[0], r[1], r[2], r[3], 0, bind];
+                    assert_eq!(run(&gpu, CMD_SET_SCANOUT, &body), RESP_OK_NODATA);
+                }
+                // Readers come and go; now and then a resource is replaced.
+                _ => match rng.below(4) {
+                    0 if held.len() < 3 => held.push(scanout.latest()),
+                    1 if !held.is_empty() => drop(held.remove(0)),
+                    2 => {
+                        assert_eq!(run(&gpu, CMD_RESOURCE_UNREF, &[id, 0]), RESP_OK_NODATA);
+                        size[id as usize] = create(&mut rng, id);
+                        transferred[id as usize] = None;
+                    }
+                    _ => {}
+                },
+            }
+            if let Some(f) = scanout.latest() {
+                let (w, h, buf) = want.as_ref().expect("a picture without a present");
+                assert!(
+                    (f.width, f.height) == (*w, *h) && f.buf == *buf,
+                    "step {step}: the picture differs from a full redraw"
+                );
+            }
+        }
+        // Both kinds of present happened plenty.
+        assert!(
+            presents > 500 && partial > 200,
+            "{presents} presents, {partial} partial"
+        );
     }
 
     #[test]
