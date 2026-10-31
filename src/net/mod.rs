@@ -10,6 +10,7 @@
 //! (172.17-20, also inside the guest), OpenShift (172.30) and AWS (172.31)
 //! default to.
 
+mod csum;
 pub mod dhcp;
 pub mod nat;
 pub mod sys;

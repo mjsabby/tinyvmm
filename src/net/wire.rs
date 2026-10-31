@@ -40,37 +40,7 @@ fn put_be32(b: &mut [u8], v: u32) {
     b[3] = (v & 0xFF) as u8;
 }
 
-/// RFC 1071 ones-complement checksum.
-pub fn checksum16(parts: &[&[u8]]) -> u16 {
-    let mut sum: u32 = 0;
-    let mut leftover: Option<u8> = None;
-    for part in parts {
-        let mut data = *part;
-        if let Some(hi) = leftover.take() {
-            if !data.is_empty() {
-                sum += ((hi as u32) << 8) | data[0] as u32;
-                data = &data[1..];
-            } else {
-                leftover = Some(hi);
-            }
-        }
-        let mut i = 0;
-        while i + 1 < data.len() {
-            sum += ((data[i] as u32) << 8) | data[i + 1] as u32;
-            i += 2;
-        }
-        if i < data.len() {
-            leftover = Some(data[i]);
-        }
-    }
-    if let Some(hi) = leftover {
-        sum += (hi as u32) << 8;
-    }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    !(sum as u16)
-}
+pub use super::csum::checksum16;
 
 // ---------------------------------------------------------------------------
 // Ethernet

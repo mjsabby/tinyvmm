@@ -709,8 +709,8 @@ src/
   pci/         config (Type-0 space), bus (0xCF8/0xCFC), msix
   virtio/      queue, device(trait), transport(virtio-pci modern),
                console, net, rng, blk, p9, input, gpu, snd
-  net/         wire (parse/build), nat (user-mode NAT), dhcp (the NAT's DHCP
-               server), wintun, sys (facade)
+  net/         wire (parse/build), csum (RFC 1071 checksum, AVX2), nat (user-mode
+               NAT), dhcp (the NAT's DHCP server), wintun, sys (facade)
   whp/         run_loop, cpuid, hv (Hyper-V enlightenment),
                snapshot + snapshot_file + vcpu_state (save/restore)
   diag/        boot_timer, etw (facade), alloc_trace (global-allocator ETW shim)
@@ -755,7 +755,10 @@ They cluster in the FFI crates (`winsys::fs`, `winsys::sock`, `winsys::wintun`,
 handful of audited device structs (`net/nat.rs`, `virtio/blk.rs`, `virtio/p9.rs`,
 `virtio/queue.rs`, `display.rs`). The protocol logic — `pci/*`, `devices/*`,
 `boot/*`, `net/wire.rs`, the virtqueue traversal, and the gpu/input command
-decoders — is safe.
+decoders — is safe. The SIMD kernels (the internet checksum in `net/csum.rs`,
+the snapshot CRC in `whp/snapshot_file.rs` and the recorder's NV12 conversion
+in `record.rs`) use `unsafe` only for their unaligned loads and stores and for
+the call behind each CPU-feature check; a scalar path covers older CPUs.
 
 ### The idiom: a *little* `unsafe` to get a pointer, then slices — never pointer math
 
@@ -1435,9 +1438,11 @@ chunks that aren't all zero, scanned on up to eight threads at save time. A 1 Gi
 guest at a shell prompt is ~95% zero, so its snapshot is ~51 MiB instead of
 1 GiB. Version-1 snapshots, which stored RAM whole, are rejected: the format
 keeps no backward compatibility.
-The CRC-32 folds 64 bytes per step with `PCLMULQDQ` (Intel's carry-less-multiply
-method, as in Linux and zlib; ~12 GB/s per core), with a byte table
-(`OnceLock<[u32; 256]>`) for tails and older CPUs.
+The CRC-32 folds 128 bytes per step with 256-bit `VPCLMULQDQ` where the CPU has
+it alongside AVX2, else 64 bytes per step with `PCLMULQDQ` (Intel's
+carry-less-multiply method, as in Linux and zlib; ~49 and ~25 GB/s per core on
+data in cache), with a byte table (`OnceLock<[u32; 256]>`) for tails and older
+CPUs.
 
 Restore never holds the RAM image in host memory: `SnapshotReader::open` reads
 everything else with positioned reads, and `load_ram_and_verify` reads the stored

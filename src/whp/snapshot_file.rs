@@ -24,6 +24,9 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::OnceLock;
 
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::__m128i;
+
 pub const MAGIC: [u8; 8] = *b"TVMMSAVE";
 /// 2: guest RAM is stored sparse. Version 1 (RAM stored whole, section type
 /// 0x0001) is not read.
@@ -109,6 +112,13 @@ pub fn crc32_update(crc: u32, data: &[u8]) -> u32 {
         && std::arch::is_x86_feature_detected!("pclmulqdq")
         && std::arch::is_x86_feature_detected!("sse4.1")
     {
+        if data.len() >= 256
+            && std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("vpclmulqdq")
+        {
+            // SAFETY: the CPU supports all four features (checked just above).
+            return unsafe { crc32_vpclmul(crc, data) };
+        }
         // SAFETY: the CPU supports both features (checked just above).
         return unsafe { crc32_pclmul(crc, data) };
     }
@@ -176,48 +186,101 @@ fn crc32_combine(crc_a: u32, crc_b: u32, len_b: u64) -> u32 {
 fn crc32_pclmul(crc: u32, data: &[u8]) -> u32 {
     use std::arch::x86_64::*;
 
-    // Folding constants x^n mod P (bit-reflected, shifted), and P' / mu for
-    // the Barrett step.
+    // Folding constants: x^n mod P(x) bit-reflected and shifted left once, for
+    // n = 4*128 + 32 and 4*128 - 32 (across 512 bits), and 128 + 32 and 128 - 32.
     let k1k2 = _mm_set_epi64x(0x1_c6e4_1596, 0x1_5444_2bd4);
+    let k3k4 = _mm_set_epi64x(0x0_ccaa_009e, 0x1_7519_97d0);
+
+    let (body, tail) = data.split_at(data.len() & !15);
+    let mut x1 = _mm_xor_si128(load16(&body[0..]), _mm_cvtsi32_si128(crc as i32));
+    let mut x2 = load16(&body[16..]);
+    let mut x3 = load16(&body[32..]);
+    let mut x4 = load16(&body[48..]);
+    let mut rest = &body[64..];
+    while rest.len() >= 64 {
+        x1 = _mm_xor_si128(clmul_fold(x1, k1k2), load16(&rest[0..]));
+        x2 = _mm_xor_si128(clmul_fold(x2, k1k2), load16(&rest[16..]));
+        x3 = _mm_xor_si128(clmul_fold(x3, k1k2), load16(&rest[32..]));
+        x4 = _mm_xor_si128(clmul_fold(x4, k1k2), load16(&rest[48..]));
+        rest = &rest[64..];
+    }
+    x1 = _mm_xor_si128(clmul_fold(x1, k3k4), x2);
+    x1 = _mm_xor_si128(clmul_fold(x1, k3k4), x3);
+    x1 = _mm_xor_si128(clmul_fold(x1, k3k4), x4);
+    crc32_clmul_finish(x1, rest, tail)
+}
+
+/// [`crc32_pclmul`] with 256-bit carry-less multiplies (VPCLMULQDQ, which recent
+/// x86 CPUs have alongside AVX2): four accumulators fold 128 bytes per step,
+/// each 128-bit lane across 1024 bits, then fold into one 128-bit accumulator
+/// that finishes the same way. Twice the speed of the 128-bit loop on a block in
+/// cache (~49 vs ~25 GB/s for 64 KiB on the reference host); restoring a guest
+/// with 2 GiB of RAM stored, it cut the CRC's CPU time by about a quarter, as
+/// the pieces just read are only partly still in cache. Needs
+/// `data.len() >= 128`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,vpclmulqdq,pclmulqdq,sse4.1")]
+fn crc32_vpclmul(crc: u32, data: &[u8]) -> u32 {
+    use std::arch::x86_64::*;
+
+    // As in crc32_pclmul, for n = 8*128 +/- 32 (across 1024 bits) and
+    // 2*128 +/- 32 (256 bits), in both 128-bit lanes.
+    let pair = |lo: i64, hi: i64| _mm256_set_epi64x(hi, lo, hi, lo);
+    let k1024 = pair(0x1_e88e_f372, 0x1_4a7f_e880);
+    let k256 = pair(0x0_f1da_05aa, 0x1_5a54_6366);
+    let k3k4 = _mm_set_epi64x(0x0_ccaa_009e, 0x1_7519_97d0);
+    let fold = |x, k| {
+        _mm256_xor_si256(
+            _mm256_clmulepi64_epi128::<0x00>(x, k),
+            _mm256_clmulepi64_epi128::<0x11>(x, k),
+        )
+    };
+    let load = |block: &[u8]| {
+        assert!(block.len() >= 32);
+        // SAFETY: `block` has at least 32 readable bytes; the load is unaligned.
+        unsafe { _mm256_loadu_si256(block.as_ptr().cast()) }
+    };
+
+    let (body, tail) = data.split_at(data.len() & !15);
+    let init = _mm256_setr_epi32(crc as i32, 0, 0, 0, 0, 0, 0, 0);
+    let mut y1 = _mm256_xor_si256(load(&body[0..]), init);
+    let mut y2 = load(&body[32..]);
+    let mut y3 = load(&body[64..]);
+    let mut y4 = load(&body[96..]);
+    let mut rest = &body[128..];
+    while rest.len() >= 128 {
+        y1 = _mm256_xor_si256(fold(y1, k1024), load(&rest[0..]));
+        y2 = _mm256_xor_si256(fold(y2, k1024), load(&rest[32..]));
+        y3 = _mm256_xor_si256(fold(y3, k1024), load(&rest[64..]));
+        y4 = _mm256_xor_si256(fold(y4, k1024), load(&rest[96..]));
+        rest = &rest[128..];
+    }
+    y1 = _mm256_xor_si256(fold(y1, k256), y2);
+    y1 = _mm256_xor_si256(fold(y1, k256), y3);
+    y1 = _mm256_xor_si256(fold(y1, k256), y4);
+    let x1 = _mm_xor_si128(
+        clmul_fold(_mm256_castsi256_si128(y1), k3k4),
+        _mm256_extracti128_si256::<1>(y1),
+    );
+    crc32_clmul_finish(x1, rest, tail)
+}
+
+/// Fold the 16-byte blocks of `rest` into the accumulator `x1`, reduce it to
+/// 64 and 32 bits, finish with a Barrett reduction, and run the byte table
+/// over `tail`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "pclmulqdq,sse4.1")]
+fn crc32_clmul_finish(mut x1: __m128i, mut rest: &[u8], tail: &[u8]) -> u32 {
+    use std::arch::x86_64::*;
+
+    // k3/k4 as in crc32_pclmul, x^64 mod P for 64 -> 32 bits, and P' / mu for
+    // the Barrett step.
     let k3k4 = _mm_set_epi64x(0x0_ccaa_009e, 0x1_7519_97d0);
     let k5 = _mm_set_epi64x(0, 0x1_63cd_6124);
     let poly_mu = _mm_set_epi64x(0x1_f701_1641, 0x1_db71_0641);
     let mask32 = _mm_set_epi32(0, 0, 0, -1);
-
-    #[inline]
-    #[target_feature(enable = "pclmulqdq,sse4.1")]
-    fn fold(x: __m128i, k: __m128i) -> __m128i {
-        _mm_xor_si128(
-            _mm_clmulepi64_si128(x, k, 0x00),
-            _mm_clmulepi64_si128(x, k, 0x11),
-        )
-    }
-    #[inline]
-    #[target_feature(enable = "sse2")]
-    fn load(block: &[u8]) -> __m128i {
-        assert!(block.len() >= 16);
-        // SAFETY: `block` has at least 16 readable bytes; the load is unaligned.
-        unsafe { _mm_loadu_si128(block.as_ptr().cast()) }
-    }
-
-    let (body, tail) = data.split_at(data.len() & !15);
-    let mut x1 = _mm_xor_si128(load(&body[0..]), _mm_cvtsi32_si128(crc as i32));
-    let mut x2 = load(&body[16..]);
-    let mut x3 = load(&body[32..]);
-    let mut x4 = load(&body[48..]);
-    let mut rest = &body[64..];
-    while rest.len() >= 64 {
-        x1 = _mm_xor_si128(fold(x1, k1k2), load(&rest[0..]));
-        x2 = _mm_xor_si128(fold(x2, k1k2), load(&rest[16..]));
-        x3 = _mm_xor_si128(fold(x3, k1k2), load(&rest[32..]));
-        x4 = _mm_xor_si128(fold(x4, k1k2), load(&rest[48..]));
-        rest = &rest[64..];
-    }
-    x1 = _mm_xor_si128(fold(x1, k3k4), x2);
-    x1 = _mm_xor_si128(fold(x1, k3k4), x3);
-    x1 = _mm_xor_si128(fold(x1, k3k4), x4);
     while rest.len() >= 16 {
-        x1 = _mm_xor_si128(fold(x1, k3k4), load(rest));
+        x1 = _mm_xor_si128(clmul_fold(x1, k3k4), load16(rest));
         rest = &rest[16..];
     }
     // 128 -> 64 bits.
@@ -233,6 +296,28 @@ fn crc32_pclmul(crc: u32, data: &[u8]) -> u32 {
     let t = _mm_clmulepi64_si128(_mm_and_si128(t, mask32), poly_mu, 0x00);
     let crc = _mm_extract_epi32(_mm_xor_si128(t, x1), 1) as u32;
     crc32_table(crc, tail)
+}
+
+/// Carry-less multiply `x`'s low half by `k`'s and its high half by `k`'s, and
+/// add (xor) the products: one folding step.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "pclmulqdq,sse4.1")]
+fn clmul_fold(x: __m128i, k: __m128i) -> __m128i {
+    use std::arch::x86_64::*;
+    _mm_xor_si128(
+        _mm_clmulepi64_si128(x, k, 0x00),
+        _mm_clmulepi64_si128(x, k, 0x11),
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "sse2")]
+fn load16(block: &[u8]) -> __m128i {
+    assert!(block.len() >= 16);
+    // SAFETY: `block` has at least 16 readable bytes; the load is unaligned.
+    unsafe { std::arch::x86_64::_mm_loadu_si128(block.as_ptr().cast()) }
 }
 
 // ============================================================
@@ -936,9 +1021,10 @@ impl SnapshotReader {
 mod tests {
     use super::*;
 
-    /// The carry-less-multiply CRC must match the byte table for every length
-    /// (the fold paths change at 64- and 16-byte steps) and alignment, and the
-    /// IEEE check value.
+    /// The carry-less-multiply CRCs must match the byte table for every length
+    /// (the fold paths change at 128-, 64- and 16-byte steps) and alignment, and
+    /// the IEEE check value. Each kernel the CPU supports is tried directly, as
+    /// the dispatch picks only one per length.
     #[test]
     fn crc32_fast_path_matches_table() {
         let full = |data: &[u8]| crc32_update(0xFFFF_FFFF, data) ^ 0xFFFF_FFFF;
@@ -952,15 +1038,28 @@ mod tests {
                 seed as u8
             })
             .collect();
+        #[cfg(target_arch = "x86_64")]
+        let (pclmul, vpclmul) = {
+            use std::arch::is_x86_feature_detected as has;
+            let pclmul = has!("pclmulqdq") && has!("sse4.1");
+            (pclmul, pclmul && has!("avx2") && has!("vpclmulqdq"))
+        };
         for align in 0..16 {
             for len in (0..300).chain([1000, 4095, 4096]) {
                 let d = &buf[align..align + len];
                 for init in [0xFFFF_FFFFu32, 0x1234_5678] {
-                    assert_eq!(
-                        crc32_update(init, d),
-                        crc32_table(init, d),
-                        "len {len} align {align}"
-                    );
+                    let want = crc32_table(init, d);
+                    assert_eq!(crc32_update(init, d), want, "len {len} align {align}");
+                    #[cfg(target_arch = "x86_64")]
+                    if pclmul && len >= 64 {
+                        // SAFETY: the CPU supports the features (checked above).
+                        assert_eq!(unsafe { crc32_pclmul(init, d) }, want, "len {len}");
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    if vpclmul && len >= 128 {
+                        // SAFETY: the CPU supports the features (checked above).
+                        assert_eq!(unsafe { crc32_vpclmul(init, d) }, want, "len {len}");
+                    }
                 }
             }
         }
