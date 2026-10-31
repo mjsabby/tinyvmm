@@ -35,6 +35,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from vhdx import make_vhdx
 
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_TINYVMM = REPO / "target" / "release" / "tinyvmm.exe"
@@ -44,68 +45,8 @@ DEFAULT_INITRD = REPO / "initramfs-blk.cpio.gz"
 MAKE_INITRAMFS = REPO / "tools" / "make_initramfs.py"
 
 BLK_VDB_BYTES = 256 * 1024 * 1024
-BLK_VDC_BYTES = 1 * 1024 * 1024
+BLK_VDC_BYTES = 4 * 1024 * 1024
 BLK_MARKER = b"TINYVMM_BLK_TEST_MARKER_v1"
-
-
-# --------------------------------------------------------------------------
-# Sparse / fixed backing files (Windows SetEndOfFile to keep NTFS sparse;
-# Python truncate() zero-fills on Windows and defeats the sparse flag).
-# --------------------------------------------------------------------------
-def _set_eof(path: Path, size_bytes: int) -> None:
-    import ctypes
-    from ctypes import wintypes
-
-    GENERIC_WRITE = 0x40000000
-    FILE_SHARE_READ = 0x00000001
-    OPEN_EXISTING = 3
-    FILE_BEGIN = 0
-    INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
-
-    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    k32.CreateFileW.restype = wintypes.HANDLE
-    k32.CreateFileW.argtypes = [
-        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
-    ]
-    k32.SetFilePointerEx.restype = wintypes.BOOL
-    k32.SetFilePointerEx.argtypes = [
-        wintypes.HANDLE, ctypes.c_longlong,
-        ctypes.POINTER(ctypes.c_longlong), wintypes.DWORD,
-    ]
-    k32.SetEndOfFile.restype = wintypes.BOOL
-    k32.SetEndOfFile.argtypes = [wintypes.HANDLE]
-    k32.CloseHandle.restype = wintypes.BOOL
-    k32.CloseHandle.argtypes = [wintypes.HANDLE]
-
-    h = k32.CreateFileW(str(path), GENERIC_WRITE, FILE_SHARE_READ, None,
-                        OPEN_EXISTING, 0, None)
-    if h == INVALID_HANDLE_VALUE or h == 0:
-        raise OSError(ctypes.get_last_error(), f"CreateFileW({path}) failed")
-    try:
-        if not k32.SetFilePointerEx(h, size_bytes, None, FILE_BEGIN):
-            raise OSError(ctypes.get_last_error(), "SetFilePointerEx failed")
-        if not k32.SetEndOfFile(h):
-            raise OSError(ctypes.get_last_error(), "SetEndOfFile failed")
-    finally:
-        k32.CloseHandle(h)
-
-
-def make_sparse(path: Path, size_bytes: int) -> None:
-    if path.exists():
-        path.unlink()
-    with open(path, "wb"):
-        pass
-    subprocess.run(["fsutil.exe", "sparse", "setflag", str(path)],
-                   check=True, stdout=subprocess.DEVNULL,
-                   stderr=subprocess.DEVNULL)
-    _set_eof(path, size_bytes)
-
-
-def make_fixed(path: Path, size_bytes: int, fill: int) -> None:
-    if path.exists():
-        path.unlink()
-    path.write_bytes(bytes([fill & 0xFF]) * size_bytes)
 
 
 # --------------------------------------------------------------------------
@@ -253,10 +194,10 @@ def main() -> int:
         print("\n========== virtio-blk under --vcpus 2 ==========")
         workdir = Path(tempfile.gettempdir()) / "tinyvmm-smp-test"
         workdir.mkdir(parents=True, exist_ok=True)
-        vdb = workdir / "smp-blk-vdb.img"
-        vdc = workdir / "smp-blk-vdc.img"
-        make_sparse(vdb, BLK_VDB_BYTES)
-        make_fixed(vdc, BLK_VDC_BYTES, 0x42)
+        vdb = workdir / "smp-blk-vdb.vhdx"
+        vdc = workdir / "smp-blk-vdc.vhdx"
+        make_vhdx(vdb, BLK_VDB_BYTES, args.tinyvmm)
+        make_vhdx(vdc, BLK_VDC_BYTES, args.tinyvmm, fill=0x42)
         try:
             argv = [
                 str(args.tinyvmm), "--pvh-run",

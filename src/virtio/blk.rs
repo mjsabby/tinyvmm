@@ -10,8 +10,16 @@
 //! interrupt via the transport.
 //!
 //! Implements READ / WRITE / FLUSH plus the RO, DISCARD, and WRITE_ZEROES
-//! feature bits. DISCARD / WRITE_ZEROES are served synchronously on the host
-//! file via `FSCTL_SET_ZERO_DATA` (sparse-unmap) from `notify_queue`.
+//! feature bits. DISCARD is a synchronous SCSI UNMAP from `notify_queue`;
+//! WRITE_ZEROES is an ordinary WRITE sourced from a shared zero buffer.
+//!
+//! The device tracks every request from the moment it leaves the avail ring
+//! until it settles (`active`). A reset cannot wait for in-flight requests (it
+//! runs under the transport lock their completions take), so it completes
+//! asynchronously: it starts a new epoch, requests from an earlier epoch settle
+//! without touching the guest, and `reset_pending` keeps the device status
+//! non-zero until they have. `quiesce` stops the device for teardown and
+//! snapshots once every request it took has completed.
 
 use crate::diag::etw;
 use crate::host::block_file::{BlockFile, Op, Request};
@@ -22,6 +30,7 @@ use crate::virtio::queue::{ChainBuf, ChainScratch, Virtqueue};
 use crate::whp::GuestMemory;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 // virtio-blk feature bits (spec §5.2.3).
 const BLK_F_SIZE_MAX: u64 = 1 << 1;
@@ -62,10 +71,20 @@ const CFG_MAX_WRITE_ZEROES_SECTORS: usize = 48; // le32
 const CFG_MAX_WRITE_ZEROES_SEG: usize = 52; // le32
 const CFG_WRITE_ZEROES_MAY_UNMAP: usize = 56; // u8
 
-// We advertise a single range per request, up to 2 GiB (4 Mi sectors).
+// We advertise a single range per request: a DISCARD of up to 2 GiB (4 Mi
+// sectors), a WRITE_ZEROES of up to one zero buffer.
 const BLK_MAX_DISCARD_SECTORS: u64 = 4 * 1024 * 1024;
-const BLK_MAX_WRITE_ZEROES_SECTORS: u64 = 4 * 1024 * 1024;
+const BLK_MAX_WRITE_ZEROES_SECTORS: u64 = (ZERO_BYTES / SECTOR_SIZE as usize) as u64;
 const BLK_MAX_RANGE_SEG: usize = 1;
+/// Size of the shared buffer every WRITE_ZEROES is written from.
+const ZERO_BYTES: usize = 4 * 1024 * 1024;
+
+/// The source of every WRITE_ZEROES. Leaked, so it outlives any write still
+/// reading it; nothing writes to it.
+fn zeroes() -> &'static [u8] {
+    static ZEROES: OnceLock<&'static [u8]> = OnceLock::new();
+    ZEROES.get_or_init(|| Box::leak(vec![0; ZERO_BYTES].into_boxed_slice()))
+}
 
 // ---- Bounce-buffer coalescing -------------------------------------------------
 //
@@ -106,6 +125,8 @@ struct BlkReq {
     /// or `NO_BOUNCE` if the request took the zero-copy per-segment path.
     bounce_slot: u16,
     rtype: u32,
+    /// The device epoch the request was taken in (see `BlockDevice::epoch`).
+    epoch: u32,
     status_ptr: *mut u8,
     /// Outstanding segment I/Os + 1 submission guard; reaching 0 finishes.
     segs_outstanding: AtomicU32,
@@ -121,6 +142,7 @@ impl BlkReq {
             head_idx: 0,
             bounce_slot: NO_BOUNCE,
             rtype: 0,
+            epoch: 0,
             status_ptr: std::ptr::null_mut(),
             segs_outstanding: AtomicU32::new(0),
             total_done: AtomicU32::new(0),
@@ -294,8 +316,18 @@ pub struct BlockDevice {
     ops_write_zeroes: AtomicU64,
     ops_err: AtomicU64,
     ops_done: AtomicU64,
-    /// Requests between submit_request and finish_request.
+    /// Requests taken off the avail ring that have not yet settled (been
+    /// retired on the used ring, or dropped). Incremented under the queue
+    /// lock, so a reset either precedes a pop or sees its request here.
     active: AtomicU64,
+    /// Bumped by each reset, under the queue lock. A request remembers the
+    /// epoch it was taken in; one from an earlier epoch is stale: it settles
+    /// without writing its status byte or read data, pushing a used element,
+    /// or raising an interrupt, as its buffers and ring belong to the driver
+    /// again (and the queue may since have been re-enabled).
+    epoch: AtomicU32,
+    /// Set by `quiesce`: the device takes no more requests.
+    stopped: AtomicBool,
     /// Most requests the guest had outstanding at once (in flight here plus
     /// still waiting in the avail ring), sampled at each pop.
     max_depth: AtomicU64,
@@ -347,8 +379,8 @@ impl BlockDevice {
             &mut cfg[CFG_MAX_WRITE_ZEROES_SEG..CFG_MAX_WRITE_ZEROES_SEG + 4],
             BLK_MAX_RANGE_SEG as u64,
         );
-        // write_zeroes_may_unmap = 1: SET_ZERO_DATA on a sparse file unmaps.
-        cfg[CFG_WRITE_ZEROES_MAY_UNMAP] = 1;
+        // WRITE_ZEROES writes zeros; it never unmaps.
+        cfg[CFG_WRITE_ZEROES_MAY_UNMAP] = 0;
 
         let dev = Arc::new(BlockDevice {
             backend: backend.clone(),
@@ -370,6 +402,8 @@ impl BlockDevice {
             ops_err: AtomicU64::new(0),
             ops_done: AtomicU64::new(0),
             active: AtomicU64::new(0),
+            epoch: AtomicU32::new(0),
+            stopped: AtomicBool::new(false),
             max_depth: AtomicU64::new(0),
         });
 
@@ -418,32 +452,85 @@ impl BlockDevice {
         self.pool.lock().unwrap().inflight()
     }
 
+    /// Take whatever the guest left in the avail ring, stop taking requests,
+    /// and wait until every request taken has settled: completed, with its
+    /// status byte and used element written and its interrupt raised. Called
+    /// with the vCPUs stopped, so the ring and guest RAM then stay still: a
+    /// snapshot never captures a request taken off the avail ring but not yet
+    /// completed, and the backend can stop with nothing in flight. Doorbells
+    /// that arrive afterwards are ignored.
+    pub fn quiesce(&self) {
+        {
+            let mut scratch = self.drain_chain.lock().unwrap();
+            if !self.stopped.load(Ordering::Relaxed) {
+                self.drain_ring(&mut scratch);
+                self.stopped.store(true, Ordering::Relaxed);
+            }
+        }
+        let start = Instant::now();
+        let mut warned = false;
+        while self.active.load(Ordering::Acquire) != 0 {
+            if !warned && start.elapsed() >= Duration::from_secs(5) {
+                warned = true;
+                eprintln!(
+                    "[blk] quiesce: still waiting for {} request(s) in flight",
+                    self.active.load(Ordering::Relaxed)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     fn raise(&self, qidx: u32) {
         if let Some(cb) = self.irq.get() {
             cb(qidx);
         }
     }
 
-    fn push_used(&self, head: u16, used_len: u32) {
-        self.queue.lock().unwrap().push(head, used_len);
+    /// Retire `head` on the used ring, unless its epoch has ended.
+    fn push_used(&self, epoch: u32, head: u16, used_len: u32) {
+        let mut q = self.queue.lock().unwrap();
+        if self.epoch.load(Ordering::Relaxed) == epoch {
+            q.push(head, used_len);
+        }
     }
 
-    fn raise_irq_if_needed(&self) {
-        let fire = self.queue.lock().unwrap().should_interrupt_driver();
+    fn raise_irq_if_needed(&self, epoch: u32) {
+        let fire = {
+            let mut q = self.queue.lock().unwrap();
+            self.epoch.load(Ordering::Relaxed) == epoch && q.should_interrupt_driver()
+        };
         if fire {
             self.raise(0);
         }
     }
 
-    /// Fail a request before it ever reaches the backend: set the status byte,
-    /// retire the chain, bump the error counter, and signal the driver.
-    fn reject(&self, head: u16, status_ptr: *mut u8, status: u8) {
-        unsafe {
-            *status_ptr = status;
-        }
-        self.push_used(head, 1);
+    /// Fail a request before it ever reaches the backend.
+    fn reject(&self, epoch: u32, head: u16, status_ptr: *mut u8, status: u8) {
         self.ops_err.fetch_add(1, Ordering::Relaxed);
-        self.raise_irq_if_needed();
+        self.finish_inline(epoch, head, Some(status_ptr), status);
+    }
+
+    /// Finish a request that never reached the backend: write its status byte
+    /// (if it has a writable one), retire the chain, signal the driver, and
+    /// settle it.
+    fn finish_inline(&self, epoch: u32, head: u16, status_ptr: Option<*mut u8>, status: u8) {
+        if let Some(p) = status_ptr
+            && self.epoch.load(Ordering::Relaxed) == epoch
+        {
+            unsafe {
+                *p = status;
+            }
+        }
+        self.push_used(epoch, head, 1);
+        self.raise_irq_if_needed(epoch);
+        self.settle();
+    }
+
+    /// A request taken off the ring has settled: the device will not touch its
+    /// guest buffers or the used ring for it again. Must come last.
+    fn settle(&self) {
+        self.active.fetch_sub(1, Ordering::Release);
     }
 
     /// Acquire a parent slot and submit every data segment of a request
@@ -453,8 +540,10 @@ impl BlockDevice {
     /// some complete immediately; the decrement that drives the count to 0
     /// finishes the request. `sync` runs the segments to completion on this
     /// thread instead (`BlockFile::submit_sync`).
+    #[allow(clippy::too_many_arguments)]
     fn submit_request(
         &self,
+        epoch: u32,
         head: u16,
         rtype: u32,
         base_offset: u64,
@@ -462,24 +551,26 @@ impl BlockDevice {
         data: &[ChainBuf],
         sync: bool,
     ) {
-        let parent: *mut BlkReq = {
+        let parent = {
             let mut pool = self.pool.lock().unwrap();
-            let Some(slot) = pool.acquire() else {
-                self.reject(head, status_ptr, BLK_S_IOERR);
-                return;
-            };
-            let p = &mut *pool.slab[slot as usize];
-            p.slot = slot;
-            p.head_idx = head;
-            p.bounce_slot = NO_BOUNCE;
-            p.rtype = rtype;
-            p.status_ptr = status_ptr;
-            p.segs_outstanding.store(1, Ordering::Relaxed); // submission guard
-            p.total_done.store(0, Ordering::Relaxed);
-            p.failed.store(false, Ordering::Relaxed);
-            p as *mut BlkReq
+            pool.acquire().map(|slot| {
+                let p = &mut *pool.slab[slot as usize];
+                p.slot = slot;
+                p.head_idx = head;
+                p.bounce_slot = NO_BOUNCE;
+                p.rtype = rtype;
+                p.epoch = epoch;
+                p.status_ptr = status_ptr;
+                p.segs_outstanding.store(1, Ordering::Relaxed); // submission guard
+                p.total_done.store(0, Ordering::Relaxed);
+                p.failed.store(false, Ordering::Relaxed);
+                p as *mut BlkReq
+            })
         };
-        self.active.fetch_add(1, Ordering::Relaxed);
+        let Some(parent) = parent else {
+            self.reject(epoch, head, status_ptr, BLK_S_IOERR);
+            return;
+        };
 
         // Total payload + file-bounds (subtraction form so it can't wrap).
         let backend_size = self.backend.size();
@@ -635,21 +726,29 @@ impl BlockDevice {
         // and holding `drain_chain` serialises the rare concurrent drain without
         // extending the contended queue-lock hold time.
         let mut scratch = self.drain_chain.lock().unwrap();
+        if self.stopped.load(Ordering::Relaxed) {
+            return;
+        }
+        self.drain_ring(&mut scratch);
+    }
+
+    /// Take every request the guest has published and start or finish each.
+    /// The caller holds `drain_chain`, whose scratch is `scratch`.
+    fn drain_ring(&self, scratch: &mut ChainScratch) {
         // On the doorbell pump, a request the guest is waiting on alone is done
         // synchronously right here (see `BlockFile::submit_sync`); concurrent
         // ones stay async so a host cache miss never stalls the others.
         let inline_ok = crate::virtio::transport::on_doorbell_pump();
         loop {
-            let (got, waiting) = {
+            let (taken, waiting, epoch) = {
                 let mut q = self.queue.lock().unwrap();
-                let got = q.pop_into(&mut scratch);
-                (got, if got { q.avail_pending() } else { 0 })
+                if !q.pop_into(scratch) {
+                    break;
+                }
+                let taken = self.active.fetch_add(1, Ordering::Relaxed) + 1;
+                (taken, q.avail_pending(), self.epoch.load(Ordering::Relaxed))
             };
-            if !got {
-                break;
-            }
-            let active = self.active.load(Ordering::Relaxed);
-            let depth = active + 1 + waiting as u64;
+            let depth = taken + waiting as u64;
             self.max_depth.fetch_max(depth, Ordering::Relaxed);
             let lone = inline_ok && depth == 1;
             let bufs = &scratch.bufs;
@@ -658,6 +757,7 @@ impl BlockDevice {
                 // Malformed (need at least header + status). Mirror the C++:
                 // drop without retiring the descriptor.
                 self.ops_err.fetch_add(1, Ordering::Relaxed);
+                self.settle();
                 continue;
             }
 
@@ -666,14 +766,8 @@ impl BlockDevice {
             let status_ptr = bufs[last].ptr;
             let sta_ok = bufs[last].write && bufs[last].len >= 1;
             if !hdr_ok || !sta_ok {
-                if sta_ok {
-                    unsafe {
-                        *status_ptr = BLK_S_UNSUPP;
-                    }
-                }
-                self.push_used(head, 1);
                 self.ops_err.fetch_add(1, Ordering::Relaxed);
-                self.raise_irq_if_needed();
+                self.finish_inline(epoch, head, sta_ok.then_some(status_ptr), BLK_S_UNSUPP);
                 continue;
             }
 
@@ -691,7 +785,7 @@ impl BlockDevice {
             // Reject ridiculous sector values before multiplying.
             let sector_ok = sector <= u64::MAX / SECTOR_SIZE as u64;
             if !sector_ok && rtype != BLK_T_FLUSH {
-                self.reject(head, status_ptr, BLK_S_IOERR);
+                self.reject(epoch, head, status_ptr, BLK_S_IOERR);
                 continue;
             }
             let cur_file_offset = if sector_ok {
@@ -700,24 +794,23 @@ impl BlockDevice {
                 0
             };
 
-            // DISCARD / WRITE_ZEROES: synchronous ZeroRange (FSCTL_SET_ZERO_DATA),
-            // which on a sparse NTFS file both zeroes the bytes and deallocates
-            // clusters. Rare, so it runs inline rather than through the IOCP.
+            // DISCARD (a SCSI UNMAP) is rare and runs inline. WRITE_ZEROES goes
+            // down the WRITE path, sourced from the shared zero buffer.
             if rtype == BLK_T_DISCARD || rtype == BLK_T_WRITE_ZEROES {
                 let is_wz = rtype == BLK_T_WRITE_ZEROES;
                 let total: usize = data.iter().map(|s| s.len).sum();
                 let segs_readable = data.iter().all(|s| !s.write);
                 if total == 0 || !total.is_multiple_of(16) || !segs_readable {
-                    self.reject(head, status_ptr, BLK_S_UNSUPP);
+                    self.reject(epoch, head, status_ptr, BLK_S_UNSUPP);
                     continue;
                 }
                 if self.readonly {
-                    self.reject(head, status_ptr, BLK_S_IOERR);
+                    self.reject(epoch, head, status_ptr, BLK_S_IOERR);
                     continue;
                 }
                 let nranges = total / 16;
                 if nranges > BLK_MAX_RANGE_SEG {
-                    self.reject(head, status_ptr, BLK_S_UNSUPP);
+                    self.reject(epoch, head, status_ptr, BLK_S_UNSUPP);
                     continue;
                 }
                 // Single range under our cap (<= 16 bytes): a stack buffer, no
@@ -737,6 +830,7 @@ impl BlockDevice {
                 };
                 let backend_size = self.backend.size();
                 let mut all_ok = true;
+                let mut write_zeroes = None;
                 for k in 0..nranges {
                     let base = k * 16;
                     let r_sector =
@@ -762,21 +856,31 @@ impl BlockDevice {
                         all_ok = false;
                         break;
                     }
-                    // DISCARD flags must be 0; WRITE_ZEROES unmap bit is advisory
-                    // (we always unmap via SET_ZERO_DATA on a sparse file).
+                    // DISCARD flags must be 0; the WRITE_ZEROES unmap bit is
+                    // advisory (we always write zeros).
                     if !is_wz && flags != 0 {
                         all_ok = false;
                         break;
                     }
-                    if !self.backend.zero_range(byte_off, byte_len) {
+                    if is_wz {
+                        write_zeroes = Some((byte_off, byte_len));
+                    } else if !self.backend.discard_range(byte_off, byte_len) {
                         all_ok = false;
                         break;
                     }
                 }
-                unsafe {
-                    *status_ptr = if all_ok { BLK_S_OK } else { BLK_S_IOERR };
+                if all_ok && let Some((byte_off, byte_len)) = write_zeroes {
+                    self.ops_write_zeroes.fetch_add(1, Ordering::Relaxed);
+                    // `byte_len` is within BLK_MAX_WRITE_ZEROES_SECTORS, so
+                    // within the buffer.
+                    let zeros = ChainBuf {
+                        ptr: zeroes().as_ptr().cast_mut(),
+                        len: byte_len as usize,
+                        write: false,
+                    };
+                    self.submit_request(epoch, head, rtype, byte_off, status_ptr, &[zeros], lone);
+                    continue;
                 }
-                self.push_used(head, 1);
                 if all_ok {
                     if is_wz {
                         self.ops_write_zeroes.fetch_add(1, Ordering::Relaxed);
@@ -786,19 +890,20 @@ impl BlockDevice {
                 } else {
                     self.ops_err.fetch_add(1, Ordering::Relaxed);
                 }
-                self.raise_irq_if_needed();
+                let status = if all_ok { BLK_S_OK } else { BLK_S_IOERR };
+                self.finish_inline(epoch, head, Some(status_ptr), status);
                 continue;
             }
 
             // FLUSH: no data segments expected; ignore any present.
             if rtype == BLK_T_FLUSH {
                 self.ops_flush.fetch_add(1, Ordering::Relaxed);
-                self.submit_request(head, rtype, cur_file_offset, status_ptr, &[], false);
+                self.submit_request(epoch, head, rtype, cur_file_offset, status_ptr, &[], false);
                 continue;
             }
 
             if rtype != BLK_T_IN && rtype != BLK_T_OUT {
-                self.reject(head, status_ptr, BLK_S_UNSUPP);
+                self.reject(epoch, head, status_ptr, BLK_S_UNSUPP);
                 continue;
             }
 
@@ -806,20 +911,16 @@ impl BlockDevice {
             // device-readable.
             let want_write = rtype == BLK_T_IN;
             if data.iter().any(|s| s.write != want_write) {
-                self.reject(head, status_ptr, BLK_S_UNSUPP);
+                self.reject(epoch, head, status_ptr, BLK_S_UNSUPP);
                 continue;
             }
             if rtype == BLK_T_OUT && self.readonly {
-                self.reject(head, status_ptr, BLK_S_IOERR);
+                self.reject(epoch, head, status_ptr, BLK_S_IOERR);
                 continue;
             }
             // Empty data: ack immediately.
             if data.is_empty() {
-                unsafe {
-                    *status_ptr = BLK_S_OK;
-                }
-                self.push_used(head, 1);
-                self.raise_irq_if_needed();
+                self.finish_inline(epoch, head, Some(status_ptr), BLK_S_OK);
                 continue;
             }
 
@@ -829,7 +930,7 @@ impl BlockDevice {
                 self.ops_out.fetch_add(1, Ordering::Relaxed);
             }
 
-            self.submit_request(head, rtype, cur_file_offset, status_ptr, data, lone);
+            self.submit_request(epoch, head, rtype, cur_file_offset, status_ptr, data, lone);
         }
     }
 
@@ -853,9 +954,11 @@ impl BlockDevice {
             // before publishing completion. We own the bounce slot (acquired at
             // submit) until finish_request releases it; the segment pointers
             // were host_range-validated at pop time and the guest-RAM slab
-            // outlives the device.
+            // outlives the device. A stale read's data stays in the bounce
+            // buffer: since the reset, its guest buffers are the driver's.
             let bidx = unsafe { (*parent).bounce_slot };
-            if bidx != NO_BOUNCE {
+            let stale = self.epoch.load(Ordering::Relaxed) != unsafe { (*parent).epoch };
+            if bidx != NO_BOUNCE && !stale {
                 let bs = {
                     let mut bp = self.bounce_pool.lock().unwrap();
                     bp.slot_ptr(bidx)
@@ -888,22 +991,27 @@ impl BlockDevice {
     }
 
     /// Finish a request: write its status byte, retire it on the used ring,
-    /// release the parent slot, and signal the driver. Runs exactly once per
-    /// request -- driven by `segs_outstanding` reaching 0 -- on whichever thread
-    /// observes that (the guard drop in `submit_request`, or the last completion).
+    /// release the parent slot, signal the driver, and settle it. Runs exactly
+    /// once per request -- driven by `segs_outstanding` reaching 0 -- on
+    /// whichever thread observes that (the guard drop in `submit_request`, or
+    /// the last completion). A stale request (see `epoch`) only releases its
+    /// slots and settles.
     fn finish_request(&self, parent: *mut BlkReq) {
-        let (head, rtype, failed, total_done, status_ptr, slot) = unsafe {
+        let (head, rtype, epoch, failed, total_done, status_ptr, slot) = unsafe {
             let p = &*parent;
             (
                 p.head_idx,
                 p.rtype,
+                p.epoch,
                 p.failed.load(Ordering::Acquire),
                 p.total_done.load(Ordering::Relaxed),
                 p.status_ptr,
                 p.slot,
             )
         };
-        unsafe { *status_ptr = if failed { BLK_S_IOERR } else { BLK_S_OK } };
+        if self.epoch.load(Ordering::Relaxed) == epoch {
+            unsafe { *status_ptr = if failed { BLK_S_IOERR } else { BLK_S_OK } };
+        }
         // used_len = data the device wrote (reads only) + the status byte.
         let used_len = if failed {
             1u32
@@ -912,7 +1020,7 @@ impl BlockDevice {
         } else {
             1
         };
-        self.push_used(head, used_len);
+        self.push_used(epoch, head, used_len);
         self.ops_done.fetch_add(1, Ordering::Relaxed);
 
         if etw::enabled(etw::VERBOSE, etw::kw::BLOCK) {
@@ -930,8 +1038,8 @@ impl BlockDevice {
             self.bounce_pool.lock().unwrap().release(bidx);
         }
         self.pool.lock().unwrap().release(slot);
-        self.active.fetch_sub(1, Ordering::Relaxed);
-        self.raise_irq_if_needed();
+        self.raise_irq_if_needed(epoch);
+        self.settle();
     }
 }
 
@@ -1001,6 +1109,9 @@ impl VirtioDevice for BlockDevice {
         if idx != 0 {
             return None;
         }
+        if self.stopped.load(Ordering::Relaxed) {
+            return Some(false);
+        }
         // A held lock is a completion pushing the used ring: let the drain look.
         Some(self.queue.try_lock().map_or(true, |q| q.has_avail()))
     }
@@ -1008,23 +1119,33 @@ impl VirtioDevice for BlockDevice {
     fn driver_ok(&self) {}
 
     fn reset(&self) {
-        // A guest-triggered reset (status write of 0) can race with reads/writes
-        // still outstanding on the IOCP worker — the worker is NOT stopped here.
-        // Two rules keep that memory-safe without draining (which would deadlock:
-        // reset runs under the transport `common` lock, and a completion's IRQ
-        // path re-takes `common`):
-        //  1. Reset the virtqueue. With `ready == false`, an in-flight completion
-        //     finds `push` / `should_interrupt_driver` early-returning, so it
-        //     retires through the normal path — releasing its parent + segment
-        //     slots — without touching the guest ring or raising an interrupt.
+        // A guest-triggered reset (status write of 0) can race with requests
+        // still in flight. It must not wait for them: it runs under the
+        // transport `common` lock, which a completion's IRQ path re-takes.
+        // Instead the reset completes asynchronously (see `reset_pending`):
+        //  1. Under the queue lock, end the epoch and reset the virtqueue. A
+        //     request taken before this is stale: it still runs to completion,
+        //     but writes no status byte or bounced read data, pushes nothing to
+        //     the used ring (which may belong to a re-enabled queue by then),
+        //     and raises no interrupt. A zero-copy read still lands in its
+        //     buffers before the request settles, but the driver does not reuse
+        //     them until the reset has completed.
         //  2. Do NOT rebuild the pool free-lists. A parent or segment slot whose
         //     ReadFile/WriteFile is still outstanding must never be reissued to a
         //     new request: that would alias a live BlkReq/SegOp across the pump
         //     and worker threads (a data race + double free). The free-lists
         //     self-heal as completions land — every acquired slot is released
         //     exactly once.
-        self.queue.lock().unwrap().reset();
+        {
+            let mut q = self.queue.lock().unwrap();
+            self.epoch.fetch_add(1, Ordering::Relaxed);
+            q.reset();
+        }
         self.driver_features.store(0, Ordering::Relaxed);
+    }
+
+    fn reset_pending(&self) -> bool {
+        self.active.load(Ordering::Acquire) != 0
     }
 
     fn read_config(&self, off: u32, size: u32) -> u32 {
@@ -1066,5 +1187,249 @@ impl VirtioDevice for BlockDevice {
                 Ordering::Relaxed,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::mpsc;
+
+    const NEXT: u16 = 1;
+    const WRITE: u16 = 2;
+    const DATA: [(u64, u32, bool); 2] = [(0x10_0000, 4096, true), (0x10_2000, 4096, true)];
+
+    /// A 64 MiB VHDX whose first 4 MiB hold 0x5a.
+    struct Image(PathBuf);
+
+    impl Image {
+        fn new() -> Self {
+            static NEXT_IMAGE: AtomicU64 = AtomicU64::new(0);
+            let image = Self(std::env::temp_dir().join(format!(
+                "tinyvmm-blk-{}-{}.vhdx",
+                std::process::id(),
+                NEXT_IMAGE.fetch_add(1, Ordering::Relaxed)
+            )));
+            winsys::host::vhdx::create(image.path(), 64 << 20).unwrap();
+            let backend = BlockFile::new(image.path(), false);
+            let (tx, rx) = mpsc::channel();
+            backend
+                .set_completion_callback(Box::new(move |r| tx.send(unsafe { (*r).ok }).unwrap()));
+            backend.start();
+            let mut bytes = vec![0x5a; 4 << 20];
+            let mut request = Request::zeroed();
+            request.op = Op::Write;
+            request.buf = bytes.as_mut_ptr();
+            request.bytes = bytes.len() as u32;
+            assert!(unsafe { backend.submit_sync(&mut request) });
+            assert!(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+            image
+        }
+
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+
+    impl Drop for Image {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn device(image: &Image) -> (Arc<GuestMemory>, Arc<BlockFile>, Arc<BlockDevice>) {
+        let backend = Arc::new(BlockFile::new(image.path(), false));
+        assert!(backend.open(), "error {}", backend.open_err());
+        let mem = Arc::new(GuestMemory::new_host_only(8 << 20).unwrap());
+        let dev = BlockDevice::new(mem.clone(), backend.clone(), 32);
+        backend.start();
+        (mem, backend, dev)
+    }
+
+    /// A 32-entry split virtqueue in guest RAM: descriptors at `base`, then the
+    /// avail ring, the used ring, request headers and status bytes, a page
+    /// apart.
+    #[derive(Clone, Copy)]
+    struct Ring(u64);
+
+    impl Ring {
+        fn avail(self) -> u64 {
+            self.0 + 0x1000
+        }
+        fn used(self) -> u64 {
+            self.0 + 0x2000
+        }
+        fn enable(self, dev: &BlockDevice) {
+            dev.enable_queue(0, self.0, self.avail(), self.used(), 32, false);
+        }
+        fn used_idx(self, mem: &GuestMemory) -> u16 {
+            u16::from_le_bytes(mem.read_array::<2>(self.used() + 2).unwrap())
+        }
+        fn desc(self, mem: &GuestMemory, i: u16, addr: u64, len: u32, flags: u16) {
+            let mut d = [0u8; 16];
+            d[0..8].copy_from_slice(&addr.to_le_bytes());
+            d[8..12].copy_from_slice(&len.to_le_bytes());
+            d[12..14].copy_from_slice(&flags.to_le_bytes());
+            d[14..16].copy_from_slice(&(i + 1).to_le_bytes());
+            mem.write_at(self.0 + u64::from(i) * 16, &d).unwrap();
+        }
+        /// Make chain `head` the ring's `slot`-th request and publish it.
+        fn publish(self, mem: &GuestMemory, slot: u16, head: u16) {
+            mem.write_at(self.avail() + 4 + u64::from(slot) * 2, &head.to_le_bytes())
+                .unwrap();
+            mem.write_at(self.avail() + 2, &(slot + 1).to_le_bytes())
+                .unwrap();
+        }
+        /// Publish request `slot` (header for sector 0, `data`, status byte)
+        /// at descriptor `head`, without a kick. Returns the status byte's GPA,
+        /// preset to 0xaa.
+        fn request(
+            self,
+            mem: &GuestMemory,
+            slot: u16,
+            head: u16,
+            rtype: u32,
+            data: &[(u64, u32, bool)],
+        ) -> u64 {
+            let header = self.0 + 0x3000 + u64::from(slot) * 16;
+            let status = self.0 + 0x3800 + u64::from(slot);
+            let mut h = [0u8; 16];
+            h[0..4].copy_from_slice(&rtype.to_le_bytes());
+            mem.write_at(header, &h).unwrap();
+            mem.write_at(status, &[0xaa]).unwrap();
+            self.desc(mem, head, header, 16, NEXT);
+            let mut i = head + 1;
+            for &(addr, len, writable) in data {
+                self.desc(mem, i, addr, len, NEXT | if writable { WRITE } else { 0 });
+                i += 1;
+            }
+            self.desc(mem, i, status, 1, WRITE);
+            self.publish(mem, slot, head);
+            status
+        }
+    }
+
+    fn byte(mem: &GuestMemory, gpa: u64) -> u8 {
+        mem.read_array::<1>(gpa).unwrap()[0]
+    }
+
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Reset with a request in flight, then reuse its buffers and re-enable a
+    /// fresh queue at once (as a driver that doesn't wait for the reset
+    /// might). The request must settle without touching the guest.
+    fn reset_with_request_in_flight(rtype: u32) {
+        let image = Image::new();
+        let (mem, backend, dev) = device(&image);
+        let (old, fresh) = (Ring(0x1_0000), Ring(0x2_0000));
+        old.enable(&dev);
+        // Hold the IOCP worker in the first interrupt (a FLUSH's), so the next
+        // request's completion queues up behind it.
+        let (entered_tx, entered) = mpsc::sync_channel(1);
+        let (release, release_rx) = mpsc::sync_channel::<()>(1);
+        let release_rx = Mutex::new(release_rx);
+        let first = AtomicBool::new(true);
+        dev.set_irq_callback(Box::new(move |_| {
+            if first.swap(false, Ordering::SeqCst) {
+                entered_tx.send(()).unwrap();
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(30));
+            }
+        }));
+        old.request(&mem, 0, 0, BLK_T_FLUSH, &[]);
+        dev.notify_queue(0);
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        let status = if rtype == BLK_T_IN {
+            old.request(&mem, 1, 4, rtype, &DATA)
+        } else {
+            let mut range = [0u8; 16];
+            range[8..12].copy_from_slice(&(BLK_MAX_WRITE_ZEROES_SECTORS as u32).to_le_bytes());
+            mem.write_at(0x3_0000, &range).unwrap();
+            old.request(&mem, 1, 4, rtype, &[(0x3_0000, 16, false)])
+        };
+        dev.notify_queue(0);
+        assert_eq!(
+            dev.pending_count(),
+            1,
+            "the request must still be in flight"
+        );
+
+        dev.reset();
+        assert!(dev.reset_pending());
+        mem.write_at(status, &[0xdd]).unwrap();
+        for &(addr, len, _) in &DATA {
+            mem.write_at(addr, &vec![0x77; len as usize]).unwrap();
+        }
+        fresh.enable(&dev);
+        release.send(()).unwrap();
+        wait_until("the reset to settle", || !dev.reset_pending());
+
+        assert_eq!(fresh.used_idx(&mem), 0, "stale completion in the new queue");
+        assert_eq!(old.used_idx(&mem), 1, "stale completion in the old queue");
+        assert_eq!(byte(&mem, status), 0xdd, "stale status write");
+        for &(addr, _, _) in &DATA {
+            assert_eq!(mem.read_array::<4096>(addr).unwrap(), [0x77; 4096]);
+        }
+        // The new queue works.
+        let status = fresh.request(&mem, 0, 0, BLK_T_FLUSH, &[]);
+        dev.notify_queue(0);
+        wait_until("a FLUSH on the new queue", || fresh.used_idx(&mem) == 1);
+        assert_eq!(byte(&mem, status), BLK_S_OK);
+        dev.quiesce();
+        backend.stop();
+    }
+
+    #[test]
+    fn reset_drops_a_stale_bounced_read() {
+        reset_with_request_in_flight(BLK_T_IN);
+    }
+
+    #[test]
+    fn reset_drops_a_stale_write_zeroes() {
+        reset_with_request_in_flight(BLK_T_WRITE_ZEROES);
+    }
+
+    #[test]
+    fn quiesce_completes_published_requests_then_stops() {
+        let image = Image::new();
+        let (mem, backend, dev) = device(&image);
+        let ring = Ring(0x1_0000);
+        ring.enable(&dev);
+        // Requests finished without the backend settle at once: a chain too
+        // short to be a request (dropped) and an unsupported type (rejected).
+        ring.desc(&mem, 0, 0x1_3000, 16, 0);
+        ring.publish(&mem, 0, 0);
+        let unsupported = ring.request(&mem, 1, 2, 99, &[]);
+        dev.notify_queue(0);
+        assert!(!dev.reset_pending());
+        assert_eq!(byte(&mem, unsupported), BLK_S_UNSUPP);
+
+        // Published after the last drain: the doorbell pump never got to it.
+        let status = ring.request(&mem, 2, 4, BLK_T_IN, &DATA);
+        dev.quiesce();
+        let q = dev.capture_queue(0).unwrap();
+        assert_eq!((q.last_avail, q.last_used_idx), (3, 2));
+        assert_eq!(ring.used_idx(&mem), 2);
+        assert_eq!(byte(&mem, status), BLK_S_OK);
+        for &(addr, _, _) in &DATA {
+            assert_eq!(mem.read_array::<4096>(addr).unwrap(), [0x5a; 4096]);
+        }
+
+        // Stopped: a later doorbell takes nothing.
+        ring.request(&mem, 3, 8, BLK_T_FLUSH, &[]);
+        assert_eq!(dev.queue_has_work(0), Some(false));
+        dev.notify_queue(0);
+        assert_eq!(dev.capture_queue(0).unwrap().last_avail, 3);
+        backend.stop();
+        assert_eq!(backend.inflight(), 0);
     }
 }

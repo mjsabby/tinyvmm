@@ -16,7 +16,7 @@ microVM needs *that* and nothing more — that is what "opinionated" means here.
 
 ```cmd
 .\target\release\tinyvmm.exe --pvh-run --vcpus 4 --ram-mb 1024 --rng ^
-    --net --drive disk.img --virtio-9p-share share=C:\host\dir ^
+    --net --drive disk.vhdx --virtio-9p-share share=C:\host\dir ^
     --gpu 1280x800 --input --initrd initramfs.cpio vmlinux
 ```
 
@@ -97,7 +97,7 @@ There are four self-tests that need **no guest kernel**:
   its first `HLT`.
 * `--pci-selftest` — exercise the PCI host-bridge config mechanism, BAR sizing,
   and 64-bit BAR assignment against a synthetic `PciFunction`.
-* `--blk-selftest` — drive virtio-blk DISCARD / WRITE_ZEROES against a temp file.
+* `--blk-selftest` — drive virtio-blk DISCARD / WRITE_ZEROES against a temporary VHDX.
 * `--pvh-info <vmlinux|bzImage>` — parse and print a kernel's PVH ELF-Note entry
   point, or a bzImage's boot protocol header.
 
@@ -276,6 +276,7 @@ The first argument selects a **mode** (`main.rs:3500`):
 | `--smoke` | Probe WHP; create a throwaway partition + 16 MiB RAM + 1 vCPU and run to `HLT`. |
 | `--pci-selftest` | Host-side PCI host-bridge + BAR-sizing self-test (no guest). |
 | `--blk-selftest` | Host-side virtio-blk DISCARD/WRITE_ZEROES self-test (no guest). |
+| `--create-vhdx <path.vhdx> <size-mb>` | Create a new dynamic VHDX; size is in MiB (at least 3). Refuses existing files. No elevation required. |
 | `--pvh-info <vmlinux\|bzImage>` | Parse and print a kernel's PVH ELF-Note entry point, or a bzImage's boot protocol header. |
 | `--pvh-run [flags] <kernel> [-- <cmdline>]` | Boot a microVM (the main mode). The kernel is a PVH ELF `vmlinux` or a `bzImage`, detected by content. |
 | `--pvh-run --iso <image> [flags] [-- <args>]` | Boot a distribution's live/install ISO (see `--iso` below). |
@@ -299,7 +300,7 @@ Parsed in `parse_pvh_args` (`main.rs:590`). Defaults and clamps are exact.
 | `--portfwd HOSTPORT:GUESTPORT` | — | Forward `127.0.0.1:HOSTPORT` (host) → `172.29.255.2:GUESTPORT` (guest). NAT only. Repeatable per NIC. |
 | `--nat-workers <N>` | a quarter of the host's logical CPUs, 1–4 | NAT worker threads for the current NIC, **1–16**. Each owns the TCP flows assigned to it; one flow never spans workers, so this scales many-flow traffic, not a single stream (see [§3](#3-devices-in-detail)). Kept across `--save`/`--restore`. |
 | `--wintun-name <adapter>` / `--wintun-host <ipv4>` | — | WinTun adapter name / host-side gateway IPv4 (wintun backend). |
-| `--drive <path>[,readonly\|ro]` | — | Add a virtio-blk disk. **Repeatable up to 8** (`/dev/vda`, `/dev/vdb`, …). |
+| `--drive <path>[,readonly\|ro]` | — | Add a VHDX-backed virtio-blk disk using the native Windows driver. Raw disk images are not supported, including read-only ones; `--iso` separately attaches read-only installation media. **Repeatable up to 8** (`/dev/vda`, `/dev/vdb`, …). |
 | `--virtio-9p-share <tag>=<host_dir>[,ro][,uid=<n>][,gid=<n>][,metadata]` | — | Share a host directory over virtio-9p (9P2000.L). **Repeatable up to 8.** Tag 1–256 bytes; host path canonicalized and must be a directory; duplicate tags rejected. NTFS has no POSIX owners, so by default every entry reports owner `uid`:`gid` (default `0:0`, root) with a synthesized mode (dirs `0755`, files `0644`, `0444` if read-only on the host). The guest enforces those bits, so set `uid`/`gid` to the guest user that must write; `chmod`/`chown` succeed but aren't stored. With `metadata` (like WSL's drvfs option of the same name), owners and modes live in WSL's `$LXUID`/`$LXGID`/`$LXMOD` NTFS extended attributes: `chmod`/`chown` persist, new files record their creator, group and mode, WSL sees the same values, and `uid`/`gid` apply only to entries without metadata. While the VM runs, the root is held open, so Windows won't rename the folders that contain it (§9). Kept across `--save`/`--restore`. |
 | `--gpu [WxH]` | off | Add a virtio-gpu 2D device and open a Win32 window showing its scanout (CPU blit). Optional `WxH` (e.g. `--gpu 1024x768`) sets the preferred size (default **1280×800**). Dropping `nofb nomodeset` from the default cmdline so the guest DRM driver mode-sets. With `--input`, the window is also the host input source. |
 | `--input` | off | Add **two** virtio-input devices — a keyboard and an absolute tablet (pointer + scroll + buttons). With `--gpu`, the host source is the GPU window (1:1 pixel coordinates); otherwise it falls back to the interactive console. Needs a guest kernel with `CONFIG_VIRTIO_INPUT`. |
@@ -337,22 +338,35 @@ and accepts a small set of overrides:
 :: 4 vCPUs, 1 GiB, RNG, NAT with a port-forward, a disk, a host share, a GPU window + input
 tinyvmm --pvh-run --vcpus 4 --ram-mb 1024 --rng ^
     --net --net-backend nat --portfwd 8080:80 ^
-    --drive ubuntu.img --virtio-9p-share host=C:\work,ro ^
+    --drive ubuntu.vhdx --virtio-9p-share host=C:\work,ro ^
     --gpu 1280x800 --input ^
     --cpu-affinity p-physical --initrd initramfs.cpio vmlinux
 
 :: snapshot on guest trigger, then instant-resume (disk re-attached read-only)
-tinyvmm --pvh-run --save vm.snap --drive disk.img,ro --initrd initramfs.cpio vmlinux
-tinyvmm --restore vm.snap --drive disk.img,ro
+tinyvmm --pvh-run --save vm.snap --drive disk.vhdx,ro --initrd initramfs.cpio vmlinux
+tinyvmm --restore vm.snap --drive disk.vhdx,ro
 
-:: a distribution's live ISO in a GPU window, installing onto a raw disk (/dev/vdb)
-tinyvmm --pvh-run --iso ubuntu-26.04.1-desktop-amd64.iso --drive disk.img ^
+:: create a 64 GiB dynamic VHDX, then install onto it (/dev/vdb)
+tinyvmm --create-vhdx disk.vhdx 65536
+tinyvmm --pvh-run --iso ubuntu-26.04.1-desktop-amd64.iso --drive disk.vhdx ^
     --vcpus 8 --ram-mb 8192 --rng --net --gpu 1600x900 --input
 
 :: the same desktop with sound, recorded (picture + guest audio) to an MP4
 tinyvmm --pvh-run --iso ubuntu-26.04.1-desktop-amd64.iso --vcpus 8 --ram-mb 8192 ^
     --rng --net --gpu 1600x900 --input --sound --record session.mp4,fps=60
 ```
+
+VHDX uses `OpenVirtualDisk` + `AttachVirtualDisk(NO_LOCAL_HOST)`: no host disk
+mount, drive letter, or elevation. Payload reads/writes use the existing
+overlapped IOCP path with Windows managing allocation, metadata, and recovery.
+Disks use 512-byte logical sectors; native 4 KiB-logical-sector VHDX images are
+rejected rather than exposed with incorrect geometry. DISCARD uses SCSI UNMAP
+when supported (otherwise it is ignored). WRITE_ZEROES is an ordinary
+asynchronous write of zeros, which VHDMP stores without allocating blocks that
+are still unallocated. It can't use UNMAP: that is only advisory, and VHDMP
+reports success for ranges that aren't 4 KiB aligned but leaves them mapped.
+Close the VM before mounting its VHDX in WSL for offline
+editing; flush, unmount, and detach it from WSL before booting the VM again.
 
 The text console forwards raw stdin to the virtio-console RX queue; **Ctrl+A then
 X** quits. The guest can also request a clean shutdown by printing a sentinel on
@@ -430,14 +444,15 @@ order they are created — that order is fixed (it is also the snapshot
 * **virtio-rng** — fills each device-writable buffer from Windows CNG
   (`BCryptGenRandom` with the system-preferred RNG, `crates/winsys/src/host.rs:29`).
   The fill is pure CPU, so it runs **inline on the vCPU thread** — no doorbell.
-* **virtio-blk** — async backend: one Win32 file opened `FILE_FLAG_OVERLAPPED`,
-  bound to a per-disk IOCP with one worker thread. READ / WRITE / FLUSH plus a RO
-  feature bit and DISCARD / WRITE_ZEROES (via `FSCTL_SET_ZERO_DATA` on a sparse
-  NTFS file). Windows completes overlapped reads asynchronously through a system
-  worker and the IOCP even when the host page cache holds the data, so a
-  request the guest is waiting on alone (nothing else queued or in flight) is
-  instead read or written synchronously on the doorbell pump through a second,
-  non-overlapped handle: two thread hand-offs fewer per QD1 round trip.
+* **virtio-blk** — VHDX-only disk backend: a VM-only VHDMP handle bound to a
+  per-disk IOCP with one worker thread. READ / WRITE / FLUSH plus a RO feature
+  bit, DISCARD (SCSI UNMAP, inline) and WRITE_ZEROES (written from a shared
+  zero buffer like any WRITE). Windows completes overlapped I/O asynchronously
+  through a system worker and the IOCP even when the host page cache holds the
+  data, so a request the guest is waiting on alone (nothing else queued or in
+  flight) is instead finished on the doorbell pump: a VHDX request keeps its
+  completion off the IOCP and is waited for there, and installation ISOs (a
+  separate read-only byte-stream backend) use a second, non-overlapped handle.
   Concurrent requests stay asynchronous, so a host cache miss never stalls the
   others.
 * **virtio-input** — `--input` adds two devices (`src/virtio/input.rs`): a
@@ -993,7 +1008,7 @@ NIC/display protocol, not to the guest-memory-access layer.
 | Workload | Result |
 |----------|--------|
 | virtio-blk single-stream read | ~533 MB/s (guest pipelines ~14 requests in flight) |
-| virtio-blk QD1 4 KiB read (`tools\irq_bench.py`, sparse scratch disk) | ~30 µs per request (was ~67–88 µs before the synchronous lone-request path and pump polling) |
+| virtio-blk QD1 4 KiB read (`tools\irq_bench.py`, dynamic VHDX scratch disk) | ~28 µs per request (was ~67–88 µs before the synchronous lone-request path and pump polling) |
 | virtio-9p single-stream read, `cache=loose` / `cache=readahead` (`tools\p9_bench.py`, 512 MiB file) | ~1.7 / ~1.6 GB/s (~500 KB per Tread) |
 | virtio-9p single-stream read, `cache=none` | ~165 MB/s (4 KiB per Tread, latency-bound; was ~85 MB/s) |
 | virtio-9p 4 concurrent readers, `cache=none` / `cache=loose` | ~620 MB/s / ~3 GB/s |
@@ -1079,8 +1094,9 @@ static mut / Box::leak
   (WHP handle delete + event close), `BlockFile`/`Inner` (`CloseHandle` of the
   file + IOCP), `MappedFile` (`UnmapViewOfFile`), `PciTransport` (tear down the
   doorbell pump + join), the `Display` window thread, and `SnapshotWriter` (delete
-  a half-written file). Teardown order is explicit in `main.rs` — IOCP workers are
-  quiesced *before* their owners drop, so no completion lands on freed memory.
+  a half-written file). Teardown order is explicit in `main.rs` — blk devices are
+  quiesced and their IOCP workers stopped *before* their owners drop, so no
+  completion lands on freed memory.
 * **`#[repr(C)]` (8) + `transmute` (12)** — ABI control at the FFI line. `repr(C)`
   guarantees field order for the `OVERLAPPED`-first request structs and the NAT
   frame slot. Every `transmute` turns an OS-resolved symbol into a typed function
@@ -1459,7 +1475,8 @@ can detect support), and when *armed* it records the requesting vp and surfaces
 `StopReason::SnapshotRequested`, advancing RIP first so restore resumes *past* the
 CPUID (`src/whp/snapshot.rs`, `src/whp/run_loop.rs`). Any vCPU may fire it: an AP
 that does also stops the BSP and the other APs. The VMM then quiesces (stops
-+ joins APs, drains the blk IOCP workers, stops net backends, quiesces 9p) and
++ joins APs, quiesces each blk device so every request it took off its ring has
+completed, stops the blk IOCP workers, stops net backends, quiesces 9p) and
 writes a self-describing file (`src/whp/snapshot_file.rs`):
 
 ```

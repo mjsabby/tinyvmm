@@ -104,7 +104,7 @@ mod tests {
             "tinyvmm",
             "--pvh-run",
             "--drive",
-            "disk.img",
+            "disk.vhdx",
             "--iso",
             "live.iso",
             "--",
@@ -119,7 +119,9 @@ mod tests {
             .iter()
             .map(|d| (d.path.as_str(), d.readonly))
             .collect();
-        assert_eq!(drives, [("live.iso", true), ("disk.img", false)]);
+        assert_eq!(drives, [("live.iso", true), ("disk.vhdx", false)]);
+        assert!(config.drives[0].iso);
+        assert!(!config.drives[1].iso);
         assert_eq!(config.iso_extra_args, "debug x=1");
         assert!(config.cmdline.starts_with("console=hvc0 "));
 

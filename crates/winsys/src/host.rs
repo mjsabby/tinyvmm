@@ -17,6 +17,7 @@ use windows_sys::Win32::Security::Cryptography::{
 
 pub mod block_file;
 pub mod mapped_file;
+pub mod vhdx;
 
 pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()

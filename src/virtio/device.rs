@@ -51,6 +51,16 @@ pub trait VirtioDevice: Send + Sync {
     fn driver_ok(&self);
     fn reset(&self);
 
+    /// Whether a reset is still settling requests taken before it. Until it
+    /// clears, the transport keeps `device_status` non-zero, and the driver
+    /// waits for 0 before reinitializing the device (virtio-pci requires this;
+    /// Linux's `vp_reset` polls). Lets a device with I/O in flight finish a
+    /// reset without blocking the vCPU under the transport lock. Default:
+    /// resets complete immediately.
+    fn reset_pending(&self) -> bool {
+        false
+    }
+
     fn read_config(&self, offset: u32, size: u32) -> u32 {
         let _ = (offset, size);
         0

@@ -98,6 +98,9 @@ struct Common {
     driver_features: u64,
     msix_config: u16,
     status: u8,
+    /// The status a reset (status write of 0) started from. Reads report it
+    /// instead of 0 while the device is still settling that reset.
+    reset_from: u8,
     config_generation: u8,
     queue_select: u16,
     queues: Vec<QueueState>,
@@ -400,6 +403,7 @@ impl PciTransport {
                 driver_features: 0,
                 msix_config: 0xFFFF,
                 status: 0,
+                reset_from: 0,
                 config_generation: 0,
                 queue_select: 0,
                 queues,
@@ -629,17 +633,30 @@ impl PciTransport {
         }
 
         if sz == 8 && (off & 0x7) == 0 {
-            let lo = self.read_cc32(&c, off) as u64;
-            let hi = self.read_cc32(&c, off + 4) as u64;
+            let lo = self.guest_read_cc32(&c, off) as u64;
+            let hi = self.guest_read_cc32(&c, off + 4) as u64;
             access.data = (lo | (hi << 32)).to_le_bytes();
             return;
         }
         let aligned = off & !0x3;
         let shift = (off & 0x3) * 8;
-        let v = self.read_cc32(&c, aligned) >> shift;
+        let v = self.guest_read_cc32(&c, aligned) >> shift;
         access.data = [0; 8];
         let n = sz.min(4) as usize;
         access.data[..n].copy_from_slice(&v.to_le_bytes()[..n]);
+    }
+
+    /// A common-cfg dword as the driver reads it. Until the device has settled
+    /// a reset, the status still reads as before it, so the driver keeps
+    /// polling for 0 (`VirtioDevice::reset_pending`). Sub-dword writes merge
+    /// into the true state (`read_cc32`) instead.
+    fn guest_read_cc32(&self, c: &Common, off: u32) -> u32 {
+        let v = self.read_cc32(c, off);
+        if off == CC_DEVICE_STATUS && c.status == 0 && self.device.reset_pending() {
+            (v & !0xFF) | c.reset_from as u32
+        } else {
+            v
+        }
     }
 
     fn read_cc32(&self, c: &Common, off: u32) -> u32 {
@@ -814,6 +831,8 @@ impl PciTransport {
 
     fn apply_status_write(&self, c: &mut Common, new_status: u8) {
         if new_status == 0 {
+            // The device may finish the reset later (`guest_read_cc32`).
+            c.reset_from = c.status;
             c.status = 0;
             self.isr_status.store(0, Ordering::Relaxed);
             c.device_feature_select = 0;
@@ -1264,5 +1283,86 @@ impl PciTransport {
             self.device.apply_queue(*qidx, st);
         }
         self.device.apply_device_state(&snap.device_state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A device whose reset leaves requests in flight until `pending` clears.
+    #[derive(Default)]
+    struct SlowReset {
+        pending: AtomicBool,
+        resets: AtomicU32,
+    }
+
+    impl VirtioDevice for SlowReset {
+        fn device_id(&self) -> u32 {
+            2
+        }
+        fn device_features(&self) -> u64 {
+            0
+        }
+        fn set_driver_features(&self, _: u64) -> bool {
+            true
+        }
+        fn queue_count(&self) -> u32 {
+            1
+        }
+        fn queue_max(&self, _: u32) -> u32 {
+            8
+        }
+        fn enable_queue(&self, _: u32, _: u64, _: u64, _: u64, _: u16, _: bool) {}
+        fn disable_queue(&self, _: u32) {}
+        fn notify_queue(&self, _: u32) {}
+        fn driver_ok(&self) {}
+        fn reset(&self) {
+            self.resets.fetch_add(1, Ordering::Relaxed);
+            self.pending.store(true, Ordering::Relaxed);
+        }
+        fn reset_pending(&self) -> bool {
+            self.pending.load(Ordering::Relaxed)
+        }
+    }
+
+    /// A common-cfg access at `off` (the BAR sits at GPA 0); returns what a
+    /// read saw.
+    fn common(t: &PciTransport, off: u32, size: u8, write: Option<u32>) -> u32 {
+        let mut a = MmioAccess {
+            gpa: off as u64,
+            access_size: size,
+            is_write: write.is_some(),
+            data: [0; 8],
+        };
+        a.data[..4].copy_from_slice(&write.unwrap_or(0).to_le_bytes());
+        t.handle_common_cfg(&mut a);
+        u32::from_le_bytes(a.data[..4].try_into().unwrap())
+    }
+
+    #[test]
+    fn status_reads_nonzero_until_the_device_settles_a_reset() {
+        let dev = Arc::new(SlowReset::default());
+        let opts = Options {
+            vendor_id: 0x1AF4,
+            sub_vendor_id: 0x1AF4,
+            sub_id: 0,
+            num_msix_vectors: 2,
+            pci_class: 0x01,
+            pci_subclass: 0,
+            doorbells: false,
+        };
+        let mmio = Arc::new(MmioBus::new());
+        let t = PciTransport::new("test", dev.clone(), opts, mmio, 0);
+        common(&t, CC_DEVICE_STATUS, 1, Some(0x0F));
+        common(&t, CC_DEVICE_STATUS, 1, Some(0));
+        assert_eq!(dev.resets.load(Ordering::Relaxed), 1);
+        assert_eq!(common(&t, CC_DEVICE_STATUS, 1, None), 0x0F);
+        // A queue_select write merges into the real status (0), not the 0x0F
+        // reported meanwhile.
+        common(&t, CC_DEVICE_STATUS + 2, 2, Some(0));
+        dev.pending.store(false, Ordering::Relaxed);
+        assert_eq!(common(&t, CC_DEVICE_STATUS, 1, None), 0);
+        assert_eq!(dev.resets.load(Ordering::Relaxed), 1);
     }
 }
