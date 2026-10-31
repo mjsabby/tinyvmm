@@ -15,7 +15,7 @@
 .EXAMPLE
   .\tools\profile.ps1 -Workload idle  -Kernel C:\images\vmlinux -Initrd C:\images\initramfs.cpio -DurationSec 30
   .\tools\profile.ps1 -Workload net   -Kernel C:\images\vmlinux -Initrd C:\images\initramfs.cpio -DurationSec 60
-  .\tools\profile.ps1 -Workload blk   -Kernel C:\images\vmlinux -Initrd C:\images\initramfs.cpio -Disk C:\images\disk.img -DurationSec 60
+  .\tools\profile.ps1 -Workload blk   -Kernel C:\images\vmlinux -Initrd C:\images\initramfs.cpio -Disk C:\images\disk.vhdx -DurationSec 60
   .\tools\profile.ps1 -Workload p9    -Kernel C:\images\vmlinux -Initrd C:\images\initramfs.cpio -Share C:\share -DurationSec 60
 #>
 param(

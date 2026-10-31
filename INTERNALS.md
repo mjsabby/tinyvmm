@@ -627,9 +627,13 @@ done. Build them in this order:
   through VHDMP, bound to a per-disk **IOCP** with a worker thread, and
   overlaps `ReadFile`/`WriteFile` **directly into/out of guest RAM**. On
   completion the worker pushes the used element and raises the MSI-X vector.
-  VHDX requests remain overlapped. Installation ISO media has a separate
-  read-only byte-stream backend; only lone ISO reads use a second synchronous
-  handle (`BlockFile::submit_sync`). Raw disk compatibility is not provided.
+  Windows completes overlapped I/O through a system worker and the IOCP even
+  on a page-cache hit, so a lone request (queue depth 1) is instead finished
+  synchronously on the pump (`BlockFile::submit_sync`): a VHDX request sets
+  the low bit of `hEvent` to keep its completion off the IOCP and is waited
+  for there; installation ISO media, a separate read-only byte-stream backend,
+  uses a second, non-overlapped handle. WRITE_ZEROES is a WRITE from a shared
+  zero buffer. Raw disk compatibility is not provided.
 - **virtio-net** (`src/virtio/net.rs`, id 1) + a backend
   (`NetBackend`: loopback / user-mode NAT / wintun). The device negotiates
   checksum offload and TCPv4 segmentation offload (TSO4) in both directions plus

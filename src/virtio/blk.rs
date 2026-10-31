@@ -10,8 +10,8 @@
 //! interrupt via the transport.
 //!
 //! Implements READ / WRITE / FLUSH plus the RO, DISCARD, and WRITE_ZEROES
-//! feature bits. DISCARD / WRITE_ZEROES are served synchronously on the host
-//! VHDX via native SCSI UNMAP or zero writes from `notify_queue`.
+//! feature bits. DISCARD is a synchronous SCSI UNMAP from `notify_queue`;
+//! WRITE_ZEROES is an ordinary WRITE sourced from a shared zero buffer.
 
 use crate::diag::etw;
 use crate::host::block_file::{BlockFile, Op, Request};
@@ -62,10 +62,20 @@ const CFG_MAX_WRITE_ZEROES_SECTORS: usize = 48; // le32
 const CFG_MAX_WRITE_ZEROES_SEG: usize = 52; // le32
 const CFG_WRITE_ZEROES_MAY_UNMAP: usize = 56; // u8
 
-// We advertise a single range per request, up to 2 GiB (4 Mi sectors).
+// We advertise a single range per request: a DISCARD of up to 2 GiB (4 Mi
+// sectors), a WRITE_ZEROES of up to one zero buffer.
 const BLK_MAX_DISCARD_SECTORS: u64 = 4 * 1024 * 1024;
-const BLK_MAX_WRITE_ZEROES_SECTORS: u64 = 4 * 1024 * 1024;
+const BLK_MAX_WRITE_ZEROES_SECTORS: u64 = (ZERO_BYTES / SECTOR_SIZE as usize) as u64;
 const BLK_MAX_RANGE_SEG: usize = 1;
+/// Size of the shared buffer every WRITE_ZEROES is written from.
+const ZERO_BYTES: usize = 4 * 1024 * 1024;
+
+/// The source of every WRITE_ZEROES. Leaked, so it outlives any write still
+/// reading it; nothing writes to it.
+fn zeroes() -> &'static [u8] {
+    static ZEROES: OnceLock<&'static [u8]> = OnceLock::new();
+    ZEROES.get_or_init(|| Box::leak(vec![0; ZERO_BYTES].into_boxed_slice()))
+}
 
 // ---- Bounce-buffer coalescing -------------------------------------------------
 //
@@ -347,8 +357,8 @@ impl BlockDevice {
             &mut cfg[CFG_MAX_WRITE_ZEROES_SEG..CFG_MAX_WRITE_ZEROES_SEG + 4],
             BLK_MAX_RANGE_SEG as u64,
         );
-        // VHDX UNMAP can reclaim zeroed storage.
-        cfg[CFG_WRITE_ZEROES_MAY_UNMAP] = 1;
+        // WRITE_ZEROES writes zeros; it never unmaps.
+        cfg[CFG_WRITE_ZEROES_MAY_UNMAP] = 0;
 
         let dev = Arc::new(BlockDevice {
             backend: backend.clone(),
@@ -451,8 +461,8 @@ impl BlockDevice {
     /// segment. A submission guard (`segs_outstanding` starts at 1) keeps the
     /// request from finishing until all segments have been submitted, even if
     /// some complete immediately; the decrement that drives the count to 0
-    /// finishes the request. `sync` allows inline ISO reads when available;
-    /// VHDX requests remain asynchronous.
+    /// finishes the request. `sync` runs the segments to completion on this
+    /// thread instead (`BlockFile::submit_sync`).
     fn submit_request(
         &self,
         head: u16,
@@ -635,8 +645,9 @@ impl BlockDevice {
         // and holding `drain_chain` serialises the rare concurrent drain without
         // extending the contended queue-lock hold time.
         let mut scratch = self.drain_chain.lock().unwrap();
-        // Lone ISO reads may complete on the pump through a synchronous handle.
-        // VHDX and concurrent requests always use the overlapped path.
+        // On the doorbell pump, a request the guest is waiting on alone is done
+        // synchronously right here (see `BlockFile::submit_sync`); concurrent
+        // ones stay async so a host cache miss never stalls the others.
         let inline_ok = crate::virtio::transport::on_doorbell_pump();
         loop {
             let (got, waiting) = {
@@ -699,7 +710,8 @@ impl BlockDevice {
                 0
             };
 
-            // Native SCSI UNMAP / zero writes are rare and run inline.
+            // DISCARD (a SCSI UNMAP) is rare and runs inline. WRITE_ZEROES goes
+            // down the WRITE path, sourced from the shared zero buffer.
             if rtype == BLK_T_DISCARD || rtype == BLK_T_WRITE_ZEROES {
                 let is_wz = rtype == BLK_T_WRITE_ZEROES;
                 let total: usize = data.iter().map(|s| s.len).sum();
@@ -734,6 +746,7 @@ impl BlockDevice {
                 };
                 let backend_size = self.backend.size();
                 let mut all_ok = true;
+                let mut write_zeroes = None;
                 for k in 0..nranges {
                     let base = k * 16;
                     let r_sector =
@@ -759,21 +772,30 @@ impl BlockDevice {
                         all_ok = false;
                         break;
                     }
-                    // DISCARD flags must be 0; WRITE_ZEROES unmap bit is advisory
-                    // (the backend may reclaim zeroed storage).
+                    // DISCARD flags must be 0; the WRITE_ZEROES unmap bit is
+                    // advisory (we always write zeros).
                     if !is_wz && flags != 0 {
                         all_ok = false;
                         break;
                     }
-                    let ok = if is_wz {
-                        self.backend.zero_range(byte_off, byte_len)
-                    } else {
-                        self.backend.discard_range(byte_off, byte_len)
-                    };
-                    if !ok {
+                    if is_wz {
+                        write_zeroes = Some((byte_off, byte_len));
+                    } else if !self.backend.discard_range(byte_off, byte_len) {
                         all_ok = false;
                         break;
                     }
+                }
+                if all_ok && let Some((byte_off, byte_len)) = write_zeroes {
+                    self.ops_write_zeroes.fetch_add(1, Ordering::Relaxed);
+                    // `byte_len` is within BLK_MAX_WRITE_ZEROES_SECTORS, so
+                    // within the buffer.
+                    let zeros = ChainBuf {
+                        ptr: zeroes().as_ptr().cast_mut(),
+                        len: byte_len as usize,
+                        write: false,
+                    };
+                    self.submit_request(head, rtype, byte_off, status_ptr, &[zeros], lone);
+                    continue;
                 }
                 unsafe {
                     *status_ptr = if all_ok { BLK_S_OK } else { BLK_S_IOERR };

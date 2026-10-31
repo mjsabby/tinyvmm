@@ -18,7 +18,7 @@
 //!
 //! Disks use VHDMP's VM-only VHDX handle. The separate read-only ISO
 //! constructor exposes installation media as bytes, never as a writable disk.
-//! DISCARD / WRITE_ZEROES use native SCSI UNMAP or zero writes.
+//! DISCARD uses native SCSI UNMAP.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -32,8 +32,10 @@ use windows_sys::Win32::Storage::FileSystem::{
     OPEN_EXISTING, ReadFile, SetFileCompletionNotificationModes, WriteFile,
 };
 use windows_sys::Win32::System::IO::{
-    CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED, PostQueuedCompletionStatus,
+    CreateIoCompletionPort, GetOverlappedResult, GetQueuedCompletionStatus, OVERLAPPED,
+    PostQueuedCompletionStatus,
 };
+use windows_sys::Win32::System::Threading::CreateEventW;
 
 use super::vhdx::VirtualDisk;
 use super::wide;
@@ -43,6 +45,22 @@ const SHUTDOWN_KEY: usize = 0x1;
 const FLUSH_KEY: usize = 0x2;
 // SetFileCompletionNotificationModes flag (WindowsProgramming in windows-sys).
 const FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: u8 = 1;
+
+/// Manual-reset event a thread waits on in `submit_sync` for VHDX I/O.
+struct SyncEvent(HANDLE);
+
+impl Drop for SyncEvent {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
+thread_local! {
+    static SYNC_EVENT: SyncEvent =
+        SyncEvent(unsafe { CreateEventW(core::ptr::null(), 1, 0, core::ptr::null()) });
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Op {
@@ -86,8 +104,9 @@ struct Inner {
     virtual_disk: Option<VirtualDisk>,
     /// A second, non-overlapped handle to the ISO for `submit_sync`:
     /// Windows completes even page-cache hits on the overlapped handle
-    /// asynchronously, through a system worker and the IOCP. Null if the
-    /// second open failed; `submit_sync` then falls back to `submit`.
+    /// asynchronously, through a system worker and the IOCP. Null for a VHDX
+    /// (VHDMP allows a single open), whose `submit_sync` waits on overlapped
+    /// I/O instead, and if the second open failed (`submit` then serves it).
     sync_handle: HANDLE,
     iocp: HANDLE,
     readonly: bool,
@@ -304,25 +323,6 @@ impl BlockFile {
         }
     }
 
-    /// Synchronously zero a byte range, reclaiming storage when safe.
-    /// Uses UNMAP only with zero-read guarantees, otherwise explicit zero writes.
-    pub fn zero_range(&self, offset: u64, length: u64) -> bool {
-        let inner = &self.inner;
-        if inner.readonly || !self.open() {
-            return false;
-        }
-        if length == 0 {
-            return true;
-        }
-        if offset > inner.size || length > inner.size - offset {
-            return false;
-        }
-        if let Some(disk) = &inner.virtual_disk {
-            return disk.zero_range(offset, length);
-        }
-        false
-    }
-
     /// Spin up the IOCP worker. Must be called before `submit`.
     pub fn start(&self) {
         let mut w = self.worker.lock().unwrap();
@@ -413,13 +413,16 @@ impl BlockFile {
         }
     }
 
-    /// Run a read or write to completion on the calling thread, through the
-    /// non-overlapped handle, then fire the completion callback here. Worth it
-    /// for a request the guest is waiting on alone: a page-cache hit costs one
-    /// copy instead of two thread hand-offs. A miss blocks the caller for the
-    /// device's latency, so callers keep concurrent requests on [`Self::submit`].
-    /// Flushes, and everything when the second handle couldn't be opened, go
-    /// through `submit`. Returns false on failure to start (as `submit`).
+    /// Run a read or write to completion on the calling thread, then fire the
+    /// completion callback here. Worth it for a request the guest is waiting
+    /// on alone: a page-cache hit costs one copy instead of two thread
+    /// hand-offs. An ISO goes through its non-overlapped second handle. A VHDX
+    /// has only its overlapped handle, so the I/O sets the low bit of `hEvent`,
+    /// which keeps its completion off the IOCP, and is waited for here. A miss
+    /// blocks the caller for the device's latency, so callers keep concurrent
+    /// requests on [`Self::submit`]. Flushes, and everything when neither path
+    /// is available, go through `submit`. Returns false on failure to start
+    /// (as `submit`).
     ///
     /// # Safety
     /// As [`Self::submit`].
@@ -427,34 +430,38 @@ impl BlockFile {
         unsafe {
             let inner = &self.inner;
             let op = (*req).op;
-            if inner.sync_handle.is_null() || op == Op::Flush || (op == Op::Write && inner.readonly)
-            {
+            if op == Op::Flush || (op == Op::Write && inner.readonly) {
+                return self.submit(req);
+            }
+            let waited = inner.sync_handle.is_null();
+            let event = if waited && inner.virtual_disk.is_some() {
+                SYNC_EVENT.with(|event| event.0)
+            } else {
+                core::ptr::null_mut()
+            };
+            if waited && event.is_null() {
                 return self.submit(req);
             }
             begin(inner, req);
-            // Positioned I/O: on a synchronous handle the OVERLAPPED only
-            // carries the offset, and the call returns once the I/O is done.
+            // Positioned I/O: the OVERLAPPED carries the offset.
             core::ptr::write_bytes(&mut (*req).ovl as *mut OVERLAPPED, 0, 1);
             (*req).ovl.Anonymous.Anonymous.Offset = ((*req).file_offset & 0xFFFF_FFFF) as u32;
             (*req).ovl.Anonymous.Anonymous.OffsetHigh = ((*req).file_offset >> 32) as u32;
             let mut done: u32 = 0;
-            let ok = if op == Op::Read {
-                ReadFile(
-                    inner.sync_handle,
-                    (*req).buf,
-                    (*req).bytes,
-                    &mut done,
-                    &mut (*req).ovl,
-                )
+            let (handle, done_ptr): (HANDLE, *mut u32) = if waited {
+                (*req).ovl.hEvent = event.map_addr(|addr| addr | 1);
+                (inner.handle, core::ptr::null_mut())
             } else {
-                WriteFile(
-                    inner.sync_handle,
-                    (*req).buf,
-                    (*req).bytes,
-                    &mut done,
-                    &mut (*req).ovl,
-                )
+                (inner.sync_handle, &mut done)
             };
+            let mut ok = if op == Op::Read {
+                ReadFile(handle, (*req).buf, (*req).bytes, done_ptr, &mut (*req).ovl)
+            } else {
+                WriteFile(handle, (*req).buf, (*req).bytes, done_ptr, &mut (*req).ovl)
+            };
+            if waited && (ok != 0 || GetLastError() == ERROR_IO_PENDING) {
+                ok = GetOverlappedResult(handle, &(*req).ovl, &mut done, 1);
+            }
             finish(inner, req, ok != 0 && done == (*req).bytes);
             true
         }
@@ -579,7 +586,12 @@ mod tests {
         request.buf = data.as_mut_ptr();
         request.bytes = data.len() as u32;
         assert!(unsafe { backend.submit_sync(&mut request) });
-        let (address, ok) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        // Reads and writes finish before submit_sync returns; flushes go to the worker.
+        let (address, ok) = if op == Op::Flush {
+            rx.recv_timeout(Duration::from_secs(10)).unwrap()
+        } else {
+            rx.try_recv().unwrap()
+        };
         assert_eq!(address, &request as *const _ as usize);
         assert!(ok);
     }
@@ -623,14 +635,13 @@ mod tests {
             }
             transfer(&backend, &rx, Op::Flush, 0, &mut []);
             assert_eq!(backend.inflight(), 0);
-            assert!(!backend.zero_range(size - 512, 1024));
-            assert!(!backend.zero_range(1, 512));
             assert!(!backend.discard_range(size - 512, 1024));
             assert!(!backend.discard_range(1, 512));
             transfer(&backend, &rx, Op::Write, 4 * 1024 * 1024, &mut [0x5a; 4096]);
             assert!(backend.discard_range(4 * 1024 * 1024, 2 * 1024 * 1024));
-            assert!(backend.zero_range(2 * 1024 * 1024, 512));
+            transfer(&backend, &rx, Op::Write, 2 * 1024 * 1024, &mut [0; 512]);
             transfer(&backend, &rx, Op::Flush, 0, &mut []);
+            assert_eq!(backend.inflight(), 0);
         }
         {
             let backend = BlockFile::new(image.path(), true);
@@ -643,7 +654,6 @@ mod tests {
             assert_eq!(&data[1024..], &[1; 3072]);
             transfer(&backend, &rx, Op::Read, 8 * 1024 * 1024, &mut data);
             assert_eq!(data, vec![0; 4096]);
-            assert!(!backend.zero_range(0, 512));
             assert!(!backend.discard_range(0, 512));
             let mut request = Request::zeroed();
             request.op = Op::Write;
@@ -685,7 +695,6 @@ mod tests {
         let mut data = [0; 4096];
         transfer(&backend, &rx, Op::Read, 0, &mut data);
         assert_eq!(data, [0x42; 4096]);
-        assert!(!backend.zero_range(0, 512));
         assert!(!backend.discard_range(0, 512));
         let mut request = Request::zeroed();
         request.op = Op::Write;

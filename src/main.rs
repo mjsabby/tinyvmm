@@ -418,14 +418,22 @@ fn run_blk_selftest() -> Result<i32> {
             );
             put(avail_gpa + 2, &(avail_slot + 1).to_le_bytes());
             dev.notify_queue(0);
-            ram.read_array::<1>(stat).expect("selftest status")[0]
+            // DISCARD finishes inline; WRITE_ZEROES completes on the IOCP worker.
+            for _ in 0..5000 {
+                let s = ram.read_array::<1>(stat).expect("selftest status")[0];
+                if s != 0xAA {
+                    return s;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            0xAA
         };
 
     // ---- READ/WRITE roundtrip through the parallel-submission path ----
     // (descriptors 0..7, avail slots 1,2). WRITE a known multi-segment pattern to
-    // sector 0, then READ it back into a fresh buffer and compare. This is the
-    // only thing here that exercises submit_request / submit_seg / on_seg_complete
-    // / finish_request (the DISCARD/WRITE_ZEROES path below does not). The
+    // sector 0, then READ it back into a fresh buffer and compare. With the
+    // WRITE_ZEROES below, this exercises submit_request / submit_seg /
+    // on_seg_complete / finish_request (DISCARD runs inline instead). The
     // WRITE_ZEROES below then re-zeros sector 0, so the final file-content checks
     // still hold.
     const T_IN: u32 = 0;
@@ -3204,12 +3212,19 @@ fn run_restore(args: &[String]) -> Result<i32> {
     for i in 0..drive_count {
         let saved_path = jr.get_str(&format!("drive{i}_path"))?;
         let saved_ro = jr.get_bool(&format!("drive{i}_readonly")).unwrap_or(true);
-        let iso = jr.get_bool(&format!("drive{i}_iso")).unwrap_or(false);
         let saved_size = jr.get_u64(&format!("drive{i}_size")).unwrap_or(0);
         // Apply a positional --drive override (relocate the disk / change RO).
         let (dpath, dro) = match drive_overrides.get(i) {
             Some((p, ro)) => (p.clone(), ro.unwrap_or(saved_ro)),
             None => (saved_path.clone(), saved_ro),
+        };
+        // Snapshots from before drives recorded their kind saved `--iso` media
+        // as a plain read-only drive: recognize it by its ISO 9660 descriptor.
+        let iso_key = format!("drive{i}_iso");
+        let iso = if jr.has(&iso_key) {
+            jr.get_bool(&iso_key)?
+        } else {
+            saved_ro && convenience::iso9660::Iso9660::open(&dpath).is_ok()
         };
         // The virtio-blk RO feature bit the guest negotiated is part of the
         // restored device model; flipping it on restore desyncs the guest.
@@ -4804,12 +4819,23 @@ fn run_create_vhdx(args: &[String]) -> Result<i32> {
     {
         return Err(Error::msg("--create-vhdx expects <path.vhdx> <size-mb>"));
     }
+    let min_mb = winsys::host::vhdx::MIN_SIZE / (1024 * 1024);
     let size = args[3]
         .parse::<u64>()
         .ok()
         .and_then(|mb| mb.checked_mul(1024 * 1024))
-        .filter(|size| *size != 0)
-        .ok_or_else(|| Error::msg("--create-vhdx size-mb must be a positive integer"))?;
+        .filter(|size| *size >= winsys::host::vhdx::MIN_SIZE)
+        .ok_or_else(|| {
+            Error::msg(format!(
+                "--create-vhdx size-mb must be an integer of at least {min_mb} (the VHDX minimum)"
+            ))
+        })?;
+    if std::path::Path::new(&args[2]).exists() {
+        return Err(Error::msg(format!(
+            "--create-vhdx: '{}' already exists",
+            args[2]
+        )));
+    }
     winsys::host::vhdx::create(&args[2], size)
         .map_err(|err| Error::msg(format!("--create-vhdx: '{}' failed: err={err}", args[2])))?;
     println!(

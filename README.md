@@ -276,7 +276,7 @@ The first argument selects a **mode** (`main.rs:3500`):
 | `--smoke` | Probe WHP; create a throwaway partition + 16 MiB RAM + 1 vCPU and run to `HLT`. |
 | `--pci-selftest` | Host-side PCI host-bridge + BAR-sizing self-test (no guest). |
 | `--blk-selftest` | Host-side virtio-blk DISCARD/WRITE_ZEROES self-test (no guest). |
-| `--create-vhdx <path.vhdx> <size-mb>` | Create a new dynamic VHDX; size is in MiB. Refuses existing files. No elevation required. |
+| `--create-vhdx <path.vhdx> <size-mb>` | Create a new dynamic VHDX; size is in MiB (at least 3). Refuses existing files. No elevation required. |
 | `--pvh-info <vmlinux\|bzImage>` | Parse and print a kernel's PVH ELF-Note entry point, or a bzImage's boot protocol header. |
 | `--pvh-run [flags] <kernel> [-- <cmdline>]` | Boot a microVM (the main mode). The kernel is a PVH ELF `vmlinux` or a `bzImage`, detected by content. |
 | `--pvh-run --iso <image> [flags] [-- <args>]` | Boot a distribution's live/install ISO (see `--iso` below). |
@@ -361,8 +361,10 @@ mount, drive letter, or elevation. Payload reads/writes use the existing
 overlapped IOCP path with Windows managing allocation, metadata, and recovery.
 Disks use 512-byte logical sectors; native 4 KiB-logical-sector VHDX images are
 rejected rather than exposed with incorrect geometry. DISCARD uses SCSI UNMAP
-when supported (otherwise it is ignored); WRITE_ZEROES uses UNMAP only when
-the driver guarantees zero reads, otherwise explicit zero writes.
+when supported (otherwise it is ignored). WRITE_ZEROES is an ordinary
+asynchronous write of zeros, which VHDMP stores without allocating blocks that
+are still unallocated. It can't use UNMAP: that is only advisory, and VHDMP
+reports success for ranges that aren't 4 KiB aligned but leaves them mapped.
 Close the VM before mounting its VHDX in WSL for offline
 editing; flush, unmount, and detach it from WSL before booting the VM again.
 
@@ -444,10 +446,15 @@ order they are created — that order is fixed (it is also the snapshot
   The fill is pure CPU, so it runs **inline on the vCPU thread** — no doorbell.
 * **virtio-blk** — VHDX-only disk backend: a VM-only VHDMP handle bound to a
   per-disk IOCP with one worker thread. READ / WRITE / FLUSH plus a RO feature
-  bit and native SCSI DISCARD / WRITE_ZEROES. VHDX payload I/O stays overlapped
-  and concurrent, with Windows managing its container. Installation ISOs use
-  a separate read-only byte-stream backend; lone ISO reads can use a second,
-  non-overlapped handle on the doorbell pump.
+  bit, DISCARD (SCSI UNMAP, inline) and WRITE_ZEROES (written from a shared
+  zero buffer like any WRITE). Windows completes overlapped I/O asynchronously
+  through a system worker and the IOCP even when the host page cache holds the
+  data, so a request the guest is waiting on alone (nothing else queued or in
+  flight) is instead finished on the doorbell pump: a VHDX request keeps its
+  completion off the IOCP and is waited for there, and installation ISOs (a
+  separate read-only byte-stream backend) use a second, non-overlapped handle.
+  Concurrent requests stay asynchronous, so a host cache miss never stalls the
+  others.
 * **virtio-input** — `--input` adds two devices (`src/virtio/input.rs`): a
   **keyboard** and an **absolute tablet** (pointer motion, buttons, scroll
   wheel). Two queues each (`eventq=0`, `statusq=1`); the host injects events with
@@ -1001,7 +1008,7 @@ NIC/display protocol, not to the guest-memory-access layer.
 | Workload | Result |
 |----------|--------|
 | virtio-blk single-stream read | ~533 MB/s (guest pipelines ~14 requests in flight) |
-| Historical virtio-blk QD1 4 KiB read (retired raw backend) | ~30 µs per request; rerun `tools\irq_bench.py` for the VHDX backend |
+| virtio-blk QD1 4 KiB read (`tools\irq_bench.py`, dynamic VHDX scratch disk) | ~28 µs per request (was ~67–88 µs before the synchronous lone-request path and pump polling) |
 | virtio-9p single-stream read, `cache=loose` / `cache=readahead` (`tools\p9_bench.py`, 512 MiB file) | ~1.7 / ~1.6 GB/s (~500 KB per Tread) |
 | virtio-9p single-stream read, `cache=none` | ~165 MB/s (4 KiB per Tread, latency-bound; was ~85 MB/s) |
 | virtio-9p 4 concurrent readers, `cache=none` / `cache=loose` | ~620 MB/s / ~3 GB/s |

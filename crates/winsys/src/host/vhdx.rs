@@ -30,10 +30,14 @@ fn storage_type() -> VIRTUAL_STORAGE_TYPE {
     }
 }
 
+/// The smallest virtual size VHDMP creates.
+pub const MIN_SIZE: u64 = 3 * 1024 * 1024;
+
 /// Create a dynamic VHDX with 2 MiB allocation blocks and 512-byte logical
-/// sectors. The destination must not exist. `size` is the virtual size in bytes.
+/// sectors. The destination must not exist. `size` is the virtual size in
+/// bytes, at least [`MIN_SIZE`].
 pub fn create(path: &str, size: u64) -> Result<(), u32> {
-    if path.contains('\0') || size == 0 || !size.is_multiple_of(512) {
+    if path.contains('\0') || size < MIN_SIZE || !size.is_multiple_of(512) {
         return Err(ERROR_INVALID_PARAMETER);
     }
     let parameters = CREATE_VIRTUAL_DISK_PARAMETERS {
@@ -76,7 +80,6 @@ pub(crate) struct VirtualDisk {
     handle: OwnedHandle,
     pub size: u64,
     unmap_sectors: u32,
-    unmap_zeroes: bool,
 }
 
 impl VirtualDisk {
@@ -146,12 +149,11 @@ impl VirtualDisk {
             handle,
             size: size.VirtualSize,
             unmap_sectors: 0,
-            unmap_zeroes: false,
         };
         if !readonly {
-            // Older VHDMP versions may not implement SCSI passthrough or UNMAP.
-            // Zero writes remain available without advertising false semantics.
-            (disk.unmap_sectors, disk.unmap_zeroes) = disk.query_unmap().unwrap_or((0, false));
+            // Older VHDMP versions may not implement SCSI passthrough or UNMAP;
+            // DISCARD is then ignored.
+            disk.unmap_sectors = disk.query_unmap().unwrap_or(0);
         }
         Ok(disk)
     }
@@ -216,29 +218,29 @@ impl VirtualDisk {
             .ok_or(ERROR_INVALID_DATA)
     }
 
-    fn query_unmap(&self) -> Result<(u32, bool), u32> {
+    /// The most sectors one UNMAP may cover, or 0 without UNMAP support.
+    fn query_unmap(&self) -> Result<u32, u32> {
         let mut buffer = [0; 255];
         let pages = self.vpd(0, &mut buffer)?;
         if !pages.contains(&0xb2) || !pages.contains(&0xb0) {
-            return Ok((0, false));
+            return Ok(0);
         }
         let provisioning = self.vpd(0xb2, &mut buffer)?;
-        let flags = *provisioning.get(1).ok_or(ERROR_INVALID_DATA)?;
-        if flags & 0x80 == 0 {
-            return Ok((0, false));
+        if provisioning.get(1).ok_or(ERROR_INVALID_DATA)? & 0x80 == 0 {
+            return Ok(0);
         }
         let limits = self.vpd(0xb0, &mut buffer)?;
         let max_sectors = limits.get(16..20).ok_or(ERROR_INVALID_DATA)?;
         let max_descriptors = limits.get(20..24).ok_or(ERROR_INVALID_DATA)?;
         if u32::from_be_bytes(max_descriptors.try_into().unwrap()) == 0 {
-            return Ok((0, false));
+            return Ok(0);
         }
-        Ok((
-            u32::from_be_bytes(max_sectors.try_into().unwrap()),
-            flags & 4 != 0,
-        ))
+        Ok(u32::from_be_bytes(max_sectors.try_into().unwrap()))
     }
 
+    /// Unmap a byte range. UNMAP is advisory: VHDMP reports success for parts
+    /// it leaves mapped (anything not 4 KiB aligned), so discarded sectors are
+    /// never promised to read back as zero.
     pub fn discard_range(&self, offset: u64, length: u64) -> bool {
         if !offset.is_multiple_of(512) || !length.is_multiple_of(512) {
             return false;
@@ -264,34 +266,6 @@ impl VirtualDisk {
         // DISCARD may be ignored when the driver does not support UNMAP.
         true
     }
-
-    pub fn zero_range(&self, offset: u64, length: u64) -> bool {
-        if !offset.is_multiple_of(512) || !length.is_multiple_of(512) {
-            return false;
-        }
-        if self.unmap_sectors != 0 && self.unmap_zeroes {
-            return self.discard_range(offset, length);
-        }
-        let mut sector = offset / 512;
-        let mut sectors = length / 512;
-        // WRITE(16) is synchronous and cannot enqueue a stray IOCP packet.
-        // This is the cold fallback when UNMAP cannot guarantee zero reads.
-        let mut zeros = [0; 64 * 1024];
-        while sectors != 0 {
-            let count = sectors.min((zeros.len() / 512) as u64) as u32;
-            let mut cdb = [0; 16];
-            cdb[0] = 0x8a;
-            cdb[2..10].copy_from_slice(&sector.to_be_bytes());
-            cdb[10..14].copy_from_slice(&count.to_be_bytes());
-            let bytes = count as usize * 512;
-            if self.command(&mut cdb, &mut zeros[..bytes], false) != Ok(bytes) {
-                return false;
-            }
-            sector += count as u64;
-            sectors -= count as u64;
-        }
-        true
-    }
 }
 
 #[cfg(test)]
@@ -299,16 +273,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_vhdx_scsi_status_and_zero_write_fallback() {
+    fn native_vhdx_scsi_passthrough() {
         let path = std::env::temp_dir().join(format!(
-            "tinyvmm-vhdx-fallback-{}-{}.vhdx",
+            "tinyvmm-vhdx-scsi-{}-{}.vhdx",
             std::process::id(),
             unique_guid().unwrap().data1
         ));
         let path_str = path.to_str().unwrap();
         create(path_str, 64 * 1024 * 1024).unwrap();
         {
-            let mut disk = VirtualDisk::open(path_str, false).unwrap();
+            let disk = VirtualDisk::open(path_str, false).unwrap();
             // A CHECK CONDITION must not be mistaken for transport success.
             assert!(disk.vpd(0xff, &mut [0; 255]).is_err());
             let mut bytes = [0x5a; 1024];
@@ -316,13 +290,11 @@ mod tests {
             write[0] = 0x8a;
             write[10..14].copy_from_slice(&2u32.to_be_bytes());
             assert_eq!(disk.command(&mut write, &mut bytes, false), Ok(1024));
-            disk.unmap_zeroes = false;
-            assert!(disk.zero_range(512, 512));
             let mut read = write;
             read[0] = 0x88;
-            assert_eq!(disk.command(&mut read, &mut bytes, true), Ok(1024));
-            assert_eq!(&bytes[..512], &[0x5a; 512]);
-            assert_eq!(&bytes[512..], &[0; 512]);
+            let mut back = [0; 1024];
+            assert_eq!(disk.command(&mut read, &mut back, true), Ok(1024));
+            assert_eq!(back, bytes);
         }
         std::fs::remove_file(path).unwrap();
     }
