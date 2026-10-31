@@ -16,38 +16,32 @@
 //! guarantee. The OS cache is fine at our scale; a FLUSH op forces
 //! `FlushFileBuffers` on the worker thread.
 //!
-//! This is the core read/write/flush backend; DISCARD / WRITE_ZEROES
-//! (`ZeroRange`) are not ported here.
+//! Disks use VHDMP's VM-only VHDX handle. The separate read-only ISO
+//! constructor exposes installation media as bytes, never as a writable disk.
+//! DISCARD / WRITE_ZEROES use native SCSI UNMAP or zero writes.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
-    INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_IO_PENDING, GENERIC_READ, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, FlushFileBuffers,
-    GetFileSizeEx, OPEN_EXISTING, ReadFile, SetFileCompletionNotificationModes, WriteFile,
+    CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FlushFileBuffers, GetFileSizeEx,
+    OPEN_EXISTING, ReadFile, SetFileCompletionNotificationModes, WriteFile,
 };
 use windows_sys::Win32::System::IO::{
-    CreateIoCompletionPort, DeviceIoControl, GetQueuedCompletionStatus, OVERLAPPED,
-    PostQueuedCompletionStatus,
-};
-use windows_sys::Win32::System::Ioctl::{
-    FILE_SET_SPARSE_BUFFER, FILE_ZERO_DATA_INFORMATION, FSCTL_SET_SPARSE, FSCTL_SET_ZERO_DATA,
+    CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED, PostQueuedCompletionStatus,
 };
 
+use super::vhdx::VirtualDisk;
 use super::wide;
 
 const INFINITE: u32 = 0xFFFF_FFFF;
 const SHUTDOWN_KEY: usize = 0x1;
 const FLUSH_KEY: usize = 0x2;
 // SetFileCompletionNotificationModes flag (WindowsProgramming in windows-sys).
-// FILE_SKIP_SET_EVENT_ON_HANDLE must NOT be added: `zero_range` issues its
-// FSCTLs without an OVERLAPPED, and kernel32 waits on the file handle itself
-// for one that pends.
 const FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: u8 = 1;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -89,7 +83,8 @@ type CompleteFn = Box<dyn Fn(*mut Request) + Send + Sync>;
 
 struct Inner {
     handle: HANDLE,
-    /// A second, non-overlapped handle to the same file for `submit_sync`:
+    virtual_disk: Option<VirtualDisk>,
+    /// A second, non-overlapped handle to the ISO for `submit_sync`:
     /// Windows completes even page-cache hits on the overlapped handle
     /// asynchronously, through a system worker and the IOCP. Null if the
     /// second open failed; `submit_sync` then falls back to `submit`.
@@ -107,10 +102,6 @@ struct Inner {
     errors: AtomicU64,
     inflight: AtomicU64,
     max_inflight: AtomicU64,
-    // DISCARD / WRITE_ZEROES support: mark the file sparse on first ZeroRange
-    // so FSCTL_SET_ZERO_DATA deallocates clusters (not just logical zero).
-    sparse_once: Once,
-    sparse_ok: AtomicBool,
 }
 
 // The handles are valid for the whole lifetime of the (Arc-shared) Inner; the
@@ -128,7 +119,10 @@ impl Drop for Inner {
             if !self.sync_handle.is_null() {
                 CloseHandle(self.sync_handle);
             }
-            if self.handle != INVALID_HANDLE_VALUE && !self.handle.is_null() {
+            if self.virtual_disk.is_none()
+                && self.handle != INVALID_HANDLE_VALUE
+                && !self.handle.is_null()
+            {
                 CloseHandle(self.handle);
             }
         }
@@ -142,12 +136,23 @@ pub struct BlockFile {
 }
 
 impl BlockFile {
-    /// Open `path` (must already exist). On failure `open()` returns false and
+    /// Open an existing VHDX (regardless of filename extension).
+    /// On failure `open()` returns false and
     /// `open_err()` carries the Win32 error.
     pub fn new(path: &str, readonly: bool) -> BlockFile {
+        Self::new_impl(path, readonly, false)
+    }
+
+    /// Open installation ISO bytes read-only. This does not enable raw disks.
+    pub fn new_iso(path: &str) -> BlockFile {
+        Self::new_impl(path, true, true)
+    }
+
+    fn new_impl(path: &str, readonly: bool, iso: bool) -> BlockFile {
         let closed = |err: u32| BlockFile {
             inner: Arc::new(Inner {
                 handle: INVALID_HANDLE_VALUE,
+                virtual_disk: None,
                 sync_handle: core::ptr::null_mut(),
                 iocp: core::ptr::null_mut(),
                 readonly,
@@ -159,40 +164,42 @@ impl BlockFile {
                 errors: AtomicU64::new(0),
                 inflight: AtomicU64::new(0),
                 max_inflight: AtomicU64::new(0),
-                sparse_once: Once::new(),
-                sparse_ok: AtomicBool::new(false),
             }),
             worker: Mutex::new(None),
             open_err: err,
         };
 
         let wpath = wide(path);
-        let access = if readonly {
-            GENERIC_READ
+        let virtual_disk = if !iso {
+            match VirtualDisk::open(path, readonly) {
+                Ok(disk) => Some(disk),
+                Err(err) => return closed(err),
+            }
         } else {
-            GENERIC_READ | GENERIC_WRITE
+            None
         };
-        let share = if readonly {
-            FILE_SHARE_READ
+        let handle = if let Some(disk) = &virtual_disk {
+            disk.handle()
         } else {
-            FILE_SHARE_READ | FILE_SHARE_WRITE
-        };
-        let handle = unsafe {
-            CreateFileW(
-                wpath.as_ptr(),
-                access,
-                share,
-                core::ptr::null(),
-                OPEN_EXISTING,
-                FILE_FLAG_OVERLAPPED,
-                core::ptr::null_mut(),
-            )
+            unsafe {
+                CreateFileW(
+                    wpath.as_ptr(),
+                    GENERIC_READ,
+                    FILE_SHARE_READ,
+                    core::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_OVERLAPPED,
+                    core::ptr::null_mut(),
+                )
+            }
         };
         if handle == INVALID_HANDLE_VALUE {
             return closed(unsafe { GetLastError() });
         }
         let mut li: i64 = 0;
-        if unsafe { GetFileSizeEx(handle, &mut li) } == 0 {
+        if let Some(disk) = &virtual_disk {
+            li = disk.size as i64;
+        } else if unsafe { GetFileSizeEx(handle, &mut li) } == 0 {
             let err = unsafe { GetLastError() };
             unsafe { CloseHandle(handle) };
             return closed(err);
@@ -200,22 +207,28 @@ impl BlockFile {
         let iocp = unsafe { CreateIoCompletionPort(handle, core::ptr::null_mut(), 0, 1) };
         if iocp.is_null() {
             let err = unsafe { GetLastError() };
-            unsafe { CloseHandle(handle) };
+            if virtual_disk.is_none() {
+                unsafe { CloseHandle(handle) };
+            }
             return closed(err);
         }
         let skip_on_success = unsafe {
             SetFileCompletionNotificationModes(handle, FILE_SKIP_COMPLETION_PORT_ON_SUCCESS)
         } != 0;
-        let sync_handle = unsafe {
-            CreateFileW(
-                wpath.as_ptr(),
-                access,
-                share,
-                core::ptr::null(),
-                OPEN_EXISTING,
-                0,
-                core::ptr::null_mut(),
-            )
+        let sync_handle = if virtual_disk.is_some() {
+            core::ptr::null_mut()
+        } else {
+            unsafe {
+                CreateFileW(
+                    wpath.as_ptr(),
+                    GENERIC_READ,
+                    FILE_SHARE_READ,
+                    core::ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    core::ptr::null_mut(),
+                )
+            }
         };
         let sync_handle = if sync_handle == INVALID_HANDLE_VALUE {
             core::ptr::null_mut()
@@ -225,6 +238,7 @@ impl BlockFile {
         BlockFile {
             inner: Arc::new(Inner {
                 handle,
+                virtual_disk,
                 sync_handle,
                 iocp,
                 readonly,
@@ -236,8 +250,6 @@ impl BlockFile {
                 errors: AtomicU64::new(0),
                 inflight: AtomicU64::new(0),
                 max_inflight: AtomicU64::new(0),
-                sparse_once: Once::new(),
-                sparse_ok: AtomicBool::new(false),
             }),
             worker: Mutex::new(None),
             open_err: 0,
@@ -278,10 +290,22 @@ impl BlockFile {
         let _ = self.inner.complete.set(f);
     }
 
-    /// Synchronously zero (and, on a sparse NTFS file, deallocate) a byte range.
-    /// Backs virtio-blk DISCARD / WRITE_ZEROES. On first call marks the file
-    /// sparse via `FSCTL_SET_SPARSE`; then issues `FSCTL_SET_ZERO_DATA`. Returns
-    /// false on a read-only file or on failure. Thread-safe.
+    /// Discard guest sectors, without promising that subsequent reads are zero.
+    /// Uses SCSI UNMAP when supported.
+    pub fn discard_range(&self, offset: u64, length: u64) -> bool {
+        if let Some(disk) = &self.inner.virtual_disk {
+            if self.inner.readonly || offset > self.inner.size || length > self.inner.size - offset
+            {
+                return false;
+            }
+            disk.discard_range(offset, length)
+        } else {
+            false
+        }
+    }
+
+    /// Synchronously zero a byte range, reclaiming storage when safe.
+    /// Uses UNMAP only with zero-read guarantees, otherwise explicit zero writes.
     pub fn zero_range(&self, offset: u64, length: u64) -> bool {
         let inner = &self.inner;
         if inner.readonly || !self.open() {
@@ -293,45 +317,10 @@ impl BlockFile {
         if offset > inner.size || length > inner.size - offset {
             return false;
         }
-        // Mark sparse once so SET_ZERO_DATA deallocates clusters. On a non-NTFS
-        // volume SET_SPARSE fails (ERROR_INVALID_FUNCTION); treat as soft —
-        // SET_ZERO_DATA still zeroes the bytes, it just won't deallocate.
-        inner.sparse_once.call_once(|| {
-            let sb = FILE_SET_SPARSE_BUFFER { SetSparse: true };
-            let mut ret: u32 = 0;
-            let ok = unsafe {
-                DeviceIoControl(
-                    inner.handle,
-                    FSCTL_SET_SPARSE,
-                    &sb as *const _ as *const core::ffi::c_void,
-                    core::mem::size_of::<FILE_SET_SPARSE_BUFFER>() as u32,
-                    core::ptr::null_mut(),
-                    0,
-                    &mut ret,
-                    core::ptr::null_mut(),
-                )
-            };
-            inner.sparse_ok.store(ok != 0, Ordering::Release);
-        });
-
-        let zd = FILE_ZERO_DATA_INFORMATION {
-            FileOffset: offset as i64,
-            BeyondFinalZero: (offset + length) as i64,
-        };
-        let mut ret: u32 = 0;
-        let ok = unsafe {
-            DeviceIoControl(
-                inner.handle,
-                FSCTL_SET_ZERO_DATA,
-                &zd as *const _ as *const core::ffi::c_void,
-                core::mem::size_of::<FILE_ZERO_DATA_INFORMATION>() as u32,
-                core::ptr::null_mut(),
-                0,
-                &mut ret,
-                core::ptr::null_mut(),
-            )
-        };
-        ok != 0
+        if let Some(disk) = &inner.virtual_disk {
+            return disk.zero_range(offset, length);
+        }
+        false
     }
 
     /// Spin up the IOCP worker. Must be called before `submit`.
@@ -535,5 +524,173 @@ fn worker_loop(inner: Arc<Inner>) {
             };
             finish(&inner, req, ok);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct TestImage(std::path::PathBuf);
+
+    impl TestImage {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            Self(std::env::temp_dir().join(format!(
+                "tinyvmm-vhdx-{}-{}.vhdx",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            )))
+        }
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+
+    impl Drop for TestImage {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn completion(backend: &BlockFile) -> mpsc::Receiver<(usize, bool)> {
+        let (tx, rx) = mpsc::channel();
+        backend.set_completion_callback(Box::new(move |request| {
+            // The submit contract keeps the request alive until this callback.
+            tx.send((request as usize, unsafe { (*request).ok }))
+                .unwrap();
+        }));
+        backend.start();
+        rx
+    }
+
+    fn transfer(
+        backend: &BlockFile,
+        rx: &mpsc::Receiver<(usize, bool)>,
+        op: Op,
+        offset: u64,
+        data: &mut [u8],
+    ) {
+        let mut request = Request::zeroed();
+        request.op = op;
+        request.file_offset = offset;
+        request.buf = data.as_mut_ptr();
+        request.bytes = data.len() as u32;
+        assert!(unsafe { backend.submit_sync(&mut request) });
+        let (address, ok) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(address, &request as *const _ as usize);
+        assert!(ok);
+    }
+
+    #[test]
+    fn native_vhdx_io_lifecycle() {
+        let image = TestImage::new();
+        let size = 64 * 1024 * 1024;
+        super::super::vhdx::create(image.path(), size).unwrap();
+        assert!(std::fs::metadata(&image.0).unwrap().len() < size);
+        assert!(super::super::vhdx::create(image.path(), size).is_err());
+        {
+            let backend = BlockFile::new(image.path(), false);
+            assert!(backend.open(), "error {}", backend.open_err());
+            assert_eq!(backend.size(), size);
+            assert!(!BlockFile::new(image.path(), false).open());
+            let rx = completion(&backend);
+            let mut slots: Vec<_> = (0..16)
+                .map(|i| {
+                    let mut bytes = vec![i as u8 + 1; 4096].into_boxed_slice();
+                    let mut request = Box::new(Request::zeroed());
+                    request.op = Op::Write;
+                    // The first request crosses a 2 MiB allocation boundary.
+                    request.file_offset = 2 * 1024 * 1024 - 512 + i * 4096;
+                    request.buf = bytes.as_mut_ptr();
+                    request.bytes = bytes.len() as u32;
+                    (request, bytes)
+                })
+                .collect();
+            for (request, _) in &mut slots {
+                assert!(unsafe { backend.submit(&mut **request) });
+            }
+            let mut completed = std::collections::HashSet::new();
+            for _ in &slots {
+                let (address, ok) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                assert!(ok);
+                assert!(completed.insert(address));
+            }
+            for (request, _) in &slots {
+                assert!(completed.contains(&(&**request as *const _ as usize)));
+            }
+            transfer(&backend, &rx, Op::Flush, 0, &mut []);
+            assert_eq!(backend.inflight(), 0);
+            assert!(!backend.zero_range(size - 512, 1024));
+            assert!(!backend.zero_range(1, 512));
+            assert!(!backend.discard_range(size - 512, 1024));
+            assert!(!backend.discard_range(1, 512));
+            transfer(&backend, &rx, Op::Write, 4 * 1024 * 1024, &mut [0x5a; 4096]);
+            assert!(backend.discard_range(4 * 1024 * 1024, 2 * 1024 * 1024));
+            assert!(backend.zero_range(2 * 1024 * 1024, 512));
+            transfer(&backend, &rx, Op::Flush, 0, &mut []);
+        }
+        {
+            let backend = BlockFile::new(image.path(), true);
+            assert!(backend.open(), "error {}", backend.open_err());
+            let rx = completion(&backend);
+            let mut data = vec![0; 4096];
+            transfer(&backend, &rx, Op::Read, 2 * 1024 * 1024 - 512, &mut data);
+            assert_eq!(&data[..512], &[1; 512]);
+            assert_eq!(&data[512..1024], &[0; 512]);
+            assert_eq!(&data[1024..], &[1; 3072]);
+            transfer(&backend, &rx, Op::Read, 8 * 1024 * 1024, &mut data);
+            assert_eq!(data, vec![0; 4096]);
+            assert!(!backend.zero_range(0, 512));
+            assert!(!backend.discard_range(0, 512));
+            let mut request = Request::zeroed();
+            request.op = Op::Write;
+            request.buf = data.as_mut_ptr();
+            request.bytes = data.len() as u32;
+            assert!(!unsafe { backend.submit(&mut request) });
+            assert_eq!(backend.inflight(), 0);
+        }
+        // All virtual handles must be closed before the image can be reopened
+        // for writing or deleted (attachment lifetime follows those handles).
+        assert!(BlockFile::new(image.path(), false).open());
+        std::fs::remove_file(&image.0).unwrap();
+    }
+
+    #[test]
+    fn native_vhdx_rejects_invalid_container() {
+        let image = TestImage::new();
+        for extension in ["vhdx", "img", "iso"] {
+            let path = image.0.with_extension(extension);
+            std::fs::write(&path, [0; 4096]).unwrap();
+            for readonly in [false, true] {
+                let backend = BlockFile::new(path.to_str().unwrap(), readonly);
+                assert!(!backend.open());
+                assert_ne!(backend.open_err(), 0);
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), vec![0; 4096]);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn installation_iso_is_explicit_and_read_only() {
+        let image = TestImage::new();
+        std::fs::write(&image.0, [0x42; 4096]).unwrap();
+        let backend = BlockFile::new_iso(image.path());
+        assert!(backend.open());
+        assert!(backend.readonly());
+        let rx = completion(&backend);
+        let mut data = [0; 4096];
+        transfer(&backend, &rx, Op::Read, 0, &mut data);
+        assert_eq!(data, [0x42; 4096]);
+        assert!(!backend.zero_range(0, 512));
+        assert!(!backend.discard_range(0, 512));
+        let mut request = Request::zeroed();
+        request.op = Op::Write;
+        request.buf = data.as_mut_ptr();
+        request.bytes = data.len() as u32;
+        assert!(!unsafe { backend.submit(&mut request) });
     }
 }

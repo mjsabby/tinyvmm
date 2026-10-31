@@ -11,7 +11,7 @@ initramfs mode, captures the guest log, and asserts:
      writer phase actually reached parallel queue depth at the device).
   3. The host backing file for the writable drive contains the
      ``TINYVMM_BLK_TEST_MARKER_v1`` sentinel that Phase E wrote into a
-     mounted ext2 fs. Finding the literal bytes in the raw file proves
+     mounted ext2 fs. Finding the literal bytes in the image proves
      the data made it past the guest page cache *and* the host page
      cache to the actual backing file before VM shutdown.
 
@@ -35,6 +35,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from vhdx import make_vhdx
 
 
 REPO = Path(__file__).resolve().parent.parent
@@ -42,82 +43,10 @@ DEFAULT_TINYVMM = REPO / "target" / "release" / "tinyvmm.exe"
 DEFAULT_VMLINUX = REPO / "vmlinux"
 DEFAULT_INITRD = REPO / "initramfs-blk.cpio.gz"
 
-VDB_SIZE_BYTES = 256 * 1024 * 1024   # writable target: 256 MiB sparse
-VDC_SIZE_BYTES = 1 * 1024 * 1024     # readonly target: 1 MiB fixed-content
+VDB_SIZE_BYTES = 256 * 1024 * 1024   # writable target: 256 MiB dynamic VHDX
+VDC_SIZE_BYTES = 4 * 1024 * 1024     # readonly target: 4 MiB prefilled VHDX
 
 MARKER = b"TINYVMM_BLK_TEST_MARKER_v1"
-
-
-# ---------------------------------------------------------------------------
-# Sparse file creation (Windows-specific; same gotcha as ubuntu_iso_boot)
-# ---------------------------------------------------------------------------
-def _set_eof(path: Path, size_bytes: int) -> None:
-    """Move EOF without writing data (so NTFS leaves the extension sparse).
-
-    Python's ``file.truncate`` on Windows calls MSVCRT ``_chsize_s``
-    which writes zeros across the extension and defeats the sparse
-    flag. Call ``SetEndOfFile`` directly.
-    """
-    import ctypes
-    from ctypes import wintypes
-
-    GENERIC_WRITE = 0x40000000
-    FILE_SHARE_READ = 0x00000001
-    OPEN_EXISTING = 3
-    FILE_BEGIN = 0
-    INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
-
-    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    k32.CreateFileW.restype = wintypes.HANDLE
-    k32.CreateFileW.argtypes = [
-        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
-    ]
-    k32.SetFilePointerEx.restype = wintypes.BOOL
-    k32.SetFilePointerEx.argtypes = [
-        wintypes.HANDLE, ctypes.c_longlong,
-        ctypes.POINTER(ctypes.c_longlong), wintypes.DWORD,
-    ]
-    k32.SetEndOfFile.restype = wintypes.BOOL
-    k32.SetEndOfFile.argtypes = [wintypes.HANDLE]
-    k32.CloseHandle.restype = wintypes.BOOL
-    k32.CloseHandle.argtypes = [wintypes.HANDLE]
-
-    h = k32.CreateFileW(str(path), GENERIC_WRITE, FILE_SHARE_READ, None,
-                        OPEN_EXISTING, 0, None)
-    if h == INVALID_HANDLE_VALUE or h == 0:
-        err = ctypes.get_last_error()
-        raise OSError(err, f"CreateFileW({path}) failed", str(path))
-    try:
-        if not k32.SetFilePointerEx(h, size_bytes, None, FILE_BEGIN):
-            err = ctypes.get_last_error()
-            raise OSError(err, f"SetFilePointerEx({size_bytes}) failed")
-        if not k32.SetEndOfFile(h):
-            err = ctypes.get_last_error()
-            raise OSError(err, "SetEndOfFile failed")
-    finally:
-        k32.CloseHandle(h)
-
-
-def make_sparse(path: Path, size_bytes: int) -> None:
-    if path.exists():
-        path.unlink()
-    with open(path, "wb"):
-        pass
-    # Set sparse flag BEFORE the extend; otherwise NTFS already
-    # committed clusters for the file's range.
-    subprocess.run(["fsutil.exe", "sparse", "setflag", str(path)],
-                   check=True, stdout=subprocess.DEVNULL,
-                   stderr=subprocess.DEVNULL)
-    _set_eof(path, size_bytes)
-
-
-def make_fixed(path: Path, size_bytes: int, fill: int) -> None:
-    if path.exists():
-        path.unlink()
-    # 1 MiB is small enough to write directly.
-    payload = bytes([fill & 0xFF]) * size_bytes
-    path.write_bytes(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +163,7 @@ def assert_max_depth(log: str, disk_index: int = 0) -> int:
 
 
 def assert_marker_in_file(vdb_path: Path) -> None:
-    """Scan the raw vdb file for the marker Phase E wrote inside ext2.
+    """Scan the vdb image for the marker Phase E wrote inside ext2.
 
     Finding the literal bytes proves Phase E's mkfs+mount+write+sync
     actually flushed to the host backing file, past *both* guest and
@@ -263,7 +192,7 @@ def assert_marker_in_file(vdb_path: Path) -> None:
             offset += len(chunk)
     if not found:
         raise SystemExit(
-            "[blk-test] FAIL: marker not found in raw vdb image; "
+            "[blk-test] FAIL: marker not found in VHDX image; "
             "Phase E flush/barrier did not persist to host file")
 
 
@@ -291,14 +220,14 @@ def main() -> int:
     if args.workdir is None:
         args.workdir = Path(tempfile.gettempdir()) / "tinyvmm-blk-test"
     args.workdir.mkdir(parents=True, exist_ok=True)
-    vdb = args.workdir / "blk-test-vdb.img"
-    vdc = args.workdir / "blk-test-vdc.img"
+    vdb = args.workdir / "blk-test-vdb.vhdx"
+    vdc = args.workdir / "blk-test-vdc.vhdx"
 
     print(f"[blk-test] workdir: {args.workdir}")
-    print(f"[blk-test] vdb: {vdb} ({VDB_SIZE_BYTES // (1024*1024)} MiB sparse)")
-    make_sparse(vdb, VDB_SIZE_BYTES)
+    print(f"[blk-test] vdb: {vdb} ({VDB_SIZE_BYTES // (1024*1024)} MiB dynamic VHDX)")
+    make_vhdx(vdb, VDB_SIZE_BYTES, args.tinyvmm)
     print(f"[blk-test] vdc: {vdc} ({VDC_SIZE_BYTES // 1024} KiB filled 0x42)")
-    make_fixed(vdc, VDC_SIZE_BYTES, 0x42)
+    make_vhdx(vdc, VDC_SIZE_BYTES, args.tinyvmm, fill=0x42)
 
     argv = [
         str(args.tinyvmm),

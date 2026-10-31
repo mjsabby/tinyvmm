@@ -34,7 +34,7 @@ import tempfile
 from pathlib import Path
 
 import vmm_harness as vh
-from blk_test import make_sparse
+from vhdx import make_vhdx
 
 SCRATCH_BYTES = 64 * 1024 * 1024
 KERNEL_HZ = {100, 250, 300, 1000}
@@ -108,12 +108,12 @@ def main() -> int:
     clock_hz = vh.whp_interrupt_clock_hz()
     workdir = Path(tempfile.gettempdir()) / "tinyvmm-irq-test"
     workdir.mkdir(parents=True, exist_ok=True)
-    scratch = workdir / "irq-scratch.img"
+    scratch = workdir / "irq-scratch.vhdx"
 
     failed = False
     for n in [int(x) for x in args.vcpus.split(",") if x.strip()]:
         print(f"\n========== irq test: --vcpus {n} ==========")
-        make_sparse(scratch, SCRATCH_BYTES)
+        make_vhdx(scratch, SCRATCH_BYTES, args.tinyvmm)
         argv = [str(args.tinyvmm), "--pvh-run", "--vcpus", str(n), "--ram-mb", "256",
                 *args.extra_arg,
                 "--drive", str(scratch), "--initrd", str(args.initrd), str(args.vmlinux),

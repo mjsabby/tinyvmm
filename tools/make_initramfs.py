@@ -1776,7 +1776,7 @@ if grep -q 'tinyvmm.test=blk' /proc/cmdline 2>/dev/null; then
     # ---- Phase E: ext2 mkfs + mount + flush + remount + verify ----
     # Tests filesystem-level flush/barrier: any data we wrote then
     # synced must survive an umount + remount cycle. The host harness
-    # additionally verifies the marker.txt content in the raw disk
+    # additionally verifies the marker.txt content in the VHDX
     # image after VM exit (proves data made it past the host page cache
     # to the BlockFile backing file).
     log "+ phase E: ext2 mkfs + flush + remount round-trip"
@@ -1788,7 +1788,7 @@ if grep -q 'tinyvmm.test=blk' /proc/cmdline 2>/dev/null; then
             fail E "mount: $(cat /tmp/E.err | head -1)"
         else
             # Marker is a fixed sentinel the host harness can grep for in
-            # the raw disk image (proves data hit the host file, not just
+            # the VHDX image (proves data hit the host file, not just
             # the guest cache).
             echo 'TINYVMM_BLK_TEST_MARKER_v1' > /mnt/E/marker.txt
             dd if=/dev/urandom of=/mnt/E/payload.bin bs=1M count=4 \

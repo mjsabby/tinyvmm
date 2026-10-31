@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A/B micro-benchmark of tinyvmm's interrupt paths (needs WHP; nested is fine).
 
-Boots the `tinyvmm.test=bench-irq` initramfs mode (2 vCPUs + a sparse scratch
+Boots the `tinyvmm.test=bench-irq` initramfs mode (2 vCPUs + a dynamic VHDX scratch
 disk) once per build per round, interleaving the builds round-robin so host
 noise lands on each alike, and prints the median (min..max) of:
 
@@ -29,7 +29,7 @@ import tempfile
 from pathlib import Path
 
 import vmm_harness as vh
-from blk_test import make_sparse
+from vhdx import make_vhdx
 
 SCRATCH_BYTES = 64 * 1024 * 1024
 IDLE = ("IRQBENCH idle begin", "IRQBENCH idle end")
@@ -47,7 +47,7 @@ METRICS = [
 
 
 def one_run(exe: str, args: argparse.Namespace, scratch: Path) -> dict[str, float]:
-    make_sparse(scratch, SCRATCH_BYTES)
+    make_vhdx(scratch, SCRATCH_BYTES, exe)
     argv = [exe, "--pvh-run", "--vcpus", str(args.vcpus), "--ram-mb", "256",
             "--drive", str(scratch), "--initrd", str(args.initrd), str(args.vmlinux),
             "--", "tinyvmm.test=bench-irq", *vh.GUEST_CMDLINE]
@@ -100,7 +100,7 @@ def main() -> int:
     if not args.no_build:
         vh.build_initramfs(args.busybox, args.initrd)
 
-    scratch = Path(tempfile.gettempdir()) / "tinyvmm-irq-bench.img"
+    scratch = Path(tempfile.gettempdir()) / "tinyvmm-irq-bench.vhdx"
     results: dict[str, list[dict[str, float]]] = {label: [] for label, _ in builds}
     for rnd in range(1, args.rounds + 1):
         for label, path in builds:

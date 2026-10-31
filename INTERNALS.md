@@ -623,14 +623,13 @@ done. Build them in this order:
   the vCPU thread** — no worker, no doorbell.
 - **virtio-blk** (`src/virtio/blk.rs`, id 2) — the first *async* device, and the
   template for the rest. A request is `header + data segments + status byte`. The
-  backend (`crates/winsys/src/host/block_file.rs`) opens the file
-  `FILE_FLAG_OVERLAPPED`, bound to a per-disk **IOCP** with a worker thread, and
+  backend (`crates/winsys/src/host/block_file.rs`) opens a VM-only VHDX handle
+  through VHDMP, bound to a per-disk **IOCP** with a worker thread, and
   overlaps `ReadFile`/`WriteFile` **directly into/out of guest RAM**. On
   completion the worker pushes the used element and raises the MSI-X vector.
-  Windows completes overlapped reads through a system worker and the IOCP even
-  on a page-cache hit, so a lone request (queue depth 1) is instead done
-  synchronously on the pump through a second, non-overlapped handle
-  (`BlockFile::submit_sync`).
+  VHDX requests remain overlapped. Installation ISO media has a separate
+  read-only byte-stream backend; only lone ISO reads use a second synchronous
+  handle (`BlockFile::submit_sync`). Raw disk compatibility is not provided.
 - **virtio-net** (`src/virtio/net.rs`, id 1) + a backend
   (`NetBackend`: loopback / user-mode NAT / wintun). The device negotiates
   checksum offload and TCPv4 segmentation offload (TSO4) in both directions plus

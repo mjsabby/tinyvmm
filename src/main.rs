@@ -130,6 +130,7 @@ impl NicSpec {
 struct DriveSpec {
     path: String,
     readonly: bool,
+    iso: bool,
 }
 
 #[derive(Clone)]
@@ -163,6 +164,7 @@ fn print_usage() {
          \x20 tinyvmm --smoke\n\
          \x20 tinyvmm --blk-selftest        host-side virtio-blk DISCARD/WRITE_ZEROES test\n\
          \x20 tinyvmm --blk-stress          host-side virtio-blk concurrency stress + failure-path test\n\
+         \x20 tinyvmm --create-vhdx <path.vhdx> <size-mb>   create a dynamic disk (no elevation)\n\
          \x20 tinyvmm --pci-selftest        host-side PCI host-bridge + BAR + sizing test\n\
          \x20 tinyvmm --pvh-info <vmlinux|bzImage>\n\
          \x20 tinyvmm --pvh-run [--initrd <cpio>] [--ram-mb N] [--vcpus N] [--rng] [--input] [--sound]\n\
@@ -329,9 +331,8 @@ fn run_smoke() -> Result<i32> {
 
 /// Host-side self-test of the virtio-blk DISCARD / WRITE_ZEROES path. Drives
 /// real requests straight through a `BlockDevice` + async `BlockFile` against a
-/// temp file (no guest kernel needed — these ops complete synchronously inside
-/// `notify_queue`). Verifies the targeted ranges are zeroed on the host file,
-/// untouched ranges are preserved, and the op counters advance. Mirrors the
+/// VHDX (no guest kernel needed). Verifies zeroing, successful discard,
+/// untouched ranges, and the operation counters. Mirrors the
 /// C++ `--virtio-blk-discard-test`.
 fn run_blk_selftest() -> Result<i32> {
     use crate::virtio::blk::BlockDevice;
@@ -357,11 +358,11 @@ fn run_blk_selftest() -> Result<i32> {
         false,
     )?);
 
-    // A 64 KiB temp file prefilled with 0xFF.
-    let path = std::env::temp_dir().join("tinyvmm_blk_selftest.img");
+    let path =
+        std::env::temp_dir().join(format!("tinyvmm_blk_selftest_{}.vhdx", std::process::id()));
     let path_str = path.to_string_lossy().to_string();
-    std::fs::write(&path, vec![0xFFu8; 64 * 1024])
-        .map_err(|e| Error::msg(format!("selftest: write temp file: {e}")))?;
+    winsys::host::vhdx::create(&path_str, 4 * 1024 * 1024)
+        .map_err(|err| Error::msg(format!("selftest: create VHDX: err={err}")))?;
 
     let backend = Arc::new(BlockFile::new(&path_str, false));
     if !backend.open() {
@@ -372,13 +373,13 @@ fn run_blk_selftest() -> Result<i32> {
         )));
     }
     backend.start();
-    let dev = BlockDevice::new(ram.clone(), backend.clone(), 64);
+    let dev = BlockDevice::new(ram.clone(), backend.clone(), 256);
 
     // Virtqueue layout in guest RAM (GPA base 0).
     let desc_gpa: u64 = 0x1_0000;
     let avail_gpa: u64 = 0x1_1000;
     let used_gpa: u64 = 0x1_2000;
-    const QSIZE: u16 = 16;
+    const QSIZE: u16 = 256;
 
     let put = |gpa: u64, bytes: &[u8]| ram.write_at(gpa, bytes).expect("selftest write_at");
     let write_desc = |i: u64, addr: u64, len: u32, flags: u16, next: u16| {
@@ -421,7 +422,7 @@ fn run_blk_selftest() -> Result<i32> {
         };
 
     // ---- READ/WRITE roundtrip through the parallel-submission path ----
-    // (descriptors 0..7, avail slots 0,1). WRITE a known multi-segment pattern to
+    // (descriptors 0..7, avail slots 1,2). WRITE a known multi-segment pattern to
     // sector 0, then READ it back into a fresh buffer and compare. This is the
     // only thing here that exercises submit_request / submit_seg / on_seg_complete
     // / finish_request (the DISCARD/WRITE_ZEROES path below does not). The
@@ -432,10 +433,6 @@ fn run_blk_selftest() -> Result<i32> {
     const SEG: u32 = 512; // one sector per data descriptor
     let wsrc = 0x8_0000u64; // write-source buffers (2 sectors)
     let rdst = 0x9_0000u64; // read-target buffers (2 sectors)
-    for k in 0..(2 * SEG as u64) {
-        put(wsrc + k, &[0x40 + (k % 64) as u8]);
-        put(rdst + k, &[0u8]);
-    }
     // Build header(d) + `segs` data descs + status, kick, and wait for the async
     // IOCP completion to write the status byte off its 0xAA sentinel.
     let issue_rw =
@@ -472,8 +469,14 @@ fn run_blk_selftest() -> Result<i32> {
             }
             0xAA
         };
-    let st_w = issue_rw(0, 0, 0x4_0000, wsrc, T_OUT, 2);
-    let st_r = issue_rw(1, 4, 0x5_0000, rdst, T_IN, 2);
+    put(wsrc, &[0xff; 64 * 1024]);
+    let st_fill = issue_rw(0, 0, 0x4_0000, wsrc, T_OUT, 128);
+    for k in 0..(2 * SEG as u64) {
+        put(wsrc + k, &[0x40 + (k % 64) as u8]);
+        put(rdst + k, &[0u8]);
+    }
+    let st_w = issue_rw(1, 0, 0x4_0000, wsrc, T_OUT, 2);
+    let st_r = issue_rw(2, 4, 0x5_0000, rdst, T_IN, 2);
     let mut rw_data_ok = true;
     for k in 0..(2 * SEG as u64) {
         if ram.read_array::<1>(rdst + k).expect("rw readback")[0] != 0x40 + (k % 64) as u8 {
@@ -484,17 +487,19 @@ fn run_blk_selftest() -> Result<i32> {
 
     // WRITE_ZEROES on sectors [0, 16) -> bytes [0, 8192); DISCARD on sectors
     // [64, 80) -> bytes [32768, 40960).
-    let st_wz = issue(2, 8, 0x2_0000, T_WRITE_ZEROES, 0, 16);
-    let st_dc = issue(3, 11, 0x3_0000, T_DISCARD, 64, 16);
+    let st_wz = issue(3, 8, 0x2_0000, T_WRITE_ZEROES, 0, 16);
+    let st_dc = issue(4, 11, 0x3_0000, T_DISCARD, 64, 16);
+    let st_verify = issue_rw(5, 0, 0x5_0000, rdst, T_IN, 128);
 
     let ops_wz = dev.ops_write_zeroes();
     let ops_dc = dev.ops_discard();
     let ops_err = dev.ops_err();
 
-    // Release the device + backend so the file handle is closed before we read.
+    let data = ram
+        .read_array::<65536>(rdst)
+        .ok_or_else(|| Error::msg("selftest: VHDX verification buffer outside guest RAM"))?;
     drop(dev);
     drop(backend);
-    let data = std::fs::read(&path).map_err(|e| Error::msg(format!("selftest: read back: {e}")))?;
     let _ = std::fs::remove_file(&path);
 
     let zeroed = |r: std::ops::Range<usize>| data[r.clone()].iter().all(|&b| b == 0);
@@ -507,6 +512,8 @@ fn run_blk_selftest() -> Result<i32> {
             eprintln!("[blk-selftest] FAIL: {msg}");
         }
     };
+    fail(st_fill == 0, "VHDX prefill status != OK");
+    fail(st_verify == 0, "VHDX verification READ status != OK");
     fail(st_w == 0, "multi-seg WRITE status != OK");
     fail(st_r == 0, "multi-seg READ status != OK");
     fail(rw_data_ok, "multi-seg READ-back != written pattern");
@@ -517,12 +524,11 @@ fn run_blk_selftest() -> Result<i32> {
     fail(ops_err == 0, "ops_err != 0");
     fail(zeroed(0..8192), "WRITE_ZEROES region not zeroed");
     fail(intact(8192..32768), "gap before DISCARD was modified");
-    fail(zeroed(32768..40960), "DISCARD region not zeroed");
     fail(intact(40960..65536), "tail after DISCARD was modified");
 
     if ok {
         println!(
-            "[blk-selftest] PASS: WRITE_ZEROES + DISCARD zero the host file, \
+            "[blk-selftest] PASS: VHDX WRITE_ZEROES + DISCARD, \
              ranges isolated (wz={ops_wz} discard={ops_dc} err={ops_err})"
         );
         Ok(0)
@@ -647,10 +653,10 @@ fn run_blk_stresstest() -> Result<i32> {
         false,
     )?);
 
-    let path = std::env::temp_dir().join("tinyvmm_blk_stress.img");
+    let path = std::env::temp_dir().join(format!("tinyvmm_blk_stress_{}.vhdx", std::process::id()));
     let path_str = path.to_string_lossy().to_string();
-    std::fs::write(&path, vec![0u8; 4 * 1024 * 1024])
-        .map_err(|e| Error::msg(format!("stress: write temp file: {e}")))?;
+    winsys::host::vhdx::create(&path_str, 4 * 1024 * 1024)
+        .map_err(|err| Error::msg(format!("stress: create VHDX: err={err}")))?;
     let backend = Arc::new(BlockFile::new(&path_str, false));
     if !backend.open() {
         let _ = std::fs::remove_file(&path);
@@ -1245,7 +1251,11 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
                 if drives.len() >= 8 {
                     return Err(Error::msg("--drive: max 8 drives supported"));
                 }
-                drives.push(DriveSpec { path, readonly });
+                drives.push(DriveSpec {
+                    path,
+                    readonly,
+                    iso: false,
+                });
             }
             "--virtio-9p-share" => {
                 const WANT: &str = "<tag>=<host_path>[,ro][,uid=N][,gid=N][,metadata]";
@@ -1382,6 +1392,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
             DriveSpec {
                 path: path.clone(),
                 readonly: true,
+                iso: true,
             },
         );
     }
@@ -1953,7 +1964,11 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     let mut blk_backends: Vec<Arc<BlockFile>> = Vec::with_capacity(cfg.drives.len());
     let mut blk_devices: Vec<Arc<BlockDevice>> = Vec::with_capacity(cfg.drives.len());
     for (i, d) in cfg.drives.iter().enumerate() {
-        let backend = Arc::new(BlockFile::new(&d.path, d.readonly));
+        let backend = Arc::new(if d.iso {
+            BlockFile::new_iso(&d.path)
+        } else {
+            BlockFile::new(&d.path, d.readonly)
+        });
         if !backend.open() {
             return Err(Error::msg(format!(
                 "--drive: failed to open '{}' (readonly={}): err={}",
@@ -2751,7 +2766,8 @@ fn write_snapshot(
     for (i, d) in cfg.drives.iter().enumerate() {
         jw.str(&format!("drive{i}_path"), &d.path)
             .u64(&format!("drive{i}_size"), blk_backends[i].size())
-            .bool(&format!("drive{i}_readonly"), d.readonly);
+            .bool(&format!("drive{i}_readonly"), d.readonly)
+            .bool(&format!("drive{i}_iso"), d.iso);
     }
     // Per-9p-share config so restore rebuilds each virtio-9p device with the same
     // tag/root/RO/owner/metadata. The device's own fid table is captured in its
@@ -3188,6 +3204,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
     for i in 0..drive_count {
         let saved_path = jr.get_str(&format!("drive{i}_path"))?;
         let saved_ro = jr.get_bool(&format!("drive{i}_readonly")).unwrap_or(true);
+        let iso = jr.get_bool(&format!("drive{i}_iso")).unwrap_or(false);
         let saved_size = jr.get_u64(&format!("drive{i}_size")).unwrap_or(0);
         // Apply a positional --drive override (relocate the disk / change RO).
         let (dpath, dro) = match drive_overrides.get(i) {
@@ -3202,7 +3219,16 @@ fn run_restore(args: &[String]) -> Result<i32> {
                  pass --unsafe-restore-mutable-drive to force"
             )));
         }
-        let backend = Arc::new(BlockFile::new(&dpath, dro));
+        if iso && !dro {
+            return Err(Error::msg(
+                "--restore: installation ISO must remain read-only",
+            ));
+        }
+        let backend = Arc::new(if iso {
+            BlockFile::new_iso(&dpath)
+        } else {
+            BlockFile::new(&dpath, dro)
+        });
         if !backend.open() {
             return Err(Error::msg(format!(
                 "--restore: failed to reopen drive '{}' (readonly={}): err={}",
@@ -4770,6 +4796,30 @@ fn run_dda_probe(args: &[String]) -> Result<i32> {
     Ok(0)
 }
 
+fn run_create_vhdx(args: &[String]) -> Result<i32> {
+    if args.len() != 4
+        || !std::path::Path::new(&args[2])
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("vhdx"))
+    {
+        return Err(Error::msg("--create-vhdx expects <path.vhdx> <size-mb>"));
+    }
+    let size = args[3]
+        .parse::<u64>()
+        .ok()
+        .and_then(|mb| mb.checked_mul(1024 * 1024))
+        .filter(|size| *size != 0)
+        .ok_or_else(|| Error::msg("--create-vhdx size-mb must be a positive integer"))?;
+    winsys::host::vhdx::create(&args[2], size)
+        .map_err(|err| Error::msg(format!("--create-vhdx: '{}' failed: err={err}", args[2])))?;
+    println!(
+        "Created '{}' ({} MiB, dynamic VHDX)",
+        args[2],
+        size / (1024 * 1024)
+    );
+    Ok(0)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -4783,6 +4833,7 @@ fn main() {
         "--smoke" => run_smoke(),
         "--blk-selftest" => run_blk_selftest(),
         "--blk-stress" => run_blk_stresstest(),
+        "--create-vhdx" => run_create_vhdx(&args),
         "--pci-selftest" => run_pci_selftest(),
         "--pvh-info" => run_pvh_info(&args),
         "--pvh-run" => run_pvh_run(&args),
