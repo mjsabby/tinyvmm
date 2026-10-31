@@ -1094,8 +1094,9 @@ static mut / Box::leak
   (WHP handle delete + event close), `BlockFile`/`Inner` (`CloseHandle` of the
   file + IOCP), `MappedFile` (`UnmapViewOfFile`), `PciTransport` (tear down the
   doorbell pump + join), the `Display` window thread, and `SnapshotWriter` (delete
-  a half-written file). Teardown order is explicit in `main.rs` — IOCP workers are
-  quiesced *before* their owners drop, so no completion lands on freed memory.
+  a half-written file). Teardown order is explicit in `main.rs` — blk devices are
+  quiesced and their IOCP workers stopped *before* their owners drop, so no
+  completion lands on freed memory.
 * **`#[repr(C)]` (8) + `transmute` (12)** — ABI control at the FFI line. `repr(C)`
   guarantees field order for the `OVERLAPPED`-first request structs and the NAT
   frame slot. Every `transmute` turns an OS-resolved symbol into a typed function
@@ -1474,7 +1475,8 @@ can detect support), and when *armed* it records the requesting vp and surfaces
 `StopReason::SnapshotRequested`, advancing RIP first so restore resumes *past* the
 CPUID (`src/whp/snapshot.rs`, `src/whp/run_loop.rs`). Any vCPU may fire it: an AP
 that does also stops the BSP and the other APs. The VMM then quiesces (stops
-+ joins APs, drains the blk IOCP workers, stops net backends, quiesces 9p) and
++ joins APs, quiesces each blk device so every request it took off its ring has
+completed, stops the blk IOCP workers, stops net backends, quiesces 9p) and
 writes a self-describing file (`src/whp/snapshot_file.rs`):
 
 ```

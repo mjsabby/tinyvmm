@@ -859,7 +859,17 @@ fn run_blk_stresstest() -> Result<i32> {
         put(avail_gpa + 2, &((2 * N + 1 + 8) as u16).to_le_bytes());
         dev.notify_queue(0);
         dev.reset(); // races the in-flight I/O; must not crash or write a stale ring
-        std::thread::sleep(std::time::Duration::from_millis(100)); // let completions drain
+        // The reset completes once the requests it raced have settled; a driver
+        // polls device_status for 0 meanwhile.
+        let mut settled = false;
+        for _ in 0..10_000 {
+            if !dev.reset_pending() {
+                settled = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        fail(settled, "reset did not settle its in-flight requests");
     }
     // Recover on a FRESH queue (clean rings): one request must succeed.
     let recovered = {
@@ -2348,18 +2358,25 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     // Finalize the recording now that the guest has stopped producing output.
     finish_recording(recorder.as_ref(), "pvh-run");
 
-    // Quiesce every virtio-blk IOCP worker before its BlockDevice owner is
-    // dropped, so no completion lands on freed memory. Then print the per-disk
-    // shutdown summary (max_depth > 1 proves the concurrent-writer phase
-    // reached real queue depth; max_inflight counts only the ops the host
+    // Quiesce every virtio-blk device, then stop its IOCP worker. With the
+    // vCPUs joined, each device takes what the guest left in its ring, stops
+    // taking requests (a doorbell pump that wakes later finds it stopped), and
+    // waits until every request it took has completed. A snapshot then holds no
+    // request taken off the avail ring but never completed, and stop() finds
+    // nothing in flight, so no completion lands on freed memory. Then print the
+    // per-disk shutdown summary (max_depth > 1 proves the concurrent-writer
+    // phase reached real queue depth; max_inflight counts only the ops the host
     // completed asynchronously, i.e. page-cache misses and flushes).
+    for d in &blk_devices {
+        d.quiesce();
+    }
     for b in &blk_backends {
         b.stop();
     }
 
     // Snapshot save: if armed and the guest issued the trigger (from any vCPU),
-    // capture the now quiesced machine (APs stopped + joined, blk IOCP workers
-    // drained) and write the file, then exit. If the guest stopped for any
+    // capture the now quiesced machine (APs stopped + joined, blk devices
+    // quiesced) and write the file, then exit. If the guest stopped for any
     // other reason, the snapshot is not written.
     if let Some(ref save_path) = cfg.save_path {
         let requested = reason == StopReason::SnapshotRequested
@@ -3209,6 +3226,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
     }
 
     let mut blk_backends: Vec<Arc<BlockFile>> = Vec::with_capacity(drive_count);
+    let mut blk_devices: Vec<Arc<BlockDevice>> = Vec::with_capacity(drive_count);
     for i in 0..drive_count {
         let saved_path = jr.get_str(&format!("drive{i}_path"))?;
         let saved_ro = jr.get_bool(&format!("drive{i}_readonly")).unwrap_or(true);
@@ -3297,6 +3315,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
         pci_bus.add_device(bt.clone() as Arc<dyn PciFunction>);
         transports.push(bt.clone());
         blk_backends.push(backend);
+        blk_devices.push(blk);
     }
 
     // virtio-input (if present in the snapshot): recreate in the same order as
@@ -3740,6 +3759,10 @@ fn run_restore(args: &[String]) -> Result<i32> {
         let _ = w.join();
     }
     console_restore.restore();
+    // As in run_pvh_run: quiesce each blk device before stopping its worker.
+    for d in &blk_devices {
+        d.quiesce();
+    }
     for b in &blk_backends {
         b.stop();
     }

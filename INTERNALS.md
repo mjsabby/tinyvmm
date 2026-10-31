@@ -554,7 +554,13 @@ small trait — `device_id`, `device_features`, `set_driver_features`,
    `enable_queue` (`transport.rs:653`);
 4. sets `DRIVER_OK` — you call `driver_ok()`.
 
-A status write of 0 is a full reset.
+A status write of 0 is a full reset. A device with requests still in flight
+finishes it asynchronously (`VirtioDevice::reset_pending`): until they have
+settled, the status keeps reading its old value, and the driver polls for 0
+before reinitializing (virtio-pci requires that; Linux's `vp_reset` does). The
+reset itself must not wait: it runs on the vCPU under the transport lock that
+every completion's interrupt path takes. virtio-blk retires a request taken
+before the reset without touching the guest (`blk.rs` `epoch`).
 
 **4. The split virtqueue** (`src/virtio/queue.rs`) — the actual data ring
 (virtio spec §2.7). Three guest-RAM structures per queue: a **descriptor table**
@@ -816,13 +822,16 @@ useful template because the ordering constraints are real:
        the whole process was confined to the mode's core class before step 3, so every
        thread it starts inherits that)
 15. teardown: stop_all → cancel + join APs → join watchdog → close the gpu window
-       stop the blk IOCP workers (BEFORE their BlockDevice owners drop)
+       quiesce each blk device (take what's left in its ring, stop taking
+         requests, wait for every one it took), then stop its IOCP worker
        if snapshot armed+requested: quiesce net backends + 9p pool, write the file
        else: print device stats + exit counters
 ```
 
-The teardown ordering is not optional: **the blk IOCP workers are stopped before
-their owning devices drop**, or a completion lands on freed memory. The NAT and
+The teardown ordering is not optional: **each blk device is quiesced and its
+IOCP worker stopped before the device drops**, or a completion lands on freed
+memory, and before a snapshot is captured, or it records a request taken off
+the avail ring that the restored device never completes. The NAT and
 9p workers aren't stopped on a normal exit — each NAT worker owns its flow state
 and reaches the device only through a `Weak<NetDevice>`, and each 9p worker holds
 a strong `Arc` to its device and lives for the process — but a snapshot quiesces
@@ -900,8 +909,10 @@ real debugging time in this project.
    (§M5)
 10. **Wrap-safe bounds checks.** Use subtraction form (`len > size - off`), never
     `off + len > size`, which overflows for hostile addresses. (§M0)
-11. **Quiesce before drop.** Stop IOCP workers before the device that owns their
-    request memory is dropped (blk), or a completion writes to freed memory. (§5)
+11. **Quiesce before drop or capture.** Stop a device taking requests and wait
+    for every one it took before stopping its IOCP worker, dropping it, or
+    snapshotting it (blk), or a completion writes to freed memory, or the
+    snapshot holds a request nothing will ever complete. (§5)
 12. **Snapshot device order is load-bearing.** Construct devices in the same fixed
     order on save and restore, or the per-device snapshot indices misalign. (§M7)
 13. **A microVM can't `poweroff` cleanly.** With no ACPI power management (no

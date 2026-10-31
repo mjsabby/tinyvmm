@@ -16,13 +16,18 @@
 //! guarantee. The OS cache is fine at our scale; a FLUSH op forces
 //! `FlushFileBuffers` on the worker thread.
 //!
+//! Ops are accepted only between `start` and `stop`, so every op has a worker
+//! to complete it, and `stop` returns only once every op it let in has
+//! completed and its callback has returned.
+//!
 //! Disks use VHDMP's VM-only VHDX handle. The separate read-only ISO
 //! constructor exposes installation media as bytes, never as a writable disk.
 //! DISCARD uses native SCSI UNMAP.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_IO_PENDING, GENERIC_READ, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
@@ -116,9 +121,13 @@ struct Inner {
     skip_on_success: bool,
     size: u64,
     complete: OnceLock<CompleteFn>,
+    /// Set unless the worker is running: new ops are refused, so none is left
+    /// without a thread to complete it.
+    closed: AtomicBool,
     submitted: AtomicU64,
     completed: AtomicU64,
     errors: AtomicU64,
+    /// Ops started whose completion callback has not yet returned.
     inflight: AtomicU64,
     max_inflight: AtomicU64,
 }
@@ -178,6 +187,7 @@ impl BlockFile {
                 skip_on_success: false,
                 size: 0,
                 complete: OnceLock::new(),
+                closed: AtomicBool::new(true),
                 submitted: AtomicU64::new(0),
                 completed: AtomicU64::new(0),
                 errors: AtomicU64::new(0),
@@ -264,6 +274,7 @@ impl BlockFile {
                 skip_on_success,
                 size: li as u64,
                 complete: OnceLock::new(),
+                closed: AtomicBool::new(true),
                 submitted: AtomicU64::new(0),
                 completed: AtomicU64::new(0),
                 errors: AtomicU64::new(0),
@@ -323,7 +334,8 @@ impl BlockFile {
         }
     }
 
-    /// Spin up the IOCP worker. Must be called before `submit`.
+    /// Spin up the IOCP worker and start accepting ops; `submit` refuses
+    /// them before this.
     pub fn start(&self) {
         let mut w = self.worker.lock().unwrap();
         if w.is_some() || !self.open() {
@@ -331,22 +343,32 @@ impl BlockFile {
         }
         let inner = self.inner.clone();
         *w = Some(std::thread::spawn(move || worker_loop(inner)));
+        self.inner.closed.store(false, Ordering::SeqCst);
     }
 
-    /// Stop the IOCP worker (signals + joins). In-flight ops are NOT cancelled;
-    /// the caller must quiesce the device first.
+    /// Refuse new ops, wait until every op already started has completed and
+    /// its completion callback has returned, then signal and join the worker.
+    /// Nothing the backend started is still running afterwards. Callers stop
+    /// issuing ops first: one refused here fails like any `submit` failure.
     pub fn stop(&self) {
-        let handle = self.worker.lock().unwrap().take();
-        if let Some(h) = handle {
-            unsafe {
-                PostQueuedCompletionStatus(self.inner.iocp, 0, SHUTDOWN_KEY, core::ptr::null());
-            }
-            let _ = h.join();
+        let mut w = self.worker.lock().unwrap();
+        let Some(h) = w.take() else {
+            return;
+        };
+        self.inner.closed.store(true, Ordering::SeqCst);
+        // The worker keeps completing ops meanwhile.
+        while self.inner.inflight.load(Ordering::SeqCst) != 0 {
+            std::thread::sleep(Duration::from_millis(1));
         }
+        unsafe {
+            PostQueuedCompletionStatus(self.inner.iocp, 0, SHUTDOWN_KEY, core::ptr::null());
+        }
+        let _ = h.join();
     }
 
     /// Submit one async op. `req` must remain alive (and `ovl` untouched) until
-    /// the completion callback fires. Returns false on synchronous failure.
+    /// the completion callback fires. Returns false on synchronous failure,
+    /// including when the backend is not started.
     ///
     /// # Safety
     /// `req` must point to a live [`Request`] embedded in a caller-owned
@@ -354,7 +376,9 @@ impl BlockFile {
     pub unsafe fn submit(&self, req: *mut Request) -> bool {
         unsafe {
             let inner = &self.inner;
-            begin(inner, req);
+            if !begin(inner, req) {
+                return false;
+            }
 
             let op = (*req).op;
             if op == Op::Flush {
@@ -362,8 +386,7 @@ impl BlockFile {
                 // thread doesn't stall; FLUSH_KEY lets the worker recognise it.
                 core::ptr::write_bytes(&mut (*req).ovl as *mut OVERLAPPED, 0, 1);
                 if PostQueuedCompletionStatus(inner.iocp, 0, FLUSH_KEY, &(*req).ovl) == 0 {
-                    inner.inflight.fetch_sub(1, Ordering::Relaxed);
-                    inner.errors.fetch_add(1, Ordering::Relaxed);
+                    fail(inner);
                     return false;
                 }
                 return true;
@@ -383,8 +406,7 @@ impl BlockFile {
                 )
             } else {
                 if inner.readonly {
-                    inner.inflight.fetch_sub(1, Ordering::Relaxed);
-                    inner.errors.fetch_add(1, Ordering::Relaxed);
+                    fail(inner);
                     return false;
                 }
                 WriteFile(
@@ -398,8 +420,7 @@ impl BlockFile {
             if started == 0 {
                 let err = GetLastError();
                 if err != ERROR_IO_PENDING {
-                    inner.inflight.fetch_sub(1, Ordering::Relaxed);
-                    inner.errors.fetch_add(1, Ordering::Relaxed);
+                    fail(inner);
                     return false;
                 }
             } else if inner.skip_on_success {
@@ -442,7 +463,9 @@ impl BlockFile {
             if waited && event.is_null() {
                 return self.submit(req);
             }
-            begin(inner, req);
+            if !begin(inner, req) {
+                return false;
+            }
             // Positioned I/O: the OVERLAPPED carries the offset.
             core::ptr::write_bytes(&mut (*req).ovl as *mut OVERLAPPED, 0, 1);
             (*req).ovl.Anonymous.Anonymous.Offset = ((*req).file_offset & 0xFFFF_FFFF) as u32;
@@ -468,18 +491,33 @@ impl BlockFile {
     }
 }
 
-/// Account a newly started op.
+/// Account a newly started op, or refuse it (false) unless the worker is
+/// running.
 ///
 /// # Safety
 /// `req` must point to a live [`Request`].
-unsafe fn begin(inner: &Inner, req: *mut Request) {
+unsafe fn begin(inner: &Inner, req: *mut Request) -> bool {
     inner.submitted.fetch_add(1, Ordering::Relaxed);
     unsafe {
         (*req).ok = false;
     }
+    // Count the op before checking `closed`. `stop` sets `closed` before it
+    // waits for the count to drain, so (SeqCst on both sides) either it waits
+    // for this op or this op sees `closed`.
+    let cur = inner.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+    if inner.closed.load(Ordering::SeqCst) {
+        fail(inner);
+        return false;
+    }
     // High-water mark of ops outstanding at once.
-    let cur = inner.inflight.fetch_add(1, Ordering::Relaxed) + 1;
     inner.max_inflight.fetch_max(cur, Ordering::Relaxed);
+    true
+}
+
+/// Account an op that failed to start after `begin` counted it.
+fn fail(inner: &Inner) {
+    inner.errors.fetch_add(1, Ordering::Relaxed);
+    inner.inflight.fetch_sub(1, Ordering::Release);
 }
 
 impl Drop for BlockFile {
@@ -501,10 +539,12 @@ unsafe fn finish(inner: &Inner, req: *mut Request, ok: bool) {
         inner.errors.fetch_add(1, Ordering::Relaxed);
     }
     inner.completed.fetch_add(1, Ordering::Relaxed);
-    inner.inflight.fetch_sub(1, Ordering::Relaxed);
     if let Some(cb) = inner.complete.get() {
         cb(req);
     }
+    // Only after the callback: `stop` reads a zero count as "every callback
+    // has returned".
+    inner.inflight.fetch_sub(1, Ordering::Release);
 }
 
 fn worker_loop(inner: Arc<Inner>) {
@@ -573,6 +613,15 @@ mod tests {
         rx
     }
 
+    /// An op counts as in flight until its callback has returned.
+    fn wait_idle(backend: &BlockFile) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while backend.inflight() != 0 {
+            assert!(std::time::Instant::now() < deadline, "ops still in flight");
+            std::thread::yield_now();
+        }
+    }
+
     fn transfer(
         backend: &BlockFile,
         rx: &mpsc::Receiver<(usize, bool)>,
@@ -588,12 +637,64 @@ mod tests {
         assert!(unsafe { backend.submit_sync(&mut request) });
         // Reads and writes finish before submit_sync returns; flushes go to the worker.
         let (address, ok) = if op == Op::Flush {
-            rx.recv_timeout(Duration::from_secs(10)).unwrap()
+            let done = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            wait_idle(backend);
+            done
         } else {
             rx.try_recv().unwrap()
         };
         assert_eq!(address, &request as *const _ as usize);
         assert!(ok);
+    }
+
+    #[test]
+    fn stop_waits_for_in_flight_ops() {
+        let image = TestImage::new();
+        super::super::vhdx::create(image.path(), 256 << 20).unwrap();
+        let backend = BlockFile::new(image.path(), false);
+        assert!(backend.open(), "error {}", backend.open_err());
+        let rx = completion(&backend);
+        // Large enough to be still in flight when stop() is called.
+        let mut data = vec![0x5a; 64 << 20];
+        let mut request = Box::new(Request::zeroed());
+        request.op = Op::Write;
+        request.buf = data.as_mut_ptr();
+        request.bytes = data.len() as u32;
+        assert!(unsafe { backend.submit(&mut *request) });
+        backend.stop();
+        assert_eq!(backend.inflight(), 0);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            (&*request as *const Request as usize, true)
+        );
+    }
+
+    #[test]
+    fn ops_need_a_running_worker() {
+        let image = TestImage::new();
+        super::super::vhdx::create(image.path(), 64 << 20).unwrap();
+        let backend = BlockFile::new(image.path(), false);
+        assert!(backend.open(), "error {}", backend.open_err());
+        let (tx, rx) = mpsc::channel();
+        backend.set_completion_callback(Box::new(move |request| {
+            tx.send(request as usize).unwrap();
+        }));
+        let mut request = Request::zeroed();
+        request.op = Op::Flush;
+        let address = &request as *const Request as usize;
+        assert!(!unsafe { backend.submit(&mut request) });
+        backend.start();
+        assert!(unsafe { backend.submit(&mut request) });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), address);
+        backend.stop();
+        assert!(!unsafe { backend.submit(&mut request) });
+        request.op = Op::Read;
+        let mut data = [0; 4096];
+        request.buf = data.as_mut_ptr();
+        request.bytes = data.len() as u32;
+        assert!(!unsafe { backend.submit_sync(&mut request) });
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        assert_eq!((backend.inflight(), backend.errors()), (0, 3));
     }
 
     #[test]
