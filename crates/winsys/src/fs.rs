@@ -9,23 +9,36 @@
 //! it to an errno).
 //!
 //! Callers pass NUL-terminated UTF-16 paths (`&[u16]`); building those (and any
-//! `\\?\` long-path / path-security policy) stays the caller's concern.
+//! `\\?\` long-path / path-security policy) stays the caller's concern. The
+//! exception is [`open_relative`], which takes a name relative to an open
+//! directory and never parses it as a Win32 path.
 
+use core::mem::{offset_of, size_of};
+use core::ptr::{null, null_mut};
+use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_STAT_LX_INFORMATION, FileStatLxInformation, LX_FILE_METADATA_HAS_GID,
-    LX_FILE_METADATA_HAS_MODE, LX_FILE_METADATA_HAS_UID, NtQueryInformationFile, NtSetEaFile,
+    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_DELETE, FILE_DISPOSITION_INFORMATION_EX,
+    FILE_DISPOSITION_POSIX_SEMANTICS, FILE_INFORMATION_CLASS, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+    FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS,
+    FILE_RENAME_REPLACE_IF_EXISTS, FILE_STAT_LX_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
+    FileDispositionInformation, FileDispositionInformationEx, FileFsFullSizeInformation,
+    FileRenameInformation, FileRenameInformationEx, FileStatLxInformation,
+    LX_FILE_METADATA_HAS_GID, LX_FILE_METADATA_HAS_MODE, LX_FILE_METADATA_HAS_UID, NtCreateFile,
+    NtQueryInformationFile, NtQueryVolumeInformationFile, NtSetEaFile, NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
-    CloseHandle, FILETIME, GetLastError, INVALID_HANDLE_VALUE, RtlNtStatusToDosError,
+    CloseHandle, ERROR_DELETE_PENDING, ERROR_DIRECTORY_NOT_SUPPORTED, ERROR_FILENAME_EXCED_RANGE,
+    FILETIME, GetLastError, INVALID_HANDLE_VALUE, NTSTATUS, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE,
+    RtlNtStatusToDosError, STATUS_DELETE_PENDING, STATUS_FILE_IS_A_DIRECTORY,
+    STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CREATE_ALWAYS, CREATE_NEW, CreateDirectoryW, CreateFileW,
-    DeleteFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_BEGIN, FILE_ID_BOTH_DIR_INFO,
-    FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, FindClose, FindFirstFileW,
-    FindNextFileW, FlushFileBuffers, GetDiskFreeSpaceExW, GetFileAttributesW,
-    GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
-    MoveFileExW, OPEN_ALWAYS, ReadFile, RemoveDirectoryW, SetEndOfFile, SetFilePointerEx,
-    SetFileTime, WIN32_FIND_DATAW, WriteFile,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+    FILE_BEGIN, FILE_ID_BOTH_DIR_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo,
+    FileStandardInfo, FindClose, FindFirstFileW, FindNextFileW, FlushFileBuffers,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW, ReadFile,
+    SYNCHRONIZE, SetEndOfFile, SetFilePointerEx, SetFileTime, WIN32_FIND_DATAW, WriteFile,
 };
 use windows_sys::Win32::System::IO::{IO_STATUS_BLOCK, OVERLAPPED};
 use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
@@ -35,7 +48,8 @@ pub use windows_sys::Win32::Foundation::HANDLE;
 const ERROR_HANDLE_EOF: u32 = 38;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_NO_MORE_FILES: u32 = 18;
-const ERROR_ALREADY_EXISTS: u32 = 183;
+/// `IO_STATUS_BLOCK.Information` of an `NtCreateFile` that created the file.
+const FILE_CREATED: usize = 2;
 
 /// A neutral snapshot of `BY_HANDLE_FILE_INFORMATION`; all fields are plain
 /// integers so no windows-sys type crosses the crate boundary. Timestamps are
@@ -73,41 +87,292 @@ pub fn create_file(
     disposition: u32,
     flags: u32,
 ) -> Result<HANDLE, u32> {
-    create_file_ex(path, access, share, disposition, flags).map(|(h, _)| h)
-}
-
-/// [`create_file`] that also says whether this call created the file, as
-/// opposed to opening one that already existed.
-pub fn create_file_ex(
-    path: &[u16],
-    access: u32,
-    share: u32,
-    disposition: u32,
-    flags: u32,
-) -> Result<(HANDLE, bool), u32> {
     let h = unsafe {
         CreateFileW(
             path.as_ptr(),
             access,
             share,
-            core::ptr::null(),
+            null(),
             disposition,
             flags,
-            core::ptr::null_mut(),
+            null_mut(),
         )
     };
-    let err = unsafe { GetLastError() };
     if h == INVALID_HANDLE_VALUE {
-        return Err(err);
+        return Err(unsafe { GetLastError() });
     }
-    // OPEN_ALWAYS / CREATE_ALWAYS report an existing file through the last
-    // error; CREATE_NEW only succeeds by creating, the others never create.
-    let created = match disposition {
-        CREATE_NEW => true,
-        OPEN_ALWAYS | CREATE_ALWAYS => err != ERROR_ALREADY_EXISTS,
-        _ => false,
+    Ok(h)
+}
+
+/// What [`open_relative`] does about an existing file of that name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Create {
+    /// Open the existing file; fail if there is none (`FILE_OPEN`).
+    Existing,
+    /// Create the file; fail if the name exists (`FILE_CREATE`).
+    New,
+    /// Open the file, creating it if there is none (`FILE_OPEN_IF`).
+    OpenOrNew,
+}
+
+/// The kind of file [`open_relative`] accepts, or creates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Any,
+    /// Not a directory: a directory fails with `ERROR_DIRECTORY_NOT_SUPPORTED`.
+    File,
+    /// A directory: a file fails with `ERROR_DIRECTORY`.
+    Directory,
+}
+
+/// How [`open_relative`] opens a name.
+#[derive(Clone, Copy, Debug)]
+pub struct Open {
+    /// `GENERIC_*` / `FILE_*` access rights. `SYNCHRONIZE` and
+    /// `FILE_READ_ATTRIBUTES` are always added, as `CreateFileW` adds them.
+    pub access: u32,
+    pub create: Create,
+    pub kind: Kind,
+    /// Open a final symlink or junction itself, not what it points at
+    /// (`FILE_OPEN_REPARSE_POINT`), as `DeleteFileW` and `MoveFileExW` do.
+    pub entry: bool,
+    /// Follow symlinks, junctions and mount points on the way. Without it the
+    /// open fails with `ERROR_REPARSE_POINT_ENCOUNTERED` at the first one, before
+    /// it has any effect (`OBJ_DONT_REPARSE`), so whatever opens lies below the
+    /// directory the name is relative to. Reparse points that a file system
+    /// filter resolves in place (compressed, deduplicated or cloud files) are
+    /// not links and open either way.
+    pub follow: bool,
+}
+
+impl Open {
+    /// Open an existing file of any kind with `access`, following no link.
+    pub const fn existing(access: u32) -> Open {
+        Open {
+            access,
+            create: Create::Existing,
+            kind: Kind::Any,
+            entry: false,
+            follow: false,
+        }
+    }
+
+    pub const fn with_create(self, create: Create) -> Open {
+        Open { create, ..self }
+    }
+
+    pub const fn with_kind(self, kind: Kind) -> Open {
+        Open { kind, ..self }
+    }
+
+    /// See [`Open::entry`].
+    pub const fn as_entry(self) -> Open {
+        Open {
+            entry: true,
+            ..self
+        }
+    }
+
+    /// See [`Open::follow`].
+    pub const fn following(self) -> Open {
+        Open {
+            follow: true,
+            ..self
+        }
+    }
+}
+
+/// `NtCreateFile` of `name` relative to the open directory `dir`, sharing read,
+/// write and delete with other openers, for synchronous I/O. `name` is one or
+/// more components separated by `\`, without a terminating NUL. It is never
+/// parsed as a Win32 path: `.` and `..` are invalid names, and nothing is
+/// stripped or mapped (no trailing dots, no DOS device names), so the caller
+/// must pass only names it has validated. An empty `name` reopens `dir`
+/// itself. `dir` needs no particular access right. Returns the handle and
+/// whether this call created the file.
+pub fn open_relative(dir: HANDLE, name: &[u16], how: Open) -> Result<(HANDLE, bool), u32> {
+    static EMPTY: [u16; 1] = [0];
+    let bytes = u16::try_from(name.len() * 2).map_err(|_| ERROR_FILENAME_EXCED_RANGE)?;
+    let buffer = if name.is_empty() {
+        EMPTY.as_ptr()
+    } else {
+        name.as_ptr()
     };
-    Ok((h, created))
+    let us = UNICODE_STRING {
+        Length: bytes,
+        MaximumLength: bytes,
+        // The kernel only reads the name.
+        Buffer: buffer.cast_mut(),
+    };
+    let mut attributes = OBJ_CASE_INSENSITIVE;
+    if !how.follow {
+        attributes |= OBJ_DONT_REPARSE;
+    }
+    let oa = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: dir,
+        ObjectName: &us,
+        Attributes: attributes,
+        SecurityDescriptor: null(),
+        SecurityQualityOfService: null(),
+    };
+    let disposition = match how.create {
+        Create::Existing => FILE_OPEN,
+        Create::New => FILE_CREATE,
+        Create::OpenOrNew => FILE_OPEN_IF,
+    };
+    let mut options = FILE_SYNCHRONOUS_IO_NONALERT;
+    match how.kind {
+        Kind::Any => {}
+        Kind::File => options |= FILE_NON_DIRECTORY_FILE,
+        Kind::Directory => options |= FILE_DIRECTORY_FILE,
+    }
+    if how.entry {
+        options |= FILE_OPEN_REPARSE_POINT;
+    }
+    let mut h: HANDLE = null_mut();
+    let mut iosb: IO_STATUS_BLOCK = unsafe { core::mem::zeroed() };
+    let status = unsafe {
+        NtCreateFile(
+            &mut h,
+            how.access | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+            &oa,
+            &mut iosb,
+            null(),
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            disposition,
+            options,
+            null(),
+            0,
+        )
+    };
+    nt_result(status)?;
+    Ok((h, iosb.Information == FILE_CREATED))
+}
+
+/// Open the file `h` refers to again, with `access`: an [`open_relative`] of the
+/// empty name, so nothing is looked up by name and the new handle reaches the
+/// same file even after it has been renamed.
+pub fn reopen(h: HANDLE, access: u32) -> Result<HANDLE, u32> {
+    open_relative(h, &[], Open::existing(access)).map(|(h, _)| h)
+}
+
+/// Whether `NtSetInformationFile` failed only because the file system lacks the
+/// information class or flag, as POSIX semantics are missing outside NTFS and
+/// ReFS. `DeleteFileW` falls back on the same statuses.
+fn unsupported(status: NTSTATUS) -> bool {
+    matches!(
+        status,
+        STATUS_INVALID_PARAMETER | STATUS_NOT_SUPPORTED | STATUS_INVALID_INFO_CLASS
+    )
+}
+
+fn set_information(
+    h: HANDLE,
+    info: *const core::ffi::c_void,
+    len: usize,
+    class: FILE_INFORMATION_CLASS,
+) -> NTSTATUS {
+    let mut iosb: IO_STATUS_BLOCK = unsafe { core::mem::zeroed() };
+    unsafe { NtSetInformationFile(h, &mut iosb, info, len as u32, class) }
+}
+
+/// Delete the file or empty directory `h` refers to, opened with `DELETE`
+/// access. With POSIX semantics where the file system has them, the name goes
+/// away at once even while other handles keep the file open; otherwise it goes
+/// when the last handle closes.
+pub fn delete_by_handle(h: HANDLE) -> Result<(), u32> {
+    let posix = FILE_DISPOSITION_INFORMATION_EX {
+        Flags: FILE_DISPOSITION_DELETE | FILE_DISPOSITION_POSIX_SEMANTICS,
+    };
+    let status = set_information(
+        h,
+        (&raw const posix).cast(),
+        size_of::<FILE_DISPOSITION_INFORMATION_EX>(),
+        FileDispositionInformationEx,
+    );
+    if !unsupported(status) {
+        return nt_result(status);
+    }
+    // FILE_DISPOSITION_INFORMATION: one BOOLEAN DeleteFile.
+    let delete = 1u8;
+    nt_result(set_information(
+        h,
+        (&raw const delete).cast(),
+        1,
+        FileDispositionInformation,
+    ))
+}
+
+/// Rename the file or directory `h` refers to, opened with `DELETE` access, to
+/// `name` (one component, no NUL) in the open directory `dir`, replacing a file
+/// of that name. With POSIX semantics where the file system has them, a target
+/// that other handles hold open is replaced too, where `MoveFileExW` fails.
+pub fn rename_by_handle(h: HANDLE, dir: HANDLE, name: &[u16]) -> Result<(), u32> {
+    let name_off = offset_of!(FILE_RENAME_INFORMATION, FileName);
+    let bytes = name.len() * 2;
+    let len = (name_off + bytes).max(size_of::<FILE_RENAME_INFORMATION>());
+    // u64 words keep the HANDLE field aligned.
+    let mut buf = vec![0u64; len.div_ceil(8)];
+    let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    // SAFETY: `buf` is zeroed, aligned and at least `len` bytes long, which
+    // covers the fixed fields and the `bytes` of name after `name_off`.
+    unsafe {
+        (*info).Anonymous.Flags = FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS;
+        (*info).RootDirectory = dir;
+        (*info).FileNameLength = u32::try_from(bytes).map_err(|_| ERROR_FILENAME_EXCED_RANGE)?;
+        core::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            info.cast::<u8>().add(name_off).cast::<u16>(),
+            name.len(),
+        );
+    }
+    let status = set_information(h, info.cast(), len, FileRenameInformationEx);
+    if !unsupported(status) {
+        return nt_result(status);
+    }
+    // FILE_RENAME_INFORMATION starts with BOOLEAN ReplaceIfExists instead of
+    // the flags.
+    // SAFETY: as above.
+    unsafe { (*info).Anonymous.Flags = 1 };
+    nt_result(set_information(h, info.cast(), len, FileRenameInformation))
+}
+
+/// `FILE_FS_FULL_SIZE_INFORMATION`, which windows-sys keeps in a module this
+/// crate doesn't otherwise need.
+#[repr(C)]
+#[derive(Default)]
+struct FsFullSizeInformation {
+    total_allocation_units: i64,
+    caller_available_allocation_units: i64,
+    actual_available_allocation_units: i64,
+    sectors_per_allocation_unit: u32,
+    bytes_per_sector: u32,
+}
+
+/// Space on the volume that holds the open file `h`, in bytes:
+/// `(available_to_caller, total, free)`, as `GetDiskFreeSpaceExW` reports for a
+/// path.
+pub fn volume_space(h: HANDLE) -> Result<(u64, u64, u64), u32> {
+    let mut info = FsFullSizeInformation::default();
+    let mut iosb: IO_STATUS_BLOCK = unsafe { core::mem::zeroed() };
+    nt_result(unsafe {
+        NtQueryVolumeInformationFile(
+            h,
+            &mut iosb,
+            (&raw mut info).cast(),
+            size_of::<FsFullSizeInformation>() as u32,
+            FileFsFullSizeInformation,
+        )
+    })?;
+    let unit = u64::from(info.sectors_per_allocation_unit) * u64::from(info.bytes_per_sector);
+    let bytes = |units: i64| u64::try_from(units).unwrap_or(0).saturating_mul(unit);
+    Ok((
+        bytes(info.caller_available_allocation_units),
+        bytes(info.total_allocation_units),
+        bytes(info.actual_available_allocation_units),
+    ))
 }
 
 /// `CloseHandle` (errors ignored). No-op on null / `INVALID_HANDLE_VALUE`.
@@ -117,35 +382,26 @@ pub fn close(h: HANDLE) {
     }
 }
 
-/// Resolve an open handle to its final canonical path (`\\?\C:\...`, with
-/// symlinks / junctions / mount points fully resolved) via
-/// `GetFinalPathNameByHandleW` (flags 0 == `FILE_NAME_NORMALIZED |
-/// VOLUME_NAME_DOS`). Returns the NUL-free UTF-16 path, or `None` on failure.
+/// Resolve an open handle to its final canonical path, with symlinks, junctions
+/// and mount points resolved and the volume as its NT device name
+/// (`\Device\HarddiskVolume3\...`, `VOLUME_NAME_NT`), via
+/// `GetFinalPathNameByHandleW`. Returns the NUL-free UTF-16 path, or `None` on
+/// failure. The NT form skips the Mount Manager round trip that maps the device
+/// to a drive letter: about half the cost of the DOS form.
 ///
-/// The 9p backend uses this to re-check that an opened handle still lands inside
-/// the share root: a lexical path check passes for a reparse point that lives
-/// inside the share but targets a directory outside it, so the *real* path of
-/// the opened handle must be re-validated to defeat that escape.
-pub fn final_path_by_handle(h: HANDLE) -> Option<Vec<u16>> {
-    final_path(h, 0)
-}
-
-/// As [`final_path_by_handle`], but with the volume as its NT device name
-/// (`\Device\HarddiskVolume3\...`, `VOLUME_NAME_NT`). Same resolution, without
-/// the Mount Manager round trip that maps the device to a drive letter: about
-/// half the cost, which matters when it runs for every 9p walk and getattr.
+/// The 9p backend uses this to check that a file it reached by following a
+/// symlink or junction lies inside the share: the real path of the opened handle
+/// shows where the link actually led.
 pub fn final_nt_path_by_handle(h: HANDLE) -> Option<Vec<u16>> {
     const VOLUME_NAME_NT: u32 = 0x2;
-    final_path(h, VOLUME_NAME_NT)
-}
-
-fn final_path(h: HANDLE, flags: u32) -> Option<Vec<u16>> {
     // One call into a buffer that fits nearly every path; each call repeats the
     // whole name query. On success the return is the length WITHOUT the NUL; if
     // the buffer is too small, it is the length needed INCLUDING the NUL.
     let mut buf = vec![0u16; 512];
     loop {
-        let n = unsafe { GetFinalPathNameByHandleW(h, buf.as_mut_ptr(), buf.len() as u32, flags) };
+        let n = unsafe {
+            GetFinalPathNameByHandleW(h, buf.as_mut_ptr(), buf.len() as u32, VOLUME_NAME_NT)
+        };
         if n == 0 {
             return None;
         }
@@ -189,13 +445,38 @@ pub struct LxMetadata {
     pub mode: Option<u32>,
 }
 
+/// The Win32 error for a failed NT call. A directory refused where a file was
+/// required is `ERROR_DIRECTORY_NOT_SUPPORTED`, and a file being deleted is
+/// `ERROR_DELETE_PENDING`, not `RtlNtStatusToDosError`'s generic
+/// `ERROR_ACCESS_DENIED` for both, so callers can tell them from "access
+/// denied".
 #[inline]
-fn nt_result(status: i32) -> Result<(), u32> {
-    if status < 0 {
-        Err(unsafe { RtlNtStatusToDosError(status) })
-    } else {
+fn nt_result(status: NTSTATUS) -> Result<(), u32> {
+    if status >= 0 {
         Ok(())
+    } else if status == STATUS_FILE_IS_A_DIRECTORY {
+        Err(ERROR_DIRECTORY_NOT_SUPPORTED)
+    } else if status == STATUS_DELETE_PENDING {
+        Err(ERROR_DELETE_PENDING)
+    } else {
+        Err(unsafe { RtlNtStatusToDosError(status) })
     }
+}
+
+/// Whether the file `h` refers to has been deleted: its last name is gone (with
+/// POSIX semantics) or goes when the last handle closes. False if that can't be
+/// queried.
+pub fn is_deleted(h: HANDLE) -> bool {
+    let mut info: FILE_STANDARD_INFO = unsafe { core::mem::zeroed() };
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            h,
+            FileStandardInfo,
+            (&raw mut info).cast(),
+            size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    };
+    ok != 0 && info.DeletePending
 }
 
 /// Read a file's [`LxMetadata`] with `NtQueryInformationFile(FileStatLxInformation)`,
@@ -355,55 +636,6 @@ pub fn flush(h: HANDLE) -> Result<(), u32> {
         return Err(unsafe { GetLastError() });
     }
     Ok(())
-}
-
-/// `CreateDirectoryW`.
-pub fn create_dir(path: &[u16]) -> Result<(), u32> {
-    if unsafe { CreateDirectoryW(path.as_ptr(), core::ptr::null()) } == 0 {
-        return Err(unsafe { GetLastError() });
-    }
-    Ok(())
-}
-
-/// `RemoveDirectoryW`.
-pub fn remove_dir(path: &[u16]) -> Result<(), u32> {
-    if unsafe { RemoveDirectoryW(path.as_ptr()) } == 0 {
-        return Err(unsafe { GetLastError() });
-    }
-    Ok(())
-}
-
-/// `DeleteFileW`.
-pub fn delete_file(path: &[u16]) -> Result<(), u32> {
-    if unsafe { DeleteFileW(path.as_ptr()) } == 0 {
-        return Err(unsafe { GetLastError() });
-    }
-    Ok(())
-}
-
-/// `MoveFileExW(from, to, flags)`.
-pub fn move_file(from: &[u16], to: &[u16], flags: u32) -> Result<(), u32> {
-    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), flags) } == 0 {
-        return Err(unsafe { GetLastError() });
-    }
-    Ok(())
-}
-
-/// `GetFileAttributesW`. Returns `INVALID_FILE_ATTRIBUTES` (`u32::MAX`) on error;
-/// the caller decides whether that matters.
-pub fn get_attributes(path: &[u16]) -> u32 {
-    unsafe { GetFileAttributesW(path.as_ptr()) }
-}
-
-/// `GetDiskFreeSpaceExW` -> `(free_available_to_caller, total, total_free)`.
-pub fn disk_free_space(path: &[u16]) -> Result<(u64, u64, u64), u32> {
-    let mut avail: u64 = 0;
-    let mut total: u64 = 0;
-    let mut free: u64 = 0;
-    if unsafe { GetDiskFreeSpaceExW(path.as_ptr(), &mut avail, &mut total, &mut free) } == 0 {
-        return Err(unsafe { GetLastError() });
-    }
-    Ok((avail, total, free))
 }
 
 /// One directory entry from [`ReadDir`].

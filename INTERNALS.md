@@ -648,14 +648,23 @@ done. Build them in this order:
 - **virtio-9p** (`src/virtio/p9.rs`, id 9) — a 9P2000.L file share with a worker
   pool. Note the **path-security** layer: every component is validated
   (reject `..`, control chars, Win32 metacharacters, reserved DOS names), `..` is
-  resolved clamp-to-root, and all host I/O goes through `\\?\` long paths
-  (`README.md` §9). NTFS has no POSIX owner or mode, so `Rgetattr` reports the
-  share's `uid=`/`gid=` (default root) and a synthesized mode; the guest enforces
-  those bits itself. A `metadata` share instead keeps owner, group and
-  permission bits in WSL's `$LXUID`/`$LXGID`/`$LXMOD` extended attributes:
-  `Tsetattr`, `Tlcreate` and `Tmkdir` write them (`NtSetEaFile`) and `Rgetattr`
-  reads them back through `NtQueryInformationFile(FileStatLxInformation)`, NTFS's
-  own decoder of those attributes (`crates/winsys/src/fs.rs`). Each fid
+  resolved clamp-to-root, and every host operation opens the fid's path relative
+  to the held-open share root with `NtCreateFile` and `OBJ_DONT_REPARSE`, so no
+  symlink or junction on the way can take it outside the share; links that stay
+  inside are followed on a checked slow path (`README.md` §9). Fids hold paths,
+  not handles: Windows refuses to rename a directory while any handle to
+  something below it is open. Deletes and renames go through
+  `FileDispositionInformationEx` / `FileRenameInformationEx` with POSIX
+  semantics, so, as on Linux, a name goes away at once and a rename can replace
+  a file that is still open. NTFS has no POSIX owner or mode, so `Rgetattr`
+  reports the share's `uid=`/`gid=` (default root) and a synthesized mode; the
+  guest enforces those bits itself. A `metadata` share instead keeps owner,
+  group and permission bits in WSL's `$LXUID`/`$LXGID`/`$LXMOD` extended
+  attributes: `Tsetattr`, `Tlcreate` and `Tmkdir` write them (`NtSetEaFile`),
+  O_TRUNC truncates the open file rather than overwriting it so they survive,
+  and `Rgetattr` reads them back through
+  `NtQueryInformationFile(FileStatLxInformation)`, NTFS's own decoder of those
+  attributes (`crates/winsys/src/fs.rs`). Each fid
   remembers its attacher's `n_uname`, the owner of what it creates. Give files a
   **non-zero `qid.version`** (here, as in QEMU, derived from the last write time
   and size): Linux treats version 0 as a synthetic file and bypasses its page
