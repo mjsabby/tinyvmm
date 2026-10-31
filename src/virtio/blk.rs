@@ -629,8 +629,7 @@ impl BlockDevice {
                 if op == Op::Write {
                     // Gather guest → bounce now (the guest pages are quiescent
                     // until completion). `seg.ptr/len` were host_range-validated.
-                    let dst = &mut bs.buf[off..off + seg.len];
-                    dst.copy_from_slice(unsafe { std::slice::from_raw_parts(seg.ptr, seg.len) });
+                    seg.read_at(0, &mut bs.buf[off..off + seg.len]);
                 }
                 off += seg.len;
             }
@@ -772,7 +771,8 @@ impl BlockDevice {
             }
 
             let (rtype, sector) = {
-                let h = bufs[0].as_slice();
+                let mut h = [0u8; 16];
+                bufs[0].read_at(0, &mut h);
                 (
                     u32::from_le_bytes(h[0..4].try_into().unwrap()),
                     u64::from_le_bytes(h[8..16].try_into().unwrap()),
@@ -818,10 +818,7 @@ impl BlockDevice {
                 let mut range_buf = [0u8; 16 * BLK_MAX_RANGE_SEG];
                 let mut filled = 0usize;
                 for s in data {
-                    let sl = s.as_slice();
-                    let n = sl.len().min(range_buf.len() - filled);
-                    range_buf[filled..filled + n].copy_from_slice(&sl[..n]);
-                    filled += n;
+                    filled += s.read_at(0, &mut range_buf[filled..]);
                 }
                 let cap_sectors = if is_wz {
                     BLK_MAX_WRITE_ZEROES_SECTORS
