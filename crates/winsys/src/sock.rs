@@ -8,11 +8,12 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
 };
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, FIONBIO, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IPPROTO_TCP, IPPROTO_UDP, SD_SEND,
-    SO_RCVBUF, SOCK_DGRAM, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKET, SOL_SOCKET, WSA_IO_PENDING,
-    WSABUF, WSADATA, WSAGetLastError, WSAIoctl, WSARecv, WSASend, WSAStartup, accept, bind,
-    closesocket, connect, getpeername, getsockname, ioctlsocket, listen, setsockopt, shutdown,
-    socket,
+    SO_PROTOCOL_INFOW, SO_RCVBUF, SOCK_DGRAM, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKET,
+    SOL_SOCKET, WSA_IO_PENDING, WSABUF, WSADATA, WSAGetLastError, WSAIoctl, WSAPROTOCOL_INFOW,
+    WSARecv, WSASend, WSAStartup, XP1_IFS_HANDLES, accept, bind, closesocket, connect, getpeername,
+    getsockname, getsockopt, ioctlsocket, listen, setsockopt, shutdown, socket,
 };
+use windows_sys::Win32::Storage::FileSystem::SetFileCompletionNotificationModes;
 use windows_sys::Win32::System::IO::{
     CreateIoCompletionPort, GetQueuedCompletionStatus, GetQueuedCompletionStatusEx, OVERLAPPED,
     OVERLAPPED_ENTRY, PostQueuedCompletionStatus,
@@ -184,6 +185,78 @@ pub fn wsa_send(s: SOCKET, data: &[u8]) -> i32 {
     };
     let mut sent = 0u32;
     unsafe { WSASend(s, &wb, 1, &mut sent, 0, std::ptr::null_mut(), None) }
+}
+
+/// What posting an overlapped receive with [`wsa_recv_inline`] did.
+pub enum RecvPost {
+    /// It completed at once, with this many bytes. On a socket in
+    /// [`skip_iocp_on_success`] mode no completion is queued for it; on any
+    /// other socket one still is.
+    Done(usize),
+    /// It is pending: its completion will be queued.
+    Pending,
+    /// It failed at once (e.g. WSAECONNRESET after an ICMP port unreachable):
+    /// no completion will be queued.
+    Failed,
+}
+
+/// Stop queueing completions for overlapped operations on `s` that complete
+/// at once (`FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`): [`wsa_recv_inline`]
+/// reports those and the caller handles them inline. Only done when the
+/// socket's provider is IFS, as a layered (LSP) provider may queue them
+/// anyway; returns whether the mode is on.
+pub fn skip_iocp_on_success(s: SOCKET) -> bool {
+    const FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: u8 = 1;
+    const FILE_SKIP_SET_EVENT_ON_HANDLE: u8 = 2;
+    let mut info: WSAPROTOCOL_INFOW = unsafe { core::mem::zeroed() };
+    let mut len = core::mem::size_of::<WSAPROTOCOL_INFOW>() as i32;
+    let rc = unsafe {
+        getsockopt(
+            s,
+            SOL_SOCKET,
+            SO_PROTOCOL_INFOW,
+            (&mut info as *mut WSAPROTOCOL_INFOW).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 || info.dwServiceFlags1 & XP1_IFS_HANDLES == 0 {
+        return false;
+    }
+    let flags = FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE;
+    unsafe { SetFileCompletionNotificationModes(s as HANDLE, flags) != 0 }
+}
+
+/// [`wsa_recv`] that tells a receive which completed at once apart from a
+/// pending one, with its size (read from the `OVERLAPPED`, which the system
+/// fills in for an immediate completion).
+///
+/// # Safety
+/// As for [`wsa_recv`].
+pub unsafe fn wsa_recv_inline(
+    s: SOCKET,
+    wsabufs: *const WSABUF,
+    count: u32,
+    ov: *mut OVERLAPPED,
+) -> RecvPost {
+    let mut flags = 0u32;
+    let r = unsafe {
+        WSARecv(
+            s,
+            wsabufs,
+            count,
+            std::ptr::null_mut(),
+            &mut flags,
+            ov,
+            None,
+        )
+    };
+    if r == 0 {
+        RecvPost::Done(unsafe { (*ov).InternalHigh })
+    } else if unsafe { WSAGetLastError() } == WSA_IO_PENDING {
+        RecvPost::Pending
+    } else {
+        RecvPost::Failed
+    }
 }
 
 /// Post an overlapped send. `wsabuf`/`ov` must outlive the operation. Returns
@@ -471,4 +544,46 @@ pub fn dns_servers() -> Vec<[u8; 4]> {
         node = unsafe { (*node).Next };
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::UdpSocket;
+    use std::os::windows::io::AsRawSocket;
+    use std::time::Duration;
+
+    /// In skip mode a receive that finds a datagram queued completes inline
+    /// and queues no completion (one would be handled twice), while one that
+    /// waits still completes through the port.
+    #[test]
+    fn skip_mode_completes_queued_receives_inline_only() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        tx.connect(rx.local_addr().unwrap()).unwrap();
+        rx.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let s = rx.as_raw_socket() as SOCKET;
+        let iocp = create_iocp().unwrap();
+        assert!(associate(iocp, s, 7));
+        assert!(skip_iocp_on_success(s));
+        let mut buf = [0u8; 64];
+        let wb = wsabuf(buf.as_mut_ptr(), buf.len());
+        let mut ov: OVERLAPPED = unsafe { core::mem::zeroed() };
+        let mut done = [(false, 0, 0, std::ptr::null_mut()); 4];
+
+        tx.send(b"hello").unwrap();
+        rx.peek(&mut [0u8; 8]).unwrap();
+        let r = unsafe { wsa_recv_inline(s, &wb, 1, &mut ov) };
+        assert!(matches!(r, RecvPost::Done(5)));
+        assert_eq!(&buf[..5], b"hello");
+        assert_eq!(get_many(iocp, &mut done, 0), 0, "nothing queued for it");
+
+        let r = unsafe { wsa_recv_inline(s, &wb, 1, &mut ov) };
+        assert!(matches!(r, RecvPost::Pending));
+        tx.send(b"world!").unwrap();
+        assert_eq!(get_many(iocp, &mut done, 5000), 1);
+        let (ok, bytes, key, _) = done[0];
+        assert!(ok && bytes == 6 && key == 7);
+        assert_eq!(&buf[..6], b"world!");
+    }
 }

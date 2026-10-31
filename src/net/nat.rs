@@ -50,6 +50,10 @@ const KEY_FRAME_OFFLOAD_BIG: usize = 7;
 /// (`NetDevice::rx_congested`): resume the paused flows.
 const KEY_RX_SPACE: usize = 8;
 const KEY_STOP: usize = 9;
+/// A UDP flow stopped after a pass's worth of datagrams that its receives found
+/// already queued; this resumes it after the completions queued meanwhile.
+/// Carries the flow's `UdpOp`, as a receive completion does.
+const KEY_UDP_MORE: usize = 10;
 
 const FRAME_CAP: usize = 2048;
 /// Max coalesced TCP payload per GSO super-frame (just under 64 KiB so the IPv4
@@ -57,6 +61,12 @@ const FRAME_CAP: usize = 2048;
 const GSO_PAYLOAD_CAP: usize = 65000;
 const GSO_FRAME_CAP: usize = ETH_HDR + 60 + GSO_PAYLOAD_CAP;
 const UDP_BUF: usize = 2048;
+/// Most datagrams one pass of a UDP flow takes from its socket: on a socket
+/// that skips the IOCP on success, a receive finding one already queued
+/// completes inline, so a burst costs one completion and one worker wake, not
+/// one per datagram. Bounded so one busy flow can't hold up the worker's other
+/// completions.
+const UDP_DRAIN_MAX: usize = 32;
 // Host-socket send buffer per overlapped op (one host send in flight per flow).
 const TCP_BUF: usize = 65536;
 // Most a host recv takes at once. Each WSARecv lands straight in the free
@@ -789,6 +799,9 @@ struct UdpOp {
     buf: [u8; UDP_BUF],
     wsabuf: WSABUF,
     sock: SOCKET,
+    /// The socket skips the IOCP for receives that complete at once
+    /// (`sys::skip_iocp_on_success`), so those are handled inline.
+    skip_on_success: bool,
     guest_ip: [u8; 4],
     guest_port: u16,
     dst_ip: [u8; 4],
@@ -1495,6 +1508,13 @@ impl NatState {
     /// Ethernet (reusing the scratch buffers) and inject it to the guest.
     /// Alloc-free.
     fn wrap_and_inject(&mut self, src_ip: [u8; 4], dst_ip: [u8; 4], proto: u8) {
+        self.wrap_l3(src_ip, dst_ip, proto);
+        self.inject(&self.l3_scratch);
+    }
+
+    /// Wrap the L4 payload in `l3_scratch` in IPv4 + Ethernet, leaving the
+    /// frame in `l3_scratch`.
+    fn wrap_l3(&mut self, src_ip: [u8; 4], dst_ip: [u8; 4], proto: u8) {
         build_ipv4_into(
             &mut self.tx_scratch,
             src_ip,
@@ -1509,7 +1529,6 @@ impl NatState {
             ETHERTYPE_IPV4,
             &self.tx_scratch,
         );
-        self.inject(&self.l3_scratch);
     }
 
     fn run(mut self) {
@@ -1633,6 +1652,7 @@ impl NatState {
                 self.big_pool.release(idx);
             }
             KEY_UDP => self.on_udp_recv(ov as *mut UdpOp, ok, bytes),
+            KEY_UDP_MORE => self.on_udp_more(ov as *mut UdpOp),
             KEY_ICMP => {
                 let msg = unsafe { Box::from_raw(ov as *mut IcmpReplyMsg) };
                 self.on_icmp_reply(&msg);
@@ -1873,6 +1893,7 @@ impl NatState {
         let mut op = self.udp_op_pool.acquire();
         op.overlapped = unsafe { core::mem::zeroed() };
         op.sock = sock;
+        op.skip_on_success = sys::skip_iocp_on_success(sock);
         op.guest_ip = gip;
         op.guest_port = gport;
         op.dst_ip = dip;
@@ -1881,16 +1902,6 @@ impl NatState {
         let p = op.buf.as_mut_ptr();
         let l = op.buf.len();
         op.wsabuf = sys::wsabuf(p, l);
-        let opp: *mut UdpOp = &mut *op;
-        let posted = unsafe { sys::wsa_recv(sock, &(*opp).wsabuf, 1, &mut (*opp).overlapped) };
-        if !posted {
-            // Recv failed synchronously: no completion will arrive, so a tracked
-            // flow could never be reaped through its recv. Release everything now
-            // instead of leaking it until the idle sweep.
-            sys::close_sock(sock);
-            self.udp_op_pool.release(op);
-            return None;
-        }
         self.udp.insert(
             key,
             UdpFlow {
@@ -1900,7 +1911,10 @@ impl NatState {
             },
         );
         self.flows.udp.fetch_add(1, Ordering::Relaxed);
-        Some(sock)
+        // Post the first receive. If it fails at once, no completion will
+        // arrive to reap the flow through, so the pump reaps it now.
+        self.udp_pump(key, None);
+        self.udp.contains_key(&key).then_some(sock)
     }
 
     /// Remove a UDP flow: close its socket if still open and return the pooled
@@ -1923,45 +1937,107 @@ impl NatState {
         if opp.is_null() {
             return;
         }
-        let op = unsafe { &mut *opp };
-        let key = op.key;
-        let now = self.now();
+        let key = unsafe { (*opp).key };
         // If the flow was reaped while this recv was in flight, the socket was
-        // closed (aborting it); the op has now drained, so free it safely.
+        // closed (aborting it); the op has now drained, so free it safely. A
+        // failed receive (e.g. ICMP port-unreachable) drops the flow too; a
+        // later guest send recreates it. No other op is pending either way.
         let dead = self.udp.get(&key).map(|f| f.dead).unwrap_or(true);
-        if dead {
+        if dead || !ok || bytes == 0 {
             self.reap_udp(key);
             return;
         }
-        if !ok || bytes == 0 {
-            // Socket error/closed (e.g. ICMP port-unreachable). Drop the flow;
-            // a later guest send recreates it. No other op is pending.
+        self.udp_pump(key, Some(bytes as usize));
+    }
+
+    /// A flow that yielded after a pass carries on (or is reaped, if it died
+    /// meanwhile; no receive is in flight).
+    fn on_udp_more(&mut self, opp: *mut UdpOp) {
+        let key = unsafe { (*opp).key };
+        if self.udp.get(&key).is_none_or(|f| f.dead) {
             self.reap_udp(key);
             return;
         }
-        let n = (bytes as usize).min(op.buf.len());
-        // Build the udp datagram into l3_scratch, then wrap+inject (alloc-free).
+        self.udp_pump(key, None);
+    }
+
+    /// Deliver the datagram a receive completed (`completed` bytes, if any) and
+    /// post the flow's next overlapped receive. A receive that completes at once
+    /// on a socket skipping the IOCP on success (one found queued) is
+    /// delivered inline and the next posted, up to [`UDP_DRAIN_MAX`] datagrams
+    /// per pass; then the flow yields through the IOCP with no receive in
+    /// flight. While the NIC's RX backlog is deep a pass takes just one, as
+    /// before: UDP isn't throttled like TCP (whose flows refill the backlog as
+    /// fast as the guest drains it) but uses the slack the RX pool keeps above
+    /// TCP's limit, and dropping there is how a congested link loses
+    /// datagrams. Only called with no receive in flight.
+    fn udp_pump(&mut self, key: FlowKey, completed: Option<usize>) {
+        let dev = self.net.upgrade();
+        let now = self.now();
+        if let Some(f) = self.udp.get_mut(&key) {
+            f.last_use = now;
+        }
+        let mut taken = 0;
+        if let Some(n) = completed {
+            self.udp_deliver(dev.as_deref(), key, n);
+            taken = 1;
+        }
+        loop {
+            let congested = dev.as_ref().is_some_and(|d| d.rx_congested());
+            if taken >= if congested { 1 } else { UDP_DRAIN_MAX } {
+                break;
+            }
+            let Some(f) = self.udp.get_mut(&key) else {
+                return;
+            };
+            let op = f.op.as_mut().unwrap();
+            let buf = &op.wsabuf as *const WSABUF;
+            let ovl = &mut op.overlapped as *mut OVERLAPPED;
+            match unsafe { sys::wsa_recv_inline(op.sock, buf, 1, ovl) } {
+                // As for a completion: an empty datagram drops the flow.
+                sys::RecvPost::Done(n) if op.skip_on_success && n > 0 => {
+                    self.udp_deliver(dev.as_deref(), key, n);
+                    taken += 1;
+                }
+                // Without skip mode an immediate completion is still queued.
+                sys::RecvPost::Done(_) if !op.skip_on_success => return,
+                sys::RecvPost::Pending => return,
+                // No completion will arrive to reap the flow through.
+                _ => {
+                    self.reap_udp(key);
+                    return;
+                }
+            }
+        }
+        let op = self
+            .udp
+            .get_mut(&key)
+            .and_then(|f| f.op.as_deref_mut())
+            .unwrap();
+        if !sys::post(self.iocp, 0, KEY_UDP_MORE, &mut op.overlapped) {
+            self.reap_udp(key);
+        }
+    }
+
+    /// Hand the first `n` bytes of `key`'s receive buffer, a datagram from the
+    /// host, to the guest. Its interrupt waits for the worker's batch
+    /// (`notify_guest`), as TCP frames' do. Alloc-free.
+    fn udp_deliver(&mut self, dev: Option<&NetDevice>, key: FlowKey, n: usize) {
+        let Some(op) = self.udp.get(&key).and_then(|f| f.op.as_deref()) else {
+            return;
+        };
         build_udp_into(
             &mut self.l3_scratch,
             op.dst_ip,
             op.guest_ip,
             op.dst_port,
             op.guest_port,
-            &op.buf[..n],
+            &op.buf[..n.min(UDP_BUF)],
         );
-        let (dst_ip, guest_ip) = (op.dst_ip, op.guest_ip);
-        self.wrap_and_inject(dst_ip, guest_ip, IP_PROTO_UDP);
-        if let Some(f) = self.udp.get_mut(&key) {
-            f.last_use = now;
-        }
-        let buf = &op.wsabuf as *const WSABUF;
-        let ovl = &mut op.overlapped as *mut OVERLAPPED;
-        let sock = op.sock;
-        let posted = unsafe { sys::wsa_recv(sock, buf, 1, ovl) };
-        if !posted {
-            // Re-arm failed synchronously: no further completion will arrive, so
-            // reap now (the op is not in flight).
-            self.reap_udp(key);
+        let (src_ip, dst_ip) = (op.dst_ip, op.guest_ip);
+        self.wrap_l3(src_ip, dst_ip, IP_PROTO_UDP);
+        if let Some(d) = dev {
+            d.inject_rx_gso_batched(&self.l3_scratch, RxHeader::default());
         }
     }
 
@@ -2703,7 +2779,8 @@ impl NatState {
     /// engine's per-conn watchdogs.
     fn expire_idle(&mut self, now: u64) {
         // UDP: reap entries idle longer than UDP_IDLE_MS. Marking dead +
-        // closing the socket aborts the pending recv; on_udp_recv frees it.
+        // closing the socket aborts the pending recv (or the queued yield);
+        // on_udp_recv (or on_udp_more) frees it.
         let udp_dead: Vec<FlowKey> = self
             .udp
             .iter()

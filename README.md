@@ -629,8 +629,13 @@ including the audio track.
   a GSO super-frame of up to 64 KiB built in place (`NEEDS_CSUM`), and are
   copied once into the guest's RX buffers. Each worker dequeues up to 16
   completions per `GetQueuedCompletionStatusEx` and interrupts the guest once
-  for the TCP frames a batch delivered (sooner if 8 are waiting); ARP, ICMP and
-  UDP replies interrupt right away. The NAT holds up to 256 TCP flows and
+  for the TCP and UDP frames a batch delivered (sooner if 8 are waiting); ARP
+  and ICMP replies interrupt right away. A UDP flow keeps one overlapped
+  receive posted on a socket set to skip the IOCP for receives that complete
+  at once, so after a completion it takes the datagrams already queued inline,
+  up to 32 per pass, instead of one completion and worker wake each (one per
+  pass while the guest's RX backlog is deep: UDP isn't throttled like TCP, and
+  uses the RX pool's slack). The NAT holds up to 256 TCP flows and
   ends connections the way a real network would:
   * The guest's SYN is answered only once the host connect succeeds. A refused
     or unreachable destination, or one that doesn't answer within 10 s, fails
