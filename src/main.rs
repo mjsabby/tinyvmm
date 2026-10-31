@@ -2257,11 +2257,18 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     let mut ap_handles = Vec::new();
     for (i, l) in loops.into_iter().enumerate() {
         let ids = cpu_set_ids.clone();
+        let stop_all = stop_all.clone();
         let h = std::thread::Builder::new()
             .name(format!("vcpu-{}", i + 1))
             .spawn(move || {
                 cpu_affinity::pin_current_thread(&ids);
-                l.run()
+                let reason = l.run();
+                // The guest fired the snapshot trigger on this AP: stop the
+                // BSP and the other APs too, so the save below can proceed.
+                if reason == StopReason::SnapshotRequested {
+                    stop_all();
+                }
+                reason
             })
             .map_err(|e| Error::msg(format!("spawn AP thread: {e}")))?;
         ap_handles.push(h);
@@ -2319,12 +2326,14 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         b.stop();
     }
 
-    // Snapshot save: if armed and the guest issued the trigger, capture the now
-    // quiesced machine (APs stopped + joined, blk IOCP workers drained) and
-    // write the file, then exit. If the guest stopped for any other reason, the
-    // snapshot is not written.
+    // Snapshot save: if armed and the guest issued the trigger (from any vCPU),
+    // capture the now quiesced machine (APs stopped + joined, blk IOCP workers
+    // drained) and write the file, then exit. If the guest stopped for any
+    // other reason, the snapshot is not written.
     if let Some(ref save_path) = cfg.save_path {
-        if matches!(reason, StopReason::SnapshotRequested) {
+        let requested = reason == StopReason::SnapshotRequested
+            || ap_reasons.contains(&StopReason::SnapshotRequested);
+        if requested {
             // Quiesce every net data plane and 9p worker pool before capturing,
             // so no inbound frame or 9p reply mutates an RX/used ring or guest
             // RAM after the device + RAM sections are taken.

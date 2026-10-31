@@ -218,6 +218,7 @@ repo root) and need WHP — bare metal or nested Hyper-V:
 | `python tools\irq_bench.py --tinyvmm base=<exe> --tinyvmm new=<exe>` | A/B interrupt-path latency: timer wake-up, virtio-blk QD1 round trip, cross-CPU wake-up, idle host CPU, VM exits |
 | `python tools\net_compare.py` | NAT networking vs OpenVMM |
 | `python tools\nat_test.py` | NAT connection semantics: refused connects, host resets, host-closed churn |
+| `python tools\save_restore_test.py [--vcpus 2 --trigger-cpu 1]` | `--save`, then three `--restore`s of the snapshot, which they leave unchanged; `--trigger-cpu` fires the trigger from that vCPU (an AP when above 0) |
 
 ### Large pages
 
@@ -1437,7 +1438,8 @@ issuing the **magic leaf `CPUID(0x4000DE57)`** (a Hyper-V leaf, so a real host
 returns nothing for it). The run loop always returns the signature (so the guest
 can detect support), and when *armed* it records the requesting vp and surfaces
 `StopReason::SnapshotRequested`, advancing RIP first so restore resumes *past* the
-CPUID (`src/whp/snapshot.rs`, `src/whp/run_loop.rs`). The VMM then quiesces (stops
+CPUID (`src/whp/snapshot.rs`, `src/whp/run_loop.rs`). Any vCPU may fire it: an AP
+that does also stops the BSP and the other APs. The VMM then quiesces (stops
 + joins APs, drains the blk IOCP workers, stops net backends, quiesces 9p) and
 writes a self-describing file (`src/whp/snapshot_file.rs`):
 

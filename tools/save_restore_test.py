@@ -28,6 +28,8 @@ Usage:
     [--initrd  <path>]   default repo/initramfs-snapshot.cpio.gz
     [--snap-path <path>] default repo/snap_test.tvm
     [--ram-mb <N>]       default 256
+    [--vcpus <N>]        default 1
+    [--trigger-cpu <N>]  fire the trigger from vCPU N (an AP when N > 0)
     [--save-timeout <N>] default 60   seconds, allows for guest sleep+sync
     [--restore-timeout <N>] default 30
     [--restore-count <N>] default 3
@@ -55,7 +57,7 @@ DEFAULT_SNAP = REPO / "snap_test.tvm"
 
 
 PRE_TRIGGER_RE = re.compile(r"SNAP-TEST: pre-trigger sentinel")
-TRIGGER_FIRED_RE = re.compile(r"\[snapshot\] trigger fired from vp=\d+")
+TRIGGER_FIRED_RE = re.compile(r"\[snapshot\] trigger fired from vp=(\d+)")
 SNAP_WROTE_RE = re.compile(r"\[snapshot\] wrote (\d+) bytes")
 POST_RESTORE_RE = re.compile(r"POST-RESTORE-CONTINUE rc=0")
 SHUTDOWN_SENTINEL = "[init] === tinyvmm shutdown requested ==="
@@ -127,10 +129,13 @@ def phase1_save(args: argparse.Namespace) -> None:
         "console=hvc0 pci=conf1,nocrs,lastbus=0 nofb nomodeset"
         " tinyvmm.test=snapshot"
     )
+    if args.trigger_cpu is not None:
+        cmdline += f" tinyvmm.trigger_cpu={args.trigger_cpu}"
     argv = [
         str(args.tinyvmm),
         "--pvh-run",
         "--ram-mb", str(args.ram_mb),
+        "--vcpus", str(args.vcpus),
         "--watchdog-secs", str(args.save_timeout),
         "--save", str(args.snap_path),
         "--initrd", str(args.initrd),
@@ -143,8 +148,13 @@ def phase1_save(args: argparse.Namespace) -> None:
         raise SystemExit(f"[save] FAIL: tinyvmm rc={rc}")
     if not PRE_TRIGGER_RE.search(log):
         raise SystemExit("[save] FAIL: pre-trigger sentinel not in log")
-    if not TRIGGER_FIRED_RE.search(log):
+    fired = TRIGGER_FIRED_RE.search(log)
+    if not fired:
         raise SystemExit("[save] FAIL: '[snapshot] trigger fired' not in log")
+    if args.trigger_cpu is not None and int(fired.group(1)) != args.trigger_cpu:
+        raise SystemExit(
+            f"[save] FAIL: trigger fired from vp={fired.group(1)},"
+            f" not vp={args.trigger_cpu}")
     m = SNAP_WROTE_RE.search(log)
     if not m:
         raise SystemExit("[save] FAIL: '[snapshot] wrote' line not in log")
@@ -194,6 +204,9 @@ def main() -> int:
     ap.add_argument("--initrd",  type=Path, default=DEFAULT_INITRD)
     ap.add_argument("--snap-path", type=Path, default=DEFAULT_SNAP)
     ap.add_argument("--ram-mb", type=int, default=256)
+    ap.add_argument("--vcpus", type=int, default=1)
+    ap.add_argument("--trigger-cpu", type=int, default=None,
+                    help="fire the trigger from this vCPU (an AP when > 0)")
     ap.add_argument("--save-timeout", type=int, default=60)
     ap.add_argument("--restore-timeout", type=int, default=30)
     ap.add_argument("--restore-count", type=int, default=3)
@@ -208,7 +221,8 @@ def main() -> int:
     print(f"[harness] tinyvmm={args.tinyvmm}")
     print(f"[harness] vmlinux={args.vmlinux}")
     print(f"[harness] initrd ={args.initrd}")
-    print(f"[harness] snap   ={args.snap_path}  ram={args.ram_mb} MiB")
+    print(f"[harness] snap   ={args.snap_path}  ram={args.ram_mb} MiB"
+          f"  vcpus={args.vcpus}  trigger_cpu={args.trigger_cpu}")
     print(f"[harness] save_timeout={args.save_timeout}s "
           f"restore_timeout={args.restore_timeout}s "
           f"restore_count={args.restore_count}")

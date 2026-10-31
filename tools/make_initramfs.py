@@ -616,7 +616,13 @@ if grep -q 'tinyvmm.test=snapshot' /proc/cmdline 2>/dev/null; then
     # confusing assertions about "post-restore continue is the only
     # line".
     sleep 1
-    /bin/cpuid_trigger
+    # tinyvmm.trigger_cpu=N fires the trigger from vCPU N (an AP when N > 0).
+    TCPU=$(tr ' ' '\\n' < /proc/cmdline | grep '^tinyvmm.trigger_cpu=' | cut -d= -f2)
+    if [ -n "$TCPU" ]; then
+        taskset -c "$TCPU" /bin/cpuid_trigger
+    else
+        /bin/cpuid_trigger
+    fi
     rc=$?
     # Reachable only after restore; the save run captures state at the
     # CPUID instruction boundary and exits the host process before
