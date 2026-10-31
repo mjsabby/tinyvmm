@@ -299,7 +299,7 @@ Parsed in `parse_pvh_args` (`main.rs:590`). Defaults and clamps are exact.
 | `--nat-workers <N>` | a quarter of the host's logical CPUs, 1–4 | NAT worker threads for the current NIC, **1–16**. Each owns the TCP flows assigned to it; one flow never spans workers, so this scales many-flow traffic, not a single stream (see [§3](#3-devices-in-detail)). Kept across `--save`/`--restore`. |
 | `--wintun-name <adapter>` / `--wintun-host <ipv4>` | — | WinTun adapter name / host-side gateway IPv4 (wintun backend). |
 | `--drive <path>[,readonly\|ro]` | — | Add a virtio-blk disk. **Repeatable up to 8** (`/dev/vda`, `/dev/vdb`, …). |
-| `--virtio-9p-share <tag>=<host_dir>[,ro][,uid=<n>][,gid=<n>][,metadata]` | — | Share a host directory over virtio-9p (9P2000.L). **Repeatable up to 8.** Tag 1–256 bytes; host path canonicalized and must be a directory; duplicate tags rejected. NTFS has no POSIX owners, so by default every entry reports owner `uid`:`gid` (default `0:0`, root) with a synthesized mode (dirs `0755`, files `0644`, `0444` if read-only on the host). The guest enforces those bits, so set `uid`/`gid` to the guest user that must write; `chmod`/`chown` succeed but aren't stored. With `metadata` (like WSL's drvfs option of the same name), owners and modes live in WSL's `$LXUID`/`$LXGID`/`$LXMOD` NTFS extended attributes: `chmod`/`chown` persist, new files record their creator, group and mode, WSL sees the same values, and `uid`/`gid` apply only to entries without metadata. Kept across `--save`/`--restore`. |
+| `--virtio-9p-share <tag>=<host_dir>[,ro][,uid=<n>][,gid=<n>][,metadata]` | — | Share a host directory over virtio-9p (9P2000.L). **Repeatable up to 8.** Tag 1–256 bytes; host path canonicalized and must be a directory; duplicate tags rejected. NTFS has no POSIX owners, so by default every entry reports owner `uid`:`gid` (default `0:0`, root) with a synthesized mode (dirs `0755`, files `0644`, `0444` if read-only on the host). The guest enforces those bits, so set `uid`/`gid` to the guest user that must write; `chmod`/`chown` succeed but aren't stored. With `metadata` (like WSL's drvfs option of the same name), owners and modes live in WSL's `$LXUID`/`$LXGID`/`$LXMOD` NTFS extended attributes: `chmod`/`chown` persist, new files record their creator, group and mode, WSL sees the same values, and `uid`/`gid` apply only to entries without metadata. While the VM runs, the root is held open, so Windows won't rename the folders that contain it (§9). Kept across `--save`/`--restore`. |
 | `--gpu [WxH]` | off | Add a virtio-gpu 2D device and open a Win32 window showing its scanout (CPU blit). Optional `WxH` (e.g. `--gpu 1024x768`) sets the preferred size (default **1280×800**). Dropping `nofb nomodeset` from the default cmdline so the guest DRM driver mode-sets. With `--input`, the window is also the host input source. |
 | `--input` | off | Add **two** virtio-input devices — a keyboard and an absolute tablet (pointer + scroll + buttons). With `--gpu`, the host source is the GPU window (1:1 pixel coordinates); otherwise it falls back to the interactive console. Needs a guest kernel with `CONFIG_VIRTIO_INPUT`. |
 | `--sound` | off | Add a virtio-snd sound card — one playback + one capture PCM stream (48 kHz / S16_LE / stereo) backed by Windows **WASAPI** (shared mode). Needs a guest kernel with `CONFIG_SND_VIRTIO`. On a host with no audio endpoint the card still appears but plays/records silence. |
@@ -1164,13 +1164,28 @@ the locking story above.
   masked to the BAR size; MSI-X table/PBA access checks 4-byte alignment and
   `vec < num_vectors`; `trigger()` refuses `vector >= num_vectors`.
 * **virtio-9p path security (`src/virtio/p9.rs`):** the share root is canonicalized
-  once; each path component is checked by `is_safe_name_component` — rejecting
+  once and then held open for the VM's lifetime; each fid is a path below it.
+  Each path component is checked by `is_safe_name_component` — rejecting
   empty / `.` / `..`, length > 255, control chars `< 0x20`, the separators and
   Win32 metacharacters `/ \ : * ? " < > |`, a trailing dot or space, and the
   reserved DOS names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`).
-  `.`/`..` in a `Twalk` are resolved with **clamp-to-root**; a lexical containment
-  check is the backstop; all Win32 calls go through `\\?\` long paths. Read-only
-  shares reject writes with `EROFS`.
+  `.`/`..` in a `Twalk` are resolved with **clamp-to-root**. Every host operation
+  parses the fid's path in one `NtCreateFile` relative to the root handle with
+  `OBJ_DONT_REPARSE`, so the kernel refuses a symlink, junction or mount point
+  anywhere on the path before the operation has any effect: a directory swapped
+  for a junction after the guest walked it (by a host process, or by the guest
+  renaming an existing junction into its place) can't redirect a create, delete,
+  rename or truncate outside the share. Paths through links still work when the
+  link leads inside the share: the slow path follows the link with attribute
+  access only, checks the real path (`GetFinalPathNameByHandleW`) against the
+  root's, and only then reopens with the requested access. Deletes and renames
+  act on a link itself, never on its target. Read-only shares reject writes with
+  `EROFS`. Because the root is held open, Windows won't rename the folders that
+  contain a share root while the VM runs, as for any open folder; the root
+  itself can still be renamed or moved, and the share follows it. If the root is
+  deleted (a build step that deletes and recreates its output folder), the share
+  reattaches to the directory then at the share path, provided it lies where the
+  root was rather than behind a link left in its place.
 * **Backpressure, not unbounded buffering:** the NAT's per-flow guest→host queue
   caps at `TO_HOST_CAP = 64 KiB` (closing the guest TCP window). Toward the
   guest, while the NIC's RX backlog (frames waiting for guest RX buffers, 64
@@ -1471,7 +1486,9 @@ What is and isn't snapshottable:
 * **virtio-net IS snapshottable:** only the *device model* is captured; on restore
   a **fresh** backend is wired in (live external flows reset, new flows work).
 * **virtio-9p IS snapshottable:** its `capture_device_state` serializes the fid
-  table (paths + open modes + qid) and **reopens the host handles** on restore.
+  table (paths + open modes + qid) and **reopens the host handles** on restore,
+  through the same confined opens as live requests; a fid whose path doesn't
+  lie below the share root is dropped.
 * **virtio-input IS snapshottable:** queues + device-state (features/status,
   config select, LED state, last absolute position) round-trip, so the pointer
   resumes where it was.

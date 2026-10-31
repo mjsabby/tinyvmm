@@ -11,9 +11,16 @@
 //! inside the drain; the fid table is a separate mutex taken only for
 //! lookup/insert/erase steps.
 //!
-//! Security: a share root is trusted (the operator chose it). We sanitise each
-//! path component (reject separators / NUL / reserved DOS names) and resolve
-//! ".."/"." against the wire path so a guest cannot escape the share.
+//! Security: the share root is trusted (the operator chose it); what lies below
+//! it is not, since host processes and the guest itself rearrange it. The
+//! device holds the root open and keeps each fid as a path below it, built from
+//! validated components (no separators, `:`, control characters or reserved DOS
+//! names) with "."/".." resolved clamp-to-root. Every host operation parses that
+//! path relative to the root handle with `OBJ_DONT_REPARSE`, so the kernel
+//! refuses a symlink, junction or mount point on the way before it has any
+//! effect: nothing outside the share is reachable by construction, and no path
+//! check can race the operation. A path through a link takes
+//! `P9Device::open_linked`, which follows links only to places inside the share.
 //!
 //! Ownership: NTFS has no POSIX owner or mode bits, so every entry reports the
 //! share's configured `uid`/`gid` (default 0, root) and a synthesized mode
@@ -36,14 +43,14 @@ use crate::virtio::device::{
 use crate::virtio::queue::{ChainBuf, ChainScratch, Virtqueue};
 use crate::whp::GuestMemory;
 use std::collections::HashMap;
-use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use std::cell::UnsafeCell;
 use std::thread;
-use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::HANDLE;
 use winsys::fs;
 use winsys::sock::{self, Iocp};
 
@@ -168,6 +175,7 @@ const MAX_WALK_NAMES: u16 = 16;
 // ---- Win32 flag / error values (defined locally to avoid import churn) ----
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
+const DELETE: u32 = 0x0001_0000;
 const FILE_LIST_DIRECTORY: u32 = 0x0001;
 const FILE_APPEND_DATA: u32 = 0x0004;
 const FILE_READ_EA: u32 = 0x0008;
@@ -176,17 +184,9 @@ const FILE_READ_ATTRIBUTES: u32 = 0x0080;
 const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
 const FILE_SHARE_RWD: u32 = 0x0000_0007; // READ | WRITE | DELETE
 const OPEN_EXISTING: u32 = 3;
-const CREATE_NEW: u32 = 1;
-const CREATE_ALWAYS: u32 = 2;
-const OPEN_ALWAYS: u32 = 4;
-const TRUNCATE_EXISTING: u32 = 5;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
-const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
-const MOVEFILE_REPLACE_EXISTING: u32 = 0x01;
-const MOVEFILE_COPY_ALLOWED: u32 = 0x02;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_PATH_NOT_FOUND: u32 = 3;
 const ERROR_INVALID_DRIVE: u32 = 15;
@@ -204,6 +204,12 @@ const ERROR_BAD_PATHNAME: u32 = 161;
 const ERROR_ALREADY_EXISTS: u32 = 183;
 const ERROR_FILENAME_EXCED_RANGE: u32 = 206;
 const ERROR_DIRECTORY: u32 = 267;
+/// A directory opened where a file was required (`winsys::fs` maps
+/// `STATUS_FILE_IS_A_DIRECTORY` to it).
+const ERROR_DIRECTORY_NOT_SUPPORTED: u32 = 336;
+/// A file being deleted (`winsys::fs` maps `STATUS_DELETE_PENDING` to it), as
+/// everything below a deleted share root is.
+const ERROR_DELETE_PENDING: u32 = 303;
 const ERROR_OPERATION_ABORTED: u32 = 995;
 const ERROR_NOT_READY: u32 = 21;
 const ERROR_WRITE_PROTECT: u32 = 19;
@@ -212,6 +218,9 @@ const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_TOO_MANY_OPEN_FILES: u32 = 4;
 const ERROR_NEGATIVE_SEEK: u32 = 131;
 const ERROR_EAS_NOT_SUPPORTED: u32 = 282;
+/// A symlink, junction or mount point on a path opened without following
+/// links (`winsys::fs::Open::follow`).
+const ERROR_REPARSE_POINT_ENCOUNTERED: u32 = 4395;
 
 pub type IrqFn = Box<dyn Fn(u32) + Send + Sync>;
 
@@ -344,7 +353,10 @@ fn errno_from_win32(e: u32) -> u32 {
         ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND | ERROR_INVALID_DRIVE | ERROR_NO_MORE_FILES => {
             E_NOENT
         }
-        ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION => E_ACCES,
+        ERROR_ACCESS_DENIED
+        | ERROR_SHARING_VIOLATION
+        | ERROR_LOCK_VIOLATION
+        | ERROR_DELETE_PENDING => E_ACCES,
         ERROR_FILE_EXISTS | ERROR_ALREADY_EXISTS => E_EXIST,
         ERROR_INVALID_NAME | ERROR_INVALID_PARAMETER | ERROR_BAD_PATHNAME | ERROR_NEGATIVE_SEEK => {
             E_INVAL
@@ -358,6 +370,7 @@ fn errno_from_win32(e: u32) -> u32 {
         ERROR_NOT_SUPPORTED => E_NOSYS,
         ERROR_EAS_NOT_SUPPORTED => E_OPNOTSUPP,
         ERROR_DIRECTORY => E_NOTDIR,
+        ERROR_DIRECTORY_NOT_SUPPORTED => E_ISDIR,
         ERROR_NOT_READY | ERROR_OPERATION_ABORTED | ERROR_BROKEN_PIPE => E_IO,
         _ => E_IO,
     }
@@ -419,11 +432,10 @@ fn to_win32_long_path(p: &Path) -> Vec<u16> {
     result
 }
 
-/// Lexically normalise (lowercase + backslash + strip trailing) for the
-/// containment prefix check. Inputs are already free of `.`/`..` (Twalk
-/// resolves them), so no canonicalisation is needed.
-fn normalize_for_containment(p: &Path) -> Vec<u16> {
-    let mut w: Vec<u16> = p.as_os_str().encode_wide().collect();
+/// Lexically normalise (lowercase + backslash + strip trailing) a real path from
+/// `fs::final_nt_path_by_handle` for the containment prefix check.
+fn normalize_for_containment(path: &[u16]) -> Vec<u16> {
+    let mut w = path.to_vec();
     for c in w.iter_mut() {
         if *c == b'/' as u16 {
             *c = b'\\' as u16;
@@ -441,24 +453,6 @@ fn normalize_for_containment(p: &Path) -> Vec<u16> {
 /// Whether normalized path `p` is `root` or lies under it.
 fn contained_in(p: &[u16], root: &[u16]) -> bool {
     p.starts_with(root) && (p.len() == root.len() || p[root.len()] == b'\\' as u16)
-}
-
-/// The share root's real path with its NT volume name, normalized, for
-/// `P9Device::handle_contained`.
-fn nt_root_path(root: &Path) -> Option<Vec<u16>> {
-    let wp = to_win32_long_path(root);
-    let h = fs::create_file(
-        &wp,
-        FILE_READ_ATTRIBUTES,
-        FILE_SHARE_RWD,
-        OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS,
-    )
-    .ok()?;
-    let real = fs::final_nt_path_by_handle(h);
-    fs::close(h);
-    let os = std::ffi::OsString::from_wide(&real?);
-    Some(normalize_for_containment(Path::new(&os)))
 }
 
 fn is_safe_name_component(comp: &str) -> bool {
@@ -488,8 +482,47 @@ fn is_safe_name_component(comp: &str) -> bool {
     !RESERVED.contains(&stem.as_str())
 }
 
-fn join_child(base: &Path, child: &str) -> PathBuf {
-    base.join(child)
+/// A fid's path below the share root as the name `fs::open_relative` takes:
+/// its components joined by `\`, empty for the root itself.
+fn rel_wide(rel: &Path) -> Vec<u16> {
+    rel.as_os_str().encode_wide().collect()
+}
+
+/// The path below the share root that `path`, from a snapshot, names: `None`
+/// unless it lies under `root` through components a walk could have produced.
+fn rel_below(root: &Path, path: &Path) -> Option<PathBuf> {
+    let rel = path.strip_prefix(root).ok()?;
+    rel.components()
+        .all(|c| {
+            matches!(c, std::path::Component::Normal(n)
+                if n.to_str().is_some_and(is_safe_name_component))
+        })
+        .then(|| rel.to_path_buf())
+}
+
+fn kind_of(is_dir: bool) -> fs::Kind {
+    if is_dir {
+        fs::Kind::Directory
+    } else {
+        fs::Kind::File
+    }
+}
+
+/// The host access rights for a Tlopen with `flags`; `None` for an invalid
+/// access mode. O_TRUNC is applied separately (see `P9Device::truncate`).
+fn open_access(is_dir: bool, flags: u32) -> Option<u32> {
+    if is_dir {
+        return Some(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES);
+    }
+    let append = flags & O_APPEND != 0;
+    Some(match flags & O_ACCMODE {
+        O_RDONLY => GENERIC_READ,
+        O_WRONLY if append => FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES,
+        O_WRONLY => GENERIC_WRITE,
+        O_RDWR if append => GENERIC_READ | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES,
+        O_RDWR => GENERIC_READ | GENERIC_WRITE,
+        _ => return None,
+    })
 }
 
 // ============================================================
@@ -530,7 +563,11 @@ impl Drop for OwnedHandle {
 }
 
 struct FidEntry {
-    host_path: PathBuf,
+    /// The file's path below the share root, empty for the root itself: made of
+    /// validated components only, never `.` or `..`. Fids keep a path, not a
+    /// handle, because Windows refuses to rename a directory while any handle
+    /// to something under it is open.
+    rel: PathBuf,
     is_dir: bool,
     qid_path: u64,
     /// The attaching user's uid (Tattach `n_uname`), recorded as the owner of
@@ -546,9 +583,9 @@ struct FidEntry {
 }
 
 impl FidEntry {
-    fn new(host_path: PathBuf, is_dir: bool, qid_path: u64, uid: u32) -> FidEntry {
+    fn new(rel: PathBuf, is_dir: bool, qid_path: u64, uid: u32) -> FidEntry {
         FidEntry {
-            host_path,
+            rel,
             is_dir,
             qid_path,
             uid,
@@ -574,6 +611,13 @@ impl FidEntry {
 
 struct Fids {
     map: HashMap<u32, FidEntry>,
+}
+
+/// The pinned share root: its handle, and its real path (normalized, NT volume
+/// name) when first pinned, the only place a deleted root is replaced from.
+struct Root {
+    handle: OwnedHandle,
+    real: Vec<u16>,
 }
 
 // ============================================================
@@ -695,16 +739,14 @@ pub struct P9Device {
     queue: Mutex<Virtqueue>,
     tag: String,
     host_root: PathBuf,
+    /// The share root, held open from first use (see [`Self::root`]); every host
+    /// path is parsed relative to it. Replaced if the root is deleted.
+    root: Mutex<Option<Arc<Root>>>,
     readonly: bool,
     // Owner reported for entries without metadata (see the module docs).
     uid: u32,
     gid: u32,
     metadata: bool,
-    share_root_norm: Vec<u16>,
-    /// The share root's real path with its NT volume name, normalized like
-    /// `share_root_norm`; `handle_contained` compares against it. None if it
-    /// couldn't be resolved, in which case the drive-letter form is used.
-    share_root_nt: Option<Vec<u16>>,
     config_bytes: Vec<u8>,
     driver_ok: AtomicBool,
     acked_features: AtomicU64,
@@ -731,8 +773,6 @@ impl P9Device {
         host_root: PathBuf,
         opts: ShareOptions,
     ) -> Arc<Self> {
-        let share_root_norm = normalize_for_containment(&host_root);
-        let share_root_nt = nt_root_path(&host_root);
         let mut config_bytes = Vec::with_capacity(2 + tag.len());
         let n = tag.len().min(0xFFFF);
         config_bytes.extend_from_slice(&(n as u16).to_le_bytes());
@@ -742,12 +782,11 @@ impl P9Device {
             queue: Mutex::new(Virtqueue::new(_mem, P9_QUEUE_MAX)),
             tag,
             host_root,
+            root: Mutex::new(None),
             readonly: opts.readonly,
             uid: opts.uid,
             gid: opts.gid,
             metadata: opts.metadata,
-            share_root_norm,
-            share_root_nt,
             config_bytes,
             driver_ok: AtomicBool::new(false),
             acked_features: AtomicU64::new(0),
@@ -780,6 +819,14 @@ impl P9Device {
             let _ = thread::Builder::new()
                 .name(format!("p9-worker-{w}"))
                 .spawn(move || p9_worker(d));
+        }
+        // Pin the share root now; if it can't be opened yet, every request tries
+        // again until it can.
+        if let Err(e) = dev.root() {
+            eprintln!(
+                "[9p] WARN: cannot open share root {} (Win32 error {e}); its requests fail until it can be",
+                dev.host_root.display()
+            );
         }
         dev
     }
@@ -838,183 +885,276 @@ impl P9Device {
         self.next_qid_path.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn path_contained(&self, p: &Path) -> bool {
-        contained_in(&normalize_for_containment(p), &self.share_root_norm)
-    }
-
-    /// Re-check containment against the *real* path of an opened handle. The
-    /// lexical [`path_contained`] check runs on the guest-supplied path, but
-    /// `CreateFileW` follows reparse points (symlinks / NTFS junctions). A
-    /// reparse point that lives lexically inside the share but targets a
-    /// directory outside it would pass the lexical check yet open an external
-    /// file. `GetFinalPathNameByHandleW` resolves the handle to its true path,
-    /// so re-running the prefix check on that real path closes the
-    /// symlink/junction escape. Both sides use the NT volume name
-    /// (`\Device\HarddiskVolumeN\...`): resolving the drive letter costs a
-    /// Mount Manager round trip on every walk and getattr. Fails closed: if the
-    /// path can't be resolved, treat as not contained. This restores parity
-    /// with the C++ backend's `weakly_canonical`-based normalization.
-    fn handle_contained(&self, h: HANDLE) -> bool {
-        if let Some(root) = &self.share_root_nt {
-            return fs::final_nt_path_by_handle(h).is_some_and(|real| {
-                let os = std::ffi::OsString::from_wide(&real);
-                contained_in(&normalize_for_containment(Path::new(&os)), root)
-            });
+    /// The share root's handle. It opens on first use (normally when the device
+    /// is created) and then stays open, pinning the share: the root may be
+    /// renamed or moved on the host and the share follows it, while Windows, as
+    /// for any open folder, won't rename the folders containing it until the VM
+    /// exits. If the root is deleted, [`Self::open_rel`] reattaches to the
+    /// directory then at the share path. Attribute access only, sharing read,
+    /// write and delete.
+    fn root(&self) -> Result<Arc<Root>, u32> {
+        if let Some(root) = self.root.lock().unwrap().as_ref() {
+            return Ok(root.clone());
         }
-        match fs::final_path_by_handle(h) {
-            Some(real) => {
-                let os = std::ffi::OsString::from_wide(&real);
-                self.path_contained(Path::new(&os))
-            }
-            None => false,
+        self.reopen_root(None)
+    }
+
+    /// Open the directory at the share path and pin it as the root, replacing
+    /// `stale` (a root that was deleted) unless another request already has.
+    /// A replacement must lie where the share first was: a link left in the
+    /// deleted root's place doesn't move the share to wherever it points.
+    fn reopen_root(&self, stale: Option<&Arc<Root>>) -> Result<Arc<Root>, u32> {
+        let mut root = self.root.lock().unwrap();
+        if let Some(cur) = root.as_ref()
+            && !stale.is_some_and(|s| Arc::ptr_eq(s, cur))
+        {
+            return Ok(cur.clone());
         }
-    }
-
-    // Open a handle for attribute-only queries (works on directories too).
-    //
-    // NOTE: the per-call `handle_contained` (GetFinalPathNameByHandle, ≈5
-    // internal QueryInfo) is the dominant cost of `Twalk`/`Tgetattr`, but it
-    // CANNOT be skipped via `FILE_FLAG_OPEN_REPARSE_POINT` + last-component
-    // attribute check: that flag only suppresses traversal of the *final*
-    // component, so an intermediate junction retargeted by a host process
-    // (the B1 TOCTOU) would still be followed and the attribute check on the
-    // landed-on file wouldn't see it. The safe optimisation is relative-open
-    // (`NtCreateFile` with `RootDirectory` = parent fid's validated handle +
-    // `OPEN_REPARSE_POINT` on the single new component) — that's the B1 fix
-    // and the perf fix in one, left as follow-up.
-    fn open_for_attrs(&self, p: &Path) -> Result<HANDLE, u32> {
-        self.open_contained(p, FILE_READ_ATTRIBUTES)
-    }
-
-    /// Open `p` (file or directory) with `access`, refusing a handle that
-    /// resolved outside the share.
-    fn open_contained(&self, p: &Path, access: u32) -> Result<HANDLE, u32> {
-        let w = to_win32_long_path(p);
-        let h = fs::create_file(
-            &w,
-            access,
+        let handle = OwnedHandle(fs::create_file(
+            &to_win32_long_path(&self.host_root),
+            FILE_READ_ATTRIBUTES,
             FILE_SHARE_RWD,
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS,
-        )?;
-        // The path was lexically contained, but the open may have traversed a
-        // reparse point out of the share. Validate the resolved handle path.
-        if !self.handle_contained(h) {
-            fs::close(h);
+        )?);
+        if fs::file_info(handle.get())?.attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(ERROR_DIRECTORY);
+        }
+        let real = fs::final_nt_path_by_handle(handle.get())
+            .map(|p| normalize_for_containment(&p))
+            .ok_or(ERROR_ACCESS_DENIED)?;
+        if root.as_ref().is_some_and(|old| old.real != real) {
             return Err(ERROR_ACCESS_DENIED);
         }
-        Ok(h)
+        let new = Arc::new(Root { handle, real });
+        *root = Some(new.clone());
+        Ok(new)
     }
 
-    /// [`Self::open_for_attrs`], plus FILE_READ_EA on a `metadata` share so
+    /// Whether the file `h` refers to lies inside the share: its real path,
+    /// every link resolved, is the root's or below it. Both sides use the NT
+    /// volume name (`\Device\HarddiskVolumeN\...`), which skips the drive-letter
+    /// lookup, and the root's is read from its handle each time, so a root that
+    /// moved is still recognized. Fails closed.
+    fn handle_contained(&self, h: HANDLE) -> bool {
+        let Ok(root) = self.root() else {
+            return false;
+        };
+        match (
+            fs::final_nt_path_by_handle(h),
+            fs::final_nt_path_by_handle(root.handle.get()),
+        ) {
+            (Some(real), Some(root)) => contained_in(
+                &normalize_for_containment(&real),
+                &normalize_for_containment(&root),
+            ),
+            _ => false,
+        }
+    }
+
+    /// Open `rel`, a path below the share root, without leaving the share. The
+    /// whole path is parsed in one `NtCreateFile` relative to the root handle
+    /// without following links (`OBJ_DONT_REPARSE`): the kernel refuses a
+    /// symlink, junction or mount point on the way before the open has any
+    /// effect, so what opens lies inside the share by construction, with no
+    /// check afterwards to race. A path through a link takes
+    /// [`Self::open_linked`]. Returns the handle and whether this call created
+    /// the file.
+    fn open_rel(&self, rel: &Path, how: fs::Open) -> Result<(OwnedHandle, bool), u32> {
+        let root = self.root()?;
+        let r = self.open_below(root.handle.get(), rel, how);
+        // A root deleted on the host fails every open below it as delete
+        // pending, though NTFS still reopens the root itself. Reattach to the
+        // directory now at the share path, as when a build step deletes and
+        // recreates its output folder, and try once more.
+        let suspect = match &r {
+            Ok(_) => rel.as_os_str().is_empty(),
+            Err(e) => *e == ERROR_DELETE_PENDING,
+        };
+        if !(suspect && fs::is_deleted(root.handle.get())) {
+            return r;
+        }
+        drop(r);
+        let root = self.reopen_root(Some(&root))?;
+        self.open_below(root.handle.get(), rel, how)
+    }
+
+    fn open_below(
+        &self,
+        root: HANDLE,
+        rel: &Path,
+        how: fs::Open,
+    ) -> Result<(OwnedHandle, bool), u32> {
+        match fs::open_relative(root, &rel_wide(rel), how) {
+            Ok((h, created)) => Ok((OwnedHandle(h), created)),
+            Err(ERROR_REPARSE_POINT_ENCOUNTERED) => self.open_linked(root, rel, how),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// [`Self::open_rel`] of a path through a symlink or junction. Links are
+    /// followed, as Windows would, but only to places inside the share: the
+    /// parent directory opens following them and is checked against the root
+    /// before anything happens in it, then the last component opens relative to
+    /// that directory without following anything. If the last component is
+    /// itself a link and `how` doesn't ask for the link itself, what it points
+    /// at opens with attribute access only and is checked the same way before
+    /// it gets `how.access`. So nothing outside the share is created, deleted,
+    /// truncated or opened for data.
+    fn open_linked(
+        &self,
+        root: HANDLE,
+        rel: &Path,
+        how: fs::Open,
+    ) -> Result<(OwnedHandle, bool), u32> {
+        // The root itself is not reached through a link.
+        let (Some(parent), Some(name)) = (rel.parent(), rel.file_name()) else {
+            return Err(ERROR_ACCESS_DENIED);
+        };
+        let dir = self.open_followed(root, &rel_wide(parent), fs::Kind::Directory)?;
+        let name: Vec<u16> = name.encode_wide().collect();
+        match fs::open_relative(dir.get(), &name, how) {
+            Ok((h, created)) => Ok((OwnedHandle(h), created)),
+            // The name exists, as a link: O_EXCL and mkdir must fail.
+            Err(ERROR_REPARSE_POINT_ENCOUNTERED) if how.create == fs::Create::New => {
+                Err(ERROR_ALREADY_EXISTS)
+            }
+            Err(ERROR_REPARSE_POINT_ENCOUNTERED) => {
+                let target = self.open_followed(dir.get(), &name, how.kind)?;
+                Ok((OwnedHandle(fs::reopen(target.get(), how.access)?), false))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Open `name` below `dir` following links, with attribute access only, and
+    /// keep it only if it lies inside the share.
+    fn open_followed(&self, dir: HANDLE, name: &[u16], kind: fs::Kind) -> Result<OwnedHandle, u32> {
+        let how = fs::Open::existing(0).with_kind(kind).following();
+        let h = OwnedHandle(fs::open_relative(dir, name, how)?.0);
+        if self.handle_contained(h.get()) {
+            Ok(h)
+        } else {
+            Err(ERROR_ACCESS_DENIED)
+        }
+    }
+
+    /// Open the file a fid names with `access`: through the fid's open handle
+    /// when it has one, which reaches the same file even after a rename, else by
+    /// the fid's path.
+    fn open_fid_file(
+        &self,
+        rel: &Path,
+        open: Option<&Arc<OwnedHandle>>,
+        access: u32,
+    ) -> Result<OwnedHandle, u32> {
+        match open {
+            Some(h) => fs::reopen(h.get(), access).map(OwnedHandle),
+            None => self
+                .open_rel(rel, fs::Open::existing(access))
+                .map(|(h, _)| h),
+        }
+    }
+
+    /// Open `rel` for Tgetattr: with FILE_READ_EA too on a `metadata` share, so
     /// [`Self::lx_metadata`] can read through the same handle.
-    fn open_for_getattr(&self, p: &Path) -> Result<HANDLE, u32> {
+    fn open_for_getattr(&self, rel: &Path) -> Result<OwnedHandle, u32> {
         if self.metadata
-            && let Ok(h) = self.open_contained(p, FILE_READ_ATTRIBUTES | FILE_READ_EA)
+            && let Ok((h, _)) = self.open_rel(rel, fs::Open::existing(FILE_READ_EA))
         {
             return Ok(h);
         }
-        self.open_for_attrs(p)
+        self.open_rel(rel, fs::Open::existing(0)).map(|(h, _)| h)
     }
 
-    /// The WSL metadata of `path`, read through `h` or, if `h` lacks
-    /// FILE_READ_EA, through a fresh handle. Empty unless the share has
-    /// `metadata`, or when the file system keeps none.
-    fn lx_metadata(&self, h: HANDLE, path: &Path) -> fs::LxMetadata {
+    /// Delete the entry at `rel`: a symlink or junction itself, never what it
+    /// points at, as `DeleteFileW` and `RemoveDirectoryW` do.
+    fn delete_entry(&self, rel: &Path, kind: fs::Kind) -> Result<(), u32> {
+        let how = fs::Open::existing(DELETE).with_kind(kind).as_entry();
+        let (h, _) = self.open_rel(rel, how)?;
+        fs::delete_by_handle(h.get())
+    }
+
+    /// Rename the entry at `from` (a symlink or junction itself) to `name` in
+    /// the directory `dir`, replacing a file of that name even if it is open.
+    fn rename_entry(&self, from: &Path, dir: &Path, name: &str) -> Result<(), u32> {
+        let (src, _) = self.open_rel(from, fs::Open::existing(DELETE).as_entry())?;
+        let dir_how = fs::Open::existing(0).with_kind(fs::Kind::Directory);
+        let (dst, _) = self.open_rel(dir, dir_how)?;
+        let name: Vec<u16> = name.encode_utf16().collect();
+        fs::rename_by_handle(src.get(), dst.get(), &name)
+    }
+
+    /// Truncate the file `h` (opened with `access`) to zero bytes for O_TRUNC.
+    /// A truncating open would also drop the file's extended attributes, and
+    /// with them a `metadata` share's owner and mode, which Linux keeps across
+    /// O_TRUNC. A handle without write-data access (O_APPEND) truncates through
+    /// a reopened one.
+    fn truncate(h: HANDLE, access: u32) -> Result<(), u32> {
+        if access & GENERIC_WRITE != 0 {
+            return fs::set_end_of_file(h, 0);
+        }
+        let w = OwnedHandle(fs::reopen(h, GENERIC_WRITE)?);
+        fs::set_end_of_file(w.get(), 0)
+    }
+
+    /// The WSL metadata of the file `h` refers to, read through a reopened
+    /// handle if `h` lacks FILE_READ_EA. Empty unless the share has `metadata`,
+    /// or when the file system keeps none.
+    fn lx_metadata(&self, h: HANDLE) -> fs::LxMetadata {
         if !self.metadata {
             return fs::LxMetadata::default();
         }
         match fs::lx_metadata(h) {
             Ok(md) => md,
-            Err(ERROR_ACCESS_DENIED) => match self.open_contained(path, FILE_READ_EA) {
-                Ok(h2) => {
-                    let md = fs::lx_metadata(h2).unwrap_or_default();
-                    fs::close(h2);
-                    md
-                }
-                Err(_) => fs::LxMetadata::default(),
-            },
+            Err(ERROR_ACCESS_DENIED) => fs::reopen(h, FILE_READ_EA)
+                .map(OwnedHandle)
+                .and_then(|h2| fs::lx_metadata(h2.get()))
+                .unwrap_or_default(),
             Err(_) => fs::LxMetadata::default(),
         }
     }
 
-    /// Store the `Some` fields of `md` as `path`'s WSL metadata.
-    fn set_lx_metadata(&self, path: &Path, md: fs::LxMetadata) -> Result<(), u32> {
-        let h = self.open_contained(path, FILE_WRITE_EA)?;
-        let r = fs::set_lx_metadata(h, md);
-        fs::close(h);
-        r
+    /// Store the `Some` fields of `md` as the WSL metadata of the file `h`
+    /// refers to.
+    fn set_lx_metadata(h: HANDLE, md: fs::LxMetadata) -> Result<(), u32> {
+        let h = OwnedHandle(fs::reopen(h, FILE_WRITE_EA)?);
+        fs::set_lx_metadata(h.get(), md)
     }
 
     /// Reopen a fid's host handle on restore from its saved (path, is_dir,
-    /// open_flags). Uses `OPEN_EXISTING` (never `TRUNCATE_EXISTING` — any
-    /// truncation already happened pre-snapshot and is reflected in captured
-    /// RAM/disk) and the same access derivation as `h_lopen`, then re-validates
-    /// containment. Returns null on failure (the fid is left unopened; the guest
-    /// just re-errors on its next use of that fid).
-    fn reopen_fid_handle(&self, path: &Path, is_dir: bool, open_flags: u32) -> HANDLE {
-        let acc = open_flags & O_ACCMODE;
-        let want_append = open_flags & O_APPEND != 0;
-        let access = if is_dir {
-            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES
+    /// open_flags): the existing file, never truncated (any truncation already
+    /// happened before the snapshot), with the access `h_lopen` gives. `None` on
+    /// failure: the fid is left unopened and the guest just re-errors on its
+    /// next use of that fid.
+    fn reopen_fid_handle(&self, rel: &Path, is_dir: bool, open_flags: u32) -> Option<OwnedHandle> {
+        let access = open_access(is_dir, open_flags)?;
+        let how = fs::Open::existing(access).with_kind(kind_of(is_dir));
+        self.open_rel(rel, how).ok().map(|(h, _)| h)
+    }
+
+    /// qid type, version and path of a file.
+    fn qid_of(&self, info: &fs::FileInfo) -> (u8, u32, u64) {
+        let qt = if info.attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            QT_DIR
         } else {
-            match acc {
-                O_RDONLY => GENERIC_READ,
-                O_WRONLY => {
-                    if want_append {
-                        FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES
-                    } else {
-                        GENERIC_WRITE
-                    }
-                }
-                O_RDWR => {
-                    GENERIC_READ
-                        | if want_append {
-                            FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES
-                        } else {
-                            GENERIC_WRITE
-                        }
-                }
-                _ => return core::ptr::null_mut(),
-            }
+            QT_FILE
         };
-        let flags_attr = if is_dir {
-            FILE_FLAG_BACKUP_SEMANTICS
-        } else {
-            FILE_ATTRIBUTE_NORMAL
+        let qp = match info.file_index {
+            0 => self.alloc_qid_path(),
+            id => id,
         };
-        let wp = to_win32_long_path(path);
-        match fs::create_file(&wp, access, FILE_SHARE_RWD, OPEN_EXISTING, flags_attr) {
-            Ok(h) => {
-                if self.handle_contained(h) {
-                    h
-                } else {
-                    fs::close(h);
-                    core::ptr::null_mut()
-                }
-            }
-            Err(_) => core::ptr::null_mut(),
-        }
+        (qt, qid_version(info), qp)
     }
 
     // Stat a path (no kept handle): fill qid type/version/path + is_dir.
-    fn stat_path_for_fid(&self, p: &Path) -> Result<(u8, u32, u64, bool), u32> {
-        let h = self.open_for_attrs(p).map_err(errno_from_win32)?;
-        let info = match fs::file_info(h) {
-            Ok(i) => i,
-            Err(e) => {
-                fs::close(h);
-                return Err(errno_from_win32(e));
-            }
-        };
-        fs::close(h);
-        let is_dir = info.attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
-        let qt = if is_dir { QT_DIR } else { QT_FILE };
-        let mut qp = info.file_index;
-        if qp == 0 {
-            qp = self.alloc_qid_path();
-        }
-        Ok((qt, qid_version(&info), qp, is_dir))
+    fn stat_rel(&self, rel: &Path) -> Result<(u8, u32, u64, bool), u32> {
+        let (h, _) = self
+            .open_rel(rel, fs::Open::existing(0))
+            .map_err(errno_from_win32)?;
+        let info = fs::file_info(h.get()).map_err(errno_from_win32)?;
+        let (qt, qv, qp) = self.qid_of(&info);
+        Ok((qt, qv, qp, qt == QT_DIR))
     }
 
     #[allow(clippy::type_complexity)]
@@ -1266,7 +1406,7 @@ impl P9Device {
             build_rlerror(reply, tag, E_NOENT);
             return;
         }
-        let (qt, qv, qp, is_dir) = match self.stat_path_for_fid(&self.host_root) {
+        let (qt, qv, qp, is_dir) = match self.stat_rel(Path::new("")) {
             Ok(v) => v,
             Err(e) => {
                 build_rlerror(reply, tag, e);
@@ -1290,7 +1430,7 @@ impl P9Device {
                 n_uname
             };
             f.map
-                .insert(fid, FidEntry::new(self.host_root.clone(), true, qp, uid));
+                .insert(fid, FidEntry::new(PathBuf::new(), true, qp, uid));
         }
         reply.clear();
         enc4(reply, 0);
@@ -1321,7 +1461,7 @@ impl P9Device {
             }
         }
 
-        let (src_path, src_is_dir, src_qid_path, src_uid);
+        let (src_rel, src_is_dir, src_qid_path, src_uid);
         {
             let f = self.fids.lock().unwrap();
             let Some(src) = f.map.get(&fid) else {
@@ -1332,7 +1472,7 @@ impl P9Device {
                 build_rlerror(reply, tag, E_INVAL);
                 return;
             }
-            src_path = src.host_path.clone();
+            src_rel = src.rel.clone();
             src_is_dir = src.is_dir;
             src_qid_path = src.qid_path;
             src_uid = src.uid;
@@ -1351,7 +1491,7 @@ impl P9Device {
         if nwname == 0 {
             self.fids.lock().unwrap().map.insert(
                 newfid,
-                FidEntry::new(src_path, src_is_dir, src_qid_path, src_uid),
+                FidEntry::new(src_rel, src_is_dir, src_qid_path, src_uid),
             );
             reply.clear();
             enc4(reply, 0);
@@ -1367,44 +1507,23 @@ impl P9Device {
             return;
         }
 
-        let mut cur = src_path;
+        let mut rel = src_rel;
         let mut qids: Vec<(u8, u32, u64)> = Vec::with_capacity(nwname as usize);
         for (i, name) in wnames.iter().enumerate() {
-            let next: PathBuf = if name == "." {
-                cur.clone()
-            } else if name == ".." {
-                if normalize_for_containment(&cur) == self.share_root_norm {
-                    cur.clone()
-                } else {
-                    let p = cur
-                        .parent()
-                        .map(|x| x.to_path_buf())
-                        .unwrap_or_else(|| cur.clone());
-                    if !self.path_contained(&p) {
-                        self.host_root.clone()
-                    } else {
-                        p
-                    }
-                }
-            } else {
-                if !is_safe_name_component(name) {
+            // "." stays put; ".." goes up a level but never above the share root.
+            let next = match name.as_str() {
+                "." => rel.clone(),
+                ".." => rel.parent().map_or_else(PathBuf::new, Path::to_path_buf),
+                _ if is_safe_name_component(name) => rel.join(name),
+                _ => {
                     if i == 0 {
                         build_rlerror(reply, tag, E_NOENT);
                         return;
                     }
                     break;
                 }
-                let p = join_child(&cur, name);
-                if !self.path_contained(&p) {
-                    if i == 0 {
-                        build_rlerror(reply, tag, E_NOENT);
-                        return;
-                    }
-                    break;
-                }
-                p
             };
-            let (qt, qv, qp, isd) = match self.stat_path_for_fid(&next) {
+            let (qt, qv, qp, isd) = match self.stat_rel(&next) {
                 Ok(v) => v,
                 Err(e) => {
                     if i == 0 {
@@ -1422,7 +1541,7 @@ impl P9Device {
                 break;
             }
             qids.push((qt, qv, qp));
-            cur = next;
+            rel = next;
         }
 
         if qids.len() == nwname as usize {
@@ -1431,7 +1550,7 @@ impl P9Device {
                 .lock()
                 .unwrap()
                 .map
-                .insert(newfid, FidEntry::new(cur, qt & QT_DIR != 0, qp, src_uid));
+                .insert(newfid, FidEntry::new(rel, qt & QT_DIR != 0, qp, src_uid));
         }
 
         reply.clear();
@@ -1451,14 +1570,14 @@ impl P9Device {
             build_rlerror(reply, tag, E_PROTO);
             return;
         };
-        let (host_path, is_dir, qid_path, already_open);
+        let (rel, is_dir, qid_path, already_open);
         {
             let f = self.fids.lock().unwrap();
             let Some(e) = f.map.get(&fid) else {
                 build_rlerror(reply, tag, E_BADF);
                 return;
             };
-            host_path = e.host_path.clone();
+            rel = e.rel.clone();
             is_dir = e.is_dir;
             qid_path = e.qid_path;
             already_open = e.opened;
@@ -1467,10 +1586,8 @@ impl P9Device {
             build_rlerror(reply, tag, E_INVAL);
             return;
         }
-        let acc = flags & O_ACCMODE;
-        let want_write = acc != O_RDONLY;
+        let want_write = flags & O_ACCMODE != O_RDONLY;
         let want_trunc = flags & O_TRUNC != 0;
-        let want_append = flags & O_APPEND != 0;
         let want_dir = flags & O_DIRECTORY != 0;
         if want_dir && !is_dir {
             build_rlerror(reply, tag, E_NOTDIR);
@@ -1480,55 +1597,23 @@ impl P9Device {
             build_rlerror(reply, tag, E_ROFS);
             return;
         }
-        let access = if is_dir {
-            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES
-        } else {
-            match acc {
-                O_RDONLY => GENERIC_READ,
-                O_WRONLY => {
-                    if want_append {
-                        FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES
-                    } else {
-                        GENERIC_WRITE
-                    }
-                }
-                O_RDWR => {
-                    GENERIC_READ
-                        | if want_append {
-                            FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES
-                        } else {
-                            GENERIC_WRITE
-                        }
-                }
-                _ => {
-                    build_rlerror(reply, tag, E_INVAL);
-                    return;
-                }
-            }
+        let Some(access) = open_access(is_dir, flags) else {
+            build_rlerror(reply, tag, E_INVAL);
+            return;
         };
-        let disposition = if want_trunc && !is_dir {
-            TRUNCATE_EXISTING
-        } else {
-            OPEN_EXISTING
-        };
-        let flags_attr = if is_dir {
-            FILE_FLAG_BACKUP_SEMANTICS
-        } else {
-            FILE_ATTRIBUTE_NORMAL
-        };
-        let wp = to_win32_long_path(&host_path);
-        let h = match fs::create_file(&wp, access, FILE_SHARE_RWD, disposition, flags_attr) {
-            Ok(h) => h,
+        let how = fs::Open::existing(access).with_kind(kind_of(is_dir));
+        let h = match self.open_rel(&rel, how) {
+            Ok((h, _)) => h,
             Err(e) => {
                 build_rlerror(reply, tag, errno_from_win32(e));
                 return;
             }
         };
-        // Re-validate against the real path: the open may have followed a
-        // reparse point out of the share (the lexical walk check can't see it).
-        if !self.handle_contained(h) {
-            fs::close(h);
-            build_rlerror(reply, tag, E_ACCES);
+        if want_trunc
+            && !is_dir
+            && let Err(e) = Self::truncate(h.get(), access)
+        {
+            build_rlerror(reply, tag, errno_from_win32(e));
             return;
         }
         // Version from the opened (possibly just truncated) file; see
@@ -1536,21 +1621,19 @@ impl P9Device {
         let qv = if is_dir {
             0
         } else {
-            fs::file_info(h).map_or(1, |i| file_qid_version(&i))
+            fs::file_info(h.get()).map_or(1, |i| file_qid_version(&i))
         };
         {
             let mut f = self.fids.lock().unwrap();
             let Some(e) = f.map.get_mut(&fid) else {
-                fs::close(h);
                 build_rlerror(reply, tag, E_BADF);
                 return;
             };
             if e.opened {
-                fs::close(h);
                 build_rlerror(reply, tag, E_INVAL);
                 return;
             }
-            e.handle = Some(Arc::new(OwnedHandle(h)));
+            e.handle = Some(Arc::new(h));
             e.opened = true;
             e.open_flags = flags;
         }
@@ -1580,7 +1663,7 @@ impl P9Device {
             build_rlerror(reply, tag, E_INVAL);
             return;
         }
-        let (parent_path, creator);
+        let (parent_rel, creator);
         {
             let f = self.fids.lock().unwrap();
             let Some(e) = f.map.get(&fid) else {
@@ -1595,14 +1678,10 @@ impl P9Device {
                 build_rlerror(reply, tag, E_INVAL);
                 return;
             }
-            parent_path = e.host_path.clone();
+            parent_rel = e.rel.clone();
             creator = e.uid;
         }
-        let new_path = join_child(&parent_path, &name);
-        if !self.path_contained(&new_path) {
-            build_rlerror(reply, tag, E_INVAL);
-            return;
-        }
+        let rel = parent_rel.join(&name);
         let acc = flags & O_ACCMODE;
         let want_append = flags & O_APPEND != 0;
         let mut access = GENERIC_WRITE | FILE_READ_ATTRIBUTES;
@@ -1612,41 +1691,33 @@ impl P9Device {
         if want_append {
             access = (access & !GENERIC_WRITE) | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES;
         }
-        let excl = flags & O_EXCL != 0;
-        let trunc = flags & O_TRUNC != 0;
-        let disposition = if excl {
-            CREATE_NEW
-        } else if trunc {
-            CREATE_ALWAYS
+        let create = if flags & O_EXCL != 0 {
+            fs::Create::New
         } else {
-            OPEN_ALWAYS
+            fs::Create::OpenOrNew
         };
-        let wp = to_win32_long_path(&new_path);
-        let (h, created) = match fs::create_file_ex(
-            &wp,
-            access,
-            FILE_SHARE_RWD,
-            disposition,
-            FILE_ATTRIBUTE_NORMAL,
-        ) {
+        let how = fs::Open::existing(access)
+            .with_create(create)
+            .with_kind(fs::Kind::File);
+        let (h, created) = match self.open_rel(&rel, how) {
             Ok(v) => v,
             Err(e) => {
                 build_rlerror(reply, tag, errno_from_win32(e));
                 return;
             }
         };
-        // A pre-existing reparse point at this name (non-exclusive create) could
-        // have been followed out of the share — validate the real handle path.
-        if !self.handle_contained(h) {
-            fs::close(h);
-            build_rlerror(reply, tag, E_ACCES);
+        if flags & O_TRUNC != 0
+            && !created
+            && let Err(e) = Self::truncate(h.get(), access)
+        {
+            build_rlerror(reply, tag, errno_from_win32(e));
             return;
         }
         if self.metadata && created {
             // Best effort, like the create itself on a file system without
             // extended attributes: the file just stays without metadata.
-            let _ = self.set_lx_metadata(
-                &new_path,
+            let _ = Self::set_lx_metadata(
+                h.get(),
                 fs::LxMetadata {
                     uid: Some(creator),
                     gid: Some(gid),
@@ -1654,29 +1725,23 @@ impl P9Device {
                 },
             );
         }
-        let (mut qp, qv) = match fs::file_info(h) {
-            Ok(info) => (info.file_index, file_qid_version(&info)),
+        let (_, qv, qp) = match fs::file_info(h.get()) {
+            Ok(info) => self.qid_of(&info),
             Err(e) => {
-                let e = errno_from_win32(e);
-                fs::close(h);
-                build_rlerror(reply, tag, e);
+                build_rlerror(reply, tag, errno_from_win32(e));
                 return;
             }
         };
-        if qp == 0 {
-            qp = self.alloc_qid_path();
-        }
         {
             let mut f = self.fids.lock().unwrap();
             let Some(e) = f.map.get_mut(&fid) else {
-                fs::close(h);
                 build_rlerror(reply, tag, E_BADF);
                 return;
             };
-            e.host_path = new_path;
+            e.rel = rel;
             e.is_dir = false;
             e.qid_path = qp;
-            e.handle = Some(Arc::new(OwnedHandle(h)));
+            e.handle = Some(Arc::new(h));
             e.opened = true;
             e.open_flags = flags;
         }
@@ -1954,14 +2019,13 @@ impl P9Device {
             build_rlerror(reply, tag, E_PROTO);
             return;
         };
-        let (dir_path, is_dir, opened, has_handle);
+        let (is_dir, opened, has_handle);
         {
             let f = self.fids.lock().unwrap();
             let Some(e) = f.map.get(&fid) else {
                 build_rlerror(reply, tag, E_BADF);
                 return;
             };
-            dir_path = e.host_path.clone();
             is_dir = e.is_dir;
             opened = e.opened;
             has_handle = e.handle.is_some();
@@ -1984,8 +2048,8 @@ impl P9Device {
         }
 
         if req_offset == 0 {
-            // Clone the fid's already-open (and `handle_contained`-validated)
-            // directory handle and enumerate by HANDLE — no per-entry open.
+            // Clone the fid's already-open directory handle and enumerate by
+            // HANDLE — no per-entry open.
             let dir_h = {
                 let f = self.fids.lock().unwrap();
                 f.map.get(&fid).and_then(|e| e.handle.clone())
@@ -1994,7 +2058,7 @@ impl P9Device {
                 build_rlerror(reply, tag, E_BADF);
                 return;
             };
-            let cache = self.build_dir_cache(dir_h.get(), &dir_path);
+            let cache = self.build_dir_cache(dir_h.get());
             let mut f = self.fids.lock().unwrap();
             if let Some(e) = f.map.get_mut(&fid) {
                 e.dir_cache = cache;
@@ -2039,16 +2103,12 @@ impl P9Device {
         finalize(reply);
     }
 
-    /// Build the readdir cache by enumerating the (already-open, already-
-    /// containment-validated) directory HANDLE with `FileIdBothDirectoryInfo`.
-    /// Each entry comes back with its 64-bit NTFS file-ID, so there is **no
-    /// per-entry CreateFile / GetFinalPathNameByHandle / GetFileInformation /
-    /// Close** — one buffer-full per ~500 entries instead of ~4 syscalls per
-    /// entry. (Profiled on a 5 000-entry dir: ~20 K host syscalls/readdir → ~10.)
-    ///
-    /// `_dir_path` is retained for a future per-entry fallback if by-handle
-    /// enumeration ever fails on a non-NTFS volume.
-    fn build_dir_cache(&self, dir_h: HANDLE, _dir_path: &Path) -> Vec<DirEntryCached> {
+    /// Build the readdir cache by enumerating the fid's open directory HANDLE
+    /// with `FileIdBothDirectoryInfo`. Each entry comes back with its 64-bit
+    /// file-ID, so there is **no per-entry open / GetFileInformation / Close**
+    /// — one buffer-full per ~500 entries instead of ~4 syscalls per entry.
+    /// (Profiled on a 5 000-entry dir: ~20 K host syscalls/readdir → ~10.)
+    fn build_dir_cache(&self, dir_h: HANDLE) -> Vec<DirEntryCached> {
         let mut cache: Vec<DirEntryCached> = Vec::new();
         let mut saw_dot = false;
         let mut saw_dotdot = false;
@@ -2104,26 +2164,26 @@ impl P9Device {
             build_rlerror(reply, tag, E_PROTO);
             return;
         };
-        let (path, was_open, existing);
+        let (rel, was_open, existing);
         {
             let f = self.fids.lock().unwrap();
             let Some(e) = f.map.get(&fid) else {
                 build_rlerror(reply, tag, E_BADF);
                 return;
             };
-            path = e.host_path.clone();
+            rel = e.rel.clone();
             was_open = e.opened;
             existing = e.handle.clone();
         }
-        let mut opened_here = INVALID_HANDLE_VALUE;
+        let opened_here;
         // `existing` (the Arc) stays in scope through `read_attrs_by_handle`, so a
         // concurrent clunk can't close the fid's handle under us.
         let h = match &existing {
             Some(a) if was_open => a.get(),
-            _ => match self.open_for_getattr(&path) {
+            _ => match self.open_for_getattr(&rel) {
                 Ok(nh) => {
                     opened_here = nh;
-                    nh
+                    opened_here.get()
                 }
                 Err(e) => {
                     build_rlerror(reply, tag, errno_from_win32(e));
@@ -2132,10 +2192,7 @@ impl P9Device {
             },
         };
         let attrs = self.read_attrs_by_handle(h);
-        let md = self.lx_metadata(h, &path);
-        if opened_here != INVALID_HANDLE_VALUE {
-            fs::close(opened_here);
-        }
+        let md = self.lx_metadata(h);
         let (qt, qv, qp, mut mode, nlink, size, blocks, atime, mtime, ctime) = match attrs {
             Ok(v) => v,
             Err(e) => {
@@ -2206,16 +2263,15 @@ impl P9Device {
             build_rlerror(reply, tag, E_ROFS);
             return;
         }
-        let (path, was_open, existing, is_dir);
+        let (rel, open, is_dir);
         {
             let f = self.fids.lock().unwrap();
             let Some(e) = f.map.get(&fid) else {
                 build_rlerror(reply, tag, E_BADF);
                 return;
             };
-            path = e.host_path.clone();
-            was_open = e.opened;
-            existing = e.handle.clone();
+            rel = e.rel.clone();
+            open = e.handle.clone().filter(|_| e.opened);
             is_dir = e.is_dir;
         }
         // chmod/chown: stored on a `metadata` share, ignored otherwise.
@@ -2226,56 +2282,30 @@ impl P9Device {
                 gid: (valid & SETATTR_GID != 0).then_some(gid),
                 mode: (valid & SETATTR_MODE != 0).then_some(file_type | (mode & PERM_BITS)),
             };
-            if let Err(e) = self.set_lx_metadata(&path, md) {
+            let r = self
+                .open_fid_file(&rel, open.as_ref(), FILE_WRITE_EA)
+                .and_then(|h| fs::set_lx_metadata(h.get(), md));
+            if let Err(e) = r {
                 build_rlerror(reply, tag, errno_from_win32(e));
                 return;
             }
         }
-        let need_size = valid & SETATTR_SIZE != 0;
-        let need_handle = need_size || !was_open || existing.is_none();
-        let mut opened_here = INVALID_HANDLE_VALUE;
-        let h = if need_handle {
-            let mut access = FILE_WRITE_ATTRIBUTES;
-            if need_size {
-                access |= GENERIC_WRITE;
-            }
-            let attr = if is_dir {
-                FILE_FLAG_BACKUP_SEMANTICS
-            } else {
-                FILE_ATTRIBUTE_NORMAL
-            };
-            let wp = to_win32_long_path(&path);
-            let nh = match fs::create_file(&wp, access, FILE_SHARE_RWD, OPEN_EXISTING, attr) {
-                Ok(nh) => nh,
-                Err(e) => {
-                    build_rlerror(reply, tag, errno_from_win32(e));
-                    return;
-                }
-            };
-            // Parity with h_lopen/h_lcreate/open_for_attrs: re-validate the
-            // resolved handle path so a reparse point can't redirect a setattr
-            // (truncate / utime) at a host file outside the share.
-            if !self.handle_contained(nh) {
-                fs::close(nh);
-                build_rlerror(reply, tag, E_ACCES);
+        let mut access = FILE_WRITE_ATTRIBUTES;
+        if valid & SETATTR_SIZE != 0 {
+            access |= GENERIC_WRITE;
+        }
+        let h = match self.open_fid_file(&rel, open.as_ref(), access) {
+            Ok(h) => h,
+            Err(e) => {
+                build_rlerror(reply, tag, errno_from_win32(e));
                 return;
             }
-            opened_here = nh;
-            nh
-        } else {
-            // `existing` (the Arc) stays in scope through the set_* calls below,
-            // so a concurrent clunk can't close the fid's handle under us.
-            existing.as_ref().unwrap().get()
         };
 
         if valid & SETATTR_SIZE != 0
-            && let Err(e) = fs::set_end_of_file(h, sz)
+            && let Err(e) = fs::set_end_of_file(h.get(), sz)
         {
-            let e = errno_from_win32(e);
-            if opened_here != INVALID_HANDLE_VALUE {
-                fs::close(opened_here);
-            }
-            build_rlerror(reply, tag, e);
+            build_rlerror(reply, tag, errno_from_win32(e));
             return;
         }
         if valid & (SETATTR_ATIME | SETATTR_MTIME) != 0 {
@@ -2295,17 +2325,10 @@ impl P9Device {
                     fs::now_filetime_ticks()
                 });
             }
-            if let Err(e) = fs::set_file_times(h, pa, pm) {
-                let e = errno_from_win32(e);
-                if opened_here != INVALID_HANDLE_VALUE {
-                    fs::close(opened_here);
-                }
-                build_rlerror(reply, tag, e);
+            if let Err(e) = fs::set_file_times(h.get(), pa, pm) {
+                build_rlerror(reply, tag, errno_from_win32(e));
                 return;
             }
-        }
-        if opened_here != INVALID_HANDLE_VALUE {
-            fs::close(opened_here);
         }
         build_header_only(reply, R_SETATTR, tag);
     }
@@ -2329,14 +2352,14 @@ impl P9Device {
             build_rlerror(reply, tag, E_PROTO);
             return;
         };
-        let (path, is_dir);
+        let (rel, is_dir);
         {
             let mut f = self.fids.lock().unwrap();
             let Some(mut e) = f.map.remove(&fid) else {
                 build_rlerror(reply, tag, E_BADF);
                 return;
             };
-            path = e.host_path.clone();
+            rel = e.rel.clone();
             is_dir = e.is_dir;
             e.close_handle(); // explicit; dropped at end of scope anyway
         }
@@ -2344,17 +2367,11 @@ impl P9Device {
             build_rlerror(reply, tag, E_ROFS);
             return;
         }
-        if normalize_for_containment(&path) == self.share_root_norm {
+        if rel.as_os_str().is_empty() {
             build_rlerror(reply, tag, E_ACCES);
             return;
         }
-        let wp = to_win32_long_path(&path);
-        let res = if is_dir {
-            fs::remove_dir(&wp)
-        } else {
-            fs::delete_file(&wp)
-        };
-        if let Err(e) = res {
+        if let Err(e) = self.delete_entry(&rel, kind_of(is_dir)) {
             build_rlerror(reply, tag, errno_from_win32(e));
             return;
         }
@@ -2413,22 +2430,22 @@ impl P9Device {
                 build_rlerror(reply, tag, E_NOTDIR);
                 return;
             }
-            parent = e.host_path.clone();
+            parent = e.rel.clone();
             creator = e.uid;
         }
-        let new_path = join_child(&parent, &name);
-        if !self.path_contained(&new_path) {
-            build_rlerror(reply, tag, E_INVAL);
-            return;
-        }
-        let wp = to_win32_long_path(&new_path);
-        if let Err(e) = fs::create_dir(&wp) {
-            build_rlerror(reply, tag, errno_from_win32(e));
-            return;
-        }
+        let how = fs::Open::existing(0)
+            .with_create(fs::Create::New)
+            .with_kind(fs::Kind::Directory);
+        let h = match self.open_rel(&parent.join(&name), how) {
+            Ok((h, _)) => h,
+            Err(e) => {
+                build_rlerror(reply, tag, errno_from_win32(e));
+                return;
+            }
+        };
         if self.metadata {
-            let _ = self.set_lx_metadata(
-                &new_path,
+            let _ = Self::set_lx_metadata(
+                h.get(),
                 fs::LxMetadata {
                     uid: Some(creator),
                     gid: Some(gid),
@@ -2436,10 +2453,10 @@ impl P9Device {
                 },
             );
         }
-        let (qt, qv, qp, _isd) = match self.stat_path_for_fid(&new_path) {
-            Ok(v) => v,
+        let (qt, qv, qp) = match fs::file_info(h.get()) {
+            Ok(info) => self.qid_of(&info),
             Err(e) => {
-                build_rlerror(reply, tag, e);
+                build_rlerror(reply, tag, errno_from_win32(e));
                 return;
             }
         };
@@ -2465,39 +2482,32 @@ impl P9Device {
             build_rlerror(reply, tag, E_INVAL);
             return;
         }
-        let (old_path, new_parent);
+        let (old_rel, new_parent);
         {
-            let mut f = self.fids.lock().unwrap();
-            if !f.map.contains_key(&fid) || !f.map.contains_key(&dfid) {
+            let f = self.fids.lock().unwrap();
+            let (Some(src), Some(dir)) = (f.map.get(&fid), f.map.get(&dfid)) else {
                 build_rlerror(reply, tag, E_BADF);
                 return;
-            }
-            if !f.map.get(&dfid).unwrap().is_dir {
+            };
+            if !dir.is_dir {
                 build_rlerror(reply, tag, E_NOTDIR);
                 return;
             }
-            old_path = f.map.get(&fid).unwrap().host_path.clone();
-            new_parent = f.map.get(&dfid).unwrap().host_path.clone();
-            // Drop any open handle on the source so MoveFileExW can proceed.
-            f.map.get_mut(&fid).unwrap().close_handle();
+            old_rel = src.rel.clone();
+            new_parent = dir.rel.clone();
         }
-        let new_path = join_child(&new_parent, &name);
-        if !self.path_contained(&new_path) {
-            build_rlerror(reply, tag, E_INVAL);
+        // The share root can't be moved.
+        if old_rel.as_os_str().is_empty() {
+            build_rlerror(reply, tag, E_ACCES);
             return;
         }
-        let wold = to_win32_long_path(&old_path);
-        let wnew = to_win32_long_path(&new_path);
-        if let Err(e) = fs::move_file(
-            &wold,
-            &wnew,
-            MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING,
-        ) {
+        // The fid's open handle, if any, stays valid: it follows the file.
+        if let Err(e) = self.rename_entry(&old_rel, &new_parent, &name) {
             build_rlerror(reply, tag, errno_from_win32(e));
             return;
         }
         if let Some(e) = self.fids.lock().unwrap().map.get_mut(&fid) {
-            e.host_path = new_path;
+            e.rel = new_parent.join(&name);
         }
         build_header_only(reply, R_RENAME, tag);
     }
@@ -2529,22 +2539,10 @@ impl P9Device {
                 build_rlerror(reply, tag, E_NOTDIR);
                 return;
             }
-            old_dir = o.host_path.clone();
-            new_dir = n.host_path.clone();
+            old_dir = o.rel.clone();
+            new_dir = n.rel.clone();
         }
-        let old_path = join_child(&old_dir, &old_name);
-        let new_path = join_child(&new_dir, &new_name);
-        if !self.path_contained(&old_path) || !self.path_contained(&new_path) {
-            build_rlerror(reply, tag, E_INVAL);
-            return;
-        }
-        let wold = to_win32_long_path(&old_path);
-        let wnew = to_win32_long_path(&new_path);
-        if let Err(e) = fs::move_file(
-            &wold,
-            &wnew,
-            MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING,
-        ) {
+        if let Err(e) = self.rename_entry(&old_dir.join(&old_name), &new_dir, &new_name) {
             build_rlerror(reply, tag, errno_from_win32(e));
             return;
         }
@@ -2576,30 +2574,12 @@ impl P9Device {
                 build_rlerror(reply, tag, E_NOTDIR);
                 return;
             }
-            parent = e.host_path.clone();
+            parent = e.rel.clone();
         }
-        let target = join_child(&parent, &name);
-        if !self.path_contained(&target) {
-            build_rlerror(reply, tag, E_INVAL);
-            return;
-        }
-        let wp = to_win32_long_path(&target);
-        let res = if flags & AT_REMOVEDIR != 0 {
-            fs::remove_dir(&wp)
-        } else {
-            fs::delete_file(&wp)
-        };
-        if let Err(err) = res {
-            // unlinkat without AT_REMOVEDIR on a directory should be EISDIR;
-            // DeleteFileW returns ERROR_ACCESS_DENIED there.
-            if flags & AT_REMOVEDIR == 0 && err == ERROR_ACCESS_DENIED {
-                let attrs = fs::get_attributes(&wp);
-                if attrs != INVALID_FILE_ATTRIBUTES && attrs & FILE_ATTRIBUTE_DIRECTORY != 0 {
-                    build_rlerror(reply, tag, E_ISDIR);
-                    return;
-                }
-            }
-            build_rlerror(reply, tag, errno_from_win32(err));
+        // Without AT_REMOVEDIR a directory fails with EISDIR, as on Linux.
+        let kind = kind_of(flags & AT_REMOVEDIR != 0);
+        if let Err(e) = self.delete_entry(&parent.join(&name), kind) {
+            build_rlerror(reply, tag, errno_from_win32(e));
             return;
         }
         build_header_only(reply, R_UNLINKAT, tag);
@@ -2611,17 +2591,17 @@ impl P9Device {
             build_rlerror(reply, tag, E_PROTO);
             return;
         };
-        let path = {
-            let f = self.fids.lock().unwrap();
-            let Some(e) = f.map.get(&fid) else {
-                build_rlerror(reply, tag, E_BADF);
-                return;
-            };
-            e.host_path.clone()
-        };
-        let wp = to_win32_long_path(&path);
+        if !self.fids.lock().unwrap().map.contains_key(&fid) {
+            build_rlerror(reply, tag, E_BADF);
+            return;
+        }
         const BLOCK: u64 = 4096;
-        let (blocks_total, blocks_free, blocks_avail) = match fs::disk_free_space(&wp) {
+        // Every fid is on the share root's volume: links are followed only to
+        // places inside the share.
+        let space = self
+            .root()
+            .and_then(|root| fs::volume_space(root.handle.get()));
+        let (blocks_total, blocks_free, blocks_avail) = match space {
             Ok((avail, total, free)) => (total / BLOCK, free / BLOCK, avail / BLOCK),
             Err(_) => (1 << 20, 1 << 20, 1 << 20),
         };
@@ -2850,8 +2830,8 @@ impl VirtioDevice for P9Device {
     }
 
     /// Encode driver_ok + negotiated features/msize + the qid allocator + the
-    /// whole fid table (path + open mode per fid). Host handles are NOT encoded;
-    /// they are reopened from each fid's path on `apply_device_state`.
+    /// whole fid table (host path + open mode per fid). Host handles are NOT
+    /// encoded; they are reopened from each fid's path on `apply_device_state`.
     fn capture_device_state(&self) -> Vec<u8> {
         let mut b = Vec::new();
         b.push(2u8); // format version (2 added each fid's uid)
@@ -2867,7 +2847,12 @@ impl VirtioDevice for P9Device {
             b.push(e.is_dir as u8);
             b.push(e.opened as u8);
             b.extend_from_slice(&e.open_flags.to_le_bytes());
-            let path = e.host_path.to_string_lossy();
+            let path = if e.rel.as_os_str().is_empty() {
+                self.host_root.clone()
+            } else {
+                self.host_root.join(&e.rel)
+            };
+            let path = path.to_string_lossy();
             let pb = path.as_bytes();
             b.extend_from_slice(&(pb.len() as u32).to_le_bytes());
             b.extend_from_slice(pb);
@@ -2878,8 +2863,9 @@ impl VirtioDevice for P9Device {
 
     /// Rebuild the device state captured above. Reopens each previously-open
     /// fid's host handle (best effort: a since-deleted file leaves the fid
-    /// unopened). Bounds-checked: a short/corrupt blob aborts the parse rather
-    /// than panicking.
+    /// unopened). A fid whose path doesn't lie under the share root is dropped.
+    /// Bounds-checked: a short/corrupt blob aborts the parse rather than
+    /// panicking.
     fn apply_device_state(&self, bytes: &[u8]) {
         let mut p = 0usize;
         macro_rules! take {
@@ -2918,18 +2904,25 @@ impl VirtioDevice for P9Device {
             } else {
                 self.uid
             };
-            let mut e = FidEntry::new(path.clone(), is_dir, qid, uid);
+            let Some(rel) = rel_below(&self.host_root, &path) else {
+                eprintln!(
+                    "[9p] restore: fid {id} ({}) is not below the share root; dropping it",
+                    path.display()
+                );
+                continue;
+            };
+            let mut e = FidEntry::new(rel, is_dir, qid, uid);
             if opened {
-                let h = self.reopen_fid_handle(&path, is_dir, flags);
-                if h.is_null() {
-                    eprintln!(
+                match self.reopen_fid_handle(&e.rel, is_dir, flags) {
+                    Some(h) => {
+                        e.handle = Some(Arc::new(h));
+                        e.opened = true;
+                        e.open_flags = flags;
+                    }
+                    None => eprintln!(
                         "[9p] restore: could not reopen fid {id} ({}); leaving it unopened",
                         path.display()
-                    );
-                } else {
-                    e.handle = Some(Arc::new(OwnedHandle(h)));
-                    e.opened = true;
-                    e.open_flags = flags;
+                    ),
                 }
             }
             new_map.insert(id, e);
@@ -2953,11 +2946,23 @@ impl VirtioDevice for P9Device {
 mod tests {
     use super::*;
 
-    /// A directory junction planted inside the share that targets a directory
-    /// outside it must be rejected: the lexical path is inside the share, but
-    /// the resolved handle path is not. `mklink /J` needs no elevation.
+    /// Create the directory junction `link` -> `target`; `mklink /J` needs no
+    /// elevation. False where junctions are unavailable, and the caller skips.
+    fn junction(link: &Path, target: &Path) -> bool {
+        std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .is_ok_and(|o| o.status.success())
+            && link.exists()
+    }
+
+    /// Links in the share are followed only to places inside it: a junction to
+    /// a directory outside can't be walked into, while one to a directory
+    /// inside works as that directory would, also partway along a path.
     #[test]
-    fn junction_escape_is_denied() {
+    fn links_are_followed_only_inside_the_share() {
         let base = std::env::temp_dir().join(format!("tinyvmm_p9_esc_{}", std::process::id()));
         let share = base.join("share");
         let sub = share.join("sub");
@@ -2965,50 +2970,236 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(sub.join("f.txt"), b"inside").unwrap();
         std::fs::write(outside.join("secret.txt"), b"top secret").unwrap();
-
-        // Plant a directory junction <share>/escape -> <outside>.
-        let escape = share.join("escape");
-        let out = std::process::Command::new("cmd")
-            .args(["/c", "mklink", "/J"])
-            .arg(&escape)
-            .arg(&outside)
-            .output();
-        if out.map(|o| !o.status.success()).unwrap_or(true) || !escape.exists() {
-            // Junctions unavailable in this environment; skip rather than fail.
+        if !junction(&share.join("escape"), &outside) || !junction(&share.join("link"), &sub) {
             eprintln!("[p9-test] skipping: could not create a directory junction");
             let _ = std::fs::remove_dir_all(&base);
             return;
         }
 
-        let canon_root = std::fs::canonicalize(&share).unwrap();
+        let root = std::fs::canonicalize(&share).unwrap();
         let mem = std::sync::Arc::new(whpsys::memory::GuestMemory::new_host_only(4096).unwrap());
-        let dev = P9Device::new(mem, "test".into(), canon_root, ShareOptions::default());
+        let dev = P9Device::new(mem, "test".into(), root, ShareOptions::default());
+        connect(&dev, 0);
 
-        // A genuine subdir of the share opens fine.
-        assert!(
-            dev.open_for_attrs(&sub).is_ok(),
-            "a real subdir of the share must be reachable"
-        );
-        // Opening through the junction resolves outside the share -> denied.
-        assert_eq!(
-            dev.open_for_attrs(&escape.join("secret.txt")),
-            Err(ERROR_ACCESS_DENIED),
-            "a file reached through a junction out of the share must be denied"
-        );
-        // The junction directory itself also resolves outside -> denied.
-        assert_eq!(
-            dev.open_for_attrs(&escape),
-            Err(ERROR_ACCESS_DENIED),
-            "the escaping junction directory itself must be denied"
-        );
+        walk(&dev, 0, 1, &["sub"]);
+        assert_eq!(walk_err(&dev, 0, 2, &["escape"]), E_ACCES);
+        assert_eq!(walk_err(&dev, 0, 2, &["escape", "secret.txt"]), E_ACCES);
+        walk(&dev, 0, 2, &["link", "f.txt"]);
+        call(&dev, T_LOPEN, |t| {
+            enc4(t, 2);
+            enc4(t, O_RDONLY);
+        });
+        let r = call(&dev, T_READ, |t| {
+            enc4(t, 2);
+            enc8(t, 0);
+            enc4(t, 64);
+        });
+        assert_eq!(&r[RREAD_HEADER_SIZE..], b"inside");
 
+        drop(dev);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A directory a fid names can turn into a junction to somewhere outside
+    /// the share after the walk: a host process can swap it, or the guest can
+    /// rename a junction already in the share into its place. No operation
+    /// through such a fid may then act outside: no delete, rename, mkdir,
+    /// create or truncate, and no open.
+    #[test]
+    fn swapped_junction_cannot_redirect_operations() {
+        let base = std::env::temp_dir().join(format!("tinyvmm_p9_swap_{}", std::process::id()));
+        let share = base.join("share");
+        let a = share.join("a");
+        let outside = base.join("outside");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(a.join("victim.txt"), b"inside").unwrap();
+        std::fs::write(outside.join("victim.txt"), b"precious").unwrap();
+        std::fs::write(outside.join("secret.txt"), b"secret").unwrap();
+
+        let root = std::fs::canonicalize(&share).unwrap();
+        let mem = std::sync::Arc::new(whpsys::memory::GuestMemory::new_host_only(4096).unwrap());
+        let dev = P9Device::new(mem, "t".into(), root, ShareOptions::default());
+        connect(&dev, 0);
+        walk(&dev, 0, 1, &["a"]);
+        walk(&dev, 0, 2, &["a", "victim.txt"]);
+        walk(&dev, 0, 3, &["a"]);
+
+        std::fs::rename(&a, share.join("a_real")).unwrap();
+        if !junction(&a, &outside) {
+            eprintln!("[p9-test] skipping: could not create a directory junction");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        let unlink = call_err(&dev, T_UNLINKAT, |t| {
+            enc4(t, 1);
+            enc_str(t, "secret.txt");
+            enc4(t, 0);
+        });
+        let rename = call_err(&dev, T_RENAMEAT, |t| {
+            enc4(t, 1);
+            enc_str(t, "secret.txt");
+            enc4(t, 0);
+            enc_str(t, "stolen.txt");
+        });
+        let mkdir = call_err(&dev, T_MKDIR, |t| {
+            enc4(t, 1);
+            enc_str(t, "planted");
+            enc4(t, 0o755);
+            enc4(t, 0);
+        });
+        let create = call_err(&dev, T_LCREATE, |t| {
+            enc4(t, 3);
+            enc_str(t, "victim.txt");
+            enc4(t, O_WRONLY | O_TRUNC);
+            enc4(t, 0o644);
+            enc4(t, 0);
+        });
+        let open = call_err(&dev, T_LOPEN, |t| {
+            enc4(t, 2);
+            enc4(t, O_WRONLY | O_TRUNC);
+        });
+        let getattr = call_err(&dev, T_GETATTR, |t| {
+            enc4(t, 2);
+            enc8(t, STATS_BASIC);
+        });
+        assert_eq!([unlink, rename, mkdir, create, open, getattr], [E_ACCES; 6]);
+        assert_eq!(
+            std::fs::read(outside.join("secret.txt")).unwrap(),
+            b"secret"
+        );
+        assert_eq!(
+            std::fs::read(outside.join("victim.txt")).unwrap(),
+            b"precious"
+        );
+        assert!(!outside.join("planted").exists());
+        assert!(!share.join("stolen.txt").exists());
+
+        drop(dev);
+        let _ = std::fs::remove_dir(&a);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Renaming over a file the guest holds open works, as on Linux, and the
+    /// open fid keeps reading the file it opened. `MoveFileExW` refuses such a
+    /// rename while any handle to the target is open.
+    #[test]
+    fn renameat_replaces_a_target_held_open() {
+        let base = std::env::temp_dir().join(format!("tinyvmm_p9_replace_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("new.txt"), b"new").unwrap();
+        std::fs::write(base.join("target.txt"), b"old").unwrap();
+        let root = std::fs::canonicalize(&base).unwrap();
+        let mem = std::sync::Arc::new(whpsys::memory::GuestMemory::new_host_only(4096).unwrap());
+        let dev = P9Device::new(mem, "t".into(), root, ShareOptions::default());
+        connect(&dev, 0);
+        walk(&dev, 0, 1, &["target.txt"]);
+        call(&dev, T_LOPEN, |t| {
+            enc4(t, 1);
+            enc4(t, O_RDONLY);
+        });
+
+        call(&dev, T_RENAMEAT, |t| {
+            enc4(t, 0);
+            enc_str(t, "new.txt");
+            enc4(t, 0);
+            enc_str(t, "target.txt");
+        });
+        let r = call(&dev, T_READ, |t| {
+            enc4(t, 1);
+            enc8(t, 0);
+            enc4(t, 64);
+        });
+        assert_eq!(&r[RREAD_HEADER_SIZE..], b"old");
+        call(&dev, T_CLUNK, |t| enc4(t, 1));
+        assert_eq!(std::fs::read(base.join("target.txt")).unwrap(), b"new");
+        assert!(!base.join("new.txt").exists());
+
+        drop(dev);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The share root deleted and recreated on the host, as a build step does to
+    /// its output folder: the share reattaches to the new directory, for fids
+    /// walked before and requests after, instead of staying on the deleted one;
+    /// but not to wherever a junction put in the root's place points.
+    #[test]
+    fn recreated_root_is_reattached() {
+        let base = std::env::temp_dir().join(format!("tinyvmm_p9_reroot_{}", std::process::id()));
+        let share = base.join("share");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&share).unwrap();
+        std::fs::write(share.join("old.txt"), b"old").unwrap();
+        let root = std::fs::canonicalize(&share).unwrap();
+        let mem = std::sync::Arc::new(whpsys::memory::GuestMemory::new_host_only(4096).unwrap());
+        let dev = P9Device::new(mem, "t".into(), root, ShareOptions::default());
+        connect(&dev, 0);
+        walk(&dev, 0, 1, &[]);
+
+        std::fs::remove_dir_all(&share).unwrap();
+        std::fs::create_dir(&share).unwrap();
+        std::fs::write(share.join("new.txt"), b"new").unwrap();
+
+        call(&dev, T_LOPEN, |t| {
+            enc4(t, 1);
+            enc4(t, O_RDONLY | O_DIRECTORY);
+        });
+        let r = call(&dev, T_READDIR, |t| {
+            enc4(t, 1);
+            enc8(t, 0);
+            enc4(t, 4096);
+        });
+        assert!(r.windows(7).any(|w| w == b"new.txt"), "{r:?}");
+        assert_eq!(walk_err(&dev, 0, 2, &["old.txt"]), E_NOENT);
+        walk(&dev, 0, 2, &["new.txt"]);
+        call(&dev, T_LOPEN, |t| {
+            enc4(t, 2);
+            enc4(t, O_RDONLY);
+        });
+        let r = call(&dev, T_READ, |t| {
+            enc4(t, 2);
+            enc8(t, 0);
+            enc4(t, 64);
+        });
+        assert_eq!(&r[RREAD_HEADER_SIZE..], b"new");
+        walk(&dev, 0, 3, &[]);
+        lcreate(&dev, 3, "made.txt", O_WRONLY, 0o644, 0);
+        assert!(share.join("made.txt").exists());
+
+        // A junction left in the deleted root's place doesn't move the share.
+        let outside = base.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::remove_dir_all(&share).unwrap();
+        if junction(&share, &outside) {
+            assert_eq!(walk_err(&dev, 0, 4, &["x"]), E_ACCES);
+            walk(&dev, 0, 4, &[]);
+            let create = call_err(&dev, T_LCREATE, |t| {
+                enc4(t, 4);
+                enc_str(t, "planted.txt");
+                enc4(t, O_WRONLY);
+                enc4(t, 0o644);
+                enc4(t, 0);
+            });
+            assert_eq!(create, E_ACCES);
+            assert!(!outside.join("planted.txt").exists());
+            let _ = std::fs::remove_dir(&share);
+        } else {
+            eprintln!("[p9-test] skipping the junction case: could not create a junction");
+        }
+
+        drop(dev);
         let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Capturing then re-applying the 9p device state must restore the negotiated
     /// state and the whole fid table, reopening the host handles of fids that
-    /// were open at capture time.
+    /// were open at capture time, and must drop a fid whose path leaves the
+    /// share, as a tampered snapshot could carry.
     #[test]
     fn device_state_roundtrip_reopens_fids() {
         let base = std::env::temp_dir().join(format!("tinyvmm_p9_snap_{}", std::process::id()));
@@ -3032,24 +3223,28 @@ mod tests {
         dev.negotiated_msize.store(512_000, Ordering::Relaxed);
         dev.next_qid_path.store(42, Ordering::Relaxed);
         {
-            let file = share.join("file.txt");
-            let hf = dev.reopen_fid_handle(&file, false, O_RDONLY);
-            let hd = dev.reopen_fid_handle(&sub, true, O_RDONLY);
-            assert!(!hf.is_null() && !hd.is_null());
+            let hf = dev
+                .reopen_fid_handle(Path::new("file.txt"), false, O_RDONLY)
+                .unwrap();
+            let hd = dev
+                .reopen_fid_handle(Path::new("sub"), true, O_RDONLY)
+                .unwrap();
             let mut fids = dev.fids.lock().unwrap();
-            let mut ef = FidEntry::new(file, false, 7, 1000);
-            ef.handle = Some(Arc::new(OwnedHandle(hf)));
+            let mut ef = FidEntry::new(PathBuf::from("file.txt"), false, 7, 1000);
+            ef.handle = Some(Arc::new(hf));
             ef.opened = true;
             ef.open_flags = O_RDONLY;
             fids.map.insert(1, ef);
-            let mut ed = FidEntry::new(sub.clone(), true, 8, 0);
-            ed.handle = Some(Arc::new(OwnedHandle(hd)));
+            let mut ed = FidEntry::new(PathBuf::from("sub"), true, 8, 0);
+            ed.handle = Some(Arc::new(hd));
             ed.opened = true;
             ed.open_flags = O_RDONLY;
             fids.map.insert(2, ed);
             // A walked-but-not-opened fid: path only, no handle.
             fids.map
-                .insert(3, FidEntry::new(root.clone(), true, 1, 1001));
+                .insert(3, FidEntry::new(PathBuf::new(), true, 1, 1001));
+            let outside = Path::new("..").join("outside");
+            fids.map.insert(4, FidEntry::new(outside, true, 9, 0));
         }
 
         let blob = dev.capture_device_state();
@@ -3061,7 +3256,7 @@ mod tests {
         assert_eq!(dev2.negotiated_msize.load(Ordering::Relaxed), 512_000);
         assert_eq!(dev2.next_qid_path.load(Ordering::Relaxed), 42);
         let fids = dev2.fids.lock().unwrap();
-        assert_eq!(fids.map.len(), 3);
+        assert_eq!(fids.map.len(), 3, "the fid leaving the share is dropped");
         let f1 = fids.map.get(&1).unwrap();
         assert!(!f1.is_dir && f1.opened && f1.handle.is_some() && f1.qid_path == 7);
         let f2 = fids.map.get(&2).unwrap();
@@ -3069,14 +3264,17 @@ mod tests {
         let f3 = fids.map.get(&3).unwrap();
         assert!(f3.is_dir && !f3.opened && f3.handle.is_none() && f3.qid_path == 1);
         assert_eq!((f1.uid, f2.uid, f3.uid), (1000, 0, 1001));
+        assert_eq!(
+            [&f1.rel, &f2.rel, &f3.rel],
+            [Path::new("file.txt"), Path::new("sub"), Path::new("")]
+        );
         drop(fids);
 
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Send one T-message to `dev` and return its R-message, which must not be
-    /// an Rlerror.
-    fn call(dev: &P9Device, mtype: u8, body: impl Fn(&mut Vec<u8>)) -> Vec<u8> {
+    /// Send one T-message to `dev` and return its R-message.
+    fn send(dev: &P9Device, mtype: u8, body: impl Fn(&mut Vec<u8>)) -> Vec<u8> {
         let mut t = Vec::new();
         enc4(&mut t, 0);
         enc1(&mut t, mtype);
@@ -3085,8 +3283,21 @@ mod tests {
         finalize(&mut t);
         let mut reply = Vec::new();
         dev.dispatch(&t, &mut reply, 8192);
+        reply
+    }
+
+    /// [`send`], for a request that must succeed.
+    fn call(dev: &P9Device, mtype: u8, body: impl Fn(&mut Vec<u8>)) -> Vec<u8> {
+        let reply = send(dev, mtype, body);
         assert_eq!(reply[4], mtype + 1, "T-message {mtype} failed: {reply:?}");
         reply
+    }
+
+    /// [`send`], for a request that must fail: the errno of its Rlerror.
+    fn call_err(dev: &P9Device, mtype: u8, body: impl Fn(&mut Vec<u8>)) -> u32 {
+        let reply = send(dev, mtype, body);
+        assert_eq!(reply[4], R_LERROR, "T-message {mtype} succeeded: {reply:?}");
+        u32::from_le_bytes(reply[7..11].try_into().unwrap())
     }
 
     /// Tversion, then Tattach fid 0 to the share root as user `n_uname`.
@@ -3105,14 +3316,21 @@ mod tests {
     }
 
     fn walk(dev: &P9Device, fid: u32, newfid: u32, names: &[&str]) {
-        call(dev, T_WALK, |t| {
-            enc4(t, fid);
-            enc4(t, newfid);
-            enc2(t, names.len() as u16);
-            for name in names {
-                enc_str(t, name);
-            }
-        });
+        call(dev, T_WALK, |t| walk_body(t, fid, newfid, names));
+    }
+
+    /// The errno of a Twalk that must fail at its first name.
+    fn walk_err(dev: &P9Device, fid: u32, newfid: u32, names: &[&str]) -> u32 {
+        call_err(dev, T_WALK, |t| walk_body(t, fid, newfid, names))
+    }
+
+    fn walk_body(t: &mut Vec<u8>, fid: u32, newfid: u32, names: &[&str]) {
+        enc4(t, fid);
+        enc4(t, newfid);
+        enc2(t, names.len() as u16);
+        for name in names {
+            enc_str(t, name);
+        }
     }
 
     /// (mode, uid, gid) from Rgetattr.
@@ -3139,13 +3357,13 @@ mod tests {
         });
     }
 
-    /// Tlcreate a write-only file: its handle can't read extended attributes,
-    /// so getattr through it must fall back to a fresh handle.
-    fn lcreate(dev: &P9Device, fid: u32, name: &str, mode: u32, gid: u32) {
+    /// Tlcreate with `flags`. A write-only file's handle can't read extended
+    /// attributes, so getattr through it must fall back to a fresh handle.
+    fn lcreate(dev: &P9Device, fid: u32, name: &str, flags: u32, mode: u32, gid: u32) {
         call(dev, T_LCREATE, |t| {
             enc4(t, fid);
             enc_str(t, name);
-            enc4(t, O_WRONLY);
+            enc4(t, flags);
             enc4(t, mode);
             enc4(t, gid);
         });
@@ -3380,7 +3598,7 @@ mod tests {
 
         // Tlcreate turns a clone of the root fid into the new file.
         walk(&dev, 0, 2, &[]);
-        lcreate(&dev, 2, "new.txt", S_IFREG | 0o640, 1001);
+        lcreate(&dev, 2, "new.txt", O_WRONLY, S_IFREG | 0o640, 1001);
         assert_eq!(stat(&dev, 2), (S_IFREG | 0o640, 1000, 1001));
         call(&dev, T_MKDIR, |t| {
             enc4(t, 0);
@@ -3393,7 +3611,7 @@ mod tests {
 
         // A create that opens an existing file must not claim it.
         walk(&dev, 0, 4, &[]);
-        lcreate(&dev, 4, "plain.txt", S_IFREG | 0o600, 1001);
+        lcreate(&dev, 4, "plain.txt", O_WRONLY, S_IFREG | 0o600, 1001);
         assert_eq!(stat(&dev, 4), (S_IFREG | 0o644, 500, 501));
 
         // chmod (setuid included), then chown of the uid alone.
@@ -3401,6 +3619,16 @@ mod tests {
         setattr(&dev, 2, SETATTR_UID, 0, 42);
         let want = (S_IFREG | 0o4755, 42, 1001);
         assert_eq!(stat(&dev, 2), want);
+
+        // Truncating creates and opens keep them, as on Linux.
+        walk(&dev, 0, 5, &[]);
+        lcreate(&dev, 5, "new.txt", O_WRONLY | O_TRUNC, S_IFREG | 0o600, 7);
+        walk(&dev, 0, 6, &["new.txt"]);
+        call(&dev, T_LOPEN, |t| {
+            enc4(t, 6);
+            enc4(t, O_WRONLY | O_TRUNC);
+        });
+        assert_eq!(stat(&dev, 6), want);
 
         let fresh = P9Device::new(mem, "t".into(), root.clone(), opts);
         connect(&fresh, 0);
