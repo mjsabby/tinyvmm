@@ -20,6 +20,7 @@ mod mem_layout;
 mod net;
 mod pci;
 mod record;
+mod scanout;
 mod virtio;
 mod whp;
 
@@ -35,6 +36,7 @@ use crate::host::block_file::BlockFile;
 use crate::net::nat::{NatBackend, NatOptions, PortForward};
 use crate::pci::{PciBus, PciFunction};
 use crate::record::{RecordSpec, Recorder};
+use crate::scanout::Scanout;
 use crate::virtio::blk::BlockDevice;
 use crate::virtio::console::ConsoleDevice;
 use crate::virtio::device::VirtioDevice;
@@ -1512,19 +1514,21 @@ fn start_recorder(
     gpu_width: u32,
     gpu_height: u32,
     sound: bool,
+    scanout: &Arc<Scanout>,
     tag: &str,
 ) -> Result<Option<Arc<Recorder>>> {
     let Some(spec) = spec else {
         return Ok(None);
     };
     let (width, height) = virtio::gpu::display_size(gpu_width, gpu_height);
-    let recorder = Recorder::start(spec, width, height, sound)?;
+    let recorder = Recorder::start(spec, width, height, sound, scanout.clone())?;
     println!("[{tag}] recording {}", recorder.description);
     Ok(Some(recorder))
 }
 
-/// The GPU present hook: the window and/or the recorder (`None` if neither).
-/// The window copies the frame; the recorder, last, takes the buffer itself.
+/// The GPU present hook: tells the window and/or the recorder (`None` if
+/// neither) that the scanout has a new picture. Each reads it on its own
+/// thread.
 fn present_hook(
     display: Option<Arc<Display>>,
     recorder: Option<Arc<Recorder>>,
@@ -1532,12 +1536,12 @@ fn present_hook(
     if display.is_none() && recorder.is_none() {
         return None;
     }
-    Some(Box::new(move |bgra: &mut Vec<u8>, w, h| {
+    Some(Box::new(move || {
         if let Some(d) = &display {
-            d.present(bgra, w, h);
+            d.frame_ready();
         }
         if let Some(r) = &recorder {
-            r.video_frame(bgra, w, h);
+            r.frame_ready();
         }
     }))
 }
@@ -1883,12 +1887,15 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     }
 
     // --- --record: start the encoder before any device can produce output, so
-    // the recording's timeline covers the whole run. ---
+    // the recording's timeline covers the whole run. It and the GPU window
+    // show the same scanout pictures. ---
+    let scanout = Arc::new(Scanout::default());
     let recorder = start_recorder(
         cfg.record.as_ref(),
         cfg.gpu_width,
         cfg.gpu_height,
         cfg.with_sound,
+        &scanout,
         "pvh-run",
     )?;
 
@@ -2085,12 +2092,13 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
             &format!("tinyvmm - virtio-gpu {}x{}", cfg.gpu_width, cfg.gpu_height),
             cfg.gpu_width,
             cfg.gpu_height,
+            scanout.clone(),
         );
         if display.is_none() {
             eprintln!("[pvh-run] WARN: virtio-gpu window creation failed; running headless");
         }
         if let Some(hook) = present_hook(display.clone(), recorder.clone()) {
-            gpu.set_present_callback(hook);
+            gpu.set_present(scanout.clone(), hook);
         }
 
         let gopts = transport::Options {
@@ -3135,11 +3143,13 @@ fn run_restore(args: &[String]) -> Result<i32> {
 
     // --record: start the encoder before any device can produce output (the
     // GPU re-presents the restored frame as its state is applied).
+    let scanout = Arc::new(Scanout::default());
     let recorder = start_recorder(
         record.as_ref(),
         gpu_width,
         gpu_height,
         with_sound,
+        &scanout,
         "restore",
     )?;
 
@@ -3332,12 +3342,13 @@ fn run_restore(args: &[String]) -> Result<i32> {
             &format!("tinyvmm - virtio-gpu {gpu_width}x{gpu_height}"),
             gpu_width,
             gpu_height,
+            scanout.clone(),
         );
         if display.is_none() {
             eprintln!("[restore] WARN: virtio-gpu window creation failed; running headless");
         }
         if let Some(hook) = present_hook(display.clone(), recorder.clone()) {
-            gpu.set_present_callback(hook);
+            gpu.set_present(scanout.clone(), hook);
         }
         let gopts = transport::Options {
             vendor_id: 0x1AF4,

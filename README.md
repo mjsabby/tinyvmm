@@ -464,10 +464,13 @@ order they are created — that order is fixed (it is also the snapshot
   (`controlq=0`, `cursorq=1`); single scanout (`NUM_SCANOUTS=1`); 32-bpp
   resources. It handles `GET_DISPLAY_INFO`, `RESOURCE_CREATE_2D` / `UNREF`,
   `SET_SCANOUT`, `RESOURCE_ATTACH`/`DETACH_BACKING`, `TRANSFER_TO_HOST_2D`, and
-  `RESOURCE_FLUSH`; on flush it swizzles the scanout rectangle of the bound
-  resource (`SET_SCANOUT`'s rect, which can be smaller than the resource, e.g.
-  llvmpipe pads heights to 64-row tiles) to BGRA into a reused shadow buffer and
-  presents it to a **Win32 GDI window** (`src/display.rs`) via a CPU blit.
+  `RESOURCE_FLUSH`; on flush it swizzles what changed of the scanout
+  rectangle of the bound resource (`SET_SCANOUT`'s rect, which can be smaller
+  than the resource, e.g. llvmpipe pads heights to 64-row tiles): the flushed
+  part, plus anything transferred to it since the last flush. The result is a
+  new BGRA picture of the scanout (`src/scanout.rs`), byte for byte the whole
+  rectangle converted, which a **Win32 GDI window** (`src/display.rs`) shows
+  via a CPU blit and `--record` encodes.
 * **virtio-snd** — sound card (`src/virtio/snd.rs`) with one playback and one
   capture PCM stream, plus one jack and one channel-map per direction. Four queues
   (`controlq=0`, `eventq=1`, `txq=2`, `rxq=3`); the control queue (PCM/jack/chmap
@@ -526,9 +529,16 @@ surface (RSDP / XSDT / MADT with one x2APIC entry per vCPU, LAPIC at
 
 `Display` owns a Win32 window on **its own message-pump thread**
 (`WNDCLASSW` + `CreateWindowExW`, non-resizable, client area == scanout, 1:1
-pixel mapping). `Display::present(bgra, w, h)` copies the frame into a shared
-`Mutex<Frame>` and posts `WM_APP_PAINT`; the window thread draws it with
-`StretchDIBits` from a top-down DIB. The window translates Win32 input messages
+pixel mapping). Each GPU flush publishes a new BGRA picture of the scanout
+(`src/scanout.rs`): the vCPU draws it in a spare buffer no reader is using,
+copying in only what changed (plus whatever that buffer missed since it was
+last shown), then makes it the latest. `Display::frame_ready()` posts a
+coalesced `WM_APP_PAINT`; the window thread resizes the window if the mode
+changed, invalidates just what changed, and `WM_PAINT` blits the latest picture
+with `StretchDIBits` from a top-down DIB, holding it by reference meanwhile
+(black until the guest's first flush). So the window keeps no copy of its own
+and a paint never holds up the guest. The
+window translates Win32 input messages
 (`WM_KEYDOWN/UP`, `WM_MOUSEMOVE`, the button + wheel messages, focus/resize/close)
 into a `WindowEvent` enum delivered through an installable
 `InputSink = Box<dyn FnMut(WindowEvent) + Send>`. When both `--gpu` and `--input`
@@ -545,10 +555,11 @@ works headless too. A dedicated encoder thread owns a Media Foundation sink
 writer (`crates/winsys/src/media.rs`) and puts everything on one timeline that
 starts once the encoder is ready:
 
-* **Video, constant frame rate.** A present hands its frame to the recorder by
-  swapping buffers with a single latest-frame slot (no copy), so the vCPU never
-  waits on the encoder. At each tick (`k / fps`) the encoder swaps out the newest
-  frame, converts it to NV12 (BT.709 limited range, 2×2 chroma averaging; AVX2,
+* **Video, constant frame rate.** A present only tells the recorder there is a
+  new picture, so the vCPU neither copies a frame for it nor waits on the
+  encoder. At each tick (`k / fps`) the encoder takes the latest picture by
+  reference (flushes draw on other buffers meanwhile), converts it to NV12
+  (BT.709 limited range, 2×2 chroma averaging; AVX2,
   ~3 ms for a 4K frame, with a bit-identical scalar fallback; Media
   Foundation's own converters default to BT.601 and cost ~4× the CPU) and
   encodes it at that timestamp, or, if the guest hasn't flushed
@@ -706,6 +717,7 @@ crates/
 src/
   main.rs      CLI dispatch, device wiring, interactive console, save/restore
   display.rs   Win32 GDI window host for virtio-gpu + host-input seam
+  scanout.rs   the GPU's published BGRA pictures, shared by the window + recorder
   record.rs    --record: GPU frames + sound playback -> MP4 encoder thread
   boot/        acpi (RSDP/XSDT/MADT), loader (PVH ELF + hvm_start_info + e820),
                bzimage (Linux boot protocol: zero page + 32-bit entry)
@@ -892,8 +904,9 @@ Plus **reused scratch buffers** with no per-event allocation: the virtqueue's
 `TxScratch { frame, chain }`; the NAT keeps `tx_scratch`/`l3_scratch` `Vec`s the
 `build_*_into` wire helpers write into; **virtio-input** reuses an `event_scratch`
 / `status_scratch` and builds its config image into a fixed `[u8; 8+128]` stack
-buffer; **virtio-gpu** reuses a single `present_buf: Vec<u8>` BGRA shadow (resized
-once, reused every flush) and reused `req`/`resp` buffers.
+buffer; **virtio-gpu** draws each flush into a spare picture buffer of the
+shared scanout (at most three, reused once no reader holds them) and reuses its
+`req`/`resp` buffers.
 
 ### Pinned / address-stable buffers for async IOCP
 
@@ -956,12 +969,17 @@ The tax the safety model adds versus a C VMM that derefs guest pointers directly
 * **Per host input event (gpu+input):** the window's `InputSink` runs on the
   message-pump thread and reuses the device's `event_scratch`, so a steady input
   stream allocates nothing after warm-up; one IRQ per `submit_frame`.
-* **Per gpu flush:** swizzle the bound resource into the reused `present_buf` BGRA
-  shadow, then a single CPU blit (`StretchDIBits`) on the window thread — no
-  per-frame allocation. With `--record`, the recorder takes the frame by swapping
-  `present_buf` with its latest-frame slot (O(1) under its mutex, no copy; the
-  device rewrites whatever buffer it gets back), and a static screen's ticks
-  resubmit the last encoded picture's buffer.
+* **Per gpu flush:** swizzle what changed of the bound resource (the flushed
+  area, plus anything transferred to the scanout since the last flush) into a
+  spare BGRA picture buffer (plus the area that buffer missed since it was last
+  shown) and publish it: the flush's one copy, on the vCPU. Each picture is
+  byte for byte what converting the whole scanout would give. The window blits
+  the latest picture (`StretchDIBits`) and the recorder converts it to NV12,
+  each on its own thread straight from the shared buffer, which later flushes
+  leave alone while it's held; a static screen's ticks resubmit the last
+  encoded picture's buffer. No per-frame allocation once warm. A page-flipping
+  guest (GNOME's Mutter on dumb buffers) flushes whole frames: Linux's
+  virtio-gpu driver uploads the whole plane when the framebuffer changes.
 
 **Honest summary:** guest *data* is zero-copy — disk bytes DMA directly in/out of
 guest RAM and rng/status writes land in place. The only fixed memcpy the safety
@@ -1116,10 +1134,11 @@ free-list, the `OnceLock` callbacks, the `UnsafeCell` slot bodies).
 | `Mutex<RxPool>` + `Mutex<TxScratch>` (net) | RX slot pool + reused TX scratch | the backend worker injecting vs the vCPU/pump draining | hand-off boundary between the network thread and the device |
 | transport mutexes (`Common`, `PciConfigSpace`, `Option<DoorbellState>`) | virtio common-cfg, PCI config space, the live doorbell set | vCPU MMIO writes vs BAR (un)map vs pump lifecycle | a config write mutates several fields consistently |
 | 9p `Mutex<Fids>` + `SlotPool` free-list `Mutex<Vec<u16>>` | the open fid→handle map; free slot indices | the 9p workers running concurrent reads/writes | a shared mutable map + index pool across the pool |
-| gpu `Mutex<GpuState>` + queue/scratch mutexes | resources map, scanout, present shadow | the vCPU draining controlq vs the present path | resource table + scanout mutate together |
+| gpu `Mutex<GpuState>` + queue/scratch mutexes | resources map, scanout binding | the vCPU draining controlq vs the present path | resource table + scanout mutate together |
+| scanout `Mutex<State>` (`src/scanout.rs`) | the latest picture (`Arc<Frame>`), spare buffers, recent damage, the window's dirty area | the vCPU publishing a flush vs the window and the recorder taking the latest picture | readers only clone an `Arc` under it and read outside it; the vCPU draws on a spare no reader holds |
 | input `Mutex<Virtqueue>` + `Mutex<ChainScratch>` (event/status) | eventq/statusq + reused scratch | the window thread injecting vs the vCPU | host-event injection vs guest kicks |
-| display `Mutex<Frame>` + `Mutex<Option<InputSink>>` | the shared BGRA frame; the installed input sink | `present()` (vCPU/gpu) vs the window thread's `WM_PAINT` | the frame buffer is produced and consumed on different threads |
-| recorder `Mutex<Frame>` + `Mutex<AudioQueue>` (`--record`) | the latest presented frame; PCM chunks awaiting the encoder | the vCPU (gpu present) and the snd playback worker vs the encoder thread | both sides only swap buffers under the frame lock (O(1)); the encoder converts/encodes outside it |
+| display `Mutex<Option<InputSink>>` | the installed input sink | the wiring code installing it vs the window thread's input messages | the sink is installed from another thread |
+| recorder `Mutex<AudioQueue>` (`--record`) | PCM chunks awaiting the encoder | the snd playback worker vs the encoder thread | the producer only appends under it; the encoder swaps the queue out and encodes outside it |
 | NAT `Mutex<VecDeque<IcmpJob>>` + `Condvar` | the bounded ping handoff queue | the vCPU enqueues, helper threads dequeue | classic bounded producer/consumer |
 | NAT `RwLock<HashMap<FlowKey, usize>>` (`FlowRouter`, 2+ workers only) | which worker owns each TCP flow | the guest TX path reads it per TCP frame; a SYN, or a worker creating or ending a flow, writes it | a map keyed by 4-tuple; writes only at flow start and end, so reads rarely wait |
 | `RwLock<Vec<Entry>>` (MMIO bus) | the GPA→device dispatch table | written once at setup, read on every MMIO | read-mostly; readers never block readers |
@@ -1157,13 +1176,13 @@ the locking story above.
   the transfer. Malformed commands are answered with an error response, not a
   panic.
 * **Recorder (`src/record.rs`, `--record`):** guest output only ever reaches it
-  through bounded buffers: one latest-frame slot (sized by the GPU's own
-  resource caps) and a PCM queue capped at 2 s, beyond which new PCM is dropped
-  and counted. A frame whose length doesn't match its dimensions is skipped, and
-  any frame size is scaled to fit the fixed output. PCM staged on the audio track
-  is capped at 4 s and silence is generated a tick at a time; a stall longer than
-  2 s (a host suspend, a blocked encoder) is cut from the recording, so no gap
-  turns into an allocation or an unbounded catch-up.
+  through bounded buffers: the scanout's pictures (at most three kept, sized by
+  the GPU's own resource caps) and a PCM queue capped at 2 s, beyond which new
+  PCM is dropped and counted. A frame whose length doesn't match its dimensions
+  is skipped, and any frame size is scaled to fit the fixed output. PCM staged
+  on the audio track is capped at 4 s and silence is generated a tick at a time;
+  a stall longer than 2 s (a host suspend, a blocked encoder) is cut from the
+  recording, so no gap turns into an allocation or an unbounded catch-up.
 * **virtio-input (`src/virtio/input.rs`):** config select/subselect indices are
   range-checked; `InputEvent::decode` is only fed the fixed 8-byte records the
   driver path produces; the host-event hot path bounds the absolute axes to

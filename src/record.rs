@@ -7,12 +7,13 @@
 //!   * Video is constant frame rate: tick `k` (time `k / fps`) is one sample one
 //!     frame period long. Never a longer one: some hardware encoders replace
 //!     sample durations with the nominal period, which would shorten the video
-//!     track. At each tick the encoder takes the most recently presented frame,
-//!     or queues the previous picture again when the guest hasn't flushed since
+//!     track. At each tick the encoder converts the scanout's latest picture,
+//!     holding it by reference (flushes draw on other buffers meanwhile), or
+//!     queues the previous picture again when the guest hasn't flushed since
 //!     (a static desktop; the encoder resubmits that picture's buffer, no copy).
-//!     A present only swaps its buffer into a single latest-frame slot, so the
-//!     vCPU neither copies a frame nor waits on the encoder; frames presented
-//!     between two ticks are dropped. A frame whose size differs from the
+//!     A present only bumps a counter, so the vCPU neither copies a frame for
+//!     the recorder nor waits on the encoder; pictures flushed between two
+//!     ticks are dropped. A frame whose size differs from the
 //!     recording's (a guest mode change) is scaled to fit and letterboxed.
 //!   * If the encoder falls behind, it catches up by repeating the previous
 //!     picture for each tick it missed, and takes a new frame only for the tick
@@ -38,6 +39,7 @@
 use crate::error::{Error, Result};
 use crate::host::audio::{Event, INFINITE, SAMPLE_RATE, WaitOutcome, wait_any};
 use crate::host::media::{Mp4Options, Mp4Writer, VideoFormat};
+use crate::scanout::Scanout;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -108,15 +110,6 @@ impl RecordSpec {
     }
 }
 
-/// A BGRA frame (top-down, `stride == width * 4`) and its present sequence.
-#[derive(Default)]
-struct Frame {
-    buf: Vec<u8>,
-    width: u32,
-    height: u32,
-    seq: u64,
-}
-
 /// PCM handed over by the playback tap: bytes plus `(track position, bytes)`
 /// for each chunk.
 #[derive(Default)]
@@ -127,7 +120,9 @@ struct AudioQueue {
 
 struct Shared {
     t0: Instant,
-    video: Mutex<Frame>,
+    /// What the guest shows; the encoder converts its latest picture at each
+    /// tick when it changed.
+    scanout: Arc<Scanout>,
     audio: Mutex<AudioQueue>,
     /// When [`Recorder::finish`] was called: the recording ends there.
     stop_at: OnceLock<Instant>,
@@ -138,10 +133,10 @@ struct Shared {
 
 impl Shared {
     /// The producer/encoder rendezvous; the timeline starts now.
-    fn new() -> Option<Arc<Shared>> {
+    fn new(scanout: Arc<Scanout>) -> Option<Arc<Shared>> {
         Some(Arc::new(Shared {
             t0: Instant::now(),
-            video: Mutex::new(Frame::default()),
+            scanout,
             audio: Mutex::new(AudioQueue {
                 data: Vec::with_capacity(AUDIO_QUEUE_MAX_BYTES / 4),
                 chunks: Vec::with_capacity(256),
@@ -151,18 +146,6 @@ impl Shared {
             presents: AtomicU64::new(0),
             audio_overflow_frames: AtomicU64::new(0),
         }))
-    }
-
-    /// See [`Recorder::video_frame`].
-    fn present(&self, bgra: &mut Vec<u8>, width: u32, height: u32) {
-        {
-            let mut slot = self.video.lock().unwrap();
-            std::mem::swap(&mut slot.buf, bgra);
-            slot.width = width;
-            slot.height = height;
-            slot.seq += 1;
-        }
-        self.presents.fetch_add(1, Ordering::Relaxed);
     }
 
     /// See [`Recorder::audio_pcm`].
@@ -237,9 +220,9 @@ impl std::fmt::Display for Summary {
     }
 }
 
-/// A running recording. Feed it with [`Self::video_frame`] (the GPU present
-/// hook) and [`Self::audio_pcm`] (the virtio-snd playback tap); [`Self::finish`]
-/// (or drop) finalizes the file.
+/// A running recording. Feed it through the scanout (telling it with
+/// [`Self::frame_ready`]) and [`Self::audio_pcm`] (the virtio-snd playback
+/// tap); [`Self::finish`] (or drop) finalizes the file.
 pub struct Recorder {
     shared: Arc<Shared>,
     worker: Mutex<Option<JoinHandle<Summary>>>,
@@ -248,10 +231,17 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    /// Create the output file and start the encoder thread. `width`x`height` is
-    /// the GPU's display size (rounded up to even for H.264); `audio` adds an
-    /// AAC track for the guest's playback stream.
-    pub fn start(spec: &RecordSpec, width: u32, height: u32, audio: bool) -> Result<Arc<Self>> {
+    /// Create the output file and start the encoder thread, which records
+    /// `scanout`. `width`x`height` is the GPU's display size (rounded up to
+    /// even for H.264); `audio` adds an AAC track for the guest's playback
+    /// stream.
+    pub fn start(
+        spec: &RecordSpec,
+        width: u32,
+        height: u32,
+        audio: bool,
+        scanout: Arc<Scanout>,
+    ) -> Result<Arc<Self>> {
         let width = (width + 1) & !1;
         let height = (height + 1) & !1;
         let bitrate = match spec.kbps {
@@ -285,7 +275,7 @@ impl Recorder {
                             return Summary::default();
                         }
                     };
-                    let Some(shared) = Shared::new() else {
+                    let Some(shared) = Shared::new(scanout) else {
                         let _ = ready_tx.send(Err(Error::msg("create recorder event")));
                         return Summary::default();
                     };
@@ -327,12 +317,10 @@ impl Recorder {
         }))
     }
 
-    /// GPU present hook: take the frame by swapping `bgra` with the latest-frame
-    /// slot's buffer (the device rewrites whatever it gets back before its next
-    /// present). Runs on the vCPU thread under the GPU lock, so it neither
-    /// copies nor allocates.
-    pub fn video_frame(&self, bgra: &mut Vec<u8>, width: u32, height: u32) {
-        self.shared.present(bgra, width, height);
+    /// GPU present hook: a flush published a new picture in the scanout. The
+    /// encoder converts it at its next tick, on its own thread.
+    pub fn frame_ready(&self) {
+        self.shared.presents.fetch_add(1, Ordering::Relaxed);
     }
 
     /// virtio-snd playback tap: queue `pcm`, which sits `offset` frames into
@@ -423,7 +411,8 @@ struct Encoder {
     /// repeat it).
     nv12: Vec<u8>,
     pictured: bool,
-    frame: Frame,
+    /// The number of the last flush converted.
+    seen: u64,
     fit: Fit,
     /// `None` without an audio stream.
     track: Option<AudioTrack>,
@@ -445,7 +434,7 @@ impl Encoder {
             next: 0,
             nv12,
             pictured: false,
-            frame: Frame::default(),
+            seen: 0,
             fit: Fit::default(),
             track: audio.then(AudioTrack::default),
             new_frames: 0,
@@ -476,11 +465,22 @@ impl Encoder {
         let (k, fps) = (self.next, self.fmt.fps);
         let (t, end) = (tick_hns(k, fps), tick_hns(k + 1, fps));
         // Behind schedule, repeat the previous picture: a frame presented by
-        // now belongs to a later tick, not this past one.
+        // now belongs to a later tick, not this past one. A new picture is
+        // converted where the scanout keeps it: holding it doesn't hold up
+        // flushes, which draw on other buffers.
         let behind = self.tick_at(now) > k;
         let new = !behind
-            && take_frame(shared, &mut self.frame)
-            && convert(&self.frame, &self.fmt, &mut self.fit, &mut self.nv12);
+            && shared.scanout.newer_than(self.seen).is_some_and(|f| {
+                self.seen = f.seq();
+                convert(
+                    &f.buf,
+                    f.width,
+                    f.height,
+                    &self.fmt,
+                    &mut self.fit,
+                    &mut self.nv12,
+                )
+            });
         if new || !self.pictured {
             sink.video(&self.nv12, t, end - t)?;
             self.pictured = true;
@@ -594,33 +594,26 @@ fn encode(shared: &Shared, mut writer: Mp4Writer, fmt: &VideoFormat, path: PathB
     s
 }
 
-/// Swap the latest presented frame into `local` if one arrived since it was
-/// last taken (O(1) under the lock; the slot keeps `local`'s old buffer, which
-/// the next present overwrites).
-fn take_frame(shared: &Shared, local: &mut Frame) -> bool {
-    let mut slot = shared.video.lock().unwrap();
-    if slot.seq == local.seq {
-        return false;
-    }
-    std::mem::swap(&mut slot.buf, &mut local.buf);
-    local.width = slot.width;
-    local.height = slot.height;
-    local.seq = slot.seq;
-    true
-}
-
-/// Convert `frame` into the recording's NV12 buffer, scaling it to fit when
-/// its size differs. False (buffer untouched) for a malformed frame.
-fn convert(frame: &Frame, fmt: &VideoFormat, fit: &mut Fit, nv12: &mut [u8]) -> bool {
-    let (w, h) = (frame.width as usize, frame.height as usize);
-    if w == 0 || h == 0 || frame.buf.len() != w * h * 4 {
+/// Convert a `width`x`height` BGRA frame into the recording's NV12 buffer,
+/// scaling it to fit when its size differs. False (buffer untouched) for a
+/// malformed frame.
+fn convert(
+    bgra: &[u8],
+    width: u32,
+    height: u32,
+    fmt: &VideoFormat,
+    fit: &mut Fit,
+    nv12: &mut [u8],
+) -> bool {
+    let (w, h) = (width as usize, height as usize);
+    if w == 0 || h == 0 || bgra.len() != w * h * 4 {
         return false;
     }
     let (ow, oh) = (fmt.width as usize, fmt.height as usize);
     if (w, h) == (ow, oh) {
-        bgra_to_nv12(&frame.buf, ow, oh, nv12);
+        bgra_to_nv12(bgra, ow, oh, nv12);
     } else {
-        fit.scale(&frame.buf, w, h, ow, oh);
+        fit.scale(bgra, w, h, ow, oh);
         bgra_to_nv12(&fit.canvas, ow, oh, nv12);
     }
     true
@@ -1186,7 +1179,7 @@ mod tests {
 
     /// A 4x2 encoder at 10 fps, its shared state, and a fake sink.
     fn test_encoder(audio: bool) -> (Arc<Shared>, Encoder, FakeSink) {
-        let shared = Shared::new().expect("event");
+        let shared = Shared::new(Arc::new(Scanout::default())).expect("event");
         let fmt = VideoFormat {
             width: 4,
             height: 2,
@@ -1201,6 +1194,15 @@ mod tests {
         bgra(&[rgb; 8])
     }
 
+    /// The guest flushes a whole 4x2 frame of one color.
+    fn show(shared: &Shared, rgb: [u8; 3]) {
+        let frame = solid(rgb);
+        let full = crate::scanout::Area::full(4, 2);
+        shared
+            .scanout
+            .flush(4, 2, full, |buf, _| buf.copy_from_slice(&frame));
+    }
+
     /// Frame `n`'s first byte on an audio track.
     fn sample(track: &[u8], n: usize) -> u8 {
         track[n * PCM_FRAME]
@@ -1213,10 +1215,10 @@ mod tests {
     fn stall_catches_up_one_sample_per_tick() {
         let (shared, mut enc, mut sink) = test_encoder(false);
         let at = |ms| shared.t0 + Duration::from_millis(ms);
-        shared.present(&mut solid([255, 255, 255]), 4, 2);
+        show(&shared, [255, 255, 255]);
         enc.tick(&shared, &mut sink, at(0)).unwrap();
         // The encoder stalls until 450 ms; a red frame arrives meanwhile.
-        shared.present(&mut solid([255, 0, 0]), 4, 2);
+        show(&shared, [255, 0, 0]);
         while enc.due() <= at(450) {
             enc.tick(&shared, &mut sink, at(450)).unwrap();
         }
@@ -1233,14 +1235,14 @@ mod tests {
     fn long_stall_is_cut_from_both_tracks() {
         let (shared, mut enc, mut sink) = test_encoder(true);
         let at = |ms| shared.t0 + Duration::from_millis(ms);
-        shared.present(&mut solid([255, 255, 255]), 4, 2);
+        show(&shared, [255, 255, 255]);
         enc.tick(&shared, &mut sink, at(0)).unwrap();
         shared.queue_pcm(at(0), 0, &pcm(2400, 1));
         // The host sleeps for 5 s. PCM from inside the gap is still queued (more
         // than the queue holds), and a green frame arrives as it wakes.
         shared.queue_pcm(at(1000), 0, &pcm(480, 2));
         shared.queue_pcm(at(1010), 0, &pcm(96_000, 2));
-        shared.present(&mut solid([0, 255, 0]), 4, 2);
+        show(&shared, [0, 255, 0]);
         enc.tick(&shared, &mut sink, at(5000)).unwrap();
         assert_eq!(enc.skipped, Duration::from_millis(4900));
         // Playback after the gap lands on tick 1 (100 ms), with the green frame.
@@ -1271,13 +1273,13 @@ mod tests {
     fn finish_during_stall_ends_both_tracks_at_the_stop() {
         let (shared, mut enc, mut sink) = test_encoder(true);
         let at = |ms| shared.t0 + Duration::from_millis(ms);
-        shared.present(&mut solid([255, 255, 255]), 4, 2);
+        show(&shared, [255, 255, 255]);
         enc.tick(&shared, &mut sink, at(0)).unwrap();
         // While the encoder is stalled the guest plays 1.5 s and presents red;
         // then the VM stops at 1.3 s.
         shared.queue_pcm(at(0), 0, &pcm(48_000, 1));
         shared.queue_pcm(at(1000), 0, &pcm(24_000, 2));
-        shared.present(&mut solid([255, 0, 0]), 4, 2);
+        show(&shared, [255, 0, 0]);
         enc.finish(&shared, &mut sink, at(1300)).unwrap();
 
         sink.assert_cfr();

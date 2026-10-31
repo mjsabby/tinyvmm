@@ -1,16 +1,19 @@
 //! A single Win32 GDI window that presents the guest's virtio-gpu scanout via a
 //! CPU blit (`StretchDIBits`). The window owns its own thread + message pump
 //! (Win32 requires the creating thread to service the window's messages); the
-//! device thread calls [`Display::present`] from outside.
+//! device thread calls [`Display::frame_ready`] from outside.
 //!
 //! Threading model:
 //! * The window thread creates the window, stores its `HWND` (so other threads
 //!   can post to it), then runs `GetMessage`/`DispatchMessage` until quit.
-//! * [`Display::present`] (called on the vCPU / virtio drain thread) copies the
-//!   BGRA frame into a shared buffer under a short mutex, then `PostMessage`s a
-//!   coalesced repaint/resize request to the window thread. The actual GDI blit
-//!   happens on the window thread in `WM_PAINT`, so no GDI object is touched
-//!   cross-thread.
+//! * A virtio-gpu flush publishes a new picture in the shared scanout
+//!   ([`crate::scanout`]) on the vCPU thread and calls
+//!   [`Display::frame_ready`], which only `PostMessage`s a coalesced update to
+//!   the window thread. That thread resizes the window if the scanout's size
+//!   changed and invalidates just what changed; `WM_PAINT` then blits from the
+//!   latest picture, which it holds by reference meanwhile (flushes draw on
+//!   other buffers), so no GDI object is touched cross-thread, nothing is
+//!   copied for the window, and the guest never waits on GDI.
 //!
 //! Input seam (for the separate virtio-input device): the window proc translates
 //! raw Win32 keyboard/pointer/wheel/focus messages into a neutral
@@ -27,10 +30,12 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use crate::scanout::Scanout;
+
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, COLORONCOLOR, DIB_RGB_COLORS, EndPaint,
-    InvalidateRect, PAINTSTRUCT, SRCCOPY, SetStretchBltMode, StretchDIBits,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLACKNESS, BeginPaint, COLORONCOLOR, DIB_RGB_COLORS,
+    EndPaint, InvalidateRect, PAINTSTRUCT, PatBlt, SRCCOPY, SetStretchBltMode, StretchDIBits,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
@@ -46,9 +51,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_VISIBLE,
 };
 
-/// Custom messages posted from the present thread to the window thread.
+/// Custom message posted from the present thread to the window thread: the
+/// scanout has a new picture.
 const WM_APP_PAINT: u32 = WM_APP + 1;
-const WM_APP_RESIZE: u32 = WM_APP + 2;
 
 /// A mouse button, as reported in [`WindowEvent::Button`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,17 +104,14 @@ pub enum WindowEvent {
 
 type InputSink = Box<dyn FnMut(WindowEvent) + Send>;
 
-struct Frame {
-    /// BGRA, top-down, tightly packed (`stride == width * 4`).
-    buf: Vec<u8>,
-    width: u32,
-    height: u32,
-}
-
 /// State shared between the window thread (via the `HWND`'s user-data pointer)
 /// and the present/control threads.
 struct Shared {
-    frame: Mutex<Frame>,
+    /// What the guest shows.
+    scanout: Arc<Scanout>,
+    /// The size of the picture the window is sized for. Only the window
+    /// thread touches it.
+    size: Mutex<(u32, u32)>,
     input: Mutex<Option<InputSink>>,
     hwnd: AtomicIsize,
     open: AtomicBool,
@@ -139,17 +141,19 @@ fn hi_i16(v: u32) -> i32 {
 
 impl Display {
     /// Create a window with an initial client size of `width`x`height` and the
-    /// given title bar text, spawning its message-pump thread. Returns `None`
-    /// if the window could not be created.
-    pub fn new(title: &str, width: u32, height: u32) -> Option<Arc<Display>> {
+    /// given title bar text, showing `scanout`, and spawn its message-pump
+    /// thread. Returns `None` if the window could not be created.
+    pub fn new(
+        title: &str,
+        width: u32,
+        height: u32,
+        scanout: Arc<Scanout>,
+    ) -> Option<Arc<Display>> {
         let width = width.max(1);
         let height = height.max(1);
         let shared = Arc::new(Shared {
-            frame: Mutex::new(Frame {
-                buf: vec![0u8; (width as usize) * (height as usize) * 4],
-                width,
-                height,
-            }),
+            scanout,
+            size: Mutex::new((width, height)),
             input: Mutex::new(None),
             hwnd: AtomicIsize::new(0),
             open: AtomicBool::new(false),
@@ -189,10 +193,10 @@ impl Display {
         *self.shared.input.lock().unwrap() = Some(sink);
     }
 
-    /// Present a BGRA (top-down, `stride == width*4`) frame of `width`x`height`.
-    /// Cheap: copies into a shared buffer and posts a coalesced repaint to the
-    /// window thread. A no-op once the window has closed.
-    pub fn present(&self, bgra: &[u8], width: u32, height: u32) {
+    /// The scanout has a new picture: have the window thread repaint. Only
+    /// posts a message (coalesced), so it's cheap on the vCPU thread. A no-op
+    /// once the window has closed.
+    pub fn frame_ready(&self) {
         if !self.shared.open.load(Ordering::Acquire) {
             return;
         }
@@ -200,33 +204,10 @@ impl Display {
         if hwnd == 0 {
             return;
         }
-        let need = (width as usize) * (height as usize) * 4;
-        if bgra.len() < need || need == 0 {
-            return;
-        }
-
-        let mut resized = false;
-        {
-            let mut f = self.shared.frame.lock().unwrap();
-            if f.width != width || f.height != height {
-                resized = true;
-                f.width = width;
-                f.height = height;
-            }
-            if f.buf.len() != need {
-                f.buf.resize(need, 0);
-            }
-            f.buf.copy_from_slice(&bgra[..need]);
-        }
-
-        let hwnd = hwnd as *mut c_void;
-        unsafe {
-            if resized {
-                PostMessageW(hwnd, WM_APP_RESIZE, width as WPARAM, height as LPARAM);
-            }
-            // Coalesce: only post a paint if one isn't already queued.
-            if !self.shared.paint_pending.swap(true, Ordering::AcqRel) {
-                PostMessageW(hwnd, WM_APP_PAINT, 0, 0);
+        // Coalesce: only post an update if one isn't already queued.
+        if !self.shared.paint_pending.swap(true, Ordering::AcqRel) {
+            unsafe {
+                PostMessageW(hwnd as *mut c_void, WM_APP_PAINT, 0, 0);
             }
         }
     }
@@ -381,68 +362,91 @@ unsafe extern "system" fn wnd_proc(
         match msg {
             WM_APP_PAINT => {
                 shared.paint_pending.store(false, Ordering::Release);
-                InvalidateRect(hwnd, std::ptr::null(), 0);
-                0
-            }
-            WM_APP_RESIZE => {
-                let cw = wparam as u32;
-                let ch = lparam as u32;
-                let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE;
-                let (ww, wh) = outer_size(cw, ch, style);
-                SetWindowPos(
-                    hwnd,
-                    std::ptr::null_mut(),
-                    0,
-                    0,
-                    ww,
-                    wh,
-                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-                InvalidateRect(hwnd, std::ptr::null(), 0);
+                let mut size = shared.size.lock().unwrap();
+                let old = *size;
+                let Some(area) = shared.scanout.window_update(&mut size) else {
+                    return 0;
+                };
+                let size = *size;
+                if size != old {
+                    // Keep the client area equal to the scanout.
+                    let style =
+                        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE;
+                    let (ww, wh) = outer_size(size.0, size.1, style);
+                    SetWindowPos(
+                        hwnd,
+                        std::ptr::null_mut(),
+                        0,
+                        0,
+                        ww,
+                        wh,
+                        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+                // Repaint only what changed: WM_PAINT's blit is clipped to it.
+                let r = RECT {
+                    left: area.x as i32,
+                    top: area.y as i32,
+                    right: (area.x + area.width) as i32,
+                    bottom: (area.y + area.height) as i32,
+                };
+                InvalidateRect(hwnd, &r, 0);
                 0
             }
             WM_ERASEBKGND => 1, // we paint everything; skip the erase to avoid flicker
             WM_PAINT => {
                 let mut ps: PAINTSTRUCT = std::mem::zeroed();
                 let hdc = BeginPaint(hwnd, &mut ps);
-                if !hdc.is_null() {
-                    let f = shared.frame.lock().unwrap();
-                    if f.width > 0
-                        && f.height > 0
-                        && f.buf.len() >= (f.width * f.height * 4) as usize
-                    {
-                        let mut bmi: BITMAPINFO = std::mem::zeroed();
-                        bmi.bmiHeader = BITMAPINFOHEADER {
-                            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                            biWidth: f.width as i32,
-                            // Negative height => top-down DIB (row 0 is the top).
-                            biHeight: -(f.height as i32),
-                            biPlanes: 1,
-                            biBitCount: 32,
-                            biCompression: BI_RGB,
-                            biSizeImage: 0,
-                            biXPelsPerMeter: 0,
-                            biYPelsPerMeter: 0,
-                            biClrUsed: 0,
-                            biClrImportant: 0,
-                        };
-                        SetStretchBltMode(hdc, COLORONCOLOR);
-                        StretchDIBits(
-                            hdc,
-                            0,
-                            0,
-                            f.width as i32,
-                            f.height as i32,
-                            0,
-                            0,
-                            f.width as i32,
-                            f.height as i32,
-                            f.buf.as_ptr() as *const c_void,
-                            &bmi,
-                            DIB_RGB_COLORS,
-                            SRCCOPY,
-                        );
-                    }
+                // Blit from the latest picture, which stays put while held:
+                // flushes draw on other buffers.
+                if !hdc.is_null()
+                    && let Some(f) = shared.scanout.latest()
+                    && f.width > 0
+                    && f.height > 0
+                    && f.buf.len() >= (f.width * f.height * 4) as usize
+                {
+                    let mut bmi: BITMAPINFO = std::mem::zeroed();
+                    bmi.bmiHeader = BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: f.width as i32,
+                        // Negative height => top-down DIB (row 0 is the top).
+                        biHeight: -(f.height as i32),
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB,
+                        biSizeImage: 0,
+                        biXPelsPerMeter: 0,
+                        biYPelsPerMeter: 0,
+                        biClrUsed: 0,
+                        biClrImportant: 0,
+                    };
+                    SetStretchBltMode(hdc, COLORONCOLOR);
+                    StretchDIBits(
+                        hdc,
+                        0,
+                        0,
+                        f.width as i32,
+                        f.height as i32,
+                        0,
+                        0,
+                        f.width as i32,
+                        f.height as i32,
+                        f.buf.as_ptr() as *const c_void,
+                        &bmi,
+                        DIB_RGB_COLORS,
+                        SRCCOPY,
+                    );
+                } else if !hdc.is_null() {
+                    // No picture yet: black, as a zeroed frame would show.
+                    let r = ps.rcPaint;
+                    PatBlt(
+                        hdc,
+                        r.left,
+                        r.top,
+                        r.right - r.left,
+                        r.bottom - r.top,
+                        BLACKNESS,
+                    );
                 }
                 EndPaint(hwnd, &ps);
                 0
@@ -571,20 +575,35 @@ unsafe extern "system" fn wnd_proc(
 mod tests {
     use super::*;
 
-    /// Runtime smoke test for the Win32 window pipeline. Opt-in (it spawns a
-    /// real, briefly-visible window) so plain `cargo test` / CI never pops a
-    /// window: run with `TINYVMM_DISPLAY_SELFTEST=1 cargo test display`.
+    /// Runtime smoke test for the Win32 window pipeline: black before any
+    /// frame, then a whole frame, then a partial flush, reach the window's
+    /// pixels. Opt-in (it spawns a real,
+    /// briefly-visible window) so plain `cargo test` / CI never pops a window:
+    /// run with `TINYVMM_DISPLAY_SELFTEST=1 cargo test display`.
     #[test]
     fn window_present_and_shutdown() {
+        use windows_sys::Win32::Graphics::Gdi::{GetDC, GetPixel, ReleaseDC};
         if std::env::var_os("TINYVMM_DISPLAY_SELFTEST").is_none() {
             return;
         }
         let (w, h) = (256u32, 128u32);
-        let Some(d) = Display::new("tinyvmm gpu selftest", w, h) else {
+        let scanout = Arc::new(Scanout::default());
+        let Some(d) = Display::new("tinyvmm gpu selftest", w, h, scanout.clone()) else {
             eprintln!("display unavailable (no window station?); skipping");
             return;
         };
         assert!(d.is_open());
+        // The window's pixel at (x, y), as a COLORREF (0x00BBGGRR).
+        let pixel = |x, y| unsafe {
+            let hwnd = d.shared.hwnd.load(Ordering::Acquire) as HWND;
+            let dc = GetDC(hwnd);
+            let c = GetPixel(dc, x, y);
+            ReleaseDC(hwnd, dc);
+            c
+        };
+        // Black until the guest shows something.
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        assert_eq!((pixel(3, 3), pixel(200, 100)), (0, 0));
         let mut buf = vec![0u8; (w * h * 4) as usize];
         for y in 0..h {
             for x in 0..w {
@@ -595,11 +614,30 @@ mod tests {
                 buf[i + 3] = 0xFF; // X
             }
         }
-        // Present a couple of frames and let the pump service the paints.
-        d.present(&buf, w, h);
+        // Present a frame and let the pump service the update and paint.
+        let full = crate::scanout::Area::full(w, h);
+        scanout.flush(w, h, full, |dst, _| dst.copy_from_slice(&buf));
+        d.frame_ready();
         std::thread::sleep(std::time::Duration::from_millis(120));
-        d.present(&buf, w, h);
+        assert_eq!(pixel(200, 100), 0x00C8_6480);
+        assert_eq!(pixel(3, 3), 0x0003_0380);
+        // Then a flush of its top-left 16x8 pixels.
+        let corner = crate::scanout::Area {
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 8,
+        };
+        scanout.flush(w, h, corner, |dst, _| {
+            for row in dst.chunks_exact_mut((w * 4) as usize).take(8) {
+                row[..64].fill(0xEE);
+            }
+        });
+        d.frame_ready();
         std::thread::sleep(std::time::Duration::from_millis(120));
+        assert_eq!(pixel(3, 3), 0x00EE_EEEE);
+        assert_eq!(pixel(20, 3), 0x0014_0380);
+        assert_eq!(pixel(200, 100), 0x00C8_6480);
         d.shutdown();
         assert!(!d.is_open());
     }

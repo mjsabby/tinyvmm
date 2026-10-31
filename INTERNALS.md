@@ -702,9 +702,11 @@ These are optional and don't change the core, but each teaches one more piece:
 
 - **virtio-gpu** (`src/virtio/gpu.rs`, id 16) — 2D scanout. Control queue handles
   `RESOURCE_CREATE_2D`, `SET_SCANOUT`, `TRANSFER_TO_HOST_2D`, `RESOURCE_FLUSH`; on
-  flush it swizzles the scanout rectangle of the bound resource to BGRA in a
-  reused shadow buffer and blits to a Win32 GDI window on its own message-pump
-  thread (`src/display.rs`).
+  flush it swizzles just what changed of the bound resource's scanout
+  rectangle (the flushed part and anything transferred since) to BGRA in a new
+  picture of the scanout (`src/scanout.rs`, a few rotating buffers), which a
+  Win32 GDI window on its own message-pump thread (`src/display.rs`) blits and
+  the recorder encodes, each reading it in place.
 - **virtio-input** (`src/virtio/input.rs`, id 18) — a keyboard + an absolute
   tablet; the host injects event frames (`EV_*` + `SYN_REPORT`) and raises one IRQ
   per frame. With `--gpu`, the window is the input source (pixel coords → absolute
@@ -1034,6 +1036,7 @@ src/virtio/      device (trait), transport (virtio-pci), queue (virtqueue),
                  console, net, rng, blk, p9, input, gpu, snd
 src/net/         wire (parse/build), nat (user-mode NAT), dhcp, wintun, sys
 src/display.rs   Win32 GDI window for virtio-gpu + host-input seam
+src/scanout.rs   the GPU's published BGRA pictures, shared by the window + recorder
 src/record.rs    --record: GPU frames + snd playback -> H.264/AAC MP4
 src/main.rs      CLI dispatch, the full machine wiring, save/restore driver
 ```
