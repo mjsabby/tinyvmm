@@ -1809,9 +1809,9 @@ impl P9Device {
             let mut got = 0usize;
             for &(p, n) in &slot.runs {
                 // SAFETY: each run lies in a host_range-validated, device-writable
-                // guest buffer that stays valid until the used-ring push.
-                let buf = unsafe { std::slice::from_raw_parts_mut(p, n) };
-                match fs::read_at(h.get(), buf, offset + got as u64) {
+                // guest buffer that stays valid until the used-ring push. The OS
+                // writes it directly; it is never borrowed as a slice.
+                match unsafe { fs::read_at_raw(h.get(), p, n as u32, offset + got as u64) } {
                     Ok(k) => {
                         got += k as usize;
                         if (k as usize) < n {
@@ -1868,13 +1868,6 @@ impl P9Device {
         };
         let append = open_flags & O_APPEND != 0;
         let len = chain_runs(&slot.rbufs, TWRITE_HEADER_SIZE, count, &mut slot.runs);
-        let write = |buf: &[u8], at: u64| {
-            if append {
-                fs::write_append(h.get(), buf)
-            } else {
-                fs::write_at(h.get(), buf, at)
-            }
-        };
         let res = if len == 0 {
             Ok(0)
         } else if slot.runs.len() == 1 || (!append && runs_direct(&slot.runs, len)) {
@@ -1883,8 +1876,7 @@ impl P9Device {
             for &(p, n) in &slot.runs {
                 // SAFETY: each run lies in a host_range-validated, device-readable
                 // guest buffer that stays valid until the used-ring push.
-                let buf = unsafe { std::slice::from_raw_parts(p, n) };
-                match write(buf, offset + done as u64) {
+                match unsafe { write_raw(h.get(), append, p, n, offset + done as u64) } {
                     Ok(k) => {
                         done += k as usize;
                         if (k as usize) < n {
@@ -1906,7 +1898,12 @@ impl P9Device {
             }
             // SAFETY: as above; the runs cover exactly `len` bytes.
             unsafe { gather(&slot.runs, &mut slot.bounce[..len]) };
-            write(&slot.bounce[..len], offset).map(|k| k as usize)
+            if append {
+                fs::write_append(h.get(), &slot.bounce[..len])
+            } else {
+                fs::write_at(h.get(), &slot.bounce[..len], offset)
+            }
+            .map(|k| k as usize)
         };
         let wrote = match res {
             Ok(n) => n as u32,
@@ -2637,23 +2634,17 @@ fn read_chain(bufs: &[ChainBuf], out: &mut Vec<u8>, max: usize) {
         if out.len() >= max {
             break;
         }
-        let s = b.as_slice();
-        let take = s.len().min(max - out.len());
-        out.extend_from_slice(&s[..take]);
+        b.extend_vec(0, max - out.len(), out);
     }
 }
 
 fn write_chain(bufs: &mut [ChainBuf], reply: &[u8]) -> u32 {
     let mut off = 0usize;
-    for b in bufs.iter_mut().filter(|b| b.write) {
+    for b in bufs.iter().filter(|b| b.write) {
         if off >= reply.len() {
             break;
         }
-        let n = b.len.min(reply.len() - off);
-        if n > 0 {
-            b.as_mut_slice()[..n].copy_from_slice(&reply[off..off + n]);
-        }
-        off += n;
+        off += b.write_at(0, &reply[off..]);
     }
     off as u32
 }
@@ -2674,7 +2665,9 @@ const DIRECT_MIN_RUN: usize = 32 * 1024;
 fn peek_readable(bufs: &[ChainBuf], mut at: usize) -> Option<u8> {
     for b in bufs.iter().filter(|b| !b.write) {
         if at < b.len {
-            return Some(b.as_slice()[at]);
+            let mut byte = [0u8];
+            b.read_at(at, &mut byte);
+            return Some(byte[0]);
         }
         at -= b.len;
     }
@@ -2735,6 +2728,19 @@ unsafe fn gather(runs: &[(*mut u8, usize)], dst: &mut [u8]) {
         let k = n.min(dst.len() - off);
         unsafe { std::ptr::copy_nonoverlapping(p, dst[off..].as_mut_ptr(), k) };
         off += k;
+    }
+}
+
+/// Positioned (or, with `append`, appending) write of `n` bytes at `p`.
+///
+/// SAFETY: `[p, p + n)` must be valid for reads until the call returns.
+unsafe fn write_raw(h: HANDLE, append: bool, p: *const u8, n: usize, at: u64) -> Result<u32, u32> {
+    unsafe {
+        if append {
+            fs::write_append_raw(h, p, n as u32)
+        } else {
+            fs::write_at_raw(h, p, n as u32, at)
+        }
     }
 }
 
@@ -3496,7 +3502,10 @@ mod tests {
             bufs
         };
         let stream = |bufs: &[ChainBuf], n: usize| {
-            let mut s: Vec<u8> = bufs.iter().flat_map(|b| b.as_slice().to_vec()).collect();
+            let mut s = Vec::new();
+            for b in bufs {
+                b.extend_vec(0, b.len, &mut s);
+            }
             s.truncate(n);
             s
         };
@@ -3543,10 +3552,8 @@ mod tests {
             let mut src = hdr.clone();
             src.extend_from_slice(&data);
             let mut at = 0usize;
-            for b in &mut slot.rbufs {
-                let k = b.len;
-                b.as_mut_slice().copy_from_slice(&src[at..at + k]);
-                at += k;
+            for b in &slot.rbufs {
+                at += b.write_at(0, &src[at..at + b.len]);
             }
             slot.t_msg = hdr;
             slot.msg_len = src.len();

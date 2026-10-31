@@ -81,6 +81,13 @@ codegen-units = 1
 panic = "abort"     # no unwinding; a panic aborts the process (see §5)
 ```
 
+`.cargo/config.toml` adds `-Ccontrol-flow-guard` for the Windows MSVC target,
+so the PE header carries `GUARD_CF` and Windows checks indirect calls in the
+code rustc compiles for the build (tinyvmm and its crates) against the image's
+valid-target table (defense in depth for a process parsing guest-controlled
+input). The prebuilt standard library is not instrumented; that would take
+`-Zbuild-std`.
+
 There are four self-tests that need **no guest kernel**:
 
 ```cmd
@@ -817,7 +824,9 @@ pub fn host_range(&self, gpa: u64, len: u64) -> Option<*mut u8> {
 ```
 
 A raw pointer is produced **once**, validated, and immediately turned into a
-fixed-size array, a slice, or an `AtomicU16`. Two distinct kinds of access live
+fixed-size array, a copy, or an `AtomicU16` — never a slice, since the guest can
+change that memory at any moment and a `&[u8]` or `&mut [u8]` promises it
+cannot. Two distinct kinds of access live
 here, and the distinction drives the performance story in [§6](#6-performance-model--allocation-pinned-buffers-hot-path-overhead):
 
 * **Copying accessors** (`read_array::<N>` / `read_into` / `write_bytes` /
@@ -826,15 +835,17 @@ here, and the distinction drives the performance story in [§6](#6-performance-m
   metadata** — the 16-byte descriptors and the 2/8-byte ring indices — whose
   guest-controlled addresses make an in-place typed read an alignment hazard.
 * **The pointer accessor** (`host_range`) is used for **bulk data buffers**: it
-  returns a validated pointer the device operates on *in place* (disk DMA, rng
-  fill, the status byte, gpu backing pages), so guest *data* is never copied
+  returns a validated pointer that disk and 9p I/O hand straight to the OS, and
+  through which the status byte is written, so guest *data* is never copied
   through a host staging buffer by this layer.
 
 The virtqueue popper is explicit about this: it reads each 16-byte descriptor
 with `read_array::<16>()` and notes *"individual descriptors are then read with
 bounds-checked `read_array` (no raw pointer math)"* (`src/virtio/queue.rs`). The
-only raw `*mut u8` that escape live in `ChainBuf { ptr, len, write }`, wrapped
-with `as_slice()` / `as_mut_slice()` at the point of use.
+only raw `*mut u8` that escape live in `ChainBuf { ptr, len, write }`, whose
+bytes devices move only by copy (`read_at` / `write_at` / `extend_vec` /
+`fill_at`) or as that raw pointer handed to the OS (`ReadFile`/`WriteFile`,
+including `winsys::fs::read_at_raw` / `write_at_raw` for 9p).
 
 ### `SharedPtr<T>`: localizing the `unsafe impl Send`
 
@@ -968,7 +979,7 @@ The tax the safety model adds versus a C VMM that derefs guest pointers directly
 * **Per data buffer — ZERO copy.** The bulk payload a descriptor points at is
   **never** staged through a host buffer by the safety layer: virtio-blk sets
   `req.buf = seg_ptr` and lets `ReadFile`/`WriteFile` DMA **straight into/out of
-  guest RAM**; virtio-rng fills the guest-writable buffer in place; the status
+  guest RAM**; the status
   byte is written through `*status_ptr`. A megabyte disk read copies **zero**
   bytes host-side beyond the OS page cache.
 * **Per guest TX frame (net):** **two CAS** on the lock-free FramePool, then an

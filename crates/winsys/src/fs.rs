@@ -548,11 +548,22 @@ pub fn set_lx_metadata(h: HANDLE, md: LxMetadata) -> Result<(), u32> {
 /// Positioned `ReadFile` (offset carried in the OVERLAPPED). Reading at/past EOF
 /// returns `Ok(0)`. Returns the number of bytes read.
 pub fn read_at(h: HANDLE, buf: &mut [u8], offset: u64) -> Result<u32, u32> {
+    // SAFETY: `buf` is valid for writes of its whole length.
+    unsafe { read_at_raw(h, buf.as_mut_ptr(), buf.len() as u32, offset) }
+}
+
+/// [`read_at`] into memory known only by a raw pointer: memory that must not
+/// be borrowed as a Rust slice, such as a guest buffer the guest may change at
+/// any moment. The OS writes it directly.
+///
+/// # Safety
+/// `[buf, buf + len)` must be valid for writes until the call returns.
+pub unsafe fn read_at_raw(h: HANDLE, buf: *mut u8, len: u32, offset: u64) -> Result<u32, u32> {
     let mut got: u32 = 0;
     let mut ov: OVERLAPPED = unsafe { core::mem::zeroed() };
     ov.Anonymous.Anonymous.Offset = (offset & 0xFFFF_FFFF) as u32;
     ov.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
-    let ok = unsafe { ReadFile(h, buf.as_mut_ptr(), buf.len() as u32, &mut got, &mut ov) };
+    let ok = unsafe { ReadFile(h, buf, len, &mut got, &mut ov) };
     if ok == 0 {
         let err = unsafe { GetLastError() };
         if err == ERROR_HANDLE_EOF {
@@ -566,11 +577,20 @@ pub fn read_at(h: HANDLE, buf: &mut [u8], offset: u64) -> Result<u32, u32> {
 /// Positioned `WriteFile` (offset carried in the OVERLAPPED). Returns the number
 /// of bytes written.
 pub fn write_at(h: HANDLE, buf: &[u8], offset: u64) -> Result<u32, u32> {
+    // SAFETY: `buf` is valid for reads of its whole length.
+    unsafe { write_at_raw(h, buf.as_ptr(), buf.len() as u32, offset) }
+}
+
+/// [`write_at`] from memory known only by a raw pointer (see [`read_at_raw`]).
+///
+/// # Safety
+/// `[buf, buf + len)` must be valid for reads until the call returns.
+pub unsafe fn write_at_raw(h: HANDLE, buf: *const u8, len: u32, offset: u64) -> Result<u32, u32> {
     let mut wrote: u32 = 0;
     let mut ov: OVERLAPPED = unsafe { core::mem::zeroed() };
     ov.Anonymous.Anonymous.Offset = (offset & 0xFFFF_FFFF) as u32;
     ov.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
-    let ok = unsafe { WriteFile(h, buf.as_ptr(), buf.len() as u32, &mut wrote, &mut ov) };
+    let ok = unsafe { WriteFile(h, buf, len, &mut wrote, &mut ov) };
     if ok == 0 {
         return Err(unsafe { GetLastError() });
     }
@@ -580,11 +600,21 @@ pub fn write_at(h: HANDLE, buf: &[u8], offset: u64) -> Result<u32, u32> {
 /// Append `WriteFile` (OVERLAPPED offset = 0xFFFFFFFF:0xFFFFFFFF). Returns the
 /// number of bytes written.
 pub fn write_append(h: HANDLE, buf: &[u8]) -> Result<u32, u32> {
+    // SAFETY: `buf` is valid for reads of its whole length.
+    unsafe { write_append_raw(h, buf.as_ptr(), buf.len() as u32) }
+}
+
+/// [`write_append`] from memory known only by a raw pointer (see
+/// [`read_at_raw`]).
+///
+/// # Safety
+/// `[buf, buf + len)` must be valid for reads until the call returns.
+pub unsafe fn write_append_raw(h: HANDLE, buf: *const u8, len: u32) -> Result<u32, u32> {
     let mut wrote: u32 = 0;
     let mut ov: OVERLAPPED = unsafe { core::mem::zeroed() };
     ov.Anonymous.Anonymous.Offset = 0xFFFF_FFFF;
     ov.Anonymous.Anonymous.OffsetHigh = 0xFFFF_FFFF;
-    let ok = unsafe { WriteFile(h, buf.as_ptr(), buf.len() as u32, &mut wrote, &mut ov) };
+    let ok = unsafe { WriteFile(h, buf, len, &mut wrote, &mut ov) };
     if ok == 0 {
         return Err(unsafe { GetLastError() });
     }

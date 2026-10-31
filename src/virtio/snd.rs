@@ -663,16 +663,12 @@ fn copy_from_readable(chain: &PoppedChain, skip: usize, off: usize, dst: &mut [u
         if b.write {
             continue;
         }
-        let s = b.as_slice();
-        if to_skip >= s.len() {
-            to_skip -= s.len();
+        if to_skip >= b.len {
+            to_skip -= b.len;
             continue;
         }
-        let src = &s[to_skip..];
+        copied += b.read_at(to_skip, &mut dst[copied..]);
         to_skip = 0;
-        let n = src.len().min(dst.len() - copied);
-        dst[copied..copied + n].copy_from_slice(&src[..n]);
-        copied += n;
         if copied == dst.len() {
             break;
         }
@@ -686,16 +682,15 @@ fn copy_from_readable(chain: &PoppedChain, skip: usize, off: usize, dst: &mut [u
 fn copy_to_writable(chain: &mut PoppedChain, data_cap: usize, off: usize, src: &[u8]) -> usize {
     let mut region_pos = 0usize;
     let mut copied = 0usize;
-    for b in chain.bufs.iter_mut() {
+    for b in chain.bufs.iter() {
         if !b.write {
             continue;
         }
         if copied >= src.len() {
             break;
         }
-        let s = b.as_mut_slice();
         let seg_start = region_pos;
-        region_pos += s.len();
+        region_pos += b.len;
         let seg_end = region_pos.min(data_cap);
         if seg_end <= seg_start {
             if region_pos >= data_cap {
@@ -713,8 +708,7 @@ fn copy_to_writable(chain: &mut PoppedChain, data_cap: usize, off: usize, src: &
             continue;
         }
         let src_lo = lo - off;
-        s[(lo - seg_start)..(hi - seg_start)].copy_from_slice(&src[src_lo..(src_lo + (hi - lo))]);
-        copied += hi - lo;
+        copied += b.write_at(lo - seg_start, &src[src_lo..src_lo + (hi - lo)]);
     }
     copied
 }
@@ -722,13 +716,12 @@ fn copy_to_writable(chain: &mut PoppedChain, data_cap: usize, off: usize, src: &
 /// Zero a chain's writable region over the logical byte range `[lo, hi)`.
 fn zero_writable(chain: &mut PoppedChain, lo: usize, hi: usize) {
     let mut region_pos = 0usize;
-    for b in chain.bufs.iter_mut() {
+    for b in chain.bufs.iter() {
         if !b.write {
             continue;
         }
-        let s = b.as_mut_slice();
         let seg_start = region_pos;
-        region_pos += s.len();
+        region_pos += b.len;
         let a = lo.max(seg_start);
         let e = hi.min(region_pos);
         if a >= e {
@@ -737,9 +730,7 @@ fn zero_writable(chain: &mut PoppedChain, lo: usize, hi: usize) {
             }
             continue;
         }
-        for x in &mut s[(a - seg_start)..(e - seg_start)] {
-            *x = 0;
-        }
+        b.fill_at(a - seg_start, e - a, 0);
     }
 }
 

@@ -761,10 +761,7 @@ fn read_tx_hdr(chain: &PoppedChain) -> TxHeader {
         if b.write {
             continue;
         }
-        let s = b.as_slice();
-        let take = s.len().min(VIRTIO_NET_HDR_SIZE - n);
-        h[n..n + take].copy_from_slice(&s[..take]);
-        n += take;
+        n += b.read_at(0, &mut h[n..]);
         if n == VIRTIO_NET_HDR_SIZE {
             return TxHeader::parse(&h);
         }
@@ -782,14 +779,11 @@ fn frame_into(out: &mut Vec<u8>, chain: &PoppedChain, skip: usize) {
         if b.write {
             continue;
         }
-        let s = b.as_slice();
-        if remaining_skip >= s.len() {
-            remaining_skip -= s.len();
+        if remaining_skip >= b.len {
+            remaining_skip -= b.len;
             continue;
         }
-        let src = &s[remaining_skip..];
-        let take = src.len().min(TX_FRAME_CAP - out.len());
-        out.extend_from_slice(&src[..take]);
+        b.extend_vec(remaining_skip, TX_FRAME_CAP - out.len(), out);
         if out.len() >= TX_FRAME_CAP {
             break;
         }
@@ -820,31 +814,27 @@ fn write_first_rx(chain: &mut PoppedChain, hdr: &RxHeader, frame: &[u8]) -> (u32
     let mut hdr_left = VIRTIO_NET_HDR_SIZE;
     let mut hdr_ptr: Option<*mut u8> = None;
     let mut frame_off = 0usize;
-    for b in chain.bufs.iter_mut() {
+    for b in chain.bufs.iter() {
         if !b.write {
             continue;
         }
-        let dst = b.as_mut_slice();
         let mut di = 0usize;
         if hdr_left > 0 {
-            let n = hdr_left.min(dst.len());
             let start = VIRTIO_NET_HDR_SIZE - hdr_left;
-            dst[..n].copy_from_slice(&h[start..start + n]);
+            let n = b.write_at(0, &h[start..]);
             // Only expose a patch pointer when the whole header lands in one
             // buffer (the Linux driver always posts ≥1536-byte RX bufs, so this
             // holds in practice; otherwise num_buffers stays 0 ⇒ guest treats
             // it as 1, which is correct only for the non-MRG single-buffer case
             // — and we never inject >MTU frames without MRG negotiated).
             if start == 0 && n == VIRTIO_NET_HDR_SIZE {
-                hdr_ptr = Some(dst.as_mut_ptr());
+                hdr_ptr = Some(b.ptr);
             }
             di = n;
             hdr_left -= n;
         }
-        if hdr_left == 0 && frame_off < frame.len() && di < dst.len() {
-            let n = (dst.len() - di).min(frame.len() - frame_off);
-            dst[di..di + n].copy_from_slice(&frame[frame_off..frame_off + n]);
-            frame_off += n;
+        if hdr_left == 0 && frame_off < frame.len() && di < b.len {
+            frame_off += b.write_at(di, &frame[frame_off..]);
         }
         if hdr_left == 0 && frame_off >= frame.len() {
             break;
@@ -857,14 +847,11 @@ fn write_first_rx(chain: &mut PoppedChain, hdr: &RxHeader, frame: &[u8]) -> (u32
 /// Returns bytes written.
 fn write_more_rx(chain: &mut PoppedChain, frame: &[u8]) -> u32 {
     let mut off = 0usize;
-    for b in chain.bufs.iter_mut() {
+    for b in chain.bufs.iter() {
         if !b.write || off >= frame.len() {
             continue;
         }
-        let dst = b.as_mut_slice();
-        let n = dst.len().min(frame.len() - off);
-        dst[..n].copy_from_slice(&frame[off..off + n]);
-        off += n;
+        off += b.write_at(0, &frame[off..]);
     }
     off as u32
 }

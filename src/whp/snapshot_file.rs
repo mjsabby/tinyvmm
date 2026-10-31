@@ -535,10 +535,10 @@ fn is_zero(b: &[u8]) -> bool {
             .all(|c| c.iter().fold(0, |a, &x| a | x) == 0)
 }
 
-/// Which [`SPARSE_CHUNK`]s of `image` hold a non-zero byte, scanned on up to
-/// eight threads.
-fn stored_chunks(image: &[u8]) -> Vec<bool> {
-    let n = image.len().div_ceil(SPARSE_CHUNK);
+/// Which [`SPARSE_CHUNK`]s of the `len`-byte image `read` copies out hold a
+/// non-zero byte, scanned on up to eight threads.
+fn stored_chunks(len: usize, read: &(impl Fn(usize, &mut [u8]) + Sync)) -> Vec<bool> {
+    let n = len.div_ceil(SPARSE_CHUNK);
     let mut stored = vec![false; n];
     let threads = std::thread::available_parallelism()
         .map_or(1, |t| t.get())
@@ -548,9 +548,12 @@ fn stored_chunks(image: &[u8]) -> Vec<bool> {
     std::thread::scope(|scope| {
         for (t, out) in stored.chunks_mut(per).enumerate() {
             scope.spawn(move || {
+                let mut chunk = vec![0u8; SPARSE_CHUNK];
                 for (j, s) in out.iter_mut().enumerate() {
                     let at = (t * per + j) * SPARSE_CHUNK;
-                    *s = !is_zero(&image[at..(at + SPARSE_CHUNK).min(image.len())]);
+                    let c = &mut chunk[..SPARSE_CHUNK.min(len - at)];
+                    read(at, c);
+                    *s = !is_zero(c);
                 }
             });
         }
@@ -619,11 +622,17 @@ impl SnapshotWriter {
     /// Write a guest RAM image as a [`SectionType::RamSparse`] section, leaving
     /// out every all-zero [`SPARSE_CHUNK`]. A booted guest's RAM is mostly
     /// zero (about 95% of a 1 GiB guest at a shell prompt), so this writes, and
-    /// a restore later reads, a small fraction of it. Returns the bytes of RAM
-    /// stored.
-    pub fn write_ram_sparse(&mut self, image: &[u8]) -> Result<u64> {
-        let stored = stored_chunks(image);
-        let chunk_len = |i: usize| SPARSE_CHUNK.min(image.len() - i * SPARSE_CHUNK);
+    /// a restore later reads, a small fraction of it. The image is `len` bytes
+    /// that `read(off, dst)` copies out a piece at a time; guest RAM is never
+    /// borrowed, since a device thread may still write it. Returns the bytes of
+    /// RAM stored.
+    pub fn write_ram_sparse(
+        &mut self,
+        len: usize,
+        read: impl Fn(usize, &mut [u8]) + Sync,
+    ) -> Result<u64> {
+        let stored = stored_chunks(len, &read);
+        let chunk_len = |i: usize| SPARSE_CHUNK.min(len - i * SPARSE_CHUNK);
         let mut bitmap = vec![0u8; stored.len().div_ceil(8)];
         let mut data_len = 0u64;
         for (i, _) in stored.iter().enumerate().filter(|(_, s)| **s) {
@@ -632,14 +641,15 @@ impl SnapshotWriter {
         }
         let mut hdr = [0u8; 32];
         hdr[0..4].copy_from_slice(&(SectionType::RamSparse as u32).to_le_bytes());
-        let len = 16 + bitmap.len() as u64 + data_len;
-        hdr[8..16].copy_from_slice(&len.to_le_bytes());
+        let section_len = 16 + bitmap.len() as u64 + data_len;
+        hdr[8..16].copy_from_slice(&section_len.to_le_bytes());
         hdr[16..20].copy_from_slice(&(SPARSE_CHUNK as u32).to_le_bytes());
-        hdr[24..32].copy_from_slice(&(image.len() as u64).to_le_bytes());
+        hdr[24..32].copy_from_slice(&(len as u64).to_le_bytes());
         self.write_raw(&hdr)?;
         self.write_raw(&bitmap)?;
         // Runs of stored chunks go out as single writes of up to 1 MiB.
         const RUN: usize = (1 << 20) / SPARSE_CHUNK;
+        let mut run = vec![0u8; RUN * SPARSE_CHUNK];
         let mut i = 0;
         while i < stored.len() {
             if !stored[i] {
@@ -650,8 +660,10 @@ impl SnapshotWriter {
             while i < stored.len() && stored[i] && i - start < RUN {
                 i += 1;
             }
-            let end = (i * SPARSE_CHUNK).min(image.len());
-            self.write_raw(&image[start * SPARSE_CHUNK..end])?;
+            let begin = start * SPARSE_CHUNK;
+            let bytes = &mut run[..(i * SPARSE_CHUNK).min(len) - begin];
+            read(begin, bytes);
+            self.write_raw(bytes)?;
         }
         Ok(data_len)
     }
@@ -1021,6 +1033,11 @@ impl SnapshotReader {
 mod tests {
     use super::*;
 
+    /// `write_ram_sparse`'s reader for an image held in a slice.
+    fn from_slice(image: &[u8]) -> impl Fn(usize, &mut [u8]) + Sync + '_ {
+        move |off, dst| dst.copy_from_slice(&image[off..off + dst.len()])
+    }
+
     /// The carry-less-multiply CRCs must match the byte table for every length
     /// (the fold paths change at 128-, 64- and 16-byte steps) and alignment, and
     /// the IEEE check value. Each kernel the CPU supports is tried directly, as
@@ -1102,7 +1119,8 @@ mod tests {
         {
             let mut w = SnapshotWriter::create(p).unwrap();
             w.write_header(&json).unwrap();
-            w.write_ram_sparse(&[1u8, 2, 3, 4, 5]).unwrap();
+            w.write_ram_sparse(5, from_slice(&[1u8, 2, 3, 4, 5]))
+                .unwrap();
             w.write_section(SectionType::VcpuRegs, &[0xABu8; 100])
                 .unwrap();
             w.finalize().unwrap();
@@ -1168,7 +1186,10 @@ mod tests {
             let mut w = SnapshotWriter::create(p).unwrap();
             w.write_header("{}").unwrap();
             w.write_section(SectionType::VcpuRegs, &[7u8; 10]).unwrap();
-            assert_eq!(w.write_ram_sparse(&image).unwrap(), stored as u64);
+            assert_eq!(
+                w.write_ram_sparse(image.len(), from_slice(&image)).unwrap(),
+                stored as u64
+            );
             w.finalize().unwrap();
         }
         let file_len = std::fs::metadata(p).unwrap().len() as usize;

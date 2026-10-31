@@ -1,11 +1,17 @@
 //! Minimal Hyper-V enlightenment surface: the Reference TSC page + the handful
 //! of MSRs Linux writes once it detects Hyper-V via CPUID. Port of
 //! src/whp/hv_enlightenment.cpp.
+//!
+//! Both partition reference clocks derive from the guest TSC: the page as
+//! `(tsc * scale) >> 64` with a zero offset, and `TIME_REF_COUNT` by reading
+//! the calling vCPU's TSC and scaling it the same way. They agree to the tick
+//! and share the guest TSC's epoch (about zero when the partition is created,
+//! as the TLFS specifies), and a snapshot restore, which puts every vCPU's TSC
+//! back, resumes both where they stopped.
 
 #![allow(unused_unsafe)]
 
 use crate::whp::GuestMemory;
-use core::arch::x86_64::_rdtsc;
 use core::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock};
 use windows_sys::Win32::System::Hypervisor::{
@@ -118,9 +124,10 @@ impl HvEnlightenment {
         self.tsc_scale
     }
 
-    fn read_100ns(&self) -> u64 {
-        let tsc = unsafe { _rdtsc() };
-        ((tsc as u128).wrapping_mul(self.tsc_scale as u128) >> 64) as u64
+    /// Partition reference time, in 100 ns units, at guest TSC `guest_tsc`:
+    /// exactly what the guest computes from the reference TSC page.
+    pub fn reference_time(&self, guest_tsc: u64) -> u64 {
+        ((guest_tsc as u128 * self.tsc_scale as u128) >> 64) as u64
     }
 
     fn write_reference_tsc_page(&self, guest_pfn: u64) -> bool {
@@ -192,7 +199,15 @@ impl HvEnlightenment {
         }
     }
 
-    pub fn handle_rdmsr(&self, vp_index: u32, msr: u32, out: &mut u64) -> MsrHandled {
+    /// `guest_tsc` reads the calling vCPU's TSC; only `TIME_REF_COUNT` needs
+    /// it, and a failed read answers with #GP.
+    pub fn handle_rdmsr(
+        &self,
+        vp_index: u32,
+        msr: u32,
+        guest_tsc: impl FnOnce() -> Option<u64>,
+        out: &mut u64,
+    ) -> MsrHandled {
         let c = self.cache.lock().unwrap();
         match msr {
             MSR_GUEST_OS_ID => {
@@ -209,8 +224,16 @@ impl HvEnlightenment {
             }
             MSR_TIME_REF_COUNT => {
                 drop(c);
-                *out = self.read_100ns();
-                MsrHandled::Yes
+                match guest_tsc() {
+                    Some(tsc) => {
+                        *out = self.reference_time(tsc);
+                        MsrHandled::Yes
+                    }
+                    None => {
+                        *out = 0;
+                        MsrHandled::NoInjectGp
+                    }
+                }
             }
             MSR_REFERENCE_TSC => {
                 *out = c.reference_tsc_msr;
@@ -289,5 +312,41 @@ impl HvEnlightenment {
         if reference_tsc_msr & 1 != 0 {
             self.write_reference_tsc_page(reference_tsc_msr >> PAGE_SHIFT);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `TIME_REF_COUNT` and the reference TSC page are one clock: for any guest
+    /// TSC the MSR returns what the guest computes from the page. The MSR used
+    /// to scale the host's TSC instead, about the host's uptime ahead.
+    #[test]
+    fn time_ref_count_matches_the_reference_tsc_page() {
+        let ram = Arc::new(GuestMemory::new_host_only(0x4000).unwrap());
+        let tsc_hz = 3_187_200_000;
+        let hv = HvEnlightenment::new(ram.clone(), tsc_hz, 200_000_000);
+        assert!(hv.handle_wrmsr(0, MSR_REFERENCE_TSC, 0x2000 | 1) == MsrHandled::Yes);
+        let page = ram.read_array::<24>(0x2000).unwrap();
+        assert_eq!(u32::from_le_bytes(page[0..4].try_into().unwrap()), 1);
+        let scale = u64::from_le_bytes(page[8..16].try_into().unwrap());
+        let offset = i64::from_le_bytes(page[16..24].try_into().unwrap());
+        for tsc in [0, 1, tsc_hz, 4_000_000_000_000, u64::MAX / 3] {
+            let mut msr = 0;
+            let r = hv.handle_rdmsr(1, MSR_TIME_REF_COUNT, || Some(tsc), &mut msr);
+            assert!(r == MsrHandled::Yes);
+            let page_time = ((tsc as u128 * scale as u128) >> 64) as i64 + offset;
+            assert_eq!(msr, page_time as u64, "guest tsc {tsc}");
+        }
+        // One second of guest TSC is 10^7 ticks of 100 ns.
+        let mut one_second = 0;
+        let _ = hv.handle_rdmsr(0, MSR_TIME_REF_COUNT, || Some(tsc_hz), &mut one_second);
+        assert!(
+            (9_999_999..=10_000_000).contains(&one_second),
+            "{one_second}"
+        );
+        let r = hv.handle_rdmsr(0, MSR_TIME_REF_COUNT, || None, &mut one_second);
+        assert!(r == MsrHandled::NoInjectGp, "an unreadable TSC answers #GP");
     }
 }

@@ -10,6 +10,7 @@
 use crate::devices::io_bus::{IoAccess, IoBus};
 use crate::devices::mmio_bus::{MmioAccess, MmioBus};
 use crate::devices::pic::Pic8259;
+use crate::whp::GuestMemory;
 use crate::whp::cpuid::{CpuidContext, resolve_cpuid};
 use crate::whp::emulator::{EmuError, Emulator, EmulatorBus};
 use crate::whp::hv::{HvEnlightenment, MsrHandled};
@@ -20,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use windows_sys::Win32::System::Hypervisor::{
     WHvRegisterPendingInterruption, WHvX64RegisterRax, WHvX64RegisterRbx, WHvX64RegisterRcx,
-    WHvX64RegisterRdx, WHvX64RegisterRip,
+    WHvX64RegisterRdx, WHvX64RegisterRip, WHvX64RegisterTsc,
 };
 
 const RFLAGS_IF: u64 = 1 << 9;
@@ -49,6 +50,7 @@ pub struct Counters {
 struct RunBus<'a> {
     io_bus: &'a IoBus,
     mmio_bus: &'a MmioBus,
+    ram: &'a GuestMemory,
     verbose_io: bool,
 }
 
@@ -76,7 +78,20 @@ impl EmulatorBus for RunBus<'_> {
         }
     }
 
+    /// Every memory operand the emulator touches comes through here, not just
+    /// device registers: a string I/O instruction's buffer, or the RAM side of
+    /// a MOVS to or from a BAR, is ordinary guest RAM. Those go to RAM; the
+    /// rest is MMIO.
     fn mmio(&self, acc: &mut crate::whp::emulator::MmioAccess) {
+        let n = (acc.access_size as usize).min(acc.data.len());
+        let in_ram = if acc.is_write {
+            self.ram.write_bytes(acc.gpa, &acc.data[..n])
+        } else {
+            self.ram.read_into(acc.gpa, &mut acc.data[..n])
+        };
+        if in_ram {
+            return;
+        }
         let mut a = MmioAccess {
             gpa: acc.gpa,
             access_size: acc.access_size,
@@ -94,6 +109,7 @@ pub struct RunLoop {
     vcpu: Arc<Vcpu>,
     io_bus: Arc<IoBus>,
     mmio_bus: Arc<MmioBus>,
+    ram: Arc<GuestMemory>,
     emulator: Emulator,
     vcpu_count: u32,
     hv: Option<Arc<HvEnlightenment>>,
@@ -113,6 +129,7 @@ impl RunLoop {
         vcpu: Arc<Vcpu>,
         io_bus: Arc<IoBus>,
         mmio_bus: Arc<MmioBus>,
+        ram: Arc<GuestMemory>,
         vcpu_count: u32,
     ) -> crate::error::Result<Self> {
         let emulator = Emulator::new()?;
@@ -120,6 +137,7 @@ impl RunLoop {
             vcpu,
             io_bus,
             mmio_bus,
+            ram,
             emulator,
             vcpu_count: vcpu_count.max(1),
             hv: None,
@@ -165,6 +183,7 @@ impl RunLoop {
         let bus = RunBus {
             io_bus: &self.io_bus,
             mmio_bus: &self.mmio_bus,
+            ram: &self.ram,
             verbose_io: self.verbose_io,
         };
         let part = self.vcpu.part();
@@ -398,7 +417,14 @@ impl RunLoop {
         let result = if is_write {
             hv.handle_wrmsr(self.vcpu.index(), msr, wr_val)
         } else {
-            hv.handle_rdmsr(self.vcpu.index(), msr, &mut rd_val)
+            let guest_tsc = || match self.vcpu.get_register_u64(WHvX64RegisterTsc) {
+                Ok(tsc) => Some(tsc),
+                Err(e) => {
+                    eprintln!("[loop] guest TSC read failed: {e}");
+                    None
+                }
+            };
+            hv.handle_rdmsr(self.vcpu.index(), msr, guest_tsc, &mut rd_val)
         };
         if result == MsrHandled::NoInjectGp {
             return self.inject_gp();

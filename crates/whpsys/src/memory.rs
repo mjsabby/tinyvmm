@@ -416,6 +416,29 @@ impl GuestMemory {
         }
     }
 
+    /// Copy bytes `[off, off + dst.len())` of the RAM image (the layout
+    /// [`Self::load_image`] takes) into `dst`. Returns false, leaving `dst`
+    /// untouched, past the end. A copy rather than a borrowed slice: device
+    /// threads may still be writing guest RAM.
+    #[must_use]
+    pub fn read_image(&self, off: usize, dst: &mut [u8]) -> bool {
+        if off > self.size || dst.len() > self.size - off {
+            return false;
+        }
+        if !dst.is_empty() {
+            // SAFETY: `[off, off + dst.len())` lies inside the allocation, and
+            // `dst` is host memory, so the two don't overlap.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.base.get().add(off),
+                    dst.as_mut_ptr(),
+                    dst.len(),
+                );
+            }
+        }
+        true
+    }
+
     /// Fill the first `len` bytes of the RAM image (the layout `load_image`
     /// takes) on up to eight threads, 16 MiB at a time: `fill(off, chunk)` must
     /// fill `chunk`, the image bytes at `off`. Returns `fill`'s results in image

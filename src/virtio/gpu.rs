@@ -307,9 +307,7 @@ impl GpuDevice {
                 if st.req.len() >= CTRL_REQ_MAX {
                     break;
                 }
-                let s = buf.as_slice();
-                let take = s.len().min(CTRL_REQ_MAX - st.req.len());
-                st.req.extend_from_slice(&s[..take]);
+                buf.extend_vec(0, CTRL_REQ_MAX - st.req.len(), &mut st.req);
             }
         }
         self.dispatch(st);
@@ -933,12 +931,7 @@ fn write_response(chain: &PoppedChain, resp: &[u8]) -> u32 {
         if off >= resp.len() {
             break;
         }
-        let n = (resp.len() - off).min(buf.len);
-        // ChainBuf is Copy; its as_mut_slice gives the already-bounds-checked
-        // guest view. The audited raw-pointer deref lives in ChainBuf, not here.
-        let mut b = *buf;
-        b.as_mut_slice()[..n].copy_from_slice(&resp[off..off + n]);
-        off += n;
+        off += buf.write_at(0, &resp[off..]);
     }
     off as u32
 }
