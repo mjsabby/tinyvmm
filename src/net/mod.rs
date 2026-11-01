@@ -12,7 +12,10 @@
 
 mod csum;
 pub mod dhcp;
+pub mod gvisor;
 pub mod nat;
+pub mod slirp;
+mod smol;
 pub mod sys;
 pub mod wintun;
 pub mod wire;

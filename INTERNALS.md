@@ -656,19 +656,25 @@ done. Build them in this order:
   uses a second, non-overlapped handle. WRITE_ZEROES is a WRITE from a shared
   zero buffer. Raw disk compatibility is not provided.
 - **virtio-net** (`src/virtio/net.rs`, id 1) + a backend
-  (`NetBackend`: loopback / user-mode NAT / wintun). The device negotiates
+  (`NetBackend`: loopback / user-mode NAT / libslirp / gVisor / wintun). The device negotiates
   checksum offload and TCPv4 segmentation offload (TSO4) in both directions plus
   mergeable RX buffers (`net.rs:878`), and tells a backend to pause while the
   guest's RX backlog is full (`net.rs:415` `rx_congested`). The NAT
   (`src/net/nat.rs`) is a slirp-style terminate-and-proxy stack (ARP, ICMP, UDP,
-  TCP via the `tcp-sans-io` crate, and a DHCP server in `src/net/dhcp.rs` that
+  TCP via the `tcp-sans-io` crate, or smoltcp with `--net-backend smoltcp`, and
+  a DHCP server in `src/net/dhcp.rs` that
   hands every client the one fixed lease) — no admin rights, no virtual adapter —
   sharded over `--nat-workers` threads (default a quarter of the host's logical
   CPUs, 1–4; `nat.rs:157`), each with its own IOCP and the flows it owns. A TCP
   flow's SYN assigns it to the least-loaded worker; UDP goes by 4-tuple hash;
-  ARP, ICMP and IP fragments go to the first worker (`nat.rs:190`, `:228`). The
+  ARP, ICMP and IP fragments go to the first worker (`nat.rs:190`, `:228`),
+  which reassembles fragments and hands each datagram to the worker that owns
+  its flow. The
   guest's SYN is answered only once the host connect succeeds, and every way a
-  flow ends reaches the guest as the far end would end it (gotcha 20).
+  flow ends reaches the guest as the far end would end it (gotcha 20). The
+  libslirp and gVisor backends (`src/net/slirp.rs`, `src/net/gvisor.rs`) give
+  the guest the same network from third-party stacks loaded from DLLs at run
+  time, as references to test the NAT against (`README.md` §3).
 - **virtio-9p** (`src/virtio/p9.rs`, id 9) — a 9P2000.L file share with a worker
   pool. Note the **path-security** layer: every component is validated
   (reject `..`, control chars, Win32 metacharacters, reserved DOS names), `..` is
@@ -964,7 +970,11 @@ real debugging time in this project.
     `connect()`s were refused after 256 such connections in a minute. Over the
     virtual link nothing is reordered, so release the flow as soon as only
     TIME_WAIT is left, and answer anything the guest sends it afterwards (a
-    retransmitted FIN) with a RST. (§M6)
+    retransmitted FIN) with a RST. The guest, the passive closer, holds no
+    TIME_WAIT and may reuse the port at once (Linux's port choice jumps back
+    over recently used ports): gVisor's netstack, used as a forwarder, passed
+    a SYN for a 4-tuple in TIME_WAIT only to a listening endpoint, so such a
+    reconnect stalled until TIME_WAIT ended. (§M6)
 20. **A terminating NAT must end connections the way the far end would.** It
     owns a TCP stack on each side, so nothing forces the two to agree. Answer
     the guest's SYN only after the host connect succeeds, or every `connect()`
@@ -972,7 +982,33 @@ real debugging time in this project.
     reset into a guest reset, not a FIN, which would make a cut-off stream look
     complete. And when the NAT gives up on a flow (a watchdog, a failed host
     send), send the guest a RST: a flow dropped silently leaves the guest
-    retransmitting into nothing until its own timeout, minutes later. (§M6)
+    retransmitting into nothing until its own timeout, minutes later. The
+    other way, close the host socket abortively (`SO_LINGER` 0) when the
+    guest resets: a graceful close turns the guest's abort into a clean end.
+    Winsock hides this while a receive is pending (a `closesocket` that
+    cancels one resets the connection), but not once the host has finished
+    sending. (§M6)
+21. **A user-mode NAT is a router for datagrams too.** Fragment what the host
+    sends past the guest's MTU, and reassemble what the guest fragments:
+    otherwise every UDP datagram over 1472 bytes (and every big ping) is lost.
+    Keep multicast and broadcast on the guest's link: relayed, a guest's mDNS
+    reached the host's LAN. And when the UDP table is full, end its least
+    recently used flow: a resolver sends each query from a fresh port, and a
+    table that refuses new flows loses DNS for a minute. (§M6)
+22. **Never advertise receive window you can't take.** With window scaling,
+    the advertised right edge must be rounded *down* (RFC 7323 §2.4). Rounded
+    up, it offered up to 2^shift − 1 bytes past the ring's free space, which
+    were then dropped: hundreds of guest retransmits per GiB uploaded
+    (mjsabby/tcp-sans-io#16). (§M6)
+23. **Switch off the TCB's own give-up timers in a NAT.** tcp-sans-io's 60 s
+    FIN_WAIT_2 and 5 min user timeouts would end half-closed or stalled flows
+    sooner than the RFC 5382 minimums the NAT's watchdogs keep (4 min half
+    closed, 2 h 4 min idle). (§M6)
+24. **On Windows, a loopback `connect()` to a closed port takes ~2 s to
+    fail:** the SYN is retried before the refusal counts. With
+    `SIO_TCP_INITIAL_RTO` set to send no SYN retransmissions (as Go does),
+    it fails at once, and so does the guest's connect to a closed port on the
+    gateway. (§M6)
 
 ---
 
@@ -1054,6 +1090,7 @@ crates/whpsys/   WHP FFI:  partition, memory, vcpu, emulator, msi, doorbell,
 crates/winsys/   Win32 FFI: host (privilege/large-page/CNG rng), host/block_file
                            (async IOCP disk), host/mapped_file (mmap), sock
                            (Winsock+IOCP), etw, fs (9p), audio (WASAPI), wintun,
+                           slirp + gvisor (run-time-loaded network stacks),
                            media (Media Foundation MP4 writer)
 src/whp/         run_loop, cpuid (policy), hv (Hyper-V MSRs), snapshot*
 src/boot/        loader (PVH ELF + start_info + e820), acpi (RSDP/XSDT/MADT),
@@ -1063,7 +1100,10 @@ src/devices/     io_bus, mmio_bus, serial (8250), pic (i8259), pit (8254), legac
 src/pci/         mod (CF8/CFC), bus, config (Type-0 + BAR), msix, passthrough
 src/virtio/      device (trait), transport (virtio-pci), queue (virtqueue),
                  console, net, rng, blk, p9, input, gpu, snd
-src/net/         wire (parse/build), nat (user-mode NAT), dhcp, wintun, sys
+src/net/         wire (parse/build), nat (user-mode NAT), smol (its smoltcp TCP
+                 engine), slirp + gvisor (libslirp / gVisor backends), dhcp,
+                 wintun, sys
+gvisor/          Go module built into tinyvmm_gvisor.dll (gvisor\build.ps1)
 src/display.rs   Win32 GDI window for virtio-gpu + host-input seam
 src/scanout.rs   the GPU's published BGRA pictures, shared by the window + recorder
 src/record.rs    --record: GPU frames + snd playback -> H.264/AAC MP4

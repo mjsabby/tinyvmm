@@ -176,14 +176,16 @@ pub fn reply(req: &[u8], lease: &Lease, out: &mut Vec<u8>) -> Option<Destination
     })
 }
 
-/// The host DNS servers a guest behind the NAT can use, at most three:
-/// loopback, link-local, unspecified and broadcast addresses are dropped, as
-/// is any address on the guest's own subnet other than the gateway (the guest
-/// would look for it on the link).
+/// The host DNS servers a guest behind the NAT can use, at most three. The
+/// host's own 127.0.0.1 (a local resolver) is offered as the gateway, whose
+/// ports the NAT relays there; other loopback, link-local, unspecified and
+/// broadcast addresses are dropped, as is any address on the guest's own
+/// subnet other than the gateway (the guest would look for it on the link).
 pub fn usable_dns(host: &[[u8; 4]], gateway: [u8; 4], netmask: [u8; 4]) -> Vec<[u8; 4]> {
     let on_subnet = |ip: [u8; 4]| (0..4).all(|i| ip[i] & netmask[i] == gateway[i] & netmask[i]);
     let mut out = Vec::new();
     for &ip in host {
+        let ip = if ip == [127, 0, 0, 1] { gateway } else { ip };
         let unusable = ip == [0; 4]
             || ip == BROADCAST_IP
             || ip[0] == 127
@@ -327,7 +329,7 @@ mod tests {
     #[test]
     fn only_reachable_host_dns_servers_are_offered() {
         let host = [
-            [127, 0, 0, 1],
+            [127, 0, 0, 53],
             [169, 254, 1, 1],
             [10, 0, 0, 7],
             [8, 8, 8, 8],
@@ -339,6 +341,15 @@ mod tests {
         assert_eq!(
             usable_dns(&host, [10, 0, 0, 1], [255, 255, 255, 0]),
             [[8, 8, 8, 8], [10, 0, 0, 1], [1, 1, 1, 1]]
+        );
+        // A resolver on the host's 127.0.0.1 is reached at the gateway.
+        assert_eq!(
+            usable_dns(
+                &[[127, 0, 0, 1], [8, 8, 8, 8]],
+                [10, 0, 0, 1],
+                [255, 255, 255, 0]
+            ),
+            [[10, 0, 0, 1], [8, 8, 8, 8]]
         );
     }
 }

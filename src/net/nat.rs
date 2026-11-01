@@ -60,7 +60,15 @@ const FRAME_CAP: usize = 2048;
 /// total-length field — u16, header included — doesn't overflow).
 const GSO_PAYLOAD_CAP: usize = 65000;
 const GSO_FRAME_CAP: usize = ETH_HDR + 60 + GSO_PAYLOAD_CAP;
-const UDP_BUF: usize = 2048;
+/// A host datagram of any size fits (an IPv4 UDP payload is at most 65507
+/// bytes): a receive into a smaller buffer fails, losing the datagram.
+const UDP_BUF: usize = 65536;
+/// The guest link's IP MTU. Larger UDP datagrams reach the guest in IPv4
+/// fragments, as they would off a real link.
+const GUEST_MTU: usize = 1500;
+/// UDP ops preallocated at start (they hold a whole datagram each; the pool
+/// grows on demand up to the flow cap).
+const UDP_OPS_WARM: usize = 32;
 /// Most datagrams one pass of a UDP flow takes from its socket: on a socket
 /// that skips the IOCP on success, a receive finding one already queued
 /// completes inline, so a burst costs one completion and one worker wake, not
@@ -154,6 +162,8 @@ pub struct NatOptions {
     /// to it (see `FlowRouter`); ARP, ICMP and other non-TCP/UDP traffic goes
     /// to the first. Clamped to 1..=MAX_WORKERS.
     pub workers: usize,
+    /// The TCP stack guest connections terminate in.
+    pub engine: TcpEngine,
 }
 
 impl Default for NatOptions {
@@ -168,6 +178,7 @@ impl Default for NatOptions {
             default_tier: DEFAULT_TIER,
             tcb_port_tier: Vec::new(),
             workers: default_workers(),
+            engine: TcpEngine::default(),
         }
     }
 }
@@ -384,13 +395,58 @@ fn make_tcb<const BUF: usize>() -> Box<dyn TcbDyn> {
     Box::new(Tcb::<BUF>::new(TCB_PLACEHOLDER).expect("nat: Tcb pool allocation"))
 }
 
+fn make_smol<const BUF: usize>() -> Box<dyn TcbDyn> {
+    crate::net::smol::make::<BUF>(TCB_PLACEHOLDER)
+}
+
+/// Recycle pooled `tcb` onto a new connection. The NAT applies RFC 5382's
+/// flow timeouts itself (`expire_idle`), so tcp-sans-io's own reapers of
+/// quiet connections are off: its 60 s FIN_WAIT_2 timeout reset a guest
+/// connection the host had half-closed after a minute of guest silence
+/// (RFC 5382 REQ-5 asks a NAT for at least 4 min), and its 5 min USER
+/// TIMEOUT aborted one whose guest reader paused (zero window), which a
+/// real path keeps as long as the guest answers the window probes.
+fn arm_tcb(tcb: &mut dyn TcbDyn, cfg: TcbConfig, secret: &[u8; 16], now: u64, csum_offload: bool) {
+    tcb.reinit(cfg);
+    tcb.set_secret(secret);
+    tcb.set_now(now);
+    tcb.set_tx_csum_offload(csum_offload);
+    tcb.set_fin_wait2_timeout(0);
+    tcb.set_user_timeout(0);
+}
+
+/// The TCP stack that terminates guest connections: `tcp-sans-io` (the
+/// default) or smoltcp (`--net-backend smoltcp`). Everything else in the NAT
+/// is the same for both.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TcpEngine {
+    #[default]
+    SansIo,
+    Smoltcp,
+}
+
+impl TcpEngine {
+    /// Per-tier constructors of this engine's TCBs.
+    fn tier_make(self) -> [fn() -> Box<dyn TcbDyn>; N_TCB_TIERS] {
+        match self {
+            TcpEngine::SansIo => TIER_MAKE,
+            TcpEngine::Smoltcp => [
+                make_smol::<{ TIER_BUF[0] }>,
+                make_smol::<{ TIER_BUF[1] }>,
+                make_smol::<{ TIER_BUF[2] }>,
+            ],
+        }
+    }
+}
+
 /// The subset of `Tcb`'s API the NAT drives, made object-safe so a flow can
 /// hold any compile-time ring size behind a single `Box<dyn TcbDyn>`. This is
 /// a worker-local trait; the vtable indirection is irrelevant here (profiling
 /// shows ~all CPU is the hypervisor + kernel I/O, not our code). The forwarding
 /// bodies call the inherent `Tcb` methods — inherent methods win over trait
 /// methods in resolution, so `self.method(..)` forwards rather than recurses.
-trait TcbDyn {
+/// [`crate::net::smol`] implements it on smoltcp.
+pub(super) trait TcbDyn {
     fn set_now(&mut self, now: u64);
     fn listen(&mut self) -> Result<(), TcpError>;
     fn connect(&mut self) -> Result<(), TcpError>;
@@ -417,6 +473,9 @@ trait TcbDyn {
     /// Key ISNs, TSval offsets and SYN cookies; `listen` requires it and
     /// `reinit` clears it.
     fn set_secret(&mut self, secret: &[u8; 16]);
+    /// The FIN_WAIT_2 timeout and the USER TIMEOUT (0: off).
+    fn set_fin_wait2_timeout(&mut self, ms: u32);
+    fn set_user_timeout(&mut self, ms: u32);
     fn stats(&self) -> TcbStats;
 }
 
@@ -474,6 +533,12 @@ impl<const BUF: usize> TcbDyn for Tcb<BUF> {
     }
     fn set_secret(&mut self, secret: &[u8; 16]) {
         self.set_secret(secret)
+    }
+    fn set_fin_wait2_timeout(&mut self, ms: u32) {
+        self.set_fin_wait2_timeout(ms)
+    }
+    fn set_user_timeout(&mut self, ms: u32) {
+        self.set_user_timeout(ms)
     }
     fn stats(&self) -> TcbStats {
         self.stats()
@@ -555,7 +620,10 @@ fn make_tcp_send_op() -> Box<TcpSendOp> {
     Box::new(unsafe { core::mem::zeroed() })
 }
 fn make_udp_op() -> Box<UdpOp> {
-    Box::new(unsafe { core::mem::zeroed() })
+    // All-zero is a valid UdpOp (as for TcpOp). Zeroed in place on the heap:
+    // no 64 KiB stack temporary for the datagram buffer.
+    // SAFETY: every field is an integer, array of them, or zeroable POD.
+    unsafe { Box::<UdpOp>::new_zeroed().assume_init() }
 }
 fn make_accept_msg() -> Box<AcceptMsg> {
     Box::new(unsafe { core::mem::zeroed() })
@@ -790,6 +858,150 @@ impl IcmpPool {
 }
 
 type FlowKey = ([u8; 4], u16, [u8; 4], u16);
+
+/// Whether the NAT relays guest traffic for `ip` to the host's network: a
+/// unicast address off the guest's link (the gateway `gw`'s subnet, whose
+/// only host beside the guest is the gateway). A router forwards no
+/// multicast, broadcast, "this network" (0/8) or reserved (240/4) traffic;
+/// relayed, a guest's mDNS, LLMNR or SSDP would reach the host's LAN.
+fn relayable(ip: [u8; 4], gw: [u8; 4]) -> bool {
+    let mask = crate::net::NETMASK;
+    let on_link = (0..4).all(|i| ip[i] & mask[i] == gw[i] & mask[i]);
+    ip[0] != 0 && ip[0] < 224 && !on_link
+}
+
+/// Most guest datagrams reassembled at once, and how long one may wait for
+/// its missing fragments (Linux's `ipfrag_time`). The oldest goes when a
+/// new one needs the room.
+const MAX_REASSEMBLIES: usize = 16;
+const REASSEMBLY_MS: u64 = 30_000;
+
+/// Reassembles the guest's IPv4 datagrams that arrive in fragments (RFC
+/// 791), as they do when bigger than the guest's MTU (e.g. a large UDP
+/// datagram). Every fragment goes to the first shard (`shard_of_frame`),
+/// whose worker owns this.
+#[derive(Default)]
+struct Reassembler {
+    pending: Vec<Reassembly>,
+}
+
+/// One datagram being reassembled.
+struct Reassembly {
+    /// (source, destination, protocol, identification).
+    key: ([u8; 4], [u8; 4], u8, u16),
+    /// The IP header of the fragment at offset 0, once it arrived.
+    hdr: Vec<u8>,
+    payload: Vec<u8>,
+    /// Which 8-byte blocks of the payload arrived (8192 cover 64 KiB).
+    have: Box<[u64; 128]>,
+    /// The payload's length, from the last fragment, once it arrived.
+    len: Option<usize>,
+    since: u64,
+}
+
+impl Reassembly {
+    fn complete(&self) -> bool {
+        let Some(len) = self.len else {
+            return false;
+        };
+        !self.hdr.is_empty() && (0..len.div_ceil(8)).all(|b| self.have[b / 64] >> (b % 64) & 1 != 0)
+    }
+}
+
+impl Reassembler {
+    /// Take a fragment (an IPv4 datagram with More-Fragments set or a
+    /// non-zero offset). Once its datagram is whole, append that, as the
+    /// guest would have sent it unfragmented, to `out` and return true.
+    /// Malformed fragments are dropped, and so is a datagram whose fragments
+    /// contradict where it ends.
+    fn add(&mut self, ip: &[u8], now: u64, out: &mut Vec<u8>) -> bool {
+        if ip.len() < 20 {
+            return false;
+        }
+        let ihl = usize::from(ip[0] & 0x0F) * 4;
+        let total = usize::from(be16(&ip[2..4])).min(ip.len());
+        let fo = be16(&ip[6..8]);
+        let (off, more) = (usize::from(fo & 0x1FFF) * 8, fo & 0x2000 != 0);
+        if ihl < 20 || total <= ihl {
+            return false;
+        }
+        let data = &ip[ihl..total];
+        let end = off + data.len();
+        if ihl + end > 0xFFFF || (more && !data.len().is_multiple_of(8)) {
+            return false;
+        }
+        let key = (
+            [ip[12], ip[13], ip[14], ip[15]],
+            [ip[16], ip[17], ip[18], ip[19]],
+            ip[9],
+            be16(&ip[4..6]),
+        );
+        let pending = &mut self.pending;
+        let i = match pending.iter().position(|r| r.key == key) {
+            Some(i) => i,
+            None => {
+                if pending.len() >= MAX_REASSEMBLIES
+                    && let Some(oldest) = (0..pending.len()).min_by_key(|&i| pending[i].since)
+                {
+                    pending.swap_remove(oldest);
+                }
+                pending.push(Reassembly {
+                    key,
+                    hdr: Vec::new(),
+                    payload: Vec::new(),
+                    have: Box::new([0; 128]),
+                    len: None,
+                    since: now,
+                });
+                pending.len() - 1
+            }
+        };
+        let r = &mut pending[i];
+        let contradicts = match r.len {
+            Some(len) => end > len || (!more && end != len),
+            None => !more && r.payload.len() > end,
+        };
+        if contradicts {
+            pending.swap_remove(i);
+            return false;
+        }
+        if r.payload.len() < end {
+            r.payload.resize(end, 0);
+        }
+        r.payload[off..end].copy_from_slice(data);
+        for b in off / 8..end.div_ceil(8) {
+            r.have[b / 64] |= 1 << (b % 64);
+        }
+        if off == 0 {
+            r.hdr.clear();
+            r.hdr.extend_from_slice(&ip[..ihl]);
+        }
+        if !more {
+            r.len = Some(end);
+        }
+        if !r.complete() {
+            return false;
+        }
+        let r = pending.swap_remove(i);
+        let (ihl, len) = (r.hdr.len(), r.len.unwrap_or(0));
+        let at = out.len();
+        out.extend_from_slice(&r.hdr);
+        out.extend_from_slice(&r.payload[..len]);
+        let hdr = &mut out[at..at + ihl];
+        hdr[2..4].copy_from_slice(&((ihl + len) as u16).to_be_bytes());
+        hdr[6..8].fill(0);
+        hdr[10..12].fill(0);
+        let c = checksum16(&[&*hdr]);
+        hdr[10..12].copy_from_slice(&c.to_be_bytes());
+        true
+    }
+
+    /// Forget the datagrams whose missing fragments never came.
+    fn expire(&mut self, now: u64) {
+        self.pending
+            .retain(|r| now.saturating_sub(r.since) <= REASSEMBLY_MS);
+    }
+}
 
 /// One overlapped UDP receive, owned by its flow. `overlapped` MUST be first
 /// so a completion's OVERLAPPED* casts straight back to `*mut UdpOp`.
@@ -1485,6 +1697,17 @@ struct NatState {
     // per-packet heap allocation (the worker is single-threaded).
     tx_scratch: Vec<u8>,
     l3_scratch: Vec<u8>,
+    /// Each IPv4 fragment's Ethernet frame (`udp_deliver`).
+    frag_scratch: Vec<u8>,
+    /// IPv4 identification of the next datagram fragmented to the guest.
+    ip_id: u16,
+    /// Guest datagrams being reassembled (first shard only), and the frame a
+    /// finished one is rebuilt in.
+    frags: Reassembler,
+    reasm_scratch: Vec<u8>,
+    /// Every shard's IOCP, by shard index (to hand a reassembled datagram to
+    /// the shard that owns its flow).
+    iocps: Arc<[Iocp]>,
     // GSO coalescing frame and the TCB receive-drain buffer, reused across
     // `tcp_drive` calls so the hot path neither allocates nor zeroes.
     gso: GsoFrame,
@@ -1505,11 +1728,43 @@ impl NatState {
     }
 
     /// Wrap the L4 payload currently sitting in `l3_scratch` in IPv4 +
-    /// Ethernet (reusing the scratch buffers) and inject it to the guest.
-    /// Alloc-free.
+    /// Ethernet (reusing the scratch buffers) and inject it to the guest, in
+    /// IPv4 fragments if it's bigger than the guest's MTU (a big ping's
+    /// reply). Alloc-free.
     fn wrap_and_inject(&mut self, src_ip: [u8; 4], dst_ip: [u8; 4], proto: u8) {
-        self.wrap_l3(src_ip, dst_ip, proto);
-        self.inject(&self.l3_scratch);
+        if 20 + self.l3_scratch.len() <= GUEST_MTU {
+            self.wrap_l3(src_ip, dst_ip, proto);
+            self.inject(&self.l3_scratch);
+        } else if let Some(d) = self.net.upgrade() {
+            self.emit_fragments(src_ip, dst_ip, proto, &mut |f| d.inject_rx(f));
+        }
+    }
+
+    /// Wrap the L4 payload in `l3_scratch` in IPv4 fragments of at most the
+    /// guest's MTU, and each in Ethernet, handing each frame to `emit`.
+    fn emit_fragments(
+        &mut self,
+        src_ip: [u8; 4],
+        dst_ip: [u8; 4],
+        proto: u8,
+        emit: &mut dyn FnMut(&[u8]),
+    ) {
+        self.ip_id = self.ip_id.wrapping_add(1);
+        let (gm, gw) = (self.guest_mac, self.gw_mac);
+        let frame = &mut self.frag_scratch;
+        ipv4_fragments(
+            &mut self.tx_scratch,
+            src_ip,
+            dst_ip,
+            proto,
+            self.ip_id,
+            &self.l3_scratch,
+            GUEST_MTU,
+            &mut |ip| {
+                build_eth_into(frame, gm, gw, ETHERTYPE_IPV4, ip);
+                emit(frame);
+            },
+        );
     }
 
     /// Wrap the L4 payload in `l3_scratch` in IPv4 + Ethernet, leaving the
@@ -1779,7 +2034,12 @@ impl NatState {
     }
 
     fn handle_ipv4(&mut self, eth: &EthView) {
-        let Some(ip) = parse_ipv4(eth.payload) else {
+        let p = eth.payload;
+        if p.len() >= 20 && p[0] >> 4 == 4 && be16(&p[6..8]) & 0x3FFF != 0 {
+            self.handle_fragment(p);
+            return;
+        }
+        let Some(ip) = parse_ipv4(p) else {
             return;
         };
         match ip.proto {
@@ -1787,6 +2047,53 @@ impl NatState {
             IP_PROTO_UDP => self.handle_udp(&ip),
             IP_PROTO_TCP => self.handle_tcp(&ip),
             _ => {}
+        }
+    }
+
+    /// Take a fragment of a guest datagram; once all of it is here, hand the
+    /// whole datagram on as if the guest had sent it unfragmented.
+    fn handle_fragment(&mut self, ip: &[u8]) {
+        let now = self.now();
+        let mut frame = std::mem::take(&mut self.reasm_scratch);
+        frame.clear();
+        frame.extend_from_slice(&self.gw_mac);
+        frame.extend_from_slice(&self.guest_mac);
+        frame.extend_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+        if self.frags.add(ip, now, &mut frame) {
+            self.deliver_reassembled(&frame);
+        }
+        self.reasm_scratch = frame;
+    }
+
+    /// Hand a reassembled guest datagram (in `frame`) to the shard that owns
+    /// its flow, as the guest TX path would have routed it unfragmented.
+    fn deliver_reassembled(&mut self, frame: &[u8]) {
+        let (hashed, tcp) = shard_of_frame(frame, self.shards);
+        let (s, assigned) = match tcp {
+            Some((key, syn)) => self.router.route(&key, syn),
+            None => (hashed, false),
+        };
+        if s == self.shard {
+            self.handle_frame(frame);
+            self.settle_route(frame);
+            return;
+        }
+        // The owning shard takes it as a guest frame. (Big-pool frames count
+        // as checksum-offloaded; this one's checksum is whole.)
+        let posted = self.big_pool.acquire().is_some_and(|idx| {
+            let n = self.big_pool.fill(idx, frame);
+            let slot = self.big_pool.slot_ptr(idx) as *mut OVERLAPPED;
+            let ok = sys::post(self.iocps[s], n as u32, KEY_FRAME_OFFLOAD_BIG, slot);
+            if !ok {
+                self.big_pool.release(idx);
+            }
+            ok
+        });
+        if !posted {
+            self.stats.tx_drops.fetch_add(1, Ordering::Relaxed);
+            if let (true, Some((key, _))) = (assigned, tcp) {
+                self.router.release(&key, s);
+            }
         }
     }
 
@@ -1799,8 +2106,12 @@ impl NatState {
             }
             return;
         }
-        // Only proxy echo requests; ignore other ICMP types.
-        if ip.payload.first().copied() != Some(ICMP_ECHO_REQUEST) || ip.payload.len() < 8 {
+        // Only proxy echo requests, to hosts beyond the guest's link; ignore
+        // other ICMP.
+        if ip.payload.first().copied() != Some(ICMP_ECHO_REQUEST)
+            || ip.payload.len() < 8
+            || !relayable(ip.dst, self.gw_ip)
+        {
             return;
         }
         // The job crosses to a worker thread, so it owns its payload copy.
@@ -1827,6 +2138,9 @@ impl NatState {
             && (ip.dst == dhcp::BROADCAST_IP || ip.dst == self.gw_ip)
         {
             self.handle_dhcp(udp.payload);
+            return;
+        }
+        if ip.dst != self.gw_ip && !relayable(ip.dst, self.gw_ip) {
             return;
         }
         if let Some(sock) = self.ensure_udp_flow(ip.src, udp.src_port, ip.dst, udp.dst_port) {
@@ -1881,11 +2195,18 @@ impl NatState {
             f.last_use = now;
             return Some(f.op.as_ref().unwrap().sock);
         }
-        if self.flows.udp.load(Ordering::Relaxed) >= MAX_UDP_FLOWS {
+        if self.flows.udp.load(Ordering::Relaxed) >= MAX_UDP_FLOWS && !self.evict_lru_udp() {
             return None;
         }
         let sock = sys::new_udp_socket()?;
-        sys::connect_sock(sock, dip, dport);
+        // As for TCP (`new_tcp_flow`), the gateway is the host's loopback;
+        // datagrams back to the guest still come from the gateway (`dst_ip`).
+        let host_dip = if dip == self.gw_ip {
+            [127, 0, 0, 1]
+        } else {
+            dip
+        };
+        sys::connect_sock(sock, host_dip, dport);
         if !sys::associate(self.iocp, sock, KEY_UDP) {
             sys::close_sock(sock);
             return None;
@@ -1915,6 +2236,40 @@ impl NatState {
         // arrive to reap the flow through, so the pump reaps it now.
         self.udp_pump(key, None);
         self.udp.contains_key(&key).then_some(sock)
+    }
+
+    /// End a UDP flow: mark it dead and close its socket, which aborts its
+    /// pending receive (or finds it yielded, `KEY_UDP_MORE` queued);
+    /// `on_udp_recv` (or `on_udp_more`) reaps it from that completion.
+    fn kill_udp(&mut self, key: FlowKey) {
+        if let Some(f) = self.udp.get_mut(&key) {
+            f.dead = true;
+            let op = f.op.as_mut().unwrap();
+            if op.sock != INVALID_SOCKET {
+                sys::close_sock(op.sock);
+                op.sock = INVALID_SOCKET;
+            }
+        }
+    }
+
+    /// Make room for a new UDP flow with the table full: end this shard's
+    /// least recently used one, as a NAT forgets its stalest mapping, rather
+    /// than drop the new flow's datagrams. Clients that send each request
+    /// from a fresh port (DNS resolvers) would otherwise lose every request
+    /// past the table's size until mappings idle out a minute later. False
+    /// if this shard has no live flow to end.
+    fn evict_lru_udp(&mut self) -> bool {
+        let Some(key) = self
+            .udp
+            .iter()
+            .filter(|(_, f)| !f.dead)
+            .min_by_key(|(_, f)| f.last_use)
+            .map(|(k, _)| *k)
+        else {
+            return false;
+        };
+        self.kill_udp(key);
+        true
     }
 
     /// Remove a UDP flow: close its socket if still open and return the pooled
@@ -2020,8 +2375,9 @@ impl NatState {
     }
 
     /// Hand the first `n` bytes of `key`'s receive buffer, a datagram from the
-    /// host, to the guest. Its interrupt waits for the worker's batch
-    /// (`notify_guest`), as TCP frames' do. Alloc-free.
+    /// host, to the guest, in IPv4 fragments if it's bigger than the guest's
+    /// MTU. Its interrupt waits for the worker's batch (`notify_guest`), as
+    /// TCP frames' do. Alloc-free.
     fn udp_deliver(&mut self, dev: Option<&NetDevice>, key: FlowKey, n: usize) {
         let Some(op) = self.udp.get(&key).and_then(|f| f.op.as_deref()) else {
             return;
@@ -2035,10 +2391,17 @@ impl NatState {
             &op.buf[..n.min(UDP_BUF)],
         );
         let (src_ip, dst_ip) = (op.dst_ip, op.guest_ip);
-        self.wrap_l3(src_ip, dst_ip, IP_PROTO_UDP);
-        if let Some(d) = dev {
+        let Some(d) = dev else {
+            return;
+        };
+        if 20 + self.l3_scratch.len() <= GUEST_MTU {
+            self.wrap_l3(src_ip, dst_ip, IP_PROTO_UDP);
             d.inject_rx_gso_batched(&self.l3_scratch, RxHeader::default());
+            return;
         }
+        self.emit_fragments(src_ip, dst_ip, IP_PROTO_UDP, &mut |f| {
+            d.inject_rx_gso_batched(f, RxHeader::default());
+        });
     }
 
     fn handle_tcp(&mut self, ip: &Ipv4View) {
@@ -2167,10 +2530,7 @@ impl NatState {
         let tier = self.choose_tier(dport);
         let csum_offload = self.rx_csum_ok();
         let mut tcb = self.tcb_pools[tier].acquire();
-        tcb.reinit(cfg);
-        tcb.set_secret(&self.tcb_secret);
-        tcb.set_now(now);
-        tcb.set_tx_csum_offload(csum_offload);
+        arm_tcb(&mut *tcb, cfg, &self.tcb_secret, now, csum_offload);
         if tcb.listen().is_err() {
             self.tcb_pools[tier].release(tcb);
             sys::close_sock(sock);
@@ -2308,10 +2668,7 @@ impl NatState {
         let tier = self.choose_tier(guest_port);
         let csum_offload = self.rx_csum_ok();
         let mut tcb = self.tcb_pools[tier].acquire();
-        tcb.reinit(cfg);
-        tcb.set_secret(&self.tcb_secret);
-        tcb.set_now(now);
-        tcb.set_tx_csum_offload(csum_offload);
+        arm_tcb(&mut *tcb, cfg, &self.tcb_secret, now, csum_offload);
         if tcb.connect().is_err() {
             // active open: emits a SYN toward the guest
             self.tcb_pools[tier].release(tcb);
@@ -2724,13 +3081,22 @@ impl NatState {
     /// pending overlapped ops so their completions drain), then reap. The
     /// TcpFlow (and its op buffers) stay alive until every outstanding op has
     /// completed, so the kernel never touches freed memory.
+    ///
+    /// A connection that ended in a reset (the guest's RST, or the NAT's
+    /// abort) is reset on the host side too: closed gracefully, the host
+    /// would see a clean end of a stream that was cut short.
     fn begin_teardown(&mut self, key: FlowKey) {
         if let Some(flow) = self.tcp.get_mut(&key)
             && !flow.dead
         {
             flow.dead = true;
             if flow.sock != INVALID_SOCKET {
-                sys::close_sock(flow.sock);
+                let reset = flow.tcb.as_ref().is_some_and(|t| t.poll() & EV_ERROR != 0);
+                if reset {
+                    sys::abort_sock(flow.sock);
+                } else {
+                    sys::close_sock(flow.sock);
+                }
                 flow.sock = INVALID_SOCKET;
             }
         }
@@ -2778,9 +3144,7 @@ impl NatState {
     /// half-close watchdogs). Mirrors the C++ backend's ExpireIdle + the TSI
     /// engine's per-conn watchdogs.
     fn expire_idle(&mut self, now: u64) {
-        // UDP: reap entries idle longer than UDP_IDLE_MS. Marking dead +
-        // closing the socket aborts the pending recv (or the queued yield);
-        // on_udp_recv (or on_udp_more) frees it.
+        // UDP: reap entries idle longer than UDP_IDLE_MS.
         let udp_dead: Vec<FlowKey> = self
             .udp
             .iter()
@@ -2788,15 +3152,10 @@ impl NatState {
             .map(|(k, _)| *k)
             .collect();
         for k in udp_dead {
-            if let Some(f) = self.udp.get_mut(&k) {
-                f.dead = true;
-                let op = f.op.as_mut().unwrap();
-                if op.sock != INVALID_SOCKET {
-                    sys::close_sock(op.sock);
-                    op.sock = INVALID_SOCKET;
-                }
-            }
+            self.kill_udp(k);
         }
+        // Datagrams whose missing fragments never came.
+        self.frags.expire(now);
 
         // TCP: collect flows that tripped a watchdog, then reset them.
         let tcp_victims: Vec<FlowKey> = self
@@ -2963,15 +3322,16 @@ impl NatBackend {
         let lease = Arc::new(opts.dhcp_lease());
         let flows = Arc::new(FlowCounts::default());
         let router = Arc::new(FlowRouter::new(n));
+        let all_iocps: Arc<[Iocp]> = iocps.clone().into();
         let mut shards = Vec::with_capacity(n);
         for (s, &iocp) in iocps.iter().enumerate() {
             // Worker-only object pools: one Tcb free-list per compile-time
             // tier, plus the overlapped op buffers. Each worker warms its own
             // share before serving completions, so VM start does not wait for
             // tens of MiB of ring buffers to be zeroed.
-            let tcb_pools: Vec<BoxPool<dyn TcbDyn>> = (0..N_TCB_TIERS)
-                .map(|i| BoxPool::new(0, TIER_MAKE[i]))
-                .collect();
+            let make = opts.engine.tier_make();
+            let tcb_pools: Vec<BoxPool<dyn TcbDyn>> =
+                (0..N_TCB_TIERS).map(|i| BoxPool::new(0, make[i])).collect();
             let tcb_warm: [usize; N_TCB_TIERS] =
                 std::array::from_fn(|i| opts.tcb_warm[i].div_ceil(n));
             let state = NatState {
@@ -3011,6 +3371,13 @@ impl NatBackend {
                 rx_spare: Vec::new(),
                 tx_scratch: Vec::with_capacity(GSO_FRAME_CAP),
                 l3_scratch: Vec::with_capacity(FRAME_CAP),
+                frag_scratch: Vec::with_capacity(ETH_HDR + GUEST_MTU),
+                // Shards fragment apart in the ID space, so two can't send
+                // the guest same-ID fragments from one remote address.
+                ip_id: (s * (0x1_0000 / MAX_WORKERS)) as u16,
+                frags: Reassembler::default(),
+                reasm_scratch: Vec::new(),
+                iocps: all_iocps.clone(),
                 gso: GsoFrame::new(),
                 drain_scratch: vec![0; 16384],
                 wake: Wake::Other,
@@ -3034,7 +3401,7 @@ impl NatBackend {
                     }
                     state.tcp_op_pool.warm(MAX_TCP_FLOWS.div_ceil(n));
                     state.tcp_send_op_pool.warm(MAX_TCP_FLOWS.div_ceil(n));
-                    state.udp_op_pool.warm(MAX_UDP_FLOWS.div_ceil(n));
+                    state.udp_op_pool.warm(UDP_OPS_WARM.div_ceil(n));
                     state.run()
                 })
                 .ok();
@@ -3282,6 +3649,144 @@ mod tests {
         );
     }
 
+    /// Guest traffic for multicast and broadcast addresses, and for the rest
+    /// of the guest's link, stays there; unicast beyond the link is relayed.
+    #[test]
+    fn only_unicast_beyond_the_link_is_relayed() {
+        let gw = crate::net::GATEWAY_IP;
+        for ip in [[1, 1, 1, 1], [192, 168, 0, 10], [172, 29, 255, 8]] {
+            assert!(relayable(ip, gw), "{ip:?}");
+        }
+        for ip in [
+            [224, 0, 0, 251],
+            [239, 255, 255, 250],
+            [255; 4],
+            [240, 0, 0, 1],
+            [0; 4],
+            [172, 29, 255, 7],
+            [172, 29, 255, 3],
+        ] {
+            assert!(!relayable(ip, gw), "{ip:?}");
+        }
+    }
+
+    /// The IPv4 fragments of a `len`-byte UDP datagram from the guest, as
+    /// Linux sends one past its 1500-byte MTU, and the UDP datagram.
+    fn guest_fragments(id: u16, len: usize) -> (Vec<u8>, Vec<Vec<u8>>) {
+        use crate::net::wire::{build_udp, ipv4_fragments};
+        let (guest, host) = ([10, 0, 0, 2], [10, 0, 0, 1]);
+        let data: Vec<u8> = (0..len).map(|i| (i * 7 + usize::from(id)) as u8).collect();
+        let udp = build_udp(guest, host, 5000, 53, &data);
+        let mut frags = Vec::new();
+        ipv4_fragments(
+            &mut Vec::new(),
+            guest,
+            host,
+            IP_PROTO_UDP,
+            id,
+            &udp,
+            1500,
+            &mut |f| frags.push(f.to_vec()),
+        );
+        (udp, frags)
+    }
+
+    /// A guest datagram's fragments, in any order and interleaved with
+    /// another's, come out as the datagram it would have sent whole: an
+    /// unfragmented header with a valid checksum, and every byte.
+    #[test]
+    fn fragmented_guest_datagrams_reassemble() {
+        use crate::net::wire::parse_ipv4;
+        let (udp_a, a) = guest_fragments(1, 4000);
+        let (udp_b, b) = guest_fragments(2, 9000);
+        assert_eq!((a.len(), b.len()), (3, 7));
+        // b's fragments last first, between a's in order.
+        let mut order = Vec::new();
+        for (i, f) in b.iter().rev().enumerate() {
+            order.push(f);
+            order.extend(a.get(i));
+        }
+        let mut r = Reassembler::default();
+        let mut whole = Vec::new();
+        for f in order {
+            let mut out = vec![0xEE];
+            if r.add(f, 0, &mut out) {
+                assert_eq!(out[0], 0xEE, "appended to what `out` held");
+                whole.push(out.split_off(1));
+            }
+        }
+        assert_eq!(whole.len(), 2, "both completed");
+        for (ip, udp) in whole.iter().zip([&udp_a, &udp_b]) {
+            assert_eq!(checksum16(&[&ip[..20]]), 0);
+            let v = parse_ipv4(ip).expect("an unfragmented datagram");
+            assert_eq!(
+                (v.src, v.dst, v.proto),
+                ([10, 0, 0, 2], [10, 0, 0, 1], IP_PROTO_UDP)
+            );
+            assert_eq!(v.datagram.len(), ip.len());
+            assert_eq!(v.payload, &udp[..]);
+        }
+        assert!(r.pending.is_empty());
+    }
+
+    /// A datagram missing a fragment never comes out, nor one whose
+    /// fragments disagree on where it ends (whichever arrives first); and
+    /// one whose fragments stopped coming is forgotten, so a late fragment
+    /// can't complete it.
+    #[test]
+    fn broken_fragment_trains_are_dropped() {
+        let (_, f) = guest_fragments(7, 4000);
+        let mut r = Reassembler::default();
+        let mut out = Vec::new();
+        // The last fragment, moved to end before the second one does.
+        let mut short = f[2].clone();
+        short[6..8].copy_from_slice(&(1480u16 / 8).to_be_bytes());
+        for train in [[&f[0], &f[1], &short], [&short, &f[1], &f[0]]] {
+            for frag in train {
+                assert!(!r.add(frag, 0, &mut out));
+            }
+            assert!(!r.add(&f[2], 0, &mut out), "the datagram was dropped");
+            r.pending.clear();
+        }
+        assert!(!r.add(&f[0], 0, &mut out));
+        assert!(!r.add(&f[2], 0, &mut out), "missing the middle one");
+        r.expire(REASSEMBLY_MS);
+        assert_eq!(r.pending.len(), 1, "still waiting");
+        r.expire(REASSEMBLY_MS + 1);
+        assert!(!r.add(&f[1], REASSEMBLY_MS + 1, &mut out), "too late");
+        assert!(out.is_empty());
+    }
+
+    /// A guest's RST leaves the NAT's tcb reporting an error, on either
+    /// engine, so the flow resets its host socket too; the close handshake
+    /// leaves none, so the host socket closes gracefully.
+    #[test]
+    fn a_guest_reset_is_an_error_and_a_close_is_not() {
+        let exchange = |nat: &mut dyn TcbDyn, guest: &mut dyn TcbDyn| {
+            for _ in 0..4 {
+                guest.tick().unwrap();
+                shuttle(guest, nat);
+                nat.tick().unwrap();
+                shuttle(nat, guest);
+            }
+        };
+        for engine in [TcpEngine::SansIo, TcpEngine::Smoltcp] {
+            let (mut nat, mut guest) = established_pair_on(engine);
+            guest.abort().unwrap();
+            exchange(&mut *nat, &mut *guest);
+            assert_eq!(nat.state(), State::Closed, "{engine:?}");
+            assert_ne!(nat.poll() & EV_ERROR, 0, "{engine:?}: reset");
+
+            let (mut nat, mut guest) = established_pair_on(engine);
+            guest.close().unwrap();
+            exchange(&mut *nat, &mut *guest);
+            nat.close().unwrap();
+            exchange(&mut *nat, &mut *guest);
+            assert_eq!(nat.state(), State::Closed, "{engine:?}");
+            assert_eq!(nat.poll() & EV_ERROR, 0, "{engine:?}: closed");
+        }
+    }
+
     /// Move every datagram `from` has staged into `to`.
     fn shuttle(from: &mut dyn TcbDyn, to: &mut dyn TcbDyn) {
         while from.extract_packet_with(&mut |pkt| {
@@ -3292,6 +3797,12 @@ mod tests {
     /// A NAT-side tcb (listening on 10.0.0.1:80) and a guest-side tcb,
     /// handshaken to ESTABLISHED.
     fn established_pair() -> (Box<dyn TcbDyn>, Box<dyn TcbDyn>) {
+        established_pair_on(TcpEngine::SansIo)
+    }
+
+    /// [`established_pair`] with the NAT side on `engine`; the guest side is
+    /// always tcp-sans-io, which checks every checksum it receives.
+    fn established_pair_on(engine: TcpEngine) -> (Box<dyn TcbDyn>, Box<dyn TcbDyn>) {
         let nat_end = Endpoint {
             ip: [10, 0, 0, 1],
             port: 80,
@@ -3300,14 +3811,14 @@ mod tests {
             ip: [10, 0, 0, 2],
             port: 40000,
         };
-        let mut nat = TIER_MAKE[0]();
-        nat.reinit(TcbConfig {
+        let mut nat = engine.tier_make()[0]();
+        let cfg = TcbConfig {
             local: nat_end,
             remote: guest_end,
             iss: 1000,
             initial_rto_ms: 1000,
-        });
-        nat.set_secret(&[0x5a; 16]);
+        };
+        arm_tcb(&mut *nat, cfg, &[0x5a; 16], 0, false);
         nat.listen().unwrap();
         let mut guest = TIER_MAKE[0]();
         guest.reinit(TcbConfig {
@@ -3360,7 +3871,18 @@ mod tests {
     /// gets every byte, then the FIN.
     #[test]
     fn host_bytes_reach_the_guest_through_the_ring_then_fin() {
-        let (nat, mut guest) = established_pair();
+        host_bytes_then_fin(TcpEngine::SansIo);
+    }
+
+    /// The same through a smoltcp TCB, whose segments the tcp-sans-io guest
+    /// takes only with correct checksums.
+    #[test]
+    fn smoltcp_tcb_carries_host_bytes_then_fin() {
+        host_bytes_then_fin(TcpEngine::Smoltcp);
+    }
+
+    fn host_bytes_then_fin(engine: TcpEngine) {
+        let (nat, mut guest) = established_pair_on(engine);
 
         // The host sends three rings' worth, then closes.
         let data: Vec<u8> = (0..3 * TIER_BUF[0] as u32).map(|i| (i * 7) as u8).collect();
@@ -3478,5 +4000,103 @@ mod tests {
         assert!(flow.shutdown_done);
         assert!(flow.lingering());
         flow.tcb.take();
+    }
+
+    /// Advance both ends to `now`, run their timers and exchange what
+    /// they send.
+    fn step(nat: &mut dyn TcbDyn, guest: &mut dyn TcbDyn, now: u64) {
+        nat.set_now(now);
+        guest.set_now(now);
+        nat.tick().unwrap();
+        shuttle(nat, guest);
+        guest.tick().unwrap();
+        shuttle(guest, nat);
+    }
+
+    /// The host closed its side; the guest is still to answer. The NAT's
+    /// TCB waits in FIN_WAIT_2 for it past tcp-sans-io's own 60 s limit
+    /// (the NAT resets half-closed flows only after RFC 5382's 4 min idle),
+    /// and the guest's late bytes and FIN still arrive.
+    #[test]
+    fn a_half_closed_flow_waits_for_the_guest_past_a_minute() {
+        half_closed_flow_waits(TcpEngine::SansIo);
+    }
+
+    #[test]
+    fn a_half_closed_smoltcp_flow_waits_for_the_guest() {
+        half_closed_flow_waits(TcpEngine::Smoltcp);
+    }
+
+    fn half_closed_flow_waits(engine: TcpEngine) {
+        let (nat, mut guest) = established_pair_on(engine);
+        let mut flow = connected_flow(nat);
+        on_host_eof(&mut flow);
+        let nat = flow.tcb.as_mut().unwrap();
+        for now in (0..=180_000).step_by(1_000) {
+            step(&mut **nat, &mut *guest, now);
+        }
+        assert_eq!(nat.state(), State::FinWait2, "{:?}", nat.stats());
+        let (a, _) = guest.send_reserve(5).unwrap();
+        a[..5].copy_from_slice(b"late\n");
+        assert_eq!(guest.send_commit(5), Ok(5));
+        guest.close().unwrap();
+        step(&mut **nat, &mut *guest, 181_000);
+        let mut rb = [0u8; 16];
+        assert_eq!(nat.recv(&mut rb), Ok(5));
+        assert_eq!(&rb[..5], b"late\n");
+        assert_eq!(nat.state(), State::TimeWait);
+        flow.tcb.take();
+    }
+
+    /// Append as much of `data[*sent..]` to `tcb`'s send ring as fits.
+    fn top_up(tcb: &mut dyn TcbDyn, data: &[u8], sent: &mut usize) {
+        if *sent == data.len() {
+            return;
+        }
+        if let Ok((a, b)) = tcb.send_reserve(data.len() - *sent) {
+            let k = a.len() + b.len();
+            let (head, tail) = data[*sent..*sent + k].split_at(a.len());
+            a.copy_from_slice(head);
+            b.copy_from_slice(tail);
+            assert_eq!(tcb.send_commit(k), Ok(k));
+            *sent += k;
+        }
+    }
+
+    /// A guest that stops reading a download (its window closes, with more
+    /// queued for it) for ten minutes keeps the connection, as on a real
+    /// path, instead of the NAT's TCB aborting it after tcp-sans-io's 5 min
+    /// USER TIMEOUT; then every byte arrives.
+    #[test]
+    fn a_paused_guest_reader_keeps_its_download() {
+        let (mut nat, mut guest) = established_pair();
+        let data: Vec<u8> = (0..4 * TIER_BUF[0] as u32)
+            .map(|i| (i * 13) as u8)
+            .collect();
+        let mut sent = 0;
+        // The guest doesn't read: its ring fills and its window closes.
+        for now in (10..=600_000).step_by(500) {
+            top_up(&mut *nat, &data, &mut sent);
+            step(&mut *nat, &mut *guest, now);
+        }
+        assert_eq!(nat.state(), State::Established, "{:?}", nat.stats());
+        assert!(sent < data.len(), "the guest's window never closed");
+        // It reads again: the rest follows.
+        let mut got = Vec::new();
+        let mut rb = [0u8; 16384];
+        for now in (600_500..700_000).step_by(10) {
+            while let Ok(k) = guest.recv(&mut rb) {
+                if k == 0 {
+                    break;
+                }
+                got.extend_from_slice(&rb[..k]);
+            }
+            top_up(&mut *nat, &data, &mut sent);
+            step(&mut *nat, &mut *guest, now);
+            if got.len() == data.len() {
+                break;
+            }
+        }
+        assert!(got == data, "{} of {} bytes", got.len(), data.len());
     }
 }

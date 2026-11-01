@@ -79,15 +79,28 @@ const MAX_VCPUS: u32 = boot::acpi::MAX_VCPUS;
 #[derive(Clone, Copy, PartialEq)]
 enum NetBackendKind {
     Loopback,
+    /// The NAT with tcp-sans-io TCBs.
     Nat,
+    /// The same NAT with smoltcp TCBs.
+    Smoltcp,
+    /// libslirp (`libslirp-0.dll`, loaded at runtime).
+    Slirp,
+    /// gVisor's netstack (`tinyvmm_gvisor.dll`, loaded at runtime).
+    Gvisor,
     Wintun,
 }
+
+/// What `--net-backend` accepts, for its messages.
+const NET_BACKENDS: &str = "loopback|nat|smoltcp|slirp|gvisor|wintun";
 
 impl NetBackendKind {
     fn as_str(self) -> &'static str {
         match self {
             NetBackendKind::Loopback => "loopback",
             NetBackendKind::Nat => "nat",
+            NetBackendKind::Smoltcp => "smoltcp",
+            NetBackendKind::Slirp => "slirp",
+            NetBackendKind::Gvisor => "gvisor",
             NetBackendKind::Wintun => "wintun",
         }
     }
@@ -95,6 +108,9 @@ impl NetBackendKind {
         match s {
             "loopback" => Some(NetBackendKind::Loopback),
             "nat" => Some(NetBackendKind::Nat),
+            "smoltcp" => Some(NetBackendKind::Smoltcp),
+            "slirp" => Some(NetBackendKind::Slirp),
+            "gvisor" => Some(NetBackendKind::Gvisor),
             "wintun" => Some(NetBackendKind::Wintun),
             _ => None,
         }
@@ -169,7 +185,8 @@ fn print_usage() {
          \x20 tinyvmm --pvh-info <vmlinux|bzImage>\n\
          \x20 tinyvmm --pvh-run [--initrd <cpio>] [--ram-mb N] [--vcpus N] [--rng] [--input] [--sound]\n\
          \x20              [--large-pages|--no-large-pages] [--poll-us N]\n\
-         \x20              [--net [--net-backend loopback|nat] [--portfwd H:G]... [--nat-workers N]]...\n\
+         \x20              [--net [--net-backend loopback|nat|smoltcp|slirp|gvisor|wintun]\n\
+         \x20              [--portfwd H:G]... [--nat-workers N]]...\n\
          \x20              (repeat --net per NIC)\n\
          \x20              [--drive <path>[,readonly]]... [--cpu-affinity p|p-physical|e|all]\n\
          \x20              (default p: P-cores only on a hybrid CPU)\n\
@@ -1140,10 +1157,10 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
                 i += 1;
                 let k = args
                     .get(i)
-                    .ok_or_else(|| Error::msg("--net-backend wants loopback|nat|wintun"))?;
+                    .ok_or_else(|| Error::msg(format!("--net-backend wants {NET_BACKENDS}")))?;
                 let backend = NetBackendKind::from_str(k).ok_or_else(|| {
                     Error::msg(format!(
-                        "--net-backend: unknown '{k}' (want loopback|nat|wintun)"
+                        "--net-backend: unknown '{k}' (want {NET_BACKENDS})"
                     ))
                 })?;
                 // Modify the most recent NIC; create one if --net-backend is
@@ -2594,13 +2611,19 @@ fn wire_net_backend(net: &Arc<NetDevice>, nic: &NicSpec) -> Result<String> {
             net.set_backend(LoopbackBackend::new(net));
             "loopback".to_string()
         }
-        NetBackendKind::Nat => {
+        NetBackendKind::Nat | NetBackendKind::Smoltcp => {
+            let engine = if nic.backend == NetBackendKind::Smoltcp {
+                crate::net::nat::TcpEngine::Smoltcp
+            } else {
+                crate::net::nat::TcpEngine::SansIo
+            };
             let opts = NatOptions {
                 port_forwards: nic.port_forwards.clone(),
                 workers: nic
                     .nat_workers
                     .unwrap_or_else(crate::net::nat::default_workers),
                 dns_servers: crate::net::sys::dns_servers(),
+                engine,
                 ..NatOptions::default()
             };
             let lease = opts.dhcp_lease();
@@ -2626,9 +2649,42 @@ fn wire_net_backend(net: &Arc<NetDevice>, nic: &NicSpec) -> Result<String> {
             };
             net.set_backend(NatBackend::new(net, opts));
             format!(
-                "nat gw={}, dhcp {}/{}, dns {dns}",
+                "{} gw={}, dhcp {}/{}, dns {dns}",
+                nic.backend.as_str(),
                 ip(lease.server),
                 ip(lease.client),
+                net::PREFIX_LEN
+            )
+        }
+        NetBackendKind::Slirp => {
+            let opts = crate::net::slirp::SlirpOptions {
+                port_forwards: nic.port_forwards.clone(),
+            };
+            let (backend, version) = crate::net::slirp::SlirpBackend::new(net, opts)
+                .map_err(|e| Error::msg(format!("slirp NIC: {e}")))?;
+            net.set_backend(backend);
+            let ip = |a: [u8; 4]| format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3]);
+            format!(
+                "slirp (libslirp {version}) gw={}, dhcp {}/{}, dns {}",
+                ip(net::GATEWAY_IP),
+                ip(net::GUEST_IP),
+                net::PREFIX_LEN,
+                ip(crate::net::slirp::NAMESERVER_IP)
+            )
+        }
+        NetBackendKind::Gvisor => {
+            let opts = crate::net::gvisor::GvisorOptions {
+                port_forwards: nic.port_forwards.clone(),
+                dns_servers: crate::net::sys::dns_servers(),
+            };
+            let (backend, version) = crate::net::gvisor::GvisorBackend::new(net, opts)
+                .map_err(|e| Error::msg(format!("gvisor NIC: {e}")))?;
+            net.set_backend(backend);
+            let ip = |a: [u8; 4]| format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3]);
+            format!(
+                "gvisor ({version}) gw={}, dhcp {}/{}",
+                ip(net::GATEWAY_IP),
+                ip(net::GUEST_IP),
                 net::PREFIX_LEN
             )
         }
