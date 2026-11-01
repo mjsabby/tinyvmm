@@ -780,12 +780,21 @@ third for every backend.
   SYN retries (phase A), and is single-threaded with software segmentation,
   which costs 4–5 times the CPU per GiB and caps uploads near 1 Gbps.
 * `gvisor` drops pings to hosts other than the gateway, and spends more CPU
-  per GiB than the NAT but downloads faster on one stream. On this machine,
-  the NAT's fixed 1 MiB receive buffer for host sockets whose peer is local
-  (`LOCAL_PEER_RCVBUF`) is what holds it back: without it, its single-stream
-  download doubles (1.9–2.4 → 4.5–4.7 Gbps over two A/B boots each), the
-  opposite of what that constant's comment measured on the reference
-  machine.
+  per GiB than the NAT but downloads faster on one stream: its host sockets
+  keep Windows' receive-window autotuning.
+* The NAT instead fixes a 1 MiB receive window on host sockets whose peer is
+  on this host (`LOCAL_PEER_RCVBUF`). With autotuning, or any fixed window up
+  to 512 KiB, the host sender stalls in ~15 ms steps: 200–300 stalls of
+  10 ms or more over two boots of this benchmark, against 25–40 at 1 MiB,
+  and four-stream download was 9–13% lower with autotuning. But a window
+  that large also makes Windows run the loopback transfer inside the
+  sender's send calls, which on this machine costs about twice the CPU per
+  byte: one sending thread tops out near 3 Gbps. So with autotuning, the
+  benchmark's single-threaded Python server downloads 4.7 Gbps on one stream,
+  against 3.0 at 1 MiB (a Go server: 3.9 against 3.8), and 4 MiB is no
+  better than 1 MiB. Where loopback is cheaper per byte, 1 MiB is the clear
+  choice: the reference machine measured 25 Gbps at 1 MiB against 5.7 with
+  autotuning.
 
 ### Doorbells — the "notify without a VM exit" path
 
