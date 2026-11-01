@@ -999,7 +999,7 @@ real debugging time in this project.
     the advertised right edge must be rounded *down* (RFC 7323 §2.4). Rounded
     up, it offered up to 2^shift − 1 bytes past the ring's free space, which
     were then dropped: hundreds of guest retransmits per GiB uploaded
-    (mjsabby/tcp-sans-io#17). (§M6)
+    (mjsabby/tcp-sans-io#16). (§M6)
 23. **Switch off the TCB's own give-up timers in a NAT.** tcp-sans-io's 60 s
     FIN_WAIT_2 and 5 min user timeouts would end half-closed or stalled flows
     sooner than the RFC 5382 minimums the NAT's watchdogs keep (4 min half

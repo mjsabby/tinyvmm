@@ -769,12 +769,13 @@ the host server on the host's LAN address, three interleaved boots of three
 The connection rate is the noisiest row: between sessions it moved by up to a
 third for every backend.
 
-* `nat`'s upload retransmits come from `tcp-sans-io` advertising a receive
-  window up to 31 bytes past its free buffer space (window scaling rounds the
-  edge up) and then dropping what the guest sent into it
-  ([mjsabby/tcp-sans-io#17](https://github.com/mjsabby/tcp-sans-io/pull/17)).
-  In an A/B with that fix, they fell from 321 and 373 per boot (three
-  uploads) to 4 and 3.
+* `nat`'s upload retransmits came from `tcp-sans-io` advertising a receive
+  window up to 31 bytes past its free buffer space (window scaling rounded the
+  edge up) and then dropping what the guest sent into it. The table predates
+  the fix, which the pinned `tcp-sans-io` now has
+  ([mjsabby/tcp-sans-io#16](https://github.com/mjsabby/tcp-sans-io/pull/16));
+  in an A/B with an equivalent fix, they fell from 321 and 373 per boot
+  (three uploads) to 4 and 3.
 * `slirp` refuses a connection to a closed port only after Windows' ~2 s of
   SYN retries (phase A), and is single-threaded with software segmentation,
   which costs 4–5 times the CPU per GiB and caps uploads near 1 Gbps.
