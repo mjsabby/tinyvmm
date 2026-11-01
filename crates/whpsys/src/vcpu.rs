@@ -246,6 +246,14 @@ impl Vcpu {
         Ok(v[0])
     }
 
+    /// Read a 64-bit register (the `Reg64` arm of the value union).
+    pub fn get_register_u64(&self, name: WHV_REGISTER_NAME) -> Result<u64> {
+        let v = self.get_register(name)?;
+        // SAFETY: every arm of the union is plain data; a 64-bit register's
+        // value is its low eight bytes.
+        Ok(unsafe { v.Reg64 })
+    }
+
     // ---- Byte-oriented save/restore API (callers stay free of the WHP union
     // and the XSAVE/interrupt-controller FFI). Each register value is the raw
     // 16-byte LE image of the WHP register-value union. ----

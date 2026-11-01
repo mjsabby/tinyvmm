@@ -80,11 +80,12 @@ impl RngDevice {
             if !q.ready() {
                 return;
             }
+            let mut random = [0u8; 4096];
             while q.pop_into(&mut chain) {
                 let mut total = 0u32;
                 // Spec §5.4.6.1: every buffer in the chain is device-writable.
                 // Ignore any read-only buffers a misbehaving driver tacks on.
-                for buf in chain.bufs.iter_mut() {
+                for buf in chain.bufs.iter() {
                     if !buf.write || buf.len == 0 {
                         continue;
                     }
@@ -92,9 +93,15 @@ impl RngDevice {
                         break;
                     }
                     let want = buf.len.min((RNG_MAX_FILL - total) as usize);
-                    if host::random_fill(&mut buf.as_mut_slice()[..want]) {
-                        total += want as u32;
+                    let mut done = 0;
+                    while done < want {
+                        let n = (want - done).min(random.len());
+                        if !host::random_fill(&mut random[..n]) {
+                            break;
+                        }
+                        done += buf.write_at(done, &random[..n]);
                     }
+                    total += done as u32;
                 }
                 q.push(chain.head_index, total);
                 ops += 1;

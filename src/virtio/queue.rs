@@ -58,8 +58,12 @@ impl QueueState {
     }
 }
 
-/// One element of a popped descriptor chain. `ptr`/`len` view a guest buffer
-/// already bounds-checked against the RAM mapping.
+/// One element of a popped descriptor chain: a guest buffer already
+/// bounds-checked against the RAM mapping. Its bytes are never borrowed as a
+/// Rust slice: the guest, or a device working on an overlapping buffer, can
+/// change them at any moment, which a `&[u8]` or `&mut [u8]` promises cannot
+/// happen. They move only through these copies, or as a raw pointer handed
+/// straight to the OS.
 #[derive(Clone, Copy)]
 pub struct ChainBuf {
     pub ptr: *mut u8,
@@ -68,11 +72,54 @@ pub struct ChainBuf {
 }
 
 impl ChainBuf {
-    pub fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    /// Copy the buffer's bytes from `off` into `dst`. Returns how many were
+    /// copied: `dst.len()`, or fewer at the end of the buffer.
+    pub fn read_at(&self, off: usize, dst: &mut [u8]) -> usize {
+        let n = self.len.saturating_sub(off).min(dst.len());
+        if n > 0 {
+            // SAFETY: `[ptr, ptr + len)` is mapped guest RAM (or host memory
+            // that outlives the chain, in tests and for blk's zero source) and
+            // `off + n <= len`; `dst` is host memory, so they don't overlap.
+            unsafe { std::ptr::copy_nonoverlapping(self.ptr.add(off), dst.as_mut_ptr(), n) };
+        }
+        n
     }
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+
+    /// Copy `src` into the buffer at `off`. Returns how many bytes fit.
+    pub fn write_at(&self, off: usize, src: &[u8]) -> usize {
+        let n = self.len.saturating_sub(off).min(src.len());
+        if n > 0 {
+            // SAFETY: as in `read_at`.
+            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.add(off), n) };
+        }
+        n
+    }
+
+    /// Append the buffer's bytes `[off, off + n)`, clipped to its end, to
+    /// `out`. Returns how many were appended.
+    pub fn extend_vec(&self, off: usize, n: usize, out: &mut Vec<u8>) -> usize {
+        let n = self.len.saturating_sub(off).min(n);
+        if n > 0 {
+            out.reserve(n);
+            let at = out.len();
+            // SAFETY: as in `read_at`; `reserve` made room for `n` more bytes,
+            // all initialized by the copy before `set_len`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.ptr.add(off), out.as_mut_ptr().add(at), n);
+                out.set_len(at + n);
+            }
+        }
+        n
+    }
+
+    /// Set the buffer's bytes `[off, off + n)`, clipped to its end, to `byte`.
+    pub fn fill_at(&self, off: usize, n: usize, byte: u8) -> usize {
+        let n = self.len.saturating_sub(off).min(n);
+        if n > 0 {
+            // SAFETY: as in `read_at`.
+            unsafe { std::ptr::write_bytes(self.ptr.add(off), byte, n) };
+        }
+        n
     }
 }
 

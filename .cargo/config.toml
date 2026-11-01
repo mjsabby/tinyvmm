@@ -1,0 +1,8 @@
+# Control Flow Guard: indirect calls in the code rustc compiles here (trait
+# objects, function pointers) are checked against the image's table of valid
+# call targets, and the PE header carries GUARD_CF so Windows enforces it.
+# Defense in depth for a process that parses guest-controlled input. The
+# prebuilt standard library stays uninstrumented (that needs -Zbuild-std).
+# Only the Windows MSVC target: tinyinit's Linux build is unaffected.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-Ccontrol-flow-guard"]

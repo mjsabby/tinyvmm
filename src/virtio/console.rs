@@ -99,18 +99,22 @@ impl ConsoleDevice {
             let mut observer = self.byte_observer.lock().unwrap();
             let mut out = std::io::stdout().lock();
             let mut chain = self.tx_scratch.lock().unwrap();
+            let mut bytes = [0u8; 4096];
             while q.pop_into(&mut chain) {
                 for buf in &chain.bufs {
                     if buf.write || buf.len == 0 {
                         continue;
                     }
-                    let bytes = buf.as_slice();
-                    let _ = out.write_all(bytes);
-                    if let Some(obs) = observer.as_mut() {
-                        obs(bytes);
+                    let mut off = 0;
+                    while off < buf.len {
+                        let n = buf.read_at(off, &mut bytes);
+                        let _ = out.write_all(&bytes[..n]);
+                        if let Some(obs) = observer.as_mut() {
+                            obs(&bytes[..n]);
+                        }
+                        off += n;
                     }
-                    self.tx_bytes
-                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    self.tx_bytes.fetch_add(buf.len as u64, Ordering::Relaxed);
                 }
                 let _ = out.flush();
                 q.push(chain.head_index, 0);
@@ -135,21 +139,16 @@ fn drain_rx(q: &mut Virtqueue, pending: &mut VecDeque<u8>, chain: &mut PoppedCha
             break;
         }
         let mut total = 0u32;
-        for buf in chain.bufs.iter_mut() {
+        for buf in chain.bufs.iter() {
             if !buf.write || buf.len == 0 {
                 continue;
             }
-            let dst = buf.as_mut_slice();
-            let mut i = 0;
-            while i < dst.len() {
-                match pending.pop_front() {
-                    Some(b) => {
-                        dst[i] = b;
-                        i += 1;
-                    }
-                    None => break,
-                }
+            let (a, b) = pending.as_slices();
+            let mut i = buf.write_at(0, a);
+            if i == a.len() {
+                i += buf.write_at(i, b);
             }
+            pending.drain(..i);
             total += i as u32;
             if pending.is_empty() {
                 break;

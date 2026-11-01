@@ -48,7 +48,7 @@ use crate::virtio::rng::RngDevice;
 use crate::virtio::snd::SndDevice;
 use crate::virtio::transport::{self, PciTransport};
 use crate::whp::cpu_affinity::{self, AffinityMode};
-use crate::whp::cpuid::{build_static_cpuid_result_list, cached_tsc_hz, set_hide_tsc_deadline};
+use crate::whp::cpuid::{cached_tsc_hz, set_hide_tsc_deadline};
 use crate::whp::hv::{HvEnlightenment, interrupt_clock_hz};
 use crate::whp::run_loop::{RunLoop, StopReason};
 use crate::whp::{GuestMemory, Partition, Vcpu};
@@ -363,8 +363,6 @@ fn run_blk_selftest() -> Result<i32> {
     let mut part = Partition::new(1)?;
     part.enable_extended_exits(true, true, false)?;
     set_hide_tsc_deadline(true);
-    let list = build_static_cpuid_result_list(true);
-    part.set_cpuid_result_list(&list)?;
     part.set_local_apic_emulation(WHvX64LocalApicEmulationModeX2Apic)?;
     part.setup()?;
     let ram = Arc::new(GuestMemory::new(
@@ -666,8 +664,6 @@ fn run_blk_stresstest() -> Result<i32> {
     let mut part = Partition::new(1)?;
     part.enable_extended_exits(true, true, false)?;
     set_hide_tsc_deadline(true);
-    let list = build_static_cpuid_result_list(true);
-    part.set_cpuid_result_list(&list)?;
     part.set_local_apic_emulation(WHvX64LocalApicEmulationModeX2Apic)?;
     part.setup()?;
     let ram = Arc::new(GuestMemory::new(
@@ -1542,9 +1538,14 @@ fn diag_enabled() -> bool {
 fn dump_guest_ram(ram: &GuestMemory, path: &str) {
     const DUMP_BYTES: usize = 64 * 1024 * 1024;
     let n = DUMP_BYTES.min(ram.size());
-    // SAFETY: host_base()..+size() is the live guest RAM slab; we read n <= size.
-    let slice = unsafe { std::slice::from_raw_parts(ram.host_base(), n) };
-    match std::fs::write(path, slice) {
+    // Copied out, never borrowed: device threads may still be writing RAM.
+    let mut image = vec![0u8; n];
+    let result = if ram.read_image(0, &mut image) {
+        std::fs::write(path, &image)
+    } else {
+        Err(std::io::Error::other("RAM image shorter than the dump"))
+    };
+    match result {
         Ok(()) => eprintln!(
             "[pvh-run] dumped {} MiB of guest RAM to {path}",
             n / (1024 * 1024)
@@ -1667,8 +1668,9 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     let mut part = Partition::new(cfg.vcpus)?;
     part.enable_extended_exits(true, true, false)?;
     set_hide_tsc_deadline(true);
-    let static_cpuid = build_static_cpuid_result_list(true);
-    part.set_cpuid_result_list(&static_cpuid)?;
+    // No static CPUID result list: every CPUID exits (`whp::cpuid`), and a
+    // static entry would replace the guest-state-aware default WHP passes the
+    // exit handler (CPUID.1 OSXSAVE follows CR4) with fixed host bits.
     // WHP's in-hypervisor LAPIC delivers MSIs, IPIs and the LAPIC timer on bare
     // metal and nested alike; only the PIC's ExtINT is injected by us.
     part.set_local_apic_emulation(WHvX64LocalApicEmulationModeX2Apic)?;
@@ -2193,7 +2195,13 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     // --- Run loops (one per vCPU) ---
     let mut loops: Vec<RunLoop> = Vec::with_capacity(cfg.vcpus as usize);
     for vp in &vcpus {
-        let mut rl = RunLoop::new(vp.clone(), io_bus.clone(), mmio_bus.clone(), cfg.vcpus)?;
+        let mut rl = RunLoop::new(
+            vp.clone(),
+            io_bus.clone(),
+            mmio_bus.clone(),
+            ram.clone(),
+            cfg.vcpus,
+        )?;
         rl.set_hv(hv.clone());
         if vp.index() == 0 {
             rl.set_ext_int_source(pic.clone());
@@ -2908,9 +2916,13 @@ fn write_snapshot(
     }
 
     // RAM last (largest section; a writer crash then leaves the metadata intact,
-    // and the CRC trailer catches truncation).
-    let ram_slice = unsafe { std::slice::from_raw_parts(ram.host_base(), ram.size()) };
-    let stored = w.write_ram_sparse(ram_slice)?;
+    // and the CRC trailer catches truncation). Copied out, never borrowed: a
+    // device thread (console input, a late doorbell) may still write guest RAM.
+    let stored = w.write_ram_sparse(ram.size(), |off, dst| {
+        if !ram.read_image(off, dst) {
+            dst.fill(0);
+        }
+    })?;
 
     let n = w.finalize()?;
     println!(
@@ -3094,8 +3106,6 @@ fn run_restore(args: &[String]) -> Result<i32> {
     let mut part = Partition::new(vcpu_count)?;
     part.enable_extended_exits(true, true, false)?;
     set_hide_tsc_deadline(true);
-    let static_cpuid = build_static_cpuid_result_list(true);
-    part.set_cpuid_result_list(&static_cpuid)?;
     part.set_local_apic_emulation(WHvX64LocalApicEmulationModeX2Apic)?;
     part.setup()?;
     let part_handle = part.handle();
@@ -3684,7 +3694,13 @@ fn run_restore(args: &[String]) -> Result<i32> {
     // --- Run loops ---
     let mut loops: Vec<RunLoop> = Vec::with_capacity(vcpu_count as usize);
     for vp in &vcpus {
-        let mut rl = RunLoop::new(vp.clone(), io_bus.clone(), mmio_bus.clone(), vcpu_count)?;
+        let mut rl = RunLoop::new(
+            vp.clone(),
+            io_bus.clone(),
+            mmio_bus.clone(),
+            ram.clone(),
+            vcpu_count,
+        )?;
         rl.set_hv(hv.clone());
         if vp.index() == 0 {
             rl.set_ext_int_source(pic.clone());

@@ -155,7 +155,6 @@ WHvCreatePartition(&handle)
 WHvSetPartitionProperty(ProcessorCount, n)
 // optional knobs, all BEFORE setup:
 WHvSetPartitionProperty(ExtendedVmExits, bits)        // bit0=cpuid bit1=msr bit2=exception
-WHvSetPartitionProperty(CpuidResultList, &entries)    // static CPUID overrides
 WHvSetPartitionProperty(LocalApicEmulationMode, mode) // X2Apic: WHP emulates the LAPIC
 WHvSetupPartition(handle)                             // finalizes; properties locked after
 ```
@@ -331,7 +330,12 @@ device buses; the register ones just forward to
 `WHvGet/SetVirtualProcessorRegisters`; `translate_gva` forwards to
 `WHvTranslateGva` (needed for string I/O like `rep insb` and RMW MMIO — **don't**
 stub it to `E_NOTIMPL`, that turns a benign instruction into a VMM-killing
-emulation failure, `emulator.rs:234`).
+emulation failure, `emulator.rs:234`). The `memory` callback sees **every**
+memory operand of the emulated instruction, not just device registers: the
+buffer of a `rep insb`/`rep outsb`, or the RAM side of a `movs` to or from a
+BAR, is ordinary guest RAM. Route those GPAs to guest memory and only the rest
+to the MMIO bus (`run_loop.rs` `RunBus::mmio`); sending them all to the bus
+silently drops `rep insb` stores and feeds zeros to `rep outsb`.
 
 **The device buses.** Two trivial range-dispatch tables
 (`src/devices/io_bus.rs`, `src/devices/mmio_bus.rs`): register `[base, base+size)
@@ -345,8 +349,9 @@ overlap** (a guest can reprogram a BAR over another's range), so it returns
 
 **CPUID exits** (`run_loop.rs:276`): advance RIP past the instruction, then write
 `RAX/RBX/RCX/RDX`. tinyvmm intercepts one magic leaf for snapshots (M7) and
-otherwise applies a policy layer (M3). WHP hands you its host-passthrough default
-in the exit; you override selectively.
+otherwise applies a policy layer (M3). WHP hands you its default result in the
+exit — host values filtered for the partition and adjusted to the guest's state
+(CPUID.1 OSXSAVE follows the guest's CR4) — and you override selectively.
 
 **MSR exits** (`run_loop.rs:380`): WHP's LAPIC owns the x2APIC MSRs, so only the
 Hyper-V enlightenment's MSRs (M3) and genuinely unknown ones reach you. A handled
@@ -373,8 +378,8 @@ legacy PIC, has to go in through the right door or it silently blocks every
 MSI. Getting Linux past `calibrate_delay()` with correct timers, and keeping
 interrupts flowing once the UART speaks, are the two hard problems here.
 
-**1. CPUID policy** (`src/whp/cpuid.rs:111`). Layer these overrides on WHP's
-host-passthrough defaults:
+**1. CPUID policy** (`src/whp/cpuid.rs:111`). Layer these overrides on the
+default result WHP passes with each exit:
 
 - **Force x2APIC on** (leaf 1, ECX[21]) even if the host masks it — WHP's LAPIC
   runs in x2APIC mode and the MADT lists x2APIC entries (`cpuid.rs:146`) — and
@@ -394,11 +399,14 @@ host-passthrough defaults:
   has to be right.
 - **Hide MONITOR/MWAIT** (leaf 1 ECX[3], with leaf 5 returned empty) and AMD's
   MONITORX/MWAITX (leaf `0x80000001` ECX[29]). They #UD in a WHP guest, yet a
-  bare-metal root partition sees MONITOR, and the static leaf 1 is copied from
-  the host: left visible, Linux idles in MWAIT and panics on its first idle.
+  bare-metal root partition sees MONITOR: left visible, Linux idles in MWAIT and
+  panics on its first idle.
 
-These also go in the *static* `CpuidResultList` set on the partition
-(`cpuid.rs:262`) so leaves that don't take an extended exit still get the override.
+There is deliberately **no static `CpuidResultList`**. With CPUID exits on,
+every leaf exits anyway (a CPUID loop counts one exit per instruction), and a
+static entry only replaces the default WHP reports with the exit by fixed host
+values: CPUID.1 then claimed OSXSAVE with the guest's CR4.OSXSAVE clear, and
+leaked host-only features such as PDCM and EIST.
 
 **Why the Hyper-V leaves?** Linux's `ms_hyperv_init_platform`, on seeing the
 frequency-MSR feature bits, sets `x86_platform.calibrate_tsc = hv_get_tsc_khz`,
@@ -417,6 +425,10 @@ writes once it detects Hyper-V:
 - `REFERENCE_TSC` (`0x40000021`): write a page holding the **TSC scale**
   `(10^7 << 64) / tsc_hz`, so the guest reads a 100 ns reference clock straight
   from the TSC with no exit (`hv.rs:126`).
+- `TIME_REF_COUNT` (`0x40000020`): the same clock through an exit — the calling
+  vCPU's TSC times the same scale, so it agrees with the page to the tick and,
+  as the TLFS requires, starts near zero with the partition. (It once scaled the
+  *host's* TSC, an epoch about the host's uptime away from the page's.)
 - `TSC_FREQUENCY`: the measured TSC Hz (`hv.rs:224`).
 - `APIC_FREQUENCY`: **WHP's interrupt clock** — the rate its LAPIC timer
   actually counts at, read once with
@@ -601,9 +613,12 @@ and asserts `pop()` never panics, never loops, never returns a buffer outside RA
 (`queue.rs:494`). **Write this test early.**
 
 **5. Reads/writes are zero-copy.** `host_range` returns a validated pointer the
-device operates on *in place*: virtio-blk hands `req.buf = seg_ptr` straight to
-`ReadFile`/`WriteFile` (disk DMA into guest RAM), rng fills the guest buffer
-directly. The only fixed copy the safety layer imposes is the 16-byte descriptor
+OS operates on *in place*: virtio-blk hands `req.buf = seg_ptr` straight to
+`ReadFile`/`WriteFile` (disk DMA into guest RAM), and 9p does the same for file
+data. Never turn that pointer into a `&[u8]`/`&mut [u8]`: the guest can change
+the memory at any moment, which a Rust reference promises cannot happen, so
+devices copy (`ChainBuf::read_at` / `write_at`) or hand the raw pointer to the
+OS. The only fixed copy the safety layer imposes is the 16-byte descriptor
 to a stack buffer (alignment safety, since the guest controls the table address).
 
 **6. MSI-X** (`src/pci/msix.rs`). The capability + a table of
@@ -864,7 +879,7 @@ equivalents are:
 | WHP instruction emulator (IO/MMIO) | KVM decodes for you; `KVM_EXIT_MMIO/IO` give the operand | you decode the instruction yourself |
 | `WHvRequestInterrupt` (MSI) / `WHvRegisterPendingEvent` (PIC ExtINT) | `KVM_SIGNAL_MSI` / `KVM_IRQ_LINE` with the in-kernel irqchip (or `KVM_INTERRUPT` without one) | your own LAPIC, injecting through the VMCS VM-entry interruption-information field; `hv_vcpu_interrupt` only forces an exit |
 | `WHvRegisterPartitionDoorbellEvent` | `KVM_IOEVENTFD` (the eventfd doorbell) | no equivalent — poll/own thread |
-| `CpuidResultList` | `KVM_SET_CPUID2` | trap `CPUID` exits |
+| CPUID exits over WHP's default result | `KVM_SET_CPUID2` | trap `CPUID` exits |
 | `LocalApicEmulationMode = X2Apic` (WHP's LAPIC) | in-kernel irqchip (`KVM_CREATE_IRQCHIP`, or a split irqchip) | **none** — HVF has no in-kernel APIC; emulate one yourself |
 
 The biggest single difference: **KVM decodes the faulting MMIO/IO instruction for

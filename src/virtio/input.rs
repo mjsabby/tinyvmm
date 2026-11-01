@@ -512,10 +512,11 @@ impl InputDevice {
                     if buf.write || buf.len == 0 {
                         continue;
                     }
-                    let data = buf.as_slice();
+                    let mut ev = [0u8; 8];
                     let mut off = 0;
-                    while off + 8 <= data.len() {
-                        self.handle_status_event(InputEvent::decode(&data[off..off + 8]));
+                    while off + 8 <= buf.len {
+                        buf.read_at(off, &mut ev);
+                        self.handle_status_event(InputEvent::decode(&ev));
                         off += 8;
                     }
                 }
@@ -552,14 +553,11 @@ fn push_event(q: &mut Virtqueue, scratch: &mut PoppedChain, ev: &InputEvent) -> 
     }
     let bytes = ev.encode();
     let mut wrote = 0u32;
-    for buf in scratch.bufs.iter_mut() {
+    for buf in scratch.bufs.iter() {
         if !buf.write || buf.len == 0 {
             continue;
         }
-        let dst = buf.as_mut_slice();
-        let n = dst.len().min(bytes.len());
-        dst[..n].copy_from_slice(&bytes[..n]);
-        wrote = n as u32;
+        wrote = buf.write_at(0, &bytes) as u32;
         break;
     }
     q.push(scratch.head_index, wrote);

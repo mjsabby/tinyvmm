@@ -1,12 +1,16 @@
 //! CPUID exit policy. Layers tinyvmm overrides (invariant TSC, ARAT, TSC
 //! frequency via leaf 0x15/0x16, per-vCPU x2APIC topology, the Hyper-V
-//! vendor/feature leaves, and hiding MONITOR/MWAIT) on top of WHP's
-//! host-passthrough defaults. Port of src/whp/cpuid.cpp.
+//! vendor/feature leaves, and hiding MONITOR/MWAIT) on top of the default
+//! result WHP reports with each CPUID exit. Port of src/whp/cpuid.cpp.
+//!
+//! Every CPUID exits (`X64CpuidExit` without a CPUID exit list), so the
+//! partition sets no static CPUID result list: an entry there would replace
+//! that default, which tracks guest state (CPUID.1 OSXSAVE follows CR4) and
+//! hides host-only features, with fixed host values.
 
-use core::arch::x86_64::{__cpuid, __cpuid_count, _rdtsc};
+use core::arch::x86_64::{__cpuid, _rdtsc};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use windows_sys::Win32::System::Hypervisor::WHV_X64_CPUID_RESULT;
 
 #[derive(Clone, Copy, Default)]
 pub struct CpuidResult {
@@ -22,7 +26,7 @@ pub struct CpuidContext {
 }
 
 // MONITOR/MWAIT #UD in a WHP guest, yet a bare-metal root partition sees
-// MONITOR and leaf 1 is copied from the host: left visible, Linux idles in
+// MONITOR: left visible, Linux idles in
 // mwait_idle and panics on its first idle; hidden, it falls back to HLT. AMD's
 // MONITORX/MWAITX (leaf 0x80000001), which Linux uses for udelay, is hidden too.
 const ECX_MONITOR: u32 = 1 << 3;
@@ -237,122 +241,6 @@ pub fn resolve_cpuid(
     r
 }
 
-fn host_cpuid(leaf: u32, subleaf: u32) -> CpuidResult {
-    let r = __cpuid_count(leaf, subleaf);
-    CpuidResult {
-        eax: r.eax,
-        ebx: r.ebx,
-        ecx: r.ecx,
-        edx: r.edx,
-    }
-}
-
-fn entry(leaf: u32, r: &CpuidResult) -> WHV_X64_CPUID_RESULT {
-    WHV_X64_CPUID_RESULT {
-        Function: leaf,
-        Reserved: [0; 3],
-        Eax: r.eax,
-        Ebx: r.ebx,
-        Ecx: r.ecx,
-        Edx: r.edx,
-    }
-}
-
-/// Static CPUID result list mirroring `BuildStaticCpuidResultList`.
-pub fn build_static_cpuid_result_list(hide_tsc_deadline: bool) -> Vec<WHV_X64_CPUID_RESULT> {
-    let mut list = Vec::with_capacity(16);
-
-    {
-        let mut r0 = host_cpuid(0x0000_0000, 0);
-        if r0.eax < 0x1F {
-            r0.eax = 0x1F;
-        }
-        list.push(entry(0x0000_0000, &r0));
-    }
-    {
-        let mut r1 = host_cpuid(0x0000_0001, 0);
-        if !hide_tsc_deadline {
-            r1.ecx |= ECX_TSC_DEADLINE;
-        } else {
-            r1.ecx &= !ECX_TSC_DEADLINE;
-        }
-        r1.ecx |= ECX_HYPERVISOR | ECX_X2APIC;
-        r1.ecx &= !ECX_MONITOR;
-        r1.ebx = (r1.ebx & 0x0000_FFFF) | (1 << 16);
-        list.push(entry(0x0000_0001, &r1));
-    }
-    list.push(entry(0x0000_0005, &CpuidResult::default()));
-    {
-        let mut r6 = host_cpuid(0x0000_0006, 0);
-        r6.eax |= EAX_ARAT;
-        list.push(entry(0x0000_0006, &r6));
-    }
-    {
-        let tsc_hz = cached_tsc_hz();
-        let r = CpuidResult {
-            eax: 1,
-            ebx: 1,
-            ecx: if tsc_hz <= 0xFFFF_FFFF {
-                tsc_hz as u32
-            } else {
-                0xFFFF_FFFF
-            },
-            edx: 0,
-        };
-        list.push(entry(0x0000_0015, &r));
-    }
-    {
-        let tsc_hz = cached_tsc_hz();
-        let base_mhz = (tsc_hz / 1_000_000) as u32;
-        let r = CpuidResult {
-            eax: base_mhz,
-            ebx: base_mhz,
-            ecx: 100,
-            edx: 0,
-        };
-        list.push(entry(0x0000_0016, &r));
-    }
-    {
-        let mut r = host_cpuid(0x8000_0007, 0);
-        r.edx |= EDX_INVARIANT_TSC;
-        list.push(entry(0x8000_0007, &r));
-    }
-    {
-        let (ebx, ecx, edx) = hv_vendor();
-        let r = CpuidResult {
-            eax: HV_MAX_LEAF,
-            ebx,
-            ecx,
-            edx,
-        };
-        list.push(entry(0x4000_0000, &r));
-    }
-    {
-        let r = CpuidResult {
-            eax: hv_interface_eax(),
-            ebx: 0,
-            ecx: 0,
-            edx: 0,
-        };
-        list.push(entry(0x4000_0001, &r));
-    }
-    list.push(entry(0x4000_0002, &CpuidResult::default()));
-    {
-        let r = CpuidResult {
-            eax: HV_FEATURES_ADVERTISED,
-            ebx: 0,
-            ecx: 0,
-            edx: HV_MISC_FEATURES_ADVERTISED,
-        };
-        list.push(entry(0x4000_0003, &r));
-    }
-    for leaf in 0x4000_0004..=0x4000_0006u32 {
-        list.push(entry(leaf, &CpuidResult::default()));
-    }
-
-    list
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,15 +264,5 @@ mod tests {
         let r = resolve_cpuid(0x8000_0001, 0, 0, 0, u32::MAX, u32::MAX, &ctx);
         assert_eq!(r.ecx, !ECX_EXT_MWAITX, "only MWAITX is hidden");
         assert_eq!(r.edx, u32::MAX);
-
-        let list = build_static_cpuid_result_list(true);
-        let leaf = |f: u32| list.iter().find(|e| e.Function == f).unwrap();
-        assert_eq!(
-            leaf(1).Ecx & ECX_MONITOR,
-            0,
-            "static leaf 1 must hide MONITOR"
-        );
-        let l5 = leaf(5);
-        assert_eq!((l5.Eax, l5.Ebx, l5.Ecx, l5.Edx), (0, 0, 0, 0));
     }
 }
