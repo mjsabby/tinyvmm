@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Compare user-mode NAT networking: tinyvmm (`--net-backend nat`) vs OpenVMM
+"""Compare user-mode NAT networking: tinyvmm's backends (`--net-backend nat`,
+and `smoltcp`, `slirp`, `gvisor` as `--vmm tinyvmm-<backend>`) vs OpenVMM
 (`--virtio-net consomme`).
 
 Both VMMs boot the SAME vmlinux + initramfs with a virtio-net NIC whose
@@ -25,7 +26,8 @@ guest reports its virtio-net interrupts over the dl, ul and par phases (from
 
 Usage:
   python tools\\net_compare.py
-    [--vmm tinyvmm,openvmm-vpci,openvmm-pcie]  VMM configs (default all)
+    [--vmm tinyvmm,openvmm-vpci,openvmm-pcie]  VMM configs (default all); also
+                                 tinyvmm-smoltcp, tinyvmm-slirp, tinyvmm-gvisor
     [--iterations 1]             full boots per VMM (results aggregated)
     [--tinyvmm <exe>] [--openvmm <exe>] [--tinyvmm-arg=<arg>]...
     [--vmlinux <path>] [--initrd <path>] [--no-build]
@@ -297,9 +299,11 @@ def guest_cmdline(a: argparse.Namespace, host: str, port: int, console: str) -> 
 
 
 def vmm_argv(name: str, a: argparse.Namespace, host: str, port: int) -> list[str]:
-    if name == "tinyvmm":
+    if name == "tinyvmm" or name.startswith("tinyvmm-"):
+        # `tinyvmm-<backend>` picks the --net-backend (nat by default).
+        backend = name.partition("-")[2] or "nat"
         return [str(a.tinyvmm), "--pvh-run", "--ram-mb", str(a.ram_mb),
-                "--vcpus", str(a.vcpus), "--net", "--net-backend", "nat",
+                "--vcpus", str(a.vcpus), "--net", "--net-backend", backend,
                 *a.tinyvmm_arg,
                 "--initrd", str(a.initrd), "--watchdog-secs", str(a.timeout_sec),
                 str(a.vmlinux), "--", guest_cmdline(a, host, port, "hvc0")]

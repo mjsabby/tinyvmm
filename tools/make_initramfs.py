@@ -416,22 +416,51 @@ fi
 
 # --- optional NAT connection-semantics test -----------------------------
 # Enabled via kernel cmdline marker `tinyvmm.test=nat`, driven by
-# tools/nat_test.py, whose host server is on 127.0.0.1:NATTEST_PORT (the
-# gateway, here). NATTEST_CLOSED_PORT has nothing listening.
-#   A   connect to a closed port      refused, as on a real network
+# tools/nat_test.py, whose host servers are on 127.0.0.1 (the gateway, here):
+# TCP on NATTEST_PORT, UDP echo on NATTEST_UDP_PORT. NATTEST_CLOSED_PORT has
+# nothing listening.
+#   A   connect to a closed port      refused, as on a real network, and at
+#                                     once (under a second)
 #   B   server resets mid-response    an error, not a complete download
 #   C   300 connections, host closes  all succeed (each leaves the NAT's TCB
 #       first                         in TIME_WAIT)
+#   D   300 UDP exchanges, each from  all answered (as DNS resolvers send
+#       a fresh source port           their queries; more than the NAT's
+#                                     UDP flow table holds)
+#   E   downloads of awkward sizes    intact (SHA-256)
+#   F   uploads of awkward sizes      intact (SHA-256, computed by the host)
+#   G   8 parallel downloads          intact
+#   H   the host downloads from the   intact (the NAT's port forward,
+#       guest's httpd                 NATTEST_FWD_PORT -> guest port 8080)
+#   I   UDP datagrams and pings       echoed intact (as IPv4 fragments both
+#       bigger than the MTU           ways)
+#   J   a datagram for a multicast    stays on the guest's link: the host, a
+#       group (NATTEST_MCAST)         member, reports none came
+#   K   the guest resets a            the host sees a reset, not a clean end
+#       connection the host has
+#       finished sending on (B the
+#       other way)
+#   L   5 connections in a row from   all answered (the stack may hold the
+#       one source port, each closed  4-tuple in TIME_WAIT; the guest holds
+#       by the host first             nothing and reuses it)
 if grep -qE 'tinyvmm.test=nat( |$)' /proc/cmdline 2>/dev/null; then
     arg() { tr ' ' '\\n' < /proc/cmdline | grep "^$1=" | cut -d= -f2; }
+    ms() { awk '{print int($1 * 1000)}' /proc/uptime; }
     base="http://${gw}:$(arg NATTEST_PORT)"
     pass=0
     total=0
 
     total=$((total + 1))
+    t0=$(ms)
     out=$(wget -q -O /dev/null -T 10 -t 1 "http://${gw}:$(arg NATTEST_CLOSED_PORT)/" 2>&1)
+    t=$(( $(ms) - t0 ))
     case "${out}" in
-        *"Connection refused"*) log "NATTEST A: closed port refused OK"; pass=$((pass + 1)) ;;
+        *"Connection refused"*)
+            if [ "${t}" -lt 1000 ]; then
+                log "NATTEST A: closed port refused OK (${t} ms)"; pass=$((pass + 1))
+            else
+                log "NATTEST A: closed port refused, but slowly FAIL (${t} ms)"
+            fi ;;
         *) log "NATTEST A: closed port FAIL (${out})" ;;
     esac
 
@@ -453,6 +482,195 @@ if grep -qE 'tinyvmm.test=nat( |$)' /proc/cmdline 2>/dev/null; then
         pass=$((pass + 1))
     else
         log "NATTEST C: host-closed connections FAIL (${ok}/300)"
+    fi
+
+    total=$((total + 1))
+    rm -f /tmp/udp_ok.*
+    uport=$(arg NATTEST_UDP_PORT)
+    for j in $(seq 1 30); do
+        (
+            n=0
+            for i in $(seq 1 10); do
+                [ "$(echo "q${j}.${i}" | nc -u -w 1 "${gw}" "${uport}" 2>/dev/null)" = "q${j}.${i}" ] \\
+                    && n=$((n + 1))
+            done
+            echo "${n}" > /tmp/udp_ok.${j}
+        ) &
+    done
+    wait
+    ok=$(cat /tmp/udp_ok.* | awk '{s += $1} END {print s + 0}')
+    if [ "${ok}" = "300" ]; then
+        log "NATTEST D: 300/300 UDP exchanges from fresh ports OK"
+        pass=$((pass + 1))
+    else
+        log "NATTEST D: UDP exchanges from fresh ports FAIL (${ok}/300)"
+    fi
+
+    # E-H move pseudo-random or patterned bytes and compare SHA-256s: sizes
+    # around segment, GSO-frame, ring and window boundaries, so a lost,
+    # duplicated or misplaced byte anywhere in the NAT shows.
+    total=$((total + 1))
+    bad=""
+    for sz in 1 1447 1448 1460 65535 65536 65537 1048575 1048576 1048577 4194311 67108871; do
+        want=$(wget -q -O - -T 10 -t 1 "${base}/sum/${sz}/${sz}" 2>/tmp/blob.err)
+        wget -q -O /tmp/blob -T 60 -t 1 "${base}/blob/${sz}/${sz}" 2>>/tmp/blob.err
+        got=$(sha256sum /tmp/blob | cut -d' ' -f1)
+        if [ "${got}" != "${want}" ]; then
+            bad="${bad} ${sz}"
+            log "NATTEST E: ${sz}: got $(wc -c < /tmp/blob) bytes, want sum '${want}': $(cat /tmp/blob.err)"
+        fi
+        rm -f /tmp/blob /tmp/blob.err
+    done
+    if [ -z "${bad}" ]; then
+        log "NATTEST E: downloads intact OK"
+        pass=$((pass + 1))
+    else
+        log "NATTEST E: downloads corrupted FAIL (sizes${bad})"
+    fi
+
+    # busybox wget sizes --post-file with strlen(): the payload has no NULs.
+    total=$((total + 1))
+    bad=""
+    for sz in 1 1448 65537 1048579 16777259 33554467; do
+        yes 'tinyvmm NAT upload check, 0123456789abcdefghijklmnopqrstuvwxyz' | head -c "${sz}" > /tmp/up
+        want=$(sha256sum /tmp/up | cut -d' ' -f1)
+        got=$(wget -q -O - -T 60 -t 1 --post-file=/tmp/up "${base}/up" 2>/dev/null)
+        [ "${got}" = "${want}" ] || bad="${bad} ${sz}"
+        rm -f /tmp/up
+    done
+    if [ -z "${bad}" ]; then
+        log "NATTEST F: uploads intact OK"
+        pass=$((pass + 1))
+    else
+        log "NATTEST F: uploads corrupted FAIL (sizes${bad})"
+    fi
+
+    total=$((total + 1))
+    rm -f /tmp/par.*
+    for j in 1 2 3 4 5 6 7 8; do
+        (
+            sz=$((8388608 + j * 4099))
+            want=$(wget -q -O - -T 10 -t 1 "${base}/sum/${sz}/$((j + 100))" 2>/tmp/par.err.${j})
+            wget -q -O /tmp/par.blob.${j} -T 60 -t 1 "${base}/blob/${sz}/$((j + 100))" 2>>/tmp/par.err.${j}
+            if [ "$(sha256sum /tmp/par.blob.${j} | cut -d' ' -f1)" = "${want}" ]; then
+                echo ok > /tmp/par.ok.${j}
+            else
+                log "NATTEST G: ${sz}: got $(wc -c < /tmp/par.blob.${j}) bytes, want sum '${want}': $(cat /tmp/par.err.${j})"
+            fi
+            rm -f /tmp/par.blob.${j} /tmp/par.err.${j}
+        ) &
+    done
+    wait
+    ok=$(ls /tmp/par.ok.* 2>/dev/null | wc -l)
+    if [ "${ok}" = "8" ]; then
+        log "NATTEST G: 8 parallel downloads intact OK"
+        pass=$((pass + 1))
+    else
+        log "NATTEST G: parallel downloads FAIL (${ok}/8 intact)"
+    fi
+
+    # H: the host fetches a file from the guest's httpd through the NAT's
+    # port forward (NATTEST_FWD_PORT on the host -> 8080 here) and reports
+    # its SHA-256.
+    total=$((total + 1))
+    mkdir -p /tmp/www
+    head -c 25165843 /dev/urandom > /tmp/www/f
+    want=$(sha256sum /tmp/www/f | cut -d' ' -f1)
+    httpd -f -p 8080 -h /tmp/www &
+    hpid=$!
+    sleep 1
+    got=$(wget -q -O - -T 60 -t 1 "${base}/pf/$(arg NATTEST_FWD_PORT)/f" 2>/dev/null)
+    kill "${hpid}" 2>/dev/null
+    rm -rf /tmp/www
+    if [ "${got}" = "${want}" ]; then
+        log "NATTEST H: port-forwarded download intact OK"
+        pass=$((pass + 1))
+    else
+        log "NATTEST H: port-forwarded download FAIL (got '${got}')"
+    fi
+
+    # I: datagrams bigger than the MTU leave the guest in IPv4 fragments,
+    # which the NAT reassembles, and their echoes reach it in fragments the
+    # NAT makes. (busybox nc sends a file of up to 8 KiB as one datagram and
+    # reads one that big.) Big pings to the gateway take both paths too.
+    total=$((total + 1))
+    bad=""
+    for n in 1473 4000 8192; do
+        head -c "${n}" /dev/urandom > /tmp/dg
+        want=$(sha256sum < /tmp/dg | cut -d' ' -f1)
+        got=$(nc -u -w 1 "${gw}" "${uport}" < /tmp/dg 2>/dev/null | sha256sum | cut -d' ' -f1)
+        [ "${got}" = "${want}" ] || bad="${bad} udp${n}"
+    done
+    rm -f /tmp/dg
+    ping -c 2 -W 2 -s 4000 "${gw}" > /dev/null 2>&1 || bad="${bad} ping4000"
+    if [ -z "${bad}" ]; then
+        log "NATTEST I: datagrams beyond the MTU echoed intact OK"
+        pass=$((pass + 1))
+    else
+        log "NATTEST I: datagrams beyond the MTU FAIL (${bad# })"
+    fi
+
+    # J: a router forwards no multicast, so neither may the NAT (a guest's
+    # mDNS or SSDP would reach the host's LAN). The host is a member of the
+    # group and counts what it gets.
+    total=$((total + 1))
+    mc=$(arg NATTEST_MCAST)
+    echo leak | nc -u -w 1 "${mc%:*}" "${mc#*:}" 2>/dev/null
+    got=$(wget -q -O - -T 10 -t 1 "${base}/mcast" 2>/dev/null)
+    if [ "${got}" = "0" ]; then
+        log "NATTEST J: multicast stayed on the guest's link OK"
+        pass=$((pass + 1))
+    else
+        log "NATTEST J: multicast reached the host FAIL (${got:-no count})"
+    fi
+
+    # K: B the other way. The host sends a response and half-closes; wget
+    # takes the headers, then blocks opening its output, a FIFO nobody
+    # reads, so the body sits unread when it's killed, and the guest kernel
+    # resets the connection (RFC 2525 2.17). The host, still reading, must
+    # see that reset, not a clean end.
+    total=$((total + 1))
+    rm -f /tmp/ff
+    mkfifo /tmp/ff
+    wget -q -O /tmp/ff -T 30 -t 1 "${base}/hold" 2>/dev/null &
+    wpid=$!
+    sleep 1
+    kill -9 "${wpid}" 2>/dev/null
+    wait "${wpid}" 2>/dev/null
+    rm -f /tmp/ff
+    got=$(wget -q -O - -T 10 -t 1 "${base}/hold-end" 2>/dev/null)
+    if [ "${got}" = "reset" ]; then
+        log "NATTEST K: guest reset reached the host OK"
+        pass=$((pass + 1))
+    else
+        log "NATTEST K: guest reset FAIL (the host saw: ${got:-nothing})"
+    fi
+
+    # L: when the host closes first, the user-mode stack closes first toward
+    # the guest and may hold the 4-tuple in TIME_WAIT, while the guest, the
+    # passive closer, holds nothing and may reuse its port at once (Linux's
+    # port choice jumps back over recently used ports). Connections from one
+    # fixed source port, one after another, must all be answered.
+    total=$((total + 1))
+    ok=0
+    for i in 1 2 3 4 5; do
+        # The guest's own last connection on the port (0x9CBB) must be gone:
+        # its LAST_ACK lasts a round trip, during which connect() is refused.
+        k=0
+        while grep -qi ':9CBB ' /proc/net/tcp && [ "${k}" -lt 40 ]; do
+            usleep 50000
+            k=$((k + 1))
+        done
+        # stdin stays open, so nc doesn't half-close first: the host does.
+        (printf 'GET /ok HTTP/1.0\\r\\n\\r\\n'; sleep 1) \\
+            | nc -w 3 -p 40123 "${gw}" "$(arg NATTEST_PORT)" 2>/dev/null | grep -qx ok \\
+            && ok=$((ok + 1))
+    done
+    if [ "${ok}" = "5" ]; then
+        log "NATTEST L: 5/5 connections from one source port OK"
+        pass=$((pass + 1))
+    else
+        log "NATTEST L: connections from one source port FAIL (${ok}/5)"
     fi
 
     log "NATTEST SUMMARY: ${pass}/${total} phases passed"
@@ -1942,7 +2160,7 @@ BUSYBOX_APPLETS = [
     # virtio-blk test surface
     "dd", "md5sum", "sha256sum", "cmp", "sync", "fsync", "mkfs.ext2",
     "mke2fs", "mountpoint", "stat", "truncate", "blkid", "blockdev",
-    "nproc", "seq", "time", "printf",
+    "nproc", "seq", "time", "printf", "mkfifo",
 ]
 
 

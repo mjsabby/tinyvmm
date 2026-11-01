@@ -20,10 +20,12 @@ pub mod cpu_affinity;
 pub mod error;
 pub mod etw;
 pub mod fs;
+pub mod gvisor;
 pub mod host;
 pub mod media;
 pub mod ptr;
 pub mod qpc;
+pub mod slirp;
 pub mod sock;
 pub mod wintun;
 

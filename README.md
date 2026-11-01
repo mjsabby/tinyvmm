@@ -26,10 +26,14 @@ microVM needs *that* and nothing more — that is what "opinionated" means here.
   `bzImage`/`vmlinuz` (Linux boot protocol), plus an initramfs; or a
   distribution's live/install ISO, booted straight from its GRUB entry with
   `--iso`.
-* **External dependencies:** `windows-sys` (which only pulls `windows-link`) and
+* **External dependencies:** `windows-sys` (which only pulls `windows-link`),
   `tcp-sans-io` (a git dependency, `github.com/mjsabby/tcp-sans-io`) that supplies
-  the NAT's TCP state machine. No tokio, no async runtime, no other third-party
-  crates.
+  the NAT's TCP state machine, and `smoltcp` (with seven small crates of its
+  own), the NAT's alternative TCP engine (`--net-backend smoltcp`). No tokio, no
+  async runtime, no other third-party crates. Two more network backends load
+  third-party stacks at run time from DLLs built outside Cargo: libslirp
+  (`--net-backend slirp`) and gVisor's netstack (`--net-backend gvisor`); see
+  [§3](#virtio-net-backends---net-backend).
 
 The repo is a Cargo workspace: **~21,400 lines of Rust across 64 files** (the
 binary in `src/`, plus two FFI crates under `crates/`). This document is written
@@ -68,9 +72,10 @@ cargo build --release
 ```
 
 The WHP import libraries (`WinHvPlatform.dll` / `WinHvEmulation.dll`) link
-automatically through `windows-sys`. A release build compiles three external
-crates (`windows-link`, `windows-sys`, `tcp-sans-io`) plus the two in-tree FFI
-crates in **~30 s** on the reference machine. The release profile is tuned for a
+automatically through `windows-sys`. A release build compiles the external
+crates (`windows-link`, `windows-sys`, `tcp-sans-io`, and `smoltcp` with its
+seven dependencies) plus the two in-tree FFI crates in **~30 s** on the
+reference machine (smoltcp adds about 5%). The release profile is tuned for a
 shippable single binary (`Cargo.toml`):
 
 ```toml
@@ -216,8 +221,8 @@ repo root) and need WHP — bare metal or nested Hyper-V:
 | `python tools\smp_test.py` | AP bring-up, scheduling on every vCPU, IPIs, blk under SMP |
 | `python tools\irq_test.py` | interrupt delivery at 1 and 2 vCPUs: COM1 IRQs reach the guest as ExtINT (also waking an idle BSP), MSIs keep flowing afterwards, the LAPIC timer is calibrated to WHP's interrupt clock, and `sleep 2` takes 2 s of host time |
 | `python tools\irq_bench.py --tinyvmm base=<exe> --tinyvmm new=<exe>` | A/B interrupt-path latency: timer wake-up, virtio-blk QD1 round trip, cross-CPU wake-up, idle host CPU, VM exits |
-| `python tools\net_compare.py` | NAT networking vs OpenVMM |
-| `python tools\nat_test.py` | NAT connection semantics: refused connects, host resets, host-closed churn |
+| `python tools\net_compare.py` | NAT networking vs OpenVMM, and tinyvmm's user-mode backends against each other (`--vmm tinyvmm,tinyvmm-smoltcp,tinyvmm-slirp,tinyvmm-gvisor`) |
+| `python tools\nat_test.py [--backend nat\|smoltcp\|slirp\|gvisor]` | how a user-mode backend ends connections and relays datagrams (phases A–L, [§3](#virtio-net-backends---net-backend)) |
 | `python tools\save_restore_test.py [--vcpus 2 --trigger-cpu 1]` | `--save`, then three `--restore`s of the snapshot, which they leave unchanged; `--trigger-cpu` fires the trigger from that vCPU (an AP when above 0) |
 
 ### Large pages
@@ -296,9 +301,9 @@ Parsed in `parse_pvh_args` (`main.rs:590`). Defaults and clamps are exact.
 | `--large-pages` / `--no-large-pages` | on (plain), off (appliance) | Attempt or skip 2 MiB `MEM_LARGE_PAGES` guest-RAM backing; see [Large pages](#large-pages). |
 | `--rng` | off | Add a virtio-rng device (`/dev/hwrng`). |
 | `--net` | off | Add a virtio-net NIC. **Repeatable** — each `--net` appends a NIC; the NIC-scoped flags below modify the *most recent* NIC. |
-| `--net-backend loopback\|nat\|wintun` | `nat` | Backend for the current NIC (see [§3](#3-devices-in-detail)). |
-| `--portfwd HOSTPORT:GUESTPORT` | — | Forward `127.0.0.1:HOSTPORT` (host) → `172.29.255.2:GUESTPORT` (guest). NAT only. Repeatable per NIC. |
-| `--nat-workers <N>` | a quarter of the host's logical CPUs, 1–4 | NAT worker threads for the current NIC, **1–16**. Each owns the TCP flows assigned to it; one flow never spans workers, so this scales many-flow traffic, not a single stream (see [§3](#3-devices-in-detail)). Kept across `--save`/`--restore`. |
+| `--net-backend loopback\|nat\|smoltcp\|slirp\|gvisor\|wintun` | `nat` | Backend for the current NIC (see [§3](#virtio-net-backends---net-backend)). `smoltcp` is the NAT with smoltcp as its TCP engine; `slirp` and `gvisor` need their DLLs. |
+| `--portfwd HOSTPORT:GUESTPORT` | — | Forward `127.0.0.1:HOSTPORT` (host) → `172.29.255.2:GUESTPORT` (guest). User-mode backends (`nat`, `smoltcp`, `slirp`, `gvisor`) only. Repeatable per NIC. |
+| `--nat-workers <N>` | a quarter of the host's logical CPUs, 1–4 | NAT worker threads for the current NIC (`nat`, `smoltcp`), **1–16**. Each owns the TCP flows assigned to it; one flow never spans workers, so this scales many-flow traffic, not a single stream (see [§3](#3-devices-in-detail)). Kept across `--save`/`--restore`. |
 | `--wintun-name <adapter>` / `--wintun-host <ipv4>` | — | WinTun adapter name / host-side gateway IPv4 (wintun backend). |
 | `--drive <path>[,readonly\|ro]` | — | Add a VHDX-backed virtio-blk disk using the native Windows driver. Raw disk images are not supported, including read-only ones; `--iso` separately attaches read-only installation media. **Repeatable up to 8** (`/dev/vda`, `/dev/vdb`, …). |
 | `--virtio-9p-share <tag>=<host_dir>[,ro][,uid=<n>][,gid=<n>][,metadata]` | — | Share a host directory over virtio-9p (9P2000.L). **Repeatable up to 8.** Tag 1–256 bytes; host path canonicalized and must be a directory; duplicate tags rejected. NTFS has no POSIX owners, so by default every entry reports owner `uid`:`gid` (default `0:0`, root) with a synthesized mode (dirs `0755`, files `0644`, `0444` if read-only on the host). The guest enforces those bits, so set `uid`/`gid` to the guest user that must write; `chmod`/`chown` succeed but aren't stored. With `metadata` (like WSL's drvfs option of the same name), owners and modes live in WSL's `$LXUID`/`$LXGID`/`$LXMOD` NTFS extended attributes: `chmod`/`chown` persist, new files record their creator, group and mode, WSL sees the same values, and `uid`/`gid` apply only to entries without metadata. While the VM runs, the root is held open, so Windows won't rename the folders that contain it (§9). Kept across `--save`/`--restore`. |
@@ -662,25 +667,117 @@ including the audio track.
   at once, so after a completion it takes the datagrams already queued inline,
   up to 32 per pass, instead of one completion and worker wake each (one per
   pass while the guest's RX backlog is deep: UDP isn't throttled like TCP, and
-  uses the RX pool's slack). The NAT holds up to 256 TCP flows and
-  ends connections the way a real network would:
+  uses the RX pool's slack). The NAT holds up to 256 TCP flows (each has a
+  pair of 1 MiB rings by default, so the cap bounds their memory) and ends
+  connections the way a real network would:
   * The guest's SYN is answered only once the host connect succeeds. A refused
     or unreachable destination, or one that doesn't answer within 10 s, fails
-    the guest's `connect()` with ECONNREFUSED.
+    the guest's `connect()` with ECONNREFUSED. A closed port on the gateway
+    (the host's loopback) refuses at once: those connects skip Windows' SYN
+    retransmissions (`SIO_TCP_INITIAL_RTO`), which otherwise take ~2 s to
+    report a refusal.
   * A host-side reset reaches the guest as a reset, not a clean EOF that would
-    make a cut-off stream look complete.
-  * A flow the NAT gives up on is reset toward the guest. That happens when it
+    make a cut-off stream look complete; and the guest's reset reaches the host
+    as one (an abortive close, `SO_LINGER` 0). Only the FIN handshake ends the
+    host connection gracefully.
+  * A flow the NAT gives up on is reset on both sides. That happens when it
     is idle for 2 h 4 min, or half-closed and idle for 4 min (RFC 5382's
-    minimums), or when a host send fails.
+    minimums), or when a host send fails. The TCB's own FIN_WAIT_2 and user
+    timeouts are off, so they can't cut a flow shorter than those.
   * Guest segments for a connection the NAT no longer has draw a RST.
   * A flow whose guest-facing TCB has only TIME_WAIT left (the host closed
     first: HTTP/1.0, `Connection: close`) is released at once instead of after
     `tcp-sans-io`'s 60 s. Holding it refused every guest `connect()` after 256
     such connections in a minute.
 
-  `tools\nat_test.py` checks the first two and the TIME_WAIT case.
+  And it relays datagrams the way a router would:
+  * UDP to the gateway, like TCP, reaches the host's loopback; a host resolver
+    on 127.0.0.1 is offered by DHCP as the gateway.
+  * A full UDP table (256 flows) ends its least recently used flow for a new
+    one, rather than drop the new flow's datagrams (a resolver sends each query
+    from a fresh port).
+  * Datagrams bigger than the guest's 1500-byte MTU cross in IPv4 fragments,
+    both ways: host datagrams (up to 64 KiB) and big echo replies are
+    fragmented toward the guest, and the guest's fragments are reassembled (up
+    to 16 datagrams at a time, each for at most 30 s).
+  * Multicast and broadcast datagrams, and pings to them, stay on the guest's
+    link; relayed, a guest's mDNS or SSDP would reach the host's LAN.
+
+  `tools\nat_test.py` checks all of these (phases A–L).
+* **`smoltcp`** — the same NAT with [smoltcp](https://github.com/smoltcp-rs/smoltcp)
+  0.14 as the guest-facing TCP engine instead of `tcp-sans-io`
+  (`src/net/smol.rs`, an implementation of the NAT's private `TcbDyn`; one
+  smoltcp interface and socket per flow, over the flow's rings). Everything
+  else is shared, so comparing the two isolates the TCP engine.
+* **`slirp`** — [libslirp](https://gitlab.freedesktop.org/slirp/libslirp), QEMU's
+  user-mode stack (`src/net/slirp.rs`, FFI in `crates/winsys/src/slirp.rs`): one
+  thread owns it and polls its host sockets with `WSAPoll`. libslirp takes and
+  builds MTU-sized frames, so guest TSO super-segments are segmented in
+  software first. Same addresses as `nat`, plus libslirp's own DNS forwarder at
+  `172.29.255.3`, which its DHCP offers. `python tools\fetch_libslirp.py`
+  fetches MSYS2's UCRT64 build (`libslirp-0.dll` and the GLib, libintl,
+  libiconv and PCRE2 DLLs it imports, with their licenses) into
+  `target\release`; tinyvmm loads it from `TINYVMM_LIBSLIRP` (a path), next to
+  `tinyvmm.exe`, or the DLL search path.
+* **`gvisor`** — [gVisor](https://gvisor.dev)'s netstack, the user-space TCP/IP
+  stack of gVisor's sandbox and of gvisor-tap-vsock (`src/net/gvisor.rs`, FFI in
+  `crates/winsys/src/gvisor.rs`). `gvisor\build.ps1` builds `gvisor/` (Go, cgo
+  with a MinGW-w64 `gcc` or `zig cc`) into `target\release\tinyvmm_gvisor.dll`,
+  loaded from `TINYVMM_GVISOR`, next to `tinyvmm.exe`, or the search path
+  (`TINYVMM_GVISOR_DEBUG=1` prints the stack's nonzero counters and any
+  connection the forwarder never finished when the VM stops; `2` also logs
+  each connection). The stack owns the gateway
+  and accepts every destination: a TCP forwarder answers the guest's SYN only
+  once the host connection succeeds, then relays both ways; a UDP forwarder
+  relays per 4-tuple. Segments for the guest leave as GSO frames up to 64 KiB
+  with partial checksums, and guest TSO super-segments go in whole. As in the
+  NAT, nothing is held in TIME_WAIT: gVisor passes a SYN for a 4-tuple in
+  TIME_WAIT only to a listening endpoint, which a forwarder isn't, so a guest
+  reusing a port the stack had closed first stalled for up to 60 s. DHCP is
+  answered in tinyvmm (the NAT's lease); pings to hosts other than the gateway
+  are dropped.
 * **`wintun`** — bridges onto a real WinTun L3 adapter (`wintun.dll` loaded at
   runtime via `GetProcAddress`; requires elevation to create the adapter).
+
+#### Comparing the user-mode backends
+
+`nat`, `smoltcp`, `slirp` and `gvisor` give the guest the same network, so
+`tools\nat_test.py --backend <b>` and `tools\net_compare.py --vmm
+tinyvmm,tinyvmm-smoltcp,tinyvmm-slirp,tinyvmm-gvisor` run unchanged against
+each. Measured on an i9-14900K (Windows 11 build 26300, bare metal), 1 vCPU,
+the host server on the host's LAN address, three interleaved boots of three
+256 MiB runs each:
+
+| | `nat` | `smoltcp` | `slirp` | `gvisor` |
+|---|---|---|---|---|
+| ping avg (ms) | 0.46 | 0.44 | 0.40 | — (dropped) |
+| TCP connect + request + response (txn/s) | 759 | 538 | 569 | 371 |
+| download, 1 stream (Gbps) | 2.63 | 2.82 | 2.76 | 4.14 |
+| upload, 1 stream (Gbps) | 4.96 | 5.11 | 0.96 | 4.19 |
+| download, 4 streams (Gbps) | 8.21 | 8.75 | 3.71 | 8.80 |
+| VMM CPU s/GiB: download / upload / 4 streams | 0.92 / 2.78 / 0.63 | 0.90 / 2.62 / 0.85 | 3.71 / 12.65 / 3.18 | 1.41 / 3.81 / 1.37 |
+| guest retransmits over the 9 uploads | 236 | 26 | 0 | 0 |
+| `nat_test.py` phases passed | 12/12 | 12/12 | 11/12 | 12/12 |
+
+The connection rate is the noisiest row: between sessions it moved by up to a
+third for every backend.
+
+* `nat`'s upload retransmits come from `tcp-sans-io` advertising a receive
+  window up to 31 bytes past its free buffer space (window scaling rounds the
+  edge up) and then dropping what the guest sent into it
+  ([mjsabby/tcp-sans-io#17](https://github.com/mjsabby/tcp-sans-io/pull/17)).
+  In an A/B with that fix, they fell from 321 and 373 per boot (three
+  uploads) to 4 and 3.
+* `slirp` refuses a connection to a closed port only after Windows' ~2 s of
+  SYN retries (phase A), and is single-threaded with software segmentation,
+  which costs 4–5 times the CPU per GiB and caps uploads near 1 Gbps.
+* `gvisor` drops pings to hosts other than the gateway, and spends more CPU
+  per GiB than the NAT but downloads faster on one stream. On this machine,
+  the NAT's fixed 1 MiB receive buffer for host sockets whose peer is local
+  (`LOCAL_PEER_RCVBUF`) is what holds it back: without it, its single-stream
+  download doubles (1.9–2.4 → 4.5–4.7 Gbps over two A/B boots each), the
+  opposite of what that constant's comment measured on the reference
+  machine.
 
 ### Doorbells — the "notify without a VM exit" path
 
@@ -723,7 +820,8 @@ crates/
     error, host (privilege + large-page + CNG random), host/block_file (async
     IOCP disk), host/mapped_file (mmap loader), sock (Winsock + IOCP), etw
     (hand-rolled TraceLogging), fs (9p file ops), cpu_affinity, wintun
-    (wintun.dll loader), qpc (QueryPerformanceCounter), ptr (SharedPtr),
+    (wintun.dll loader), slirp (libslirp loader), gvisor (tinyvmm_gvisor.dll
+    loader), qpc (QueryPerformanceCounter), ptr (SharedPtr),
     audio (WASAPI + waitable timers), media (Media Foundation MP4 writer)
   whpsys/      Windows Hypervisor Platform FFI ONLY:
     partition, memory (GuestMemory + typed accessors), vcpu (run loop + decoded
@@ -743,10 +841,13 @@ src/
   virtio/      queue, device(trait), transport(virtio-pci modern),
                console, net, rng, blk, p9, input, gpu, snd
   net/         wire (parse/build), csum (RFC 1071 checksum, AVX2), nat (user-mode
-               NAT), dhcp (the NAT's DHCP server), wintun, sys (facade)
+               NAT), smol (its smoltcp TCP engine), dhcp (the NAT's DHCP
+               server), slirp + gvisor (the libslirp and gVisor backends),
+               wintun, sys (facade)
   whp/         run_loop, cpuid, hv (Hyper-V enlightenment),
                snapshot + snapshot_file + vcpu_state (save/restore)
   diag/        boot_timer, etw (facade), alloc_trace (global-allocator ETW shim)
+gvisor/        Go module built into tinyvmm_gvisor.dll (`--net-backend gvisor`)
 ```
 
 The whole point of the split: **`unsafe` lives in `winsys`/`whpsys`** (raw
@@ -760,9 +861,9 @@ Win32/WHP calls) plus a short list of audited hot-path device structs. The
 |-------|-----------|------|
 | `VirtioDevice: Send + Sync` | `src/virtio/device.rs:25` | console/net/rng/blk/9p/input/gpu, each behind one `Arc<dyn VirtioDevice>` the transport drives (feature negotiation, queue lifecycle, notify, plus four save/restore hooks). |
 | `PciFunction: Send + Sync` | `src/pci/mod.rs:82` | anything the PCI bus enumerates (the transports): config read/write, BAR layout/assign. |
-| `NetBackend: Send + Sync` | `src/virtio/net.rs:37` | loopback / nat / wintun data-plane peers: `on_guest_frame(&[u8])` + `stop()`. |
+| `NetBackend: Send + Sync` | `src/virtio/net.rs:37` | loopback / nat (and smoltcp) / slirp / gvisor / wintun data-plane peers: `on_guest_frame(&[u8])` + `stop()`. |
 | `EmulatorBus` | `crates/whpsys/src/emulator.rs:41` | the run loop's IO/MMIO dispatch handed to the WHP instruction emulator. |
-| `TcbDyn` (private) | `src/net/nat.rs` | an object-safe wrapper so the NAT can store the `tcp-sans-io` generic TCB as `Box<dyn TcbDyn>` per flow. |
+| `TcbDyn` (private) | `src/net/nat.rs` | an object-safe wrapper so the NAT can store a flow's TCB as `Box<dyn TcbDyn>`: the `tcp-sans-io` generic TCB, or the smoltcp one (`src/net/smol.rs`). |
 
 Cost of `dyn` dispatch: one indirect call per kick — negligible next to the VM
 exit it replaces.
@@ -784,9 +885,10 @@ unsafe (keyword, total)        ~347
 ```
 
 They cluster in the FFI crates (`winsys::fs`, `winsys::sock`, `winsys::wintun`,
+`winsys::slirp`, `winsys::gvisor`,
 `crates/whpsys/src/{vcpu,memory,emulator}.rs`, `winsys/host/block_file.rs`) and a
-handful of audited device structs (`net/nat.rs`, `virtio/blk.rs`, `virtio/p9.rs`,
-`virtio/queue.rs`, `display.rs`). The protocol logic — `pci/*`, `devices/*`,
+handful of audited device structs (`net/nat.rs`, `net/smol.rs`, `virtio/blk.rs`,
+`virtio/p9.rs`, `virtio/queue.rs`, `display.rs`). The protocol logic — `pci/*`, `devices/*`,
 `boot/*`, `net/wire.rs`, the virtqueue traversal, and the gpu/input command
 decoders — is safe. The SIMD kernels (the internet checksum in `net/csum.rs`,
 the snapshot CRC in `whp/snapshot_file.rs` and the recorder's NV12 conversion
@@ -1137,7 +1239,8 @@ A systems programmer sees "preallocated, partitioned buffers" and rightly asks
 *why are there locks at all?* Because **multiple host threads** touch shared
 device state: the vCPU threads (one per `--vcpus`), the per-device **doorbell
 pump** threads, the per-disk **IOCP worker** threads, the **9p worker pool**, the
-NAT workers + their ICMP helpers, the **display window** message-pump thread, the
+NAT workers + their ICMP helpers (or the libslirp thread, or gVisor's
+goroutines and the thread that flushes their held frames), the **display window** message-pump thread, the
 **recorder**'s encoder thread, and the watchdog. The locks serialize *host-thread* access; they are **not** about the
 guest. Where single-ownership can be proven instead, there is no lock (the Treiber
 free-list, the `OnceLock` callbacks, the `UnsafeCell` slot bodies).
@@ -1157,6 +1260,9 @@ free-list, the `OnceLock` callbacks, the `UnsafeCell` slot bodies).
 | recorder `Mutex<AudioQueue>` (`--record`) | PCM chunks awaiting the encoder | the snd playback worker vs the encoder thread | the producer only appends under it; the encoder swaps the queue out and encodes outside it |
 | NAT `Mutex<VecDeque<IcmpJob>>` + `Condvar` | the bounded ping handoff queue | the vCPU enqueues, helper threads dequeue | classic bounded producer/consumer |
 | NAT `RwLock<HashMap<FlowKey, usize>>` (`FlowRouter`, 2+ workers only) | which worker owns each TCP flow | the guest TX path reads it per TCP frame; a SYN, or a worker creating or ending a flow, writes it | a map keyed by 4-tuple; writes only at flow start and end, so reads rarely wait |
+| slirp `Mutex<FrameQueue>` (`src/net/slirp.rs`) | guest frames waiting for the libslirp thread, and spare buffers | the vCPU/pump appends, the libslirp thread takes the batch | libslirp isn't thread-safe, so only its own thread calls into it |
+| gvisor `Mutex<VecDeque<…>>` `held` + `Mutex<bool>`/`Condvar` (`src/net/gvisor.rs`) | frames gVisor built while the guest's RX backlog was deep; the flusher's wake flag | gVisor's goroutines delivering (an emptiness check per frame) vs the flusher thread draining | keeps held frames in order ahead of new ones |
+| `winsys::gvisor` `RwLock<Option<handle>>` | the Go stack's handle | every guest frame (read) vs `close` (write) | no frame may enter a stack being closed |
 | `RwLock<Vec<Entry>>` (MMIO bus) | the GPA→device dispatch table | written once at setup, read on every MMIO | read-mostly; readers never block readers |
 | `OnceLock` (IRQ / present callbacks, backends) | set-once handles | the setup writer, then lock-free readers | **not a lock in steady state** — `get()` is a plain Acquire load |
 
@@ -1242,7 +1348,16 @@ the locking story above.
   mistaken for loss. The held data fills the TCB rings, which stops host recvs
   in turn. Sources that don't throttle (ARP, ICMP, UDP, the WinTun
   and loopback backends) still **drop** at a full backlog. The ICMP handoff
-  queue is bounded.
+  queue is bounded. The libslirp and gVisor backends hold what their stacks
+  build during a deep backlog, up to 8192 frames (beyond that their TCP
+  retransmits), and the libslirp thread's queue of guest frames holds 4096.
+* **NAT datagrams (`src/net/nat.rs`):** reassembly holds at most 16 guest
+  datagrams at a time (the oldest gives way), each at most 64 KiB and for at
+  most 30 s; a malformed fragment (bad header length, a non-final fragment
+  whose length isn't a multiple of 8, data past 64 KiB) is dropped, and so is
+  a datagram whose fragments disagree on where it ends. The UDP table's 256
+  flows give way least recently used first. UDP and pings to multicast,
+  broadcast or reserved addresses aren't relayed to the host's network.
 
 ---
 
@@ -1365,7 +1480,17 @@ and every other counter sits on a slow path):
   most completions a NAT worker found already queued when its 20 ms timer
   sweep came due. The sweep spends up to 10 ms handling them first, so a worker
   that fell behind does not read the guest ACKs still in its queue as a lost
-  tail.
+  tail. (With the `smoltcp` engine the per-connection TCB counters stay 0:
+  smoltcp doesn't report them.)
+* **libslirp** (`slirp: tx_drops rx_drops rx_held_max`): guest frames dropped
+  at the libslirp thread's full queue, frames for the guest dropped at a full
+  hold queue, and the most frames held for the guest at once.
+* **gVisor** (`gvisor: …`): the stack's own counters (TCP flows, refused
+  connects, UDP flows, segments out and in, retransmits and their causes,
+  frames it dropped on input), then tinyvmm's: frames for the guest dropped at
+  a full hold queue and the most held at once, frames whose checksum or
+  segmentation was finished in software for a guest that didn't negotiate the
+  offloads (`soft_offload`), and dropped pings (`icmp_drops`).
 
 `TINYVMM_NET_DIAG=1` adds live stderr lines: guest-bound data stalls of 10 ms or
 more with what resumed them (a host recv outstanding about as long as the stall

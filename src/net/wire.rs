@@ -169,9 +169,10 @@ pub fn parse_ipv4(p: &[u8]) -> Option<Ipv4View<'_>> {
     if ihl < 20 || p.len() < ihl {
         return None;
     }
-    // Drop fragments (More-Fragments set or non-zero fragment offset): the NAT
-    // doesn't reassemble, and forwarding a fragment as a standalone datagram
-    // yields garbage ports/payload and spurious flows. DF (0x4000) is fine.
+    // Fragments (More-Fragments set or non-zero fragment offset) aren't a
+    // datagram of their own: forwarding one as such yields garbage ports and
+    // payload. The NAT reassembles them first (`handle_fragment`). DF
+    // (0x4000) is fine.
     if be16(&p[6..8]) & 0x3FFF != 0 {
         return None;
     }
@@ -214,6 +215,46 @@ pub fn build_ipv4_into(out: &mut Vec<u8>, src: [u8; 4], dst: [u8; 4], proto: u8,
     put_be16(&mut h[10..12], csum);
     out.extend_from_slice(&h);
     out.extend_from_slice(payload);
+}
+
+/// The IPv4 fragments (RFC 791) of the datagram carrying `payload` (a whole
+/// L4 datagram, checksum included), each at most `mtu` bytes, in order:
+/// each is built into `out` and handed to `emit`. `id` identifies the
+/// datagram among the sender's recent ones to `dst`.
+#[allow(clippy::too_many_arguments)]
+pub fn ipv4_fragments(
+    out: &mut Vec<u8>,
+    src: [u8; 4],
+    dst: [u8; 4],
+    proto: u8,
+    id: u16,
+    payload: &[u8],
+    mtu: usize,
+    emit: &mut dyn FnMut(&[u8]),
+) {
+    // Every fragment but the last carries a multiple of 8 bytes.
+    let step = (mtu.saturating_sub(20) & !7).max(8);
+    let mut off = 0;
+    while off < payload.len() {
+        let chunk = &payload[off..(off + step).min(payload.len())];
+        let more = off + chunk.len() < payload.len();
+        let mut h = [0u8; 20];
+        h[0] = 0x45;
+        put_be16(&mut h[2..4], (20 + chunk.len()) as u16);
+        put_be16(&mut h[4..6], id);
+        put_be16(&mut h[6..8], u16::from(more) << 13 | (off / 8) as u16);
+        h[8] = 64; // TTL
+        h[9] = proto;
+        h[12..16].copy_from_slice(&src);
+        h[16..20].copy_from_slice(&dst);
+        let csum = checksum16(&[&h]);
+        put_be16(&mut h[10..12], csum);
+        out.clear();
+        out.extend_from_slice(&h);
+        out.extend_from_slice(chunk);
+        emit(out);
+        off += chunk.len();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -466,6 +507,40 @@ mod tests {
         assert_eq!(v.payload, &[9, 8, 7, 6, 5]);
         assert_eq!(v.datagram.len(), 25);
         assert!(parse_ipv4(&[0u8; 10]).is_none());
+    }
+
+    /// A datagram over the MTU leaves in MTU-sized fragments with 8-byte
+    /// aligned offsets, More Fragments on all but the last, valid header
+    /// checksums, and payloads that reassemble to the original.
+    #[test]
+    fn ipv4_fragments_reassemble() {
+        let data: Vec<u8> = (0..4000u32).map(|i| (i * 7) as u8).collect();
+        let mut frags = Vec::new();
+        let mut out = Vec::new();
+        ipv4_fragments(
+            &mut out,
+            IP_A,
+            IP_B,
+            IP_PROTO_UDP,
+            0x1234,
+            &data,
+            1500,
+            &mut |f| frags.push(f.to_vec()),
+        );
+        assert_eq!(
+            frags.iter().map(Vec::len).collect::<Vec<_>>(),
+            [1500, 1500, 1060]
+        );
+        let mut whole = Vec::new();
+        for (i, f) in frags.iter().enumerate() {
+            assert_eq!(checksum16(&[&f[..20]]), 0);
+            assert_eq!(be16(&f[4..6]), 0x1234);
+            let flags_off = be16(&f[6..8]);
+            assert_eq!(flags_off & 0x2000 != 0, i < 2, "More Fragments");
+            assert_eq!(usize::from(flags_off & 0x1FFF) * 8, whole.len());
+            whole.extend_from_slice(&f[20..]);
+        }
+        assert_eq!(whole, data);
     }
 
     #[test]

@@ -7,11 +7,12 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
     IcmpCreateFile, IcmpSendEcho,
 };
 use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, FIONBIO, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IPPROTO_TCP, IPPROTO_UDP, SD_SEND,
-    SO_PROTOCOL_INFOW, SO_RCVBUF, SOCK_DGRAM, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKET,
-    SOL_SOCKET, WSA_IO_PENDING, WSABUF, WSADATA, WSAGetLastError, WSAIoctl, WSAPROTOCOL_INFOW,
-    WSARecv, WSASend, WSAStartup, XP1_IFS_HANDLES, accept, bind, closesocket, connect, getpeername,
-    getsockname, getsockopt, ioctlsocket, listen, setsockopt, shutdown, socket,
+    AF_INET, FIONBIO, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IPPROTO_TCP, IPPROTO_UDP, LINGER,
+    SD_SEND, SO_LINGER, SO_PROTOCOL_INFOW, SO_RCVBUF, SOCK_DGRAM, SOCK_STREAM, SOCKADDR,
+    SOCKADDR_IN, SOCKET, SOL_SOCKET, WSA_IO_PENDING, WSABUF, WSADATA, WSAGetLastError, WSAIoctl,
+    WSAPROTOCOL_INFOW, WSARecv, WSASend, WSAStartup, XP1_IFS_HANDLES, accept, bind, closesocket,
+    connect, getpeername, getsockname, getsockopt, ioctlsocket, listen, setsockopt, shutdown,
+    socket,
 };
 use windows_sys::Win32::Storage::FileSystem::SetFileCompletionNotificationModes;
 use windows_sys::Win32::System::IO::{
@@ -153,6 +154,26 @@ pub fn connect_sock(s: SOCKET, ip: [u8; 4], port: u16) -> bool {
 
 pub fn close_sock(s: SOCKET) {
     unsafe {
+        closesocket(s);
+    }
+}
+
+/// Close `s` abortively: its peer gets a RST rather than a FIN, and anything
+/// unsent is dropped (SO_LINGER with a zero timeout), so the peer sees the
+/// connection fail instead of end.
+pub fn abort_sock(s: SOCKET) {
+    let l = LINGER {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    unsafe {
+        setsockopt(
+            s,
+            SOL_SOCKET,
+            SO_LINGER,
+            &l as *const LINGER as *const u8,
+            core::mem::size_of::<LINGER>() as i32,
+        );
         closesocket(s);
     }
 }
@@ -392,6 +413,41 @@ type ConnectExFn = unsafe extern "system" fn(
     *mut OVERLAPPED,
 ) -> i32;
 
+/// Send no SYN retransmissions on `s`'s connect (`SIO_TCP_INITIAL_RTO` with
+/// `TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS`, Windows 10 1709+; falls back to
+/// one). Only for loopback, where a SYN can't be lost. Best effort.
+fn no_syn_retransmissions(s: SOCKET) {
+    const SIO_TCP_INITIAL_RTO: u32 = 0x9800_0011;
+    #[repr(C)]
+    struct InitialRto {
+        rtt: u16,
+        max_syn_retransmissions: u8,
+    }
+    for max in [0xFE, 1] {
+        let params = InitialRto {
+            rtt: u16::MAX, // TCP_INITIAL_RTO_UNSPECIFIED_RTT
+            max_syn_retransmissions: max,
+        };
+        let mut bytes = 0u32;
+        let rc = unsafe {
+            WSAIoctl(
+                s,
+                SIO_TCP_INITIAL_RTO,
+                &params as *const InitialRto as *const c_void,
+                core::mem::size_of::<InitialRto>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes,
+                std::ptr::null_mut(),
+                None,
+            )
+        };
+        if rc == 0 {
+            return;
+        }
+    }
+}
+
 fn connect_ex_ptr() -> Option<ConnectExFn> {
     static PTR: OnceLock<usize> = OnceLock::new();
     let p = *PTR.get_or_init(|| {
@@ -435,6 +491,11 @@ fn connect_ex_ptr() -> Option<ConnectExFn> {
 /// Start an overlapped connect. `ov` must outlive the operation. Returns true
 /// if the connect is in progress (or completed immediately).
 ///
+/// To a loopback address, a refused connect fails at once, as it would on
+/// Linux: by default Windows answers the RST from a closed local port by
+/// resending the SYN twice, so the refusal takes ~2 s (Go's net package
+/// does the same thing for its loopback dials).
+///
 /// # Safety
 /// `ov` must point to an `OVERLAPPED` that remains alive and pinned until the
 /// IOCP completion for this connect is dequeued.
@@ -442,6 +503,9 @@ pub unsafe fn connect_ex(s: SOCKET, ip: [u8; 4], port: u16, ov: *mut OVERLAPPED)
     let Some(f) = connect_ex_ptr() else {
         return false;
     };
+    if ip[0] == 127 {
+        no_syn_retransmissions(s);
+    }
     let sa = sockaddr_in(ip, port);
     let mut sent = 0u32;
     let r = unsafe {
