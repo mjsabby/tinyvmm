@@ -696,6 +696,12 @@ including the audio track.
     first: HTTP/1.0, `Connection: close`) is released at once instead of after
     `tcp-sans-io`'s 60 s. Holding it refused every guest `connect()` after 256
     such connections in a minute.
+  * Guest data is ACKed at once: the TCB's delayed ACK is off. The NAT relays
+    the bytes to the host straight away and the host's reply rarely comes back
+    within the delay to carry the ACK, so holding it only stalled the guest. A
+    request written in two parts with Nagle on waited 62 ms per round trip
+    (0.2 ms now), and uploads limited by the NAT's window drew the guest's
+    tail-loss probes.
 
   And it relays datagrams the way a router would:
   * UDP to the gateway, like TCP, reaches the host's loopback; a host resolver
@@ -1478,8 +1484,8 @@ and every other counter sits on a slow path):
 ```text
 [net] nic0 rx_frames=193859 tx_frames=84052 msix=99274 rx_irqs=60214 tx_irqs=39060
   rx_backlogged=238 rx_rewinds=249 rx_truncated=0 rx_backlog_drops=0 rx_backlog_max=33
-  rx_throttles=1 | nat: tcp_flows=22 retransmits=0 (0 B) rto=0 tlp=0 recoveries=0
-  dsacks=0 dup_bytes_from_guest=0 ooo_drops=0 tx_drops=0 iocp_backlog_max=404
+  rx_throttles=1 | nat: tcp_flows=22 retransmits=0 (0 B) rto=0 (spurious 0) tlp=0
+  recoveries=0 dsacks=0 dup_bytes_from_guest=0 ooo_drops=0 tx_drops=0 iocp_backlog_max=404
 ```
 
 * **Interrupts:** `msix` is what the NIC's MSI-X actually injected
@@ -1494,15 +1500,17 @@ and every other counter sits on a slow path):
   guest lost and should be 0.
 * **NAT** (tcp-sans-io's per-connection `TcbStats` for the guest-facing TCBs,
   summed over flows): retransmits and their causes (`rto`, `tlp`, fast
-  `recoveries`), `dsacks` (the guest received a duplicate, so a retransmit was
-  spurious), `dup_bytes_from_guest` / `ooo_drops` (guest data received twice, or
-  dropped because the out-of-order tracker was full), `tx_drops` (guest
-  frames dropped because the frame pool was full), and `iocp_backlog_max`: the
-  most completions a NAT worker found already queued when its 20 ms timer
-  sweep came due. The sweep spends up to 10 ms handling them first, so a worker
-  that fell behind does not read the guest ACKs still in its queue as a lost
-  tail. (With the `smoltcp` engine the per-connection TCB counters stay 0:
-  smoltcp doesn't report them.)
+  `recoveries`); of the timeouts, how many were `spurious` and undone because
+  the guest's next ACK echoed a timestamp from before the timeout (its vCPU
+  was descheduled, not the segment lost); `dsacks` (the guest received a
+  duplicate, so a retransmit was spurious), `dup_bytes_from_guest` /
+  `ooo_drops` (guest data received twice, or dropped because the out-of-order
+  tracker was full), `tx_drops` (guest frames dropped because the frame pool
+  was full), and `iocp_backlog_max`: the most completions a NAT worker found
+  already queued when its 20 ms timer sweep came due. The sweep spends up to
+  10 ms handling them first, so a worker that fell behind does not read the
+  guest ACKs still in its queue as a lost tail. (With the `smoltcp` engine the
+  per-connection TCB counters stay 0: smoltcp doesn't report them.)
 * **libslirp** (`slirp: tx_drops rx_drops rx_held_max`): guest frames dropped
   at the libslirp thread's full queue, frames for the guest dropped at a full
   hold queue, and the most frames held for the guest at once.
