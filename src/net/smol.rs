@@ -20,7 +20,7 @@ use crate::net::wire::{IP_PROTO_TCP, checksum16};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Checksum, ChecksumCapabilities, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp;
-use smoltcp::time::Instant;
+use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{
     HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address,
 };
@@ -504,6 +504,11 @@ impl TcbDyn for SmolTcb {
     // smoltcp reaps neither half-closed nor stalled connections by default.
     fn set_fin_wait2_timeout(&mut self, _ms: u32) {}
     fn set_user_timeout(&mut self, _ms: u32) {}
+
+    fn set_delayed_ack(&mut self, ms: u32) {
+        let delay = (ms != 0).then(|| Duration::from_millis(u64::from(ms)));
+        self.sock_mut().set_ack_delay(delay);
+    }
 
     fn stats(&self) -> TcbStats {
         TcbStats {

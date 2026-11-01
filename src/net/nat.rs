@@ -406,6 +406,14 @@ fn make_smol<const BUF: usize>() -> Box<dyn TcbDyn> {
 /// (RFC 5382 REQ-5 asks a NAT for at least 4 min), and its 5 min USER
 /// TIMEOUT aborted one whose guest reader paused (zero window), which a
 /// real path keeps as long as the guest answers the window probes.
+///
+/// Guest data is ACKed at once (no delayed ACK): the NAT hands it to the
+/// host straight away, and the host's reply rarely comes back within a
+/// delayed-ACK timeout to carry the ACK, so holding it only stalled a guest
+/// waiting on it. A request written in two parts with Nagle on waited out
+/// the timer (62 ms a round trip with tcp-sans-io, 31 ms with smoltcp, the
+/// 20 ms timer sweep included), and a window-limited upload's tail drew
+/// the guest's tail-loss probes.
 fn arm_tcb(tcb: &mut dyn TcbDyn, cfg: TcbConfig, secret: &[u8; 16], now: u64, csum_offload: bool) {
     tcb.reinit(cfg);
     tcb.set_secret(secret);
@@ -413,6 +421,7 @@ fn arm_tcb(tcb: &mut dyn TcbDyn, cfg: TcbConfig, secret: &[u8; 16], now: u64, cs
     tcb.set_tx_csum_offload(csum_offload);
     tcb.set_fin_wait2_timeout(0);
     tcb.set_user_timeout(0);
+    tcb.set_delayed_ack(0);
 }
 
 /// The TCP stack that terminates guest connections: `tcp-sans-io` (the
@@ -476,6 +485,8 @@ pub(super) trait TcbDyn {
     /// The FIN_WAIT_2 timeout and the USER TIMEOUT (0: off).
     fn set_fin_wait2_timeout(&mut self, ms: u32);
     fn set_user_timeout(&mut self, ms: u32);
+    /// The delayed-ACK timeout (0: every data segment is ACKed at once).
+    fn set_delayed_ack(&mut self, ms: u32);
     fn stats(&self) -> TcbStats;
 }
 
@@ -539,6 +550,9 @@ impl<const BUF: usize> TcbDyn for Tcb<BUF> {
     }
     fn set_user_timeout(&mut self, ms: u32) {
         self.set_user_timeout(ms)
+    }
+    fn set_delayed_ack(&mut self, ms: u32) {
+        self.set_delayed_ack(ms)
     }
     fn stats(&self) -> TcbStats {
         self.stats()
@@ -1474,6 +1488,8 @@ struct Losses {
     segs_retrans: u64,
     bytes_retrans: u64,
     rto: u64,
+    /// Timeouts undone because timestamps showed the original arrived.
+    spurious_rto: u64,
     tlp: u64,
     fast_recoveries: u64,
     /// D-SACKs from the guest: it got a duplicate, so we retransmitted
@@ -1491,6 +1507,7 @@ impl From<&TcbStats> for Losses {
             segs_retrans: s.segs_retrans,
             bytes_retrans: s.bytes_retrans,
             rto: s.rto_count.into(),
+            spurious_rto: s.spurious_rtos.into(),
             tlp: s.tlp_count.into(),
             fast_recoveries: s.fast_recoveries.into(),
             dsacks: s.dsacks_received,
@@ -1509,6 +1526,7 @@ struct NatStats {
     segs_retrans: AtomicU64,
     bytes_retrans: AtomicU64,
     rto: AtomicU64,
+    spurious_rto: AtomicU64,
     tlp: AtomicU64,
     fast_recoveries: AtomicU64,
     dsacks: AtomicU64,
@@ -1537,6 +1555,7 @@ impl NatStats {
         add(&self.segs_retrans, new.segs_retrans, old.segs_retrans);
         add(&self.bytes_retrans, new.bytes_retrans, old.bytes_retrans);
         add(&self.rto, new.rto, old.rto);
+        add(&self.spurious_rto, new.spurious_rto, old.spurious_rto);
         add(&self.tlp, new.tlp, old.tlp);
         add(
             &self.fast_recoveries,
@@ -1555,12 +1574,13 @@ impl NatStats {
     fn summary(&self) -> String {
         let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
         let mut s = format!(
-            "nat: tcp_flows={} retransmits={} ({} B) rto={} tlp={} recoveries={} dsacks={} \
-             dup_bytes_from_guest={} ooo_drops={} tx_drops={} iocp_backlog_max={}",
+            "nat: tcp_flows={} retransmits={} ({} B) rto={} (spurious {}) tlp={} recoveries={} \
+             dsacks={} dup_bytes_from_guest={} ooo_drops={} tx_drops={} iocp_backlog_max={}",
             ld(&self.tcp_flows),
             ld(&self.segs_retrans),
             ld(&self.bytes_retrans),
             ld(&self.rto),
+            ld(&self.spurious_rto),
             ld(&self.tlp),
             ld(&self.fast_recoveries),
             ld(&self.dsacks),
@@ -3792,6 +3812,24 @@ mod tests {
         while from.extract_packet_with(&mut |pkt| {
             let _ = to.inject_packet(pkt);
         }) {}
+    }
+
+    /// Guest data is ACKed at once on either engine, with no time passing:
+    /// a small request the host won't answer until its second part arrives
+    /// (Nagle on in the guest) used to wait out the delayed-ACK timer.
+    #[test]
+    fn guest_data_is_acked_at_once() {
+        for engine in [TcpEngine::SansIo, TcpEngine::Smoltcp] {
+            let (mut nat, mut guest) = established_pair_on(engine);
+            let (a, _) = guest.send_reserve(100).unwrap();
+            a[..100].fill(b'q');
+            assert_eq!(guest.send_commit(100), Ok(100));
+            guest.tick().unwrap();
+            assert_eq!(guest.stats().pipe, 100, "{engine:?}: in flight");
+            shuttle(&mut *guest, &mut *nat);
+            shuttle(&mut *nat, &mut *guest);
+            assert_eq!(guest.stats().pipe, 0, "{engine:?}: ACKed at once");
+        }
     }
 
     /// A NAT-side tcb (listening on 10.0.0.1:80) and a guest-side tcb,
