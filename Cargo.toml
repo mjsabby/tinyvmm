@@ -52,7 +52,7 @@ windows-sys = { version = "0.61", features = [
 # that temporary overflows even the 16 MiB nat-worker stack (STATUS_STACK_OVERFLOW
 # at TCP connect). Ring SIZE is unchanged (still 1 MiB/direction), so throughput
 # and the per-Tcb window are unaffected.
-tcp-sans-io = { git = "https://github.com/mjsabby/tcp-sans-io", rev = "97d9c837e5d44698e89566448b3959efd6f4248c", features = ["std", "heap-buffers"] }
+tcp-sans-io = { git = "https://github.com/mjsabby/tcp-sans-io", rev = "d33b62ba34b3c7d6a1c41465e847e1ecba933d6e", features = ["std", "heap-buffers"] }
 # User-directed dependency: smoltcp, the NAT's alternative TCP engine
 # (`--net-backend smoltcp`, src/net/smol.rs). IP medium and TCP only: the NAT
 # itself handles Ethernet, ARP, DHCP, UDP and ICMP.
