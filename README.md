@@ -685,9 +685,11 @@ including the audio track.
   guest under a test harness keeps hundreds of mostly idle connections open
   (browser contexts, pooled keep-alive clients), and past the cap an accepted
   port-forward client is closed and a guest `connect()` refused. The first 256
-  open flows get a pair of 256 KiB rings by default (about 654 KiB a flow with
-  the TCB's own state and its send buffer); flows past them get the 64 KiB
-  tier (about 270 KiB a flow), so all 4096 together hold about 1.15 GiB. A
+  open flows get a pair of 256 KiB rings by default (about 590 KiB a flow with
+  the TCB's own state); flows past them get the 64 KiB tier (about 206 KiB a
+  flow), so all 4096 together hold about 0.9 GiB while idle. A flow holds a
+  64 KiB send buffer from its worker's pool only while a send to the host is
+  in flight, and the idle sweep frees an emptied queue toward the host. A
   guest upload can have at most one ring unacknowledged, so on a nested host
   (~0.4 ms a round trip) one connection uploads at most about 4 Gbps, against
   ~9 Gbps with the 1 MiB tier. The pools keep 256 flows' worth of idle

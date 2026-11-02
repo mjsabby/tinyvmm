@@ -98,11 +98,11 @@ const MAX_UDP_FLOWS: usize = 256;
 const MAX_TCP_FLOWS: usize = 4096;
 /// With this many flows open, a new flow takes the smallest Tcb tier
 /// (`TIER_BUF[0]`) unless a port override names one, so a crowd of idle
-/// connections costs about 270 KiB each (two 64 KiB rings, the Tcb's own
-/// ~78 KiB and a 64 KiB send op) rather than the default tier's 654 KiB: all
-/// MAX_TCP_FLOWS open hold about 1.15 GiB. The pools keep this many flows'
-/// worth of idle boxes per tier and free the rest, so the memory goes when
-/// the flows do.
+/// connections costs about 206 KiB each (two 64 KiB rings and the Tcb's own
+/// ~78 KiB) rather than the default tier's 590 KiB: all MAX_TCP_FLOWS open and
+/// idle hold about 0.9 GiB, and each send in flight to the host adds its
+/// 64 KiB send op. The pools keep this many flows' worth of idle boxes per
+/// tier and free the rest, so the memory goes when the flows do.
 const FULL_RING_FLOWS: usize = 256;
 
 /// The Tcb tier for a new flow: a port override's, else the default while
@@ -407,7 +407,7 @@ const TIER_MAKE: [fn() -> Box<dyn TcbDyn>; N_TCB_TIERS] = [
 const DEFAULT_TCB_WARM: [usize; N_TCB_TIERS] = [192, 16, 0];
 /// Default tier index (256 KiB) when no port override matches. On a nested
 /// host its rings cap one connection's guest upload near 4 Gbps (see above),
-/// but a flow costs about 654 KiB rather than the 1 MiB tier's 2.1 MiB, and a
+/// but a flow costs about 590 KiB rather than the 1 MiB tier's 2.1 MiB, and a
 /// server guest under a test harness keeps hundreds of connections open.
 const DEFAULT_TIER: usize = 1;
 
@@ -1144,10 +1144,14 @@ struct TcpOp {
     wsabuf: [WSABUF; 2],
 }
 
-/// The send op, owned by its flow. At most one host send is in flight per flow
-/// (the next chunk is posted from the completion), which preserves stream
-/// order and bounds memory. Runs concurrently with the recv op (full duplex,
-/// distinct OVERLAPPED). `overlapped` MUST be first, `kind` second.
+/// The send op. At most one host send is in flight per flow (the next chunk is
+/// posted from the completion), which preserves stream order and bounds
+/// memory. Runs concurrently with the recv op (full duplex, distinct
+/// OVERLAPPED). A flow holds one only while it needs the buffer: from the send
+/// that takes it from the worker's pool until a completion leaves nothing
+/// queued, and on an outbound flow while the guest's SYN waits in it for the
+/// host connect. An idle connection holds none. `overlapped` MUST be first,
+/// `kind` second.
 #[repr(C)]
 struct TcpSendOp {
     overlapped: OVERLAPPED,
@@ -1159,8 +1163,9 @@ struct TcpSendOp {
 
 struct TcpFlow {
     // Option so the pooled boxes can be take()n into their pools at reap while
-    // TcpFlow still implements Drop (socket-close safety net). Always Some while
-    // the flow is live.
+    // TcpFlow still implements Drop (socket-close safety net). `tcb` and `op`
+    // are Some while the flow is live, `send_op` only while it needs one (see
+    // `TcpSendOp`).
     tcb: Option<Box<dyn TcbDyn>>,
     tier: usize, // which compile-time Tcb size-tier pool to recycle into
     sock: SOCKET,
@@ -1181,8 +1186,8 @@ struct TcpFlow {
     published: Losses,        // TCB loss counters already added to NatStats
     rx_blocked: bool,         // paused on the NIC's RX backlog (in rx_blocked list)
     csum_offload: bool,       // the TCB leaves TCP checksums partial (guest GUEST_CSUM)
-    /// Length of the guest's SYN, kept in `send_op.buf` (idle until the host
-    /// connect completes) while the host connect is pending; 0 otherwise.
+    /// Length of the guest's SYN, kept in `send_op.buf` while the host connect
+    /// is pending (the flow holds a send op for it until then); 0 otherwise.
     syn_len: usize,
     /// That SYN came with a partial (offloaded) TCP checksum.
     syn_csum_trusted: bool,
@@ -1235,6 +1240,33 @@ impl TcpFlow {
         let syn = &self.send_op.as_ref()?.buf[..len];
         let at = usize::from(syn.first()? & 0x0F) * 4 + 4;
         Some(u32::from_be_bytes(syn.get(at..at + 4)?.try_into().ok()?))
+    }
+
+    /// Give the send op back to `pool` once nothing needs it: no send in
+    /// flight (until its completion is dequeued, the kernel may still use the
+    /// op's OVERLAPPED and buffer), no guest SYN waiting in it, and nothing
+    /// queued for it to send.
+    fn release_send_op(&mut self, pool: &mut BoxPool<TcpSendOp>) {
+        if !self.send_inflight
+            && self.syn_len == 0
+            && self.pending_to_host.is_empty()
+            && let Some(op) = self.send_op.take()
+        {
+            pool.release(op);
+        }
+    }
+
+    /// Free the guest->host queue's buffer if nothing waits in it and no send
+    /// is in flight. The idle sweep calls this, not each send, so a busy flow
+    /// keeps its buffer between chunks while an idle one gives back what an
+    /// upload grew it to (`TO_HOST_CAP` and up).
+    fn shed_idle_queue(&mut self) {
+        if self.pending_to_host.is_empty()
+            && !self.send_inflight
+            && self.pending_to_host.capacity() > 0
+        {
+            self.pending_to_host = Vec::new();
+        }
     }
 }
 
@@ -1475,10 +1507,11 @@ fn maybe_post_recv(flow: &mut TcpFlow) -> bool {
 }
 
 /// Post the next queued guest->host chunk as an overlapped send (one in flight
-/// at a time, which keeps stream order and bounds memory). When the queue is
-/// empty, perform any deferred host-send half-close. Returns false if the send
-/// failed synchronously (the caller should tear the flow down).
-fn pump_send(flow: &mut TcpFlow) -> bool {
+/// at a time, which keeps stream order and bounds memory), in a send op taken
+/// from `pool` if the flow holds none. When the queue is empty, perform any
+/// deferred host-send half-close. Returns false if the send failed
+/// synchronously (the caller should tear the flow down).
+fn pump_send(flow: &mut TcpFlow, key: FlowKey, pool: &mut BoxPool<TcpSendOp>) -> bool {
     if !flow.connected || flow.send_inflight || flow.dead {
         return true;
     }
@@ -1491,22 +1524,43 @@ fn pump_send(flow: &mut TcpFlow) -> bool {
         return true;
     }
     let n = flow.pending_to_host.len().min(TCP_BUF);
-    {
-        let op = flow.send_op.as_mut().unwrap();
+    let op = flow.send_op.get_or_insert_with(|| {
+        let mut op = pool.acquire();
+        op.overlapped = unsafe { core::mem::zeroed() };
         op.kind = 2;
-        op.buf[..n].copy_from_slice(&flow.pending_to_host[..n]);
-        op.wsabuf = sys::wsabuf(op.buf.as_mut_ptr(), n);
-    }
-    let sock = flow.sock;
-    let wb = &flow.send_op.as_ref().unwrap().wsabuf as *const WSABUF;
-    let ovl = &mut flow.send_op.as_mut().unwrap().overlapped as *mut OVERLAPPED;
-    if unsafe { sys::wsa_send_ov(sock, wb, ovl) } {
+        op.key = key;
+        op
+    });
+    op.buf[..n].copy_from_slice(&flow.pending_to_host[..n]);
+    op.wsabuf = sys::wsabuf(op.buf.as_mut_ptr(), n);
+    let wb = &op.wsabuf as *const WSABUF;
+    let ovl = &mut op.overlapped as *mut OVERLAPPED;
+    // SAFETY: the op is pinned in its Box, and the flow keeps it until the
+    // completion is dequeued (it is never released while `send_inflight`).
+    if unsafe { sys::wsa_send_ov(flow.sock, wb, ovl) } {
         flow.pending_to_host.drain(..n);
         flow.send_inflight = true;
         true
     } else {
         false
     }
+}
+
+/// A host send completed, taking `bytes` of its chunk (the caller cleared
+/// `send_inflight`). Overlapped stream sends normally take the whole chunk; a
+/// short one's tail is requeued at the front, which keeps byte order. With
+/// nothing left to send, the op goes back to `pool` until the next send.
+fn send_done(flow: &mut TcpFlow, bytes: u32, pool: &mut BoxPool<TcpSendOp>) {
+    let op = flow.send_op.as_ref().unwrap();
+    let req = op.wsabuf.len as usize;
+    let sent = (bytes as usize).min(req);
+    if sent < req {
+        // Requeue the unsent tail at the front (disjoint fields, no temporary
+        // Vec).
+        let tail = op.buf[sent..req].iter().copied();
+        flow.pending_to_host.splice(0..0, tail);
+    }
+    flow.release_send_op(pool);
 }
 
 /// What woke the NAT worker for the current dispatch. Net-diag mode uses it to
@@ -2783,10 +2837,6 @@ impl NatState {
         op.overlapped = unsafe { core::mem::zeroed() };
         op.kind = 0;
         op.key = key;
-        let mut send_op = self.tcp_send_op_pool.acquire();
-        send_op.overlapped = unsafe { core::mem::zeroed() };
-        send_op.kind = 2;
-        send_op.key = key;
         self.stats.tcp_flows.fetch_add(1, Ordering::Relaxed);
         self.tcp.insert(
             key,
@@ -2795,7 +2845,7 @@ impl NatState {
                 tier,
                 sock: host_sock,
                 op: Some(op),
-                send_op: Some(send_op),
+                send_op: None,   // taken from the pool for each send (pump_send)
                 connected: true, // host side is already connected (accepted)
                 connect_pending: false,
                 recv_pending: false,
@@ -2858,6 +2908,8 @@ impl NatState {
                 } else {
                     tcb.inject_packet(syn)
                 };
+                // The SYN was the op's only use until the guest sends data.
+                flow.release_send_op(&mut self.tcp_send_op_pool);
             }
         }
         if dead {
@@ -2935,20 +2987,9 @@ impl NatState {
             } else if !ok {
                 failed = true;
             } else {
-                // The completed op is this flow's send_op, so read it through
-                // the safe borrow. Overlapped stream sends normally transfer
-                // the whole request; requeue any short tail at the front to
-                // preserve byte order.
-                let req = flow.send_op.as_ref().unwrap().wsabuf.len as usize;
-                let sent = (bytes as usize).min(req);
-                if sent < req {
-                    // Requeue the unsent tail at the front (disjoint fields, no
-                    // temporary Vec).
-                    let tail = flow.send_op.as_ref().unwrap().buf[sent..req]
-                        .iter()
-                        .copied();
-                    flow.pending_to_host.splice(0..0, tail);
-                }
+                // The completed op is this flow's send_op (a flow keeps it
+                // while a send is in flight), so it's read through the flow.
+                send_done(flow, bytes, &mut self.tcp_send_op_pool);
                 flow.last_activity = now;
             }
         }
@@ -3124,7 +3165,7 @@ impl NatState {
             if ev & (EV_CLOSED | EV_ERROR) != 0 {
                 teardown = true;
             }
-            if !teardown && !pump_send(flow) {
+            if !teardown && !pump_send(flow, key, &mut self.tcp_send_op_pool) {
                 teardown = true;
             }
             if !teardown && !maybe_post_recv(flow) {
@@ -3234,9 +3275,10 @@ impl NatState {
     }
 
     /// Periodic idle sweep (runs every EXPIRE_GATE_MS): reap idle UDP NAT
-    /// entries, and reset stuck or idle TCP flows (connect-deadline, idle, and
-    /// half-close watchdogs). Mirrors the C++ backend's ExpireIdle + the TSI
-    /// engine's per-conn watchdogs.
+    /// entries, free the guest->host queue buffers TCP flows no longer use, and
+    /// reset stuck or idle TCP flows (connect-deadline, idle, and half-close
+    /// watchdogs). Mirrors the C++ backend's ExpireIdle + the TSI engine's
+    /// per-conn watchdogs.
     fn expire_idle(&mut self, now: u64) {
         // UDP: reap entries idle longer than UDP_IDLE_MS.
         let udp_dead: Vec<FlowKey> = self
@@ -3251,7 +3293,11 @@ impl NatState {
         // Datagrams whose missing fragments never came.
         self.frags.expire(now);
 
-        // TCP: collect flows that tripped a watchdog, then reset them.
+        // TCP: flows with nothing to send give back their queue's buffer.
+        for f in self.tcp.values_mut() {
+            f.shed_idle_queue();
+        }
+        // Collect flows that tripped a watchdog, then reset them.
         let tcp_victims: Vec<FlowKey> = self
             .tcp
             .iter()
@@ -4039,6 +4085,9 @@ mod tests {
         (nat, guest)
     }
 
+    /// The key of the connection [`established_pair`] makes.
+    const FLOW_KEY: FlowKey = ([10, 0, 0, 2], 40000, [10, 0, 0, 1], 80);
+
     /// A connected flow around `nat`, with no host socket or ops.
     fn connected_flow(nat: Box<dyn TcbDyn>) -> TcpFlow {
         TcpFlow {
@@ -4196,10 +4245,120 @@ mod tests {
         flow.send_inflight = true;
         assert!(!flow.lingering(), "guest bytes in flight to the host");
         flow.send_inflight = false;
-        // ...and, with the queue empty, shuts down the host send side.
-        assert!(pump_send(&mut flow));
+        // ...and, with the queue empty, shuts down the host send side. Of a
+        // real socket: shutdown(INVALID_SOCKET) crashed the test process
+        // while another test used sockets.
+        sys::wsa_startup();
+        flow.sock = sys::new_tcp_socket().unwrap();
+        let mut pool = BoxPool::new(0, 0, make_tcp_send_op);
+        assert!(pump_send(&mut flow, FLOW_KEY, &mut pool));
         assert!(flow.shutdown_done);
         assert!(flow.lingering());
+        flow.tcb.take();
+    }
+
+    /// A flow holds a send op only while it sends: pumping queued bytes takes
+    /// one from the pool, armed for the flow, which it keeps while bytes
+    /// remain for it; the completion that leaves nothing queued gives it back.
+    /// The host gets every byte, in order.
+    #[test]
+    fn a_flow_takes_a_send_op_for_its_sends_and_gives_it_back() {
+        use std::io::Read;
+        use std::os::windows::io::IntoRawSocket;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut host, _) = listener.accept().unwrap();
+        // More than one op's worth, so it takes two sends.
+        let data: Vec<u8> = (0..TCP_BUF as u32 + 1000).map(|i| (i * 7) as u8).collect();
+        let len = data.len();
+        let reader = std::thread::spawn(move || {
+            let mut got = vec![0; len];
+            host.read_exact(&mut got).map(|_| got)
+        });
+        let iocp = sys::create_iocp().unwrap();
+        let mut flow = connected_flow(TIER_MAKE[0]());
+        flow.sock = client.into_raw_socket() as SOCKET;
+        assert!(sys::associate(iocp, flow.sock, KEY_TCP));
+        flow.pending_to_host.extend_from_slice(&data);
+        let mut pool = BoxPool::new(1, 1, make_tcp_send_op);
+        let mut done = [(false, 0, 0, std::ptr::null_mut()); 1];
+        for left in [1000, 0] {
+            assert!(pump_send(&mut flow, FLOW_KEY, &mut pool));
+            assert!(flow.send_inflight);
+            assert!(pool.free.is_empty(), "the flow holds the op");
+            assert_eq!(flow.pending_to_host.len(), left);
+            assert_eq!(sys::get_many(iocp, &mut done, 5000), 1);
+            let (ok, bytes, _, ov) = done[0];
+            let op = flow.send_op.as_deref().unwrap();
+            assert!(ok && std::ptr::eq(ov, &op.overlapped));
+            assert_eq!((op.kind, op.key), (2, FLOW_KEY), "routes to the flow");
+            flow.send_inflight = false;
+            send_done(&mut flow, bytes, &mut pool);
+            assert_eq!(flow.send_op.is_some(), left > 0, "kept while bytes remain");
+        }
+        assert_eq!(pool.free.len(), 1, "given back");
+        assert!(reader.join().unwrap().unwrap() == data);
+        flow.tcb.take();
+    }
+
+    /// A short send's tail goes back to the front of the queue, read out of
+    /// the op before the flow lets the op go, so the flow keeps it to send
+    /// the tail.
+    #[test]
+    fn a_short_send_keeps_the_op_for_its_tail() {
+        let mut pool = BoxPool::new(1, 1, make_tcp_send_op);
+        let mut op = pool.acquire();
+        op.buf[..6].copy_from_slice(b"abcdef");
+        op.wsabuf = sys::wsabuf(op.buf.as_mut_ptr(), 6);
+        let mut flow = connected_flow(TIER_MAKE[0]());
+        flow.send_op = Some(op);
+        send_done(&mut flow, 4, &mut pool);
+        assert_eq!(flow.pending_to_host, b"ef");
+        assert!(flow.send_op.is_some() && pool.free.is_empty());
+        flow.send_op.take();
+        flow.tcb.take();
+    }
+
+    /// A flow never gives back an op the kernel may still write (a send in
+    /// flight) or that holds the guest's SYN until the host connect is done:
+    /// the pool can free a box it doesn't keep, so either would be a
+    /// use-after-free.
+    #[test]
+    fn an_op_in_use_is_never_given_back() {
+        let mut pool = BoxPool::new(1, 1, make_tcp_send_op);
+        let mut flow = connected_flow(TIER_MAKE[0]());
+        flow.send_op = Some(pool.acquire());
+        flow.send_inflight = true;
+        flow.release_send_op(&mut pool);
+        assert!(flow.send_op.is_some(), "kept while its send is in flight");
+        flow.send_inflight = false;
+        flow.syn_len = 40;
+        flow.release_send_op(&mut pool);
+        assert!(
+            flow.send_op.is_some(),
+            "kept while it holds the guest's SYN"
+        );
+        flow.syn_len = 0;
+        flow.release_send_op(&mut pool);
+        assert!(flow.send_op.is_none() && pool.free.len() == 1);
+        flow.tcb.take();
+    }
+
+    /// The idle sweep frees an emptied guest->host queue's buffer, but not
+    /// while bytes wait in it or a send is in flight.
+    #[test]
+    fn the_idle_sweep_frees_an_emptied_queue() {
+        let mut flow = connected_flow(TIER_MAKE[0]());
+        flow.pending_to_host.extend_from_slice(&[7; 1000]);
+        flow.shed_idle_queue();
+        assert_eq!(flow.pending_to_host.len(), 1000);
+        flow.pending_to_host.clear();
+        flow.send_inflight = true;
+        flow.shed_idle_queue();
+        assert!(flow.pending_to_host.capacity() >= 1000);
+        flow.send_inflight = false;
+        flow.shed_idle_queue();
+        assert_eq!(flow.pending_to_host.capacity(), 0);
         flow.tcb.take();
     }
 
