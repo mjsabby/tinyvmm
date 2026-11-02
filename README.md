@@ -318,7 +318,7 @@ Parsed in `parse_pvh_args` (`main.rs:590`). Defaults and clamps are exact.
 | `--sound` | off | Add a virtio-snd sound card — one playback + one capture PCM stream (48 kHz / S16_LE / stereo) backed by Windows **WASAPI** (shared mode). Needs a guest kernel with `CONFIG_SND_VIRTIO`. On a host with no audio endpoint the card still appears but plays/records silence. |
 | `--record <file.mp4>[,fps=N][,kbps=N]` | off | Record the VM, in real time, to a **fragmented MP4** through Windows **Media Foundation**: the virtio-gpu display as H.264 at a constant `fps` (default **30**, max 60; static screens repeat the last frame) and, with `--sound`, the guest's playback stream as AAC-LC (48 kHz stereo, 192 kbps). Needs `--gpu`; the video has the display size, and frames from a different guest mode are scaled to fit (letterboxed). A hardware H.264 encoder is used when one accepts the stream, else Microsoft's software encoder. `kbps` sets the mean video bitrate (default 0.15 bit/pixel/frame, e.g. 4.6 Mbps at 1280×800@30). The file is playable while it grows and, up to its last fragment, if tinyvmm is killed. See [Recording](#recording---record-srcrecordrs). |
 | `--cpu-affinity p\|p-physical\|e\|all` | `p` | Which cores tinyvmm runs on, by CPU-set `EfficiencyClass`. On a hybrid CPU, `p` confines the whole process (vCPUs, doorbell pumps, NAT and 9p workers) to the P-cores, and `e` to the E-cores. `p-physical` also limits the vCPU threads to one logical processor per P-core (no SMT sharing). `all` lets Windows place threads anywhere. On a non-hybrid CPU, `p` and `e` change nothing. See [CPU placement](#cpu-placement). |
-| `--poll-us <N>` | `50` | Ceiling, in µs, of the doorbell pumps' adaptive busy-poll (see [Doorbells](#doorbells--the-notify-without-a-vm-exit-path)); `0` disables it. **0–10000.** |
+| `--poll-us <N>` | `200` | Ceiling, in µs, of the doorbell pumps' adaptive busy-poll (see [Doorbells](#doorbells--the-notify-without-a-vm-exit-path)); `0` disables it. **0–10000.** |
 | `--save <path>` | — | Arm snapshot-on-trigger: when the guest issues `CPUID(0x4000DE57)`, quiesce the machine, write `<path>`, and exit. |
 | `--unsafe-save-mutable-drive` | off | Allow `--save` with a *writable* `--drive` attached (otherwise refused — the disk is not part of the snapshot, so a mutated disk would diverge from restored RAM). |
 | `--watchdog-secs <N>` | `0` | `0` = run until stopped; else stop after N seconds, printing `io/cpuid/msr` exit counters each second. |
@@ -836,9 +836,13 @@ as much as serving a cached 4 KiB request. blk and 9p therefore let their pump
 `transport.rs`, modelled on KVM's halt polling): when the guest's next request
 arrives within the window the pump takes it straight from guest memory. The
 window grows while the gap between requests stays under the `--poll-us`
-ceiling (default 50 µs) and decays to zero otherwise, so an idle or lightly
-used device never spins. Polling trades host CPU for latency only while
-requests come back to back: a QD1 4 KiB read loop costs about half a core more.
+ceiling (default 200 µs, KVM's default `halt_poll_ns`) and decays to zero
+otherwise, so an idle or lightly used device never spins. The gap the pump
+measures includes the guest's completion interrupt and turnaround, which
+nested often exceed 50 µs: with that ceiling the window collapsed, and a
+sequential 9p walk ran no faster than with polling off. Polling trades host
+CPU for latency only while requests come back to back, when the pump spins
+up to a core.
 
 ---
 

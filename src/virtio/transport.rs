@@ -152,8 +152,12 @@ pub fn on_doorbell_pump() -> bool {
     ON_DOORBELL_PUMP.with(|c| c.get())
 }
 
-/// Default ceiling of a pump's busy-poll window (`--poll-us`).
-pub const DEFAULT_POLL_US: u64 = 50;
+/// Default ceiling of a pump's busy-poll window (`--poll-us`), KVM's default
+/// `halt_poll_ns`. Nested, the gap a pump sees between finishing a request
+/// and the doorbell for the guest's next one (the completion interrupt, the
+/// guest's turnaround and the doorbell's own wake-up) is often over 50 us, so
+/// a 50 us ceiling let the window collapse and every request paid the wake-up.
+pub const DEFAULT_POLL_US: u64 = 200;
 static POLL_MAX_NS: AtomicU64 = AtomicU64::new(DEFAULT_POLL_US * 1000);
 
 /// Set the busy-poll ceiling for pumps started from now on; 0 disables polling.
