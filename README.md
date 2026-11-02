@@ -681,9 +681,19 @@ including the audio track.
   at once, so after a completion it takes the datagrams already queued inline,
   up to 32 per pass, instead of one completion and worker wake each (one per
   pass while the guest's RX backlog is deep: UDP isn't throttled like TCP, and
-  uses the RX pool's slack). The NAT holds up to 256 TCP flows (each has a
-  pair of 1 MiB rings by default, so the cap bounds their memory) and ends
-  connections the way a real network would:
+  uses the RX pool's slack). The NAT holds up to 4096 TCP flows: a server
+  guest under a test harness keeps hundreds of mostly idle connections open
+  (browser contexts, pooled keep-alive clients), and past the cap an accepted
+  port-forward client is closed and a guest `connect()` refused. The first 256
+  open flows get a pair of 256 KiB rings by default (about 654 KiB a flow with
+  the TCB's own state and its send buffer); flows past them get the 64 KiB
+  tier (about 270 KiB a flow), so all 4096 together hold about 1.15 GiB. A
+  guest upload can have at most one ring unacknowledged, so on a nested host
+  (~0.4 ms a round trip) one connection uploads at most about 4 Gbps, against
+  ~9 Gbps with the 1 MiB tier. The pools keep 256 flows' worth of idle
+  buffers per tier for reuse and free the rest as flows close. A listener
+  accepts up to 1024 clients ahead of the workers before it drops new ones.
+  The NAT ends connections the way a real network would:
   * The guest's SYN is answered only once the host connect succeeds. A refused
     or unreachable destination, or one that doesn't answer within 10 s, fails
     the guest's `connect()` with ECONNREFUSED. A closed port on the gateway
@@ -784,7 +794,8 @@ the host server on the host's LAN address, three interleaved boots of three
 | `nat_test.py` phases passed | 12/12 | 12/12 | 11/12 | 12/12 |
 
 The connection rate is the noisiest row: between sessions it moved by up to a
-third for every backend.
+third for every backend. The `nat` and `smoltcp` columns were measured when
+TCP flows still defaulted to 1 MiB rings.
 
 * `nat`'s upload retransmits came from `tcp-sans-io` advertising a receive
   window up to 31 bytes past its free buffer space (window scaling rounded the
@@ -1524,8 +1535,9 @@ and every other counter sits on a slow path):
 ```text
 [net] nic0 rx_frames=193859 tx_frames=84052 msix=99274 rx_irqs=60214 tx_irqs=39060
   rx_backlogged=238 rx_rewinds=249 rx_truncated=0 rx_backlog_drops=0 rx_backlog_max=33
-  rx_throttles=1 | nat: tcp_flows=22 retransmits=0 (0 B) rto=0 tlp=0 recoveries=0
-  dsacks=0 dup_bytes_from_guest=0 ooo_drops=0 tx_drops=0 iocp_backlog_max=404
+  rx_throttles=1 | nat: tcp_flows=22 tcp_peak=9 tcp_full=0 accept_drops=0
+  retransmits=0 (0 B) rto=0 tlp=0 recoveries=0 dsacks=0 dup_bytes_from_guest=0
+  ooo_drops=0 tx_drops=0 iocp_backlog_max=404
 ```
 
 * **Interrupts:** `msix` is what the NIC's MSI-X actually injected
@@ -1538,8 +1550,11 @@ and every other counter sits on a slow path):
   retried later); `rx_throttles` counts times the backlog got deep enough to
   pause the NAT (see §9); `rx_truncated` / `rx_backlog_drops` are frames the
   guest lost and should be 0.
-* **NAT** (tcp-sans-io's per-connection `TcbStats` for the guest-facing TCBs,
-  summed over flows): retransmits and their causes (`rto`, `tlp`, fast
+* **NAT:** `tcp_flows` TCP flows opened in all, at most `tcp_peak` at once;
+  `tcp_full` connections turned away at the 4096-flow cap and `accept_drops`
+  port-forward clients dropped at accept (both should be 0). Then
+  tcp-sans-io's per-connection `TcbStats` for the guest-facing TCBs, summed
+  over flows: retransmits and their causes (`rto`, `tlp`, fast
   `recoveries`), `dsacks` (the guest received a duplicate, so a retransmit was
   spurious), `dup_bytes_from_guest` / `ooo_drops` (guest data received twice, or
   dropped because the out-of-order tracker was full), `tx_drops` (guest

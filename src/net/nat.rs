@@ -42,8 +42,9 @@ const KEY_ICMP: usize = 4;
 const KEY_ACCEPT: usize = 5;
 /// Cap on accepted-but-undrained port-forward connections in flight to the
 /// worker. A remote accept-flood is dropped past this rather than piling up host
-/// sockets/memory unboundedly.
-const MAX_ACCEPT_INFLIGHT: usize = 64;
+/// sockets/memory unboundedly; a browser opening its connections at once, from
+/// several test processes, stays well inside it.
+const MAX_ACCEPT_INFLIGHT: usize = 1024;
 /// Guest TX frame with offload metadata (partial L4 checksum and/or a TCPv4
 /// super-segment): small-pool slot / big-pool slot respectively.
 const KEY_FRAME_OFFLOAD: usize = 6;
@@ -90,7 +91,29 @@ const TCP_RECV_MAX: usize = 256 * 1024;
 /// so a nearly full ring refills in a few large recvs, not many small ones.
 const TCP_RECV_MIN: usize = 64 * 1024;
 const MAX_UDP_FLOWS: usize = 256;
-const MAX_TCP_FLOWS: usize = 256;
+/// Most TCP flows (guest connections and port-forwarded clients) open at once;
+/// past it a guest connect() is refused and an accepted client is closed. A
+/// server guest under a test harness holds hundreds of mostly idle
+/// connections (browser contexts, pooled keep-alive clients).
+const MAX_TCP_FLOWS: usize = 4096;
+/// With this many flows open, a new flow takes the smallest Tcb tier
+/// (`TIER_BUF[0]`) unless a port override names one, so a crowd of idle
+/// connections costs about 270 KiB each (two 64 KiB rings, the Tcb's own
+/// ~78 KiB and a 64 KiB send op) rather than the default tier's 654 KiB: all
+/// MAX_TCP_FLOWS open hold about 1.15 GiB. The pools keep this many flows'
+/// worth of idle boxes per tier and free the rest, so the memory goes when
+/// the flows do.
+const FULL_RING_FLOWS: usize = 256;
+
+/// The Tcb tier for a new flow: a port override's, else the default while
+/// fewer than `FULL_RING_FLOWS` flows are open, else the smallest.
+fn tier_for(port_override: Option<usize>, open_flows: usize, default_tier: usize) -> usize {
+    match port_override {
+        Some(tier) => tier,
+        None if open_flows >= FULL_RING_FLOWS => 0,
+        None => default_tier,
+    }
+}
 /// Number of preallocated guest-TX frame slots shared across all shards.
 const POOL_SLOTS: usize = 1024;
 /// Slots for >`FRAME_CAP` TSO super-segments (each [`TX_FRAME_CAP`] bytes,
@@ -156,8 +179,8 @@ pub struct NatOptions {
     /// port reaches the host's loopback; see [`host_dest`].
     pub host_local: bool,
     /// Per-tier count of Tcbs to preallocate at startup (warm pool). Pools
-    /// still grow on demand up to the flow cap and recycle thereafter, so this
-    /// only governs cold-start latency, not the hard ceiling.
+    /// still grow on demand up to the flow cap and keep up to 256 idle Tcbs
+    /// per tier for reuse, so this only governs cold-start latency.
     pub tcb_warm: [usize; N_TCB_TIERS],
     /// Tier index assigned to a flow when no port override matches.
     pub default_tier: usize,
@@ -377,12 +400,16 @@ const TIER_MAKE: [fn() -> Box<dyn TcbDyn>; N_TCB_TIERS] = [
     make_tcb::<{ TIER_BUF[2] }>,
 ];
 /// Default warm counts (cold-start preallocation; pools still grow on demand).
-/// Most flows ride the default 1 MiB tier; the small/mid tiers are opt-in via
-/// `tcb_port_tier`. Preallocated ring memory (two rings per Tcb):
-/// 192 x 128 KiB + 8 x 512 KiB + 16 x 2 MiB = 60 MiB.
-const DEFAULT_TCB_WARM: [usize; N_TCB_TIERS] = [192, 8, 16];
-/// Default tier index (1 MiB) when no port override matches.
-const DEFAULT_TIER: usize = 2;
+/// Most flows ride the default 256 KiB tier, and flows past `FULL_RING_FLOWS`
+/// the 64 KiB one; the 1 MiB tier is opt-in via `tcb_port_tier`, so it starts
+/// cold. Preallocated ring memory (two rings per Tcb):
+/// 192 x 128 KiB + 16 x 512 KiB = 32 MiB.
+const DEFAULT_TCB_WARM: [usize; N_TCB_TIERS] = [192, 16, 0];
+/// Default tier index (256 KiB) when no port override matches. On a nested
+/// host its rings cap one connection's guest upload near 4 Gbps (see above),
+/// but a flow costs about 654 KiB rather than the 1 MiB tier's 2.1 MiB, and a
+/// server guest under a test harness keeps hundreds of connections open.
+const DEFAULT_TIER: usize = 1;
 
 /// Placeholder config a pooled Tcb is built with; `reinit` on acquire fully
 /// overwrites it, so these values never reach the wire.
@@ -554,20 +581,23 @@ impl<const BUF: usize> TcbDyn for Tcb<BUF> {
 }
 
 /// Worker-thread-only free-list of preallocated boxed objects (ArrayPool<T>).
-/// `acquire` pops a recycled box or, on a cold miss, makes one (bounded by the
-/// flow caps); `release` returns it. Single-threaded → no locking, and no
-/// steady-state allocation once the high-water mark is warmed. `T: ?Sized` so
-/// the same type serves both concrete ops and `dyn TcbDyn`.
+/// `acquire` pops a recycled box or, on a cold miss, makes one; `release`
+/// returns it, keeping at most `keep` idle boxes and freeing the rest, so a
+/// burst of flows doesn't pin its memory after it ends. Single-threaded → no
+/// locking, and no steady-state allocation within the kept count. `T: ?Sized`
+/// so the same type serves both concrete ops and `dyn TcbDyn`.
 struct BoxPool<T: ?Sized> {
     free: Vec<Box<T>>,
     make: fn() -> Box<T>,
+    keep: usize,
 }
 
 impl<T: ?Sized> BoxPool<T> {
-    fn new(warm: usize, make: fn() -> Box<T>) -> Self {
+    fn new(warm: usize, keep: usize, make: fn() -> Box<T>) -> Self {
         let mut pool = BoxPool {
             free: Vec::new(),
             make,
+            keep: keep.max(warm),
         };
         pool.warm(warm);
         pool
@@ -577,6 +607,7 @@ impl<T: ?Sized> BoxPool<T> {
         for _ in 0..count {
             self.free.push((self.make)());
         }
+        self.keep = self.keep.max(self.free.len());
     }
     fn acquire(&mut self) -> Box<T> {
         match self.free.pop() {
@@ -585,7 +616,9 @@ impl<T: ?Sized> BoxPool<T> {
         }
     }
     fn release(&mut self, b: Box<T>) {
-        self.free.push(b);
+        if self.free.len() < self.keep {
+            self.free.push(b);
+        }
     }
 }
 
@@ -1540,6 +1573,14 @@ impl From<&TcbStats> for Losses {
 #[derive(Default)]
 struct NatStats {
     tcp_flows: AtomicU64,
+    /// Most TCP flows open at once.
+    tcp_peak: AtomicU64,
+    /// Connections turned away at `MAX_TCP_FLOWS`: guest SYNs refused and
+    /// accepted port-forward clients closed.
+    tcp_full: AtomicU64,
+    /// Port-forward clients closed at accept because `MAX_ACCEPT_INFLIGHT`
+    /// were already waiting for a worker.
+    accept_drops: AtomicU64,
     segs_retrans: AtomicU64,
     bytes_retrans: AtomicU64,
     rto: AtomicU64,
@@ -1589,9 +1630,13 @@ impl NatStats {
     fn summary(&self) -> String {
         let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
         let mut s = format!(
-            "nat: tcp_flows={} retransmits={} ({} B) rto={} tlp={} recoveries={} dsacks={} \
-             dup_bytes_from_guest={} ooo_drops={} tx_drops={} iocp_backlog_max={}",
+            "nat: tcp_flows={} tcp_peak={} tcp_full={} accept_drops={} retransmits={} ({} B) \
+             rto={} tlp={} recoveries={} dsacks={} dup_bytes_from_guest={} ooo_drops={} \
+             tx_drops={} iocp_backlog_max={}",
             ld(&self.tcp_flows),
+            ld(&self.tcp_peak),
+            ld(&self.tcp_full),
+            ld(&self.accept_drops),
             ld(&self.segs_retrans),
             ld(&self.bytes_retrans),
             ld(&self.rto),
@@ -2025,12 +2070,14 @@ impl NatState {
     }
 
     /// Pick the Tcb size-tier for a flow from its service port, falling back to
-    /// the configured default. No mid-flow promotion: the tier is fixed here.
+    /// the configured default, or to the smallest tier once `FULL_RING_FLOWS`
+    /// flows are open. No mid-flow promotion: the tier is fixed here.
     fn choose_tier(&self, port: u16) -> usize {
-        self.port_tier
-            .get(&port)
-            .copied()
-            .unwrap_or(self.default_tier)
+        tier_for(
+            self.port_tier.get(&port).copied(),
+            self.flows.tcp.load(Ordering::Relaxed),
+            self.default_tier,
+        )
     }
 
     fn next_iss(&mut self) -> u32 {
@@ -2495,10 +2542,11 @@ impl NatState {
         // failed: refuse with a RST so the guest's connect() fails fast instead
         // of retrying for ~minutes.
         let refused = match host_dest(key.2, key.3, self.gw_ip, self.host_local) {
-            Some(host_dip) => {
-                self.flows.tcp.load(Ordering::Relaxed) >= MAX_TCP_FLOWS
-                    || self.new_tcp_flow(key, ip.datagram, host_dip).is_none()
+            Some(_) if self.flows.tcp.load(Ordering::Relaxed) >= MAX_TCP_FLOWS => {
+                self.stats.tcp_full.fetch_add(1, Ordering::Relaxed);
+                true
             }
+            Some(host_dip) => self.new_tcp_flow(key, ip.datagram, host_dip).is_none(),
             None => true,
         };
         if refused {
@@ -2629,8 +2677,16 @@ impl NatState {
                 syn_csum_trusted: self.l4_csum_trusted,
             },
         );
-        self.flows.tcp.fetch_add(1, Ordering::Relaxed);
+        self.note_flow_opened();
         Some(())
+    }
+
+    /// Count a flow just inserted against the cap and the peak.
+    fn note_flow_opened(&self) {
+        let open = self.flows.tcp.fetch_add(1, Ordering::Relaxed) + 1;
+        self.stats
+            .tcp_peak
+            .fetch_max(open as u64, Ordering::Relaxed);
     }
 
     /// Pick a free gateway-side ephemeral port for an inbound flow and claim
@@ -2679,6 +2735,7 @@ impl NatState {
     /// socket is already connected.
     fn new_inbound_flow(&mut self, host_sock: SOCKET, guest_ip: [u8; 4], guest_port: u16) {
         if self.flows.tcp.load(Ordering::Relaxed) >= MAX_TCP_FLOWS {
+            self.stats.tcp_full.fetch_add(1, Ordering::Relaxed);
             sys::close_sock(host_sock);
             return;
         }
@@ -2758,7 +2815,7 @@ impl NatState {
                 syn_csum_trusted: false,
             },
         );
-        self.flows.tcp.fetch_add(1, Ordering::Relaxed);
+        self.note_flow_opened();
         // Emit the SYN toward the guest and arm the host receive.
         self.tcp_drive(key);
     }
@@ -3352,9 +3409,10 @@ impl NatBackend {
                 let ap = accept_pool.clone();
                 let ai = accept_inflight.clone();
                 let targets = iocps.clone();
+                let st = stats.clone();
                 if let Ok(h) = std::thread::Builder::new()
                     .name(format!("nat-listen{family}-{}", pf.host_port))
-                    .spawn(move || listener_loop(lsock, &targets, pf, ap, ai))
+                    .spawn(move || listener_loop(lsock, &targets, pf, ap, ai, &st))
                 {
                     listener_threads.push(h);
                 }
@@ -3386,8 +3444,13 @@ impl NatBackend {
             // share before serving completions, so VM start does not wait for
             // tens of MiB of ring buffers to be zeroed.
             let make = opts.engine.tier_make();
-            let tcb_pools: Vec<BoxPool<dyn TcbDyn>> =
-                (0..N_TCB_TIERS).map(|i| BoxPool::new(0, make[i])).collect();
+            // Idle boxes a pool keeps for reuse: 256 flows' worth per tier and
+            // op kind across the shards. Past that a released box is freed, so
+            // a burst of flows leaves no more than that pinned behind it.
+            let keep = FULL_RING_FLOWS.div_ceil(n);
+            let tcb_pools: Vec<BoxPool<dyn TcbDyn>> = (0..N_TCB_TIERS)
+                .map(|i| BoxPool::new(0, keep, make[i]))
+                .collect();
             let tcb_warm: [usize; N_TCB_TIERS] =
                 std::array::from_fn(|i| opts.tcb_warm[i].div_ceil(n));
             let state = NatState {
@@ -3409,9 +3472,9 @@ impl NatBackend {
                 big_pool: big_pool.clone(),
                 l4_csum_trusted: false,
                 tcb_pools,
-                tcp_op_pool: BoxPool::new(0, make_tcp_op),
-                tcp_send_op_pool: BoxPool::new(0, make_tcp_send_op),
-                udp_op_pool: BoxPool::new(0, make_udp_op),
+                tcp_op_pool: BoxPool::new(0, keep, make_tcp_op),
+                tcp_send_op_pool: BoxPool::new(0, keep, make_tcp_send_op),
+                udp_op_pool: BoxPool::new(0, MAX_UDP_FLOWS.div_ceil(n), make_udp_op),
                 accept_pool: accept_pool.clone(),
                 accept_inflight: accept_inflight.clone(),
                 icmp_reply_pool: icmp_reply_pool.clone(),
@@ -3456,8 +3519,10 @@ impl NatBackend {
                     for (pool, count) in state.tcb_pools.iter_mut().zip(tcb_warm) {
                         pool.warm(count);
                     }
-                    state.tcp_op_pool.warm(MAX_TCP_FLOWS.div_ceil(n));
-                    state.tcp_send_op_pool.warm(MAX_TCP_FLOWS.div_ceil(n));
+                    // Warm one op pair per full-ring flow; past that the pools
+                    // grow on demand (each send op holds a 64 KiB buffer).
+                    state.tcp_op_pool.warm(FULL_RING_FLOWS.div_ceil(n));
+                    state.tcp_send_op_pool.warm(FULL_RING_FLOWS.div_ceil(n));
                     state.udp_op_pool.warm(UDP_OPS_WARM.div_ceil(n));
                     state.run()
                 })
@@ -3489,6 +3554,7 @@ fn listener_loop(
     pf: PortForward,
     accept_pool: Arc<SyncBoxPool<AcceptMsg>>,
     accept_inflight: Arc<AtomicUsize>,
+    stats: &NatStats,
 ) {
     let mut next = 0usize;
     loop {
@@ -3500,6 +3566,7 @@ fn listener_loop(
         // dropped here (the client can retry) rather than piling up host sockets
         // and AcceptMsg boxes faster than the workers drain them.
         if accept_inflight.load(Ordering::Acquire) >= MAX_ACCEPT_INFLIGHT {
+            stats.accept_drops.fetch_add(1, Ordering::Relaxed);
             sys::close_sock(c);
             continue;
         }
@@ -3768,6 +3835,40 @@ mod tests {
             let want = if ip == gw { loopback } else { Some(ip) };
             assert_eq!(host_dest(ip, port, gw, true), want, "{ip:?}:{port}");
         }
+    }
+
+    /// A crowd of connections can't each take the default tier's rings: past
+    /// FULL_RING_FLOWS open flows a new one gets the smallest tier, unless its
+    /// port names a tier.
+    #[test]
+    fn flows_past_the_full_ring_count_get_small_rings() {
+        assert_eq!(tier_for(None, 0, DEFAULT_TIER), DEFAULT_TIER);
+        assert_eq!(
+            tier_for(None, FULL_RING_FLOWS - 1, DEFAULT_TIER),
+            DEFAULT_TIER
+        );
+        assert_eq!(tier_for(None, FULL_RING_FLOWS, DEFAULT_TIER), 0);
+        assert_eq!(tier_for(Some(2), FULL_RING_FLOWS, DEFAULT_TIER), 2);
+    }
+
+    /// A pool keeps at most `keep` idle boxes (or its warm count): what a
+    /// burst of flows released beyond that is freed.
+    #[test]
+    fn pools_free_what_they_would_not_reuse() {
+        let mut pool: BoxPool<[u8; 16]> = BoxPool::new(2, 4, || Box::new([0; 16]));
+        let held: Vec<_> = (0..10).map(|_| pool.acquire()).collect();
+        assert!(pool.free.is_empty());
+        for b in held {
+            pool.release(b);
+        }
+        assert_eq!(pool.free.len(), 4);
+        pool.warm(6);
+        assert_eq!(pool.free.len(), 10, "warming raises what the pool keeps");
+        let held: Vec<_> = (0..12).map(|_| pool.acquire()).collect();
+        for b in held {
+            pool.release(b);
+        }
+        assert_eq!(pool.free.len(), 10);
     }
 
     /// The IPv4 fragments of a `len`-byte UDP datagram from the guest, as
