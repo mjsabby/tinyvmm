@@ -4,10 +4,11 @@ use crate::error::{Error, Result, check_hr};
 use core::ffi::c_void;
 use windows_sys::Win32::System::Hypervisor::{
     WHV_MEMORY_ACCESS_CONTEXT, WHV_PARTITION_HANDLE, WHV_REGISTER_NAME, WHV_REGISTER_VALUE,
-    WHV_RUN_VP_EXIT_CONTEXT, WHV_UINT128, WHV_UINT128_0, WHV_VP_EXIT_CONTEXT,
-    WHV_X64_IO_PORT_ACCESS_CONTEXT, WHvCancelRunVirtualProcessor, WHvCreateVirtualProcessor,
-    WHvDeleteVirtualProcessor, WHvGetVirtualProcessorInterruptControllerState2,
-    WHvGetVirtualProcessorRegisters, WHvGetVirtualProcessorXsaveState, WHvRegisterInterruptState,
+    WHV_RUN_VP_EXIT_CONTEXT, WHV_UINT128, WHV_UINT128_0, WHV_VIRTUAL_PROCESSOR_STATE_TYPE,
+    WHV_VP_EXIT_CONTEXT, WHV_X64_IO_PORT_ACCESS_CONTEXT, WHvCancelRunVirtualProcessor,
+    WHvCreateVirtualProcessor, WHvDeleteVirtualProcessor,
+    WHvGetVirtualProcessorInterruptControllerState2, WHvGetVirtualProcessorRegisters,
+    WHvGetVirtualProcessorState, WHvGetVirtualProcessorXsaveState, WHvRegisterInterruptState,
     WHvRegisterPendingEvent, WHvRegisterPendingInterruption, WHvRunVirtualProcessor,
     WHvRunVpExitReasonCanceled, WHvRunVpExitReasonException,
     WHvRunVpExitReasonInvalidVpRegisterValue, WHvRunVpExitReasonMemoryAccess,
@@ -16,7 +17,7 @@ use windows_sys::Win32::System::Hypervisor::{
     WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64InterruptWindow,
     WHvRunVpExitReasonX64IoPortAccess, WHvRunVpExitReasonX64MsrAccess,
     WHvSetVirtualProcessorInterruptControllerState2, WHvSetVirtualProcessorRegisters,
-    WHvSetVirtualProcessorXsaveState, WHvX64PendingEventExtInt,
+    WHvSetVirtualProcessorState, WHvSetVirtualProcessorXsaveState, WHvX64PendingEventExtInt,
     WHvX64RegisterDeliverabilityNotifications, WHvX64RegisterRflags,
 };
 
@@ -384,6 +385,44 @@ impl Vcpu {
                 )
             },
             "WHvSetVirtualProcessorInterruptControllerState2",
+        )
+    }
+
+    /// Read state the hypervisor keeps for this vCPU outside its registers
+    /// (`WHvGetVirtualProcessorState`): the synthetic timers, or the SynIC
+    /// message or event-flag page. Returns the bytes written into `buf`.
+    pub fn get_state(&self, ty: WHV_VIRTUAL_PROCESSOR_STATE_TYPE, buf: &mut [u8]) -> Result<usize> {
+        let mut written: u32 = 0;
+        // SAFETY: WHP writes at most `buf.len()` bytes into `buf`.
+        check_hr(
+            unsafe {
+                WHvGetVirtualProcessorState(
+                    self.part,
+                    self.index,
+                    ty,
+                    buf.as_mut_ptr() as *mut c_void,
+                    buf.len() as u32,
+                    &mut written,
+                )
+            },
+            "WHvGetVirtualProcessorState",
+        )?;
+        Ok((written as usize).min(buf.len()))
+    }
+
+    /// Write back state read with [`Self::get_state`].
+    pub fn set_state(&self, ty: WHV_VIRTUAL_PROCESSOR_STATE_TYPE, buf: &[u8]) -> Result<()> {
+        check_hr(
+            unsafe {
+                WHvSetVirtualProcessorState(
+                    self.part,
+                    self.index,
+                    ty,
+                    buf.as_ptr() as *const c_void,
+                    buf.len() as u32,
+                )
+            },
+            "WHvSetVirtualProcessorState",
         )
     }
 

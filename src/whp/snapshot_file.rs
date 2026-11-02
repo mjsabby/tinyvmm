@@ -28,9 +28,10 @@ use std::sync::OnceLock;
 use std::arch::x86_64::__m128i;
 
 pub const MAGIC: [u8; 8] = *b"TVMMSAVE";
-/// 2: guest RAM is stored sparse. Version 1 (RAM stored whole, section type
-/// 0x0001) is not read.
-pub const VERSION: u32 = 2;
+/// 3: the hypervisor implements the Hyper-V enlightenments, and their state
+/// is saved through WHP (the `HvPartition` and per-vCPU SynIC sections). 2
+/// stored guest RAM sparse, 1 whole. Older versions are not read.
+pub const VERSION: u32 = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u32)]
@@ -42,7 +43,11 @@ pub enum SectionType {
     VcpuIntrCtl = 0x0013,
     VcpuTiming = 0x0014,
     VcpuSupMsr = 0x0015,
-    HvEnlightenment = 0x0020,
+    VcpuSynic = 0x0016,
+    VcpuSynicTimers = 0x0017,
+    VcpuSynicMessagePage = 0x0018,
+    VcpuSynicEventFlagsPage = 0x0019,
+    HvPartition = 0x0021,
     PciDevice = 0x0030,
     VirtioPciTransport = 0x0031,
     MsixState = 0x0032,
@@ -68,7 +73,11 @@ impl SectionType {
             0x0013 => VcpuIntrCtl,
             0x0014 => VcpuTiming,
             0x0015 => VcpuSupMsr,
-            0x0020 => HvEnlightenment,
+            0x0016 => VcpuSynic,
+            0x0017 => VcpuSynicTimers,
+            0x0018 => VcpuSynicMessagePage,
+            0x0019 => VcpuSynicEventFlagsPage,
+            0x0021 => HvPartition,
             0x0030 => PciDevice,
             0x0031 => VirtioPciTransport,
             0x0032 => MsixState,

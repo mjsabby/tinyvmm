@@ -15,6 +15,9 @@ Three phases:
     * launches ``tinyvmm.exe --restore <path>`` (no other args),
     * asserts rc=0, ``POST-RESTORE-CONTINUE rc=0`` and the shutdown
       sentinel appear in the combined log,
+    * asserts the guest clock carried on from the save: under a second of
+      guest time between the trigger and the resumed guest, and a
+      ``sleep 1`` armed after the restore takes about a second,
     * measures wall-time and warns if a single restore takes > 5s.
 
   Phase 3 -- snapshot file stability:
@@ -30,6 +33,7 @@ Usage:
     [--ram-mb <N>]       default 256
     [--vcpus <N>]        default 1
     [--trigger-cpu <N>]  fire the trigger from vCPU N (an AP when N > 0)
+    [--load]             keep every vCPU busy across the snapshot
     [--save-timeout <N>] default 60   seconds, allows for guest sleep+sync
     [--restore-timeout <N>] default 30
     [--restore-count <N>] default 3
@@ -60,6 +64,8 @@ PRE_TRIGGER_RE = re.compile(r"SNAP-TEST: pre-trigger sentinel")
 TRIGGER_FIRED_RE = re.compile(r"\[snapshot\] trigger fired from vp=(\d+)")
 SNAP_WROTE_RE = re.compile(r"\[snapshot\] wrote (\d+) bytes")
 POST_RESTORE_RE = re.compile(r"POST-RESTORE-CONTINUE rc=0")
+CLOCK_RE = re.compile(
+    r"SNAP-TEST: CLOCK pre=([\d.]+) post=([\d.]+) sleep_start=([\d.]+) sleep_end=([\d.]+)")
 SHUTDOWN_SENTINEL = "[init] === tinyvmm shutdown requested ==="
 
 
@@ -131,6 +137,8 @@ def phase1_save(args: argparse.Namespace) -> None:
     )
     if args.trigger_cpu is not None:
         cmdline += f" tinyvmm.trigger_cpu={args.trigger_cpu}"
+    if args.load:
+        cmdline += " tinyvmm.snap_load=1"
     argv = [
         str(args.tinyvmm),
         "--pvh-run",
@@ -189,10 +197,25 @@ def phase2_restore(args: argparse.Namespace, attempt: int) -> float:
     if SHUTDOWN_SENTINEL not in log:
         raise SystemExit(
             f"[restore#{attempt}] FAIL: shutdown sentinel not in log")
+    clock = CLOCK_RE.search(log)
+    if not clock:
+        raise SystemExit(f"[restore#{attempt}] FAIL: 'SNAP-TEST: CLOCK' line not in log")
+    pre, post, s0, s1 = (float(v) for v in clock.groups())
+    # The save stops the guest's clocks and the restore resumes them, so the
+    # gap is the save's own few hundred ms, not the time spent on disk.
+    if not 0 <= post - pre < 1.0:
+        raise SystemExit(
+            f"[restore#{attempt}] FAIL: guest clock went {post - pre:+.2f}s across"
+            " the snapshot (want 0..1s)")
+    if not 0.9 <= s1 - s0 <= 1.5:
+        raise SystemExit(
+            f"[restore#{attempt}] FAIL: 'sleep 1' after the restore took"
+            f" {s1 - s0:.2f}s of guest time")
     # The shutdown sentinel is set up to fire only after a 6+s sleep in
     # the guest, so wall-time will dominantly include that sleep. The
     # actual restore + first instructions should be < 5s of the wall.
-    print(f"[restore#{attempt}] OK in {wall:.2f}s")
+    print(f"[restore#{attempt}] OK in {wall:.2f}s (guest clock: {post - pre:+.2f}s across"
+          f" the snapshot, sleep 1 took {s1 - s0:.2f}s)")
     return wall
 
 
@@ -207,6 +230,8 @@ def main() -> int:
     ap.add_argument("--vcpus", type=int, default=1)
     ap.add_argument("--trigger-cpu", type=int, default=None,
                     help="fire the trigger from this vCPU (an AP when > 0)")
+    ap.add_argument("--load", action="store_true",
+                    help="keep every vCPU busy across the snapshot")
     ap.add_argument("--save-timeout", type=int, default=60)
     ap.add_argument("--restore-timeout", type=int, default=30)
     ap.add_argument("--restore-count", type=int, default=3)
@@ -222,7 +247,7 @@ def main() -> int:
     print(f"[harness] vmlinux={args.vmlinux}")
     print(f"[harness] initrd ={args.initrd}")
     print(f"[harness] snap   ={args.snap_path}  ram={args.ram_mb} MiB"
-          f"  vcpus={args.vcpus}  trigger_cpu={args.trigger_cpu}")
+          f"  vcpus={args.vcpus}  trigger_cpu={args.trigger_cpu}  load={args.load}")
     print(f"[harness] save_timeout={args.save_timeout}s "
           f"restore_timeout={args.restore_timeout}s "
           f"restore_count={args.restore_count}")

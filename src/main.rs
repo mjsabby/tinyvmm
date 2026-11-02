@@ -49,7 +49,7 @@ use crate::virtio::snd::SndDevice;
 use crate::virtio::transport::{self, PciTransport};
 use crate::whp::cpu_affinity::{self, AffinityMode};
 use crate::whp::cpuid::{cached_tsc_hz, set_hide_tsc_deadline};
-use crate::whp::hv::{HvEnlightenment, interrupt_clock_hz};
+use crate::whp::hv::{self, CrashMsrs};
 use crate::whp::run_loop::{RunLoop, StopReason};
 use crate::whp::{GuestMemory, Partition, Vcpu};
 
@@ -1683,8 +1683,11 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     // WHP's in-hypervisor LAPIC delivers MSIs, IPIs and the LAPIC timer on bare
     // metal and nested alike; only the PIC's ExtINT is injected by us.
     part.set_local_apic_emulation(WHvX64LocalApicEmulationModeX2Apic)?;
+    // The hypervisor implements the Hyper-V enlightenments (`whp::hv`).
+    let hv_features = hv::offload(&part, None)?;
     part.setup()?;
     let part_handle = part.handle();
+    println!("[pvh-run] Hyper-V enlightenments run in the hypervisor (features 0x{hv_features:x})");
     btimer.mark("partition ready");
 
     // --- Guest RAM ---
@@ -1720,18 +1723,8 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         );
     }
 
-    // --- Hyper-V enlightenment (Reference TSC page + MSRs) ---
-    let hv = Arc::new(HvEnlightenment::new(
-        ram.clone(),
-        cached_tsc_hz(),
-        interrupt_clock_hz(),
-    ));
-    println!(
-        "[pvh-run] Hyper-V enlightenment ready (tsc_hz={}, scale=0x{:016x}, apic_hz={})",
-        hv.tsc_hz(),
-        hv.tsc_scale(),
-        hv.apic_hz()
-    );
+    // --- Guest crash MSRs (the one Hyper-V interface the VMM implements) ---
+    let crash = Arc::new(CrashMsrs::new(ram.clone()));
     btimer.mark("guest RAM mapped");
 
     // File mappings and embedded PE data are borrowed, without a payload Vec;
@@ -2211,7 +2204,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
             ram.clone(),
             cfg.vcpus,
         )?;
-        rl.set_hv(hv.clone());
+        rl.set_crash_msrs(crash.clone());
         if vp.index() == 0 {
             rl.set_ext_int_source(pic.clone());
         }
@@ -2430,10 +2423,10 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
             write_snapshot(
                 save_path,
                 &cfg,
-                part_handle,
+                &part,
+                hv_features,
                 &vcpus,
                 &ram,
-                &hv,
                 &pic,
                 &pit,
                 &com1,
@@ -2794,10 +2787,10 @@ fn parse_restore_nic(
 fn write_snapshot(
     path: &str,
     cfg: &PvhArgs,
-    _part_handle: windows_sys::Win32::System::Hypervisor::WHV_PARTITION_HANDLE,
+    part: &Partition,
+    hv_features: u64,
     vcpus: &[Arc<Vcpu>],
     ram: &Arc<GuestMemory>,
-    hv: &Arc<HvEnlightenment>,
     pic: &Arc<Pic8259>,
     pit: &Arc<Pit8254>,
     com1: &Arc<Serial8250>,
@@ -2810,12 +2803,18 @@ fn write_snapshot(
     use crate::whp::snapshot_file::{JsonWriter, SectionType, SnapshotWriter};
     use crate::whp::vcpu_state as vs;
 
+    // Stop the partition's clocks first, so every vCPU's TSC and the
+    // reference time are captured as one instant; the restore resumes them
+    // from it. The process exits after the save, so they stay stopped.
+    part.suspend_time()?;
+
     // Capture per-vCPU state first (the vCPUs are stopped, so registers are
     // stable).
     let mut caps = Vec::with_capacity(vcpus.len());
     for vp in vcpus {
         caps.push(vs::capture(vp)?);
     }
+    let hv_state = hv::PartitionState::capture(part, &vcpus[0])?;
 
     // Header JSON: enough to reconstruct the device tree + RAM on restore.
     let mut jw = JsonWriter::new();
@@ -2823,7 +2822,7 @@ fn write_snapshot(
         .u64("vcpu_count", vcpus.len() as u64)
         .u64("ram_size_bytes", ram.size() as u64)
         .bool("large_pages", ram.large_pages())
-        .u64("tsc_hz_at_save", cached_tsc_hz())
+        .u64("hv_features", hv_features)
         .bool("hide_tsc_deadline", true)
         .bool("with_rng", cfg.with_rng)
         .bool("with_gpu", cfg.with_gpu)
@@ -2912,10 +2911,26 @@ fn write_snapshot(
             SectionType::VcpuTiming,
             &vs::encode_regs(i, vs::TIMING_REGS, &c.timing),
         )?;
+        w.write_section(
+            SectionType::VcpuSynic,
+            &vs::encode_regs(i, vs::SYNIC_REGS, &c.synic),
+        )?;
+        w.write_section(
+            SectionType::VcpuSynicTimers,
+            &vs::encode_blob(i, &c.synic_timers),
+        )?;
+        w.write_section(
+            SectionType::VcpuSynicMessagePage,
+            &vs::encode_blob(i, &c.synic_message_page),
+        )?;
+        w.write_section(
+            SectionType::VcpuSynicEventFlagsPage,
+            &vs::encode_blob(i, &c.synic_event_flags_page),
+        )?;
     }
 
-    // HV enlightenment MSRs.
-    w.write_section(SectionType::HvEnlightenment, &hv.snapshot_capture())?;
+    // Partition-wide Hyper-V enlightenment state.
+    w.write_section(SectionType::HvPartition, &hv_state.encode())?;
 
     // Legacy singletons.
     w.write_section(SectionType::LegacyPic8259, &pic.snapshot_capture())?;
@@ -3079,7 +3094,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
         )));
     }
     let large_pages = jr.get_bool("large_pages").unwrap_or(true);
-    let tsc_hz_at_save = jr.get_u64("tsc_hz_at_save").unwrap_or(0);
+    let saved_hv_features = jr.get_u64("hv_features")?;
     let with_rng = jr.get_bool("with_rng").unwrap_or(false);
     let with_gpu = jr.get_bool("with_gpu").unwrap_or(false);
     let with_sound = jr.get_bool("with_sound").unwrap_or(false);
@@ -3125,7 +3140,13 @@ fn run_restore(args: &[String]) -> Result<i32> {
     part.enable_extended_exits(true, true, false)?;
     set_hide_tsc_deadline(true);
     part.set_local_apic_emulation(WHvX64LocalApicEmulationModeX2Apic)?;
+    // The same enlightenments the guest booted with: it chose its code paths
+    // from them.
+    hv::offload(&part, Some(saved_hv_features))?;
     part.setup()?;
+    // Keep the clocks stopped until every vCPU's TSC and the reference time
+    // are back, then resume them together from the saved instant.
+    part.suspend_time()?;
     let part_handle = part.handle();
     btimer.mark("partition ready");
 
@@ -3138,11 +3159,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
         large_pages,
     )?);
     btimer.mark("guest RAM mapped");
-    let hv = Arc::new(HvEnlightenment::new(
-        ram.clone(),
-        cached_tsc_hz(),
-        interrupt_clock_hz(),
-    ));
+    let crash = Arc::new(CrashMsrs::new(ram.clone()));
 
     let mut vcpus: Vec<Arc<Vcpu>> = Vec::with_capacity(vcpu_count as usize);
     for i in 0..vcpu_count {
@@ -3550,7 +3567,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
                 // (`load_ram_and_verify`).
                 n_ram += 1;
             }
-            SectionType::HvEnlightenment => sec_hv = Some(s.payload.to_vec()),
+            SectionType::HvPartition => sec_hv = Some(s.payload.to_vec()),
             SectionType::LegacyPic8259 => sec_pic = Some(s.payload.to_vec()),
             SectionType::LegacyPit8254 => sec_pit = Some(s.payload.to_vec()),
             SectionType::LegacySerial8250 => sec_serial = Some(s.payload.to_vec()),
@@ -3600,6 +3617,30 @@ fn run_restore(args: &[String]) -> Result<i32> {
                 if (i as usize) < caps.len() {
                     caps[i as usize].sup_msr = v;
                     caps[i as usize].sup_msr_ok = ok;
+                }
+            }
+            SectionType::VcpuSynic => {
+                let (i, v) = vs::decode_regs(s.payload, vs::SYNIC_REGS)?;
+                if (i as usize) < caps.len() {
+                    caps[i as usize].synic = v;
+                }
+            }
+            SectionType::VcpuSynicTimers => {
+                let (i, b) = vs::decode_blob(s.payload)?;
+                if (i as usize) < caps.len() {
+                    caps[i as usize].synic_timers = b;
+                }
+            }
+            SectionType::VcpuSynicMessagePage => {
+                let (i, b) = vs::decode_blob(s.payload)?;
+                if (i as usize) < caps.len() {
+                    caps[i as usize].synic_message_page = b;
+                }
+            }
+            SectionType::VcpuSynicEventFlagsPage => {
+                let (i, b) = vs::decode_blob(s.payload)?;
+                if (i as usize) < caps.len() {
+                    caps[i as usize].synic_event_flags_page = b;
                 }
             }
             _ => {}
@@ -3683,30 +3724,16 @@ fn run_restore(args: &[String]) -> Result<i32> {
         );
     }
 
-    // HV after RAM, so the freshly published hypercall + reference-TSC pages
-    // (carrying THIS host's tsc_scale) win over the snapshot's bytes.
+    // Partition-wide enlightenment state, before the vCPUs': the hypervisor
+    // rebuilds the hypercall and reference TSC overlay pages from their MSRs.
     if let Some(b) = sec_hv {
-        hv.snapshot_apply(&b);
+        hv::PartitionState::decode(&b)?.apply(&part, &vcpus[0])?;
     }
 
-    // vCPU non-timing state (arch -> sup_msr -> XSAVE -> APIC -> intr_ctl).
+    // vCPU non-timing state (arch -> sup_msr -> XSAVE -> APIC -> intr_ctl ->
+    // SynIC).
     for (i, vp) in vcpus.iter().enumerate() {
         vs::apply_non_timing(vp, &caps[i])?;
-    }
-
-    let tsc_now = cached_tsc_hz();
-    if tsc_hz_at_save != 0 && tsc_now != 0 {
-        let drift = (tsc_now as i64 - tsc_hz_at_save as i64).unsigned_abs();
-        // 100 ppm = tsc_hz / 10_000. The reference-TSC page scales by tsc_hz, so
-        // a host whose TSC frequency differs from the save host by more than this
-        // will skew the guest clock until it re-syncs.
-        if drift > tsc_hz_at_save / 10_000 {
-            let ppm = drift.saturating_mul(1_000_000) / tsc_hz_at_save;
-            eprintln!(
-                "[restore] WARN: TSC frequency drift {tsc_hz_at_save} -> {tsc_now} Hz \
-                 (~{ppm} ppm > 100 ppm); guest timekeeping may skew until it re-syncs"
-            );
-        }
     }
 
     // --- Run loops ---
@@ -3719,7 +3746,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
             ram.clone(),
             vcpu_count,
         )?;
-        rl.set_hv(hv.clone());
+        rl.set_crash_msrs(crash.clone());
         if vp.index() == 0 {
             rl.set_ext_int_source(pic.clone());
         }
@@ -3775,11 +3802,12 @@ fn run_restore(args: &[String]) -> Result<i32> {
         }));
     }
 
-    // Apply timing (TSC/TscAux) back-to-back across all vCPUs immediately before
-    // running, to minimize cross-vCPU TSC skew on resume.
+    // Put back every vCPU's TSC/TscAux, then restart the partition's clocks:
+    // the TSCs and the reference time resume together from the saved instant.
     for (i, vp) in vcpus.iter().enumerate() {
         vs::apply_timing(vp, &caps[i])?;
     }
+    part.resume_time()?;
 
     // Watchdog (optional): stop everything after N seconds, printing per-second
     // exit counters. Mirrors the --pvh-run watchdog. Must be set up while `loops`

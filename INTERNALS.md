@@ -55,7 +55,7 @@ The feature set, framed as capabilities you must provide:
 | **Guest physical memory** | A flat slab of host RAM mapped into the guest's physical address space | `crates/whpsys/src/memory.rs` |
 | **Boot protocol** | Get a kernel image into RAM and the CPU pointed at its entry point with the right machine state | `src/boot/loader.rs` (PVH), `src/boot/bzimage.rs` (bzImage) |
 | **Firmware tables** | The minimal ACPI a modern Linux expects (so it finds the LAPIC) | `src/boot/acpi.rs` |
-| **A clock & invariant TSC** | The guest must be able to calibrate time without legacy timers | `src/whp/cpuid.rs`, `src/whp/hv.rs` |
+| **A clock** | The guest must be able to calibrate time without legacy timers | `src/whp/cpuid.rs`, `src/whp/hv.rs` (Hyper-V enlightenments, run by the hypervisor) |
 | **An interrupt controller** | Deliver device interrupts to the guest (x2APIC + MSI, plus the legacy PIC) | WHP's in-hypervisor LAPIC, `crates/whpsys/src/msi.rs`, `src/devices/pic.rs` |
 | **A PCI host bridge** | The `0xCF8/0xCFC` config mechanism and a BAR allocator | `src/pci/` |
 | **A device transport** | virtio-PCI "modern" + the virtqueue ring protocol | `src/virtio/transport.rs`, `src/virtio/queue.rs` |
@@ -106,9 +106,10 @@ single most useful map for a reimplementer.
 | VT-x/AMD-V root mode, VMCS/VMCB, world switches | nothing — you call `WHvRunVirtualProcessor` |
 | Second-level address translation (EPT/NPT) from your GPA→HVA map | provide the map (`WHvMapGpaRange`), and keep the host buffer pinned |
 | Decoding the faulting instruction on an MMIO/IO exit | provide the *data* (what the device returns), via the WHP **instruction emulator** callbacks |
-| Emulating each vCPU's local APIC in x2APIC mode — MSIs, IPIs (incl. INIT/SIPI), the LAPIC timer, HLT wake-ups — on bare metal and nested alike | switch it on (`LocalApicEmulationMode = X2Apic`), tell the guest the timer's real frequency, and inject what doesn't arrive through it (the legacy PIC's ExtINT) |
+| Emulating each vCPU's local APIC in x2APIC mode — MSIs, IPIs (incl. INIT/SIPI), the LAPIC timer, HLT wake-ups — on bare metal and nested alike | switch it on (`LocalApicEmulationMode = X2Apic`), and inject what doesn't arrive through it (the legacy PIC's ExtINT) |
 | Delivering an MSI you hand it (`WHvRequestInterrupt`) | decode the MSI address/data into that request |
-| CPUID/MSR *default* values (host passthrough) | override the leaves/MSRs the guest needs (TSC freq, x2APIC, Hyper-V) |
+| The Hyper-V enlightenments — hypercalls, SynIC and synthetic timers, the reference TSC page — once asked | name them before setup, and save/restore their state through WHP |
+| CPUID/MSR *default* values (host passthrough) | override the leaves/MSRs the guest needs (TSC freq, x2APIC) |
 | Nothing about boot, firmware, devices, or time | **all of it** |
 
 WHP's public surface is a flat C API in `windows-sys`
@@ -353,11 +354,12 @@ otherwise applies a policy layer (M3). WHP hands you its default result in the
 exit — host values filtered for the partition and adjusted to the guest's state
 (CPUID.1 OSXSAVE follows the guest's CR4) — and you override selectively.
 
-**MSR exits** (`run_loop.rs:380`): WHP's LAPIC owns the x2APIC MSRs, so only the
-Hyper-V enlightenment's MSRs (M3) and genuinely unknown ones reach you. A handled
+**MSR exits** (`run_loop.rs:422`): WHP's LAPIC owns the x2APIC MSRs and its
+hypervisor the Hyper-V enlightenments' (M3), so only the guest crash MSRs and
+genuinely unknown ones reach you. A handled
 read writes back `RAX:RDX`, and a handled access advances RIP; an unhandled MSR
 injects `#GP(0)` at the faulting instruction (RIP not advanced) rather than
-killing the VM (`run_loop.rs:431`).
+killing the VM (`run_loop.rs:489`).
 
 **HLT** (`run_loop.rs:204`): if `RFLAGS.IF=1` the guest is just idle — re-run.
 WHP's LAPIC normally waits out `HLT` inside the hypervisor until an interrupt
@@ -378,11 +380,11 @@ legacy PIC, has to go in through the right door or it silently blocks every
 MSI. Getting Linux past `calibrate_delay()` with correct timers, and keeping
 interrupts flowing once the UART speaks, are the two hard problems here.
 
-**1. CPUID policy** (`src/whp/cpuid.rs:111`). Layer these overrides on the
+**1. CPUID policy** (`src/whp/cpuid.rs:110`). Layer these overrides on the
 default result WHP passes with each exit:
 
 - **Force x2APIC on** (leaf 1, ECX[21]) even if the host masks it — WHP's LAPIC
-  runs in x2APIC mode and the MADT lists x2APIC entries (`cpuid.rs:146`) — and
+  runs in x2APIC mode and the MADT lists x2APIC entries (`cpuid.rs:147`) — and
   set the **hypervisor present** bit (ECX[31]). Pack `(vcpu_count, vcpu_index)`
   into EBX[23:16]/[31:24].
 - **Advertise invariant TSC** (leaf `0x80000007` EDX[8]) and **ARAT** (leaf 6
@@ -392,16 +394,16 @@ default result WHP passes with each exit:
   (`WHvGetCapability(WHvCapabilityCodeProcessorClockFrequency)`, the rate the
   hypervisor itself keeps time by and the value OpenVMM uses), else leaf 0x15,
   else 0x16, else a 50 ms RDTSC calibration, and caches it in a `OnceLock`
-  (`cpuid.rs:80`). The fallbacks only guess: the calibration is ~10 ppm off when
+  (`cpuid.rs:91`). The fallbacks only guess: the calibration is ~10 ppm off when
   the thread runs undisturbed and far more when it is preempted, and a guest
   with no NTP keeps that error as clock drift.
-- **Emulate the Hyper-V vendor leaves** `0x40000000`–`0x40000006`: vendor
-  `"Microsoft Hv"`, interface `"Hv#1"`, and a feature bitmask advertising the
-  hypercall page, VP index, reference TSC, and the **frequency MSRs**
-  (`cpuid.rs:45`).
-- **Hide TSC-deadline** (leaf 1 ECX[24]). Linux then runs the LAPIC timer in
-  count mode, taking its period from the APIC-frequency MSR below — so that MSR
-  has to be right.
+- **Pass the Hyper-V leaves through** (`0x40000000`–`0x400000FF`). The
+  hypervisor implements the enlightenments (step 2), and its default result
+  describes exactly the ones it runs; tinyvmm adds only the guest crash MSRs it
+  implements itself (`0x40000003` EDX[10]).
+- **Hide TSC-deadline** (leaf 1 ECX[24]). Linux then runs the LAPIC timer, its
+  fallback clock event device, in count mode, taking its period from the
+  APIC-frequency MSR.
 - **Hide MONITOR/MWAIT** (leaf 1 ECX[3], with leaf 5 returned empty) and AMD's
   MONITORX/MWAITX (leaf `0x80000001` ECX[29]). They #UD in a WHP guest, yet a
   bare-metal root partition sees MONITOR: left visible, Linux idles in MWAIT and
@@ -417,38 +419,47 @@ leaked host-only features such as PDCM and EIST.
 frequency-MSR feature bits, sets `x86_platform.calibrate_tsc = hv_get_tsc_khz`,
 takes the LAPIC timer period from `HV_X64_MSR_APIC_FREQUENCY`, and **skips legacy
 timer calibration entirely**. Without them it falls back to PIT calibration,
-which — with no IRQ0/HPET/PM-timer — wedges `calibrate_delay()` forever
-(`cpuid.rs:54`). This is *the* trick that makes a deviceless microVM boot.
+which — with no IRQ0/HPET/PM-timer — wedges `calibrate_delay()` forever. This
+is *the* trick that makes a deviceless microVM boot.
 
-**2. The Hyper-V enlightenment** (`src/whp/hv.rs`). A handful of MSRs the guest
-writes once it detects Hyper-V:
+**2. The Hyper-V enlightenments run in the hypervisor** (`src/whp/hv.rs`).
+Before `WHvSetupPartition`, name them in
+`WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks`. tinyvmm asks for
+OpenVMM's set (`hv::OFFLOADED`), masked by what the host supports
+(`WHvCapabilityCodeSyntheticProcessorFeaturesBanks`). The hypervisor then serves
+their MSRs, hypercalls and overlay pages, none of it exiting to you:
 
-- `GUEST_OS_ID`, `VP_INDEX` — bookkeeping.
-- `HYPERCALL` (`0x40000001`): on enable, write a tiny stub page into guest RAM
-  (`mov eax, 2; ret` — "invalid hypercall", since tinyvmm implements no
-  hypercalls, `hv.rs:142`).
-- `REFERENCE_TSC` (`0x40000021`): write a page holding the **TSC scale**
-  `(10^7 << 64) / tsc_hz`, so the guest reads a 100 ns reference clock straight
-  from the TSC with no exit (`hv.rs:126`).
-- `TIME_REF_COUNT` (`0x40000020`): the same clock through an exit — the calling
-  vCPU's TSC times the same scale, so it agrees with the page to the tick and,
-  as the TLFS requires, starts near zero with the partition. (It once scaled the
-  *host's* TSC, an epoch about the host's uptime away from the page's.)
-- `TSC_FREQUENCY`: the TSC Hz above (`hv.rs:224`).
-- `APIC_FREQUENCY`: **WHP's interrupt clock** — the rate its LAPIC timer
-  actually counts at, read once with
-  `WHvGetCapability(WHvCapabilityCodeInterruptClockFrequency)` (200 MHz on
-  current builds, also the fallback) — *not* the TSC rate (`hv.rs:49`, `:229`).
-  Report the TSC rate (~3 GHz) and every LAPIC timer the guest programs runs
-  ~16× too long.
-- `CRASH_P0`–`P4`, `CRASH_CTL` (`0x40000100`–`0x40000105`), advertised in
-  CPUID `0x40000003` EDX[10]: a read of `CRASH_CTL` offers both report kinds,
+- the hypercall page and `GUEST_OS_ID`, `VP_INDEX`, and the **reference TSC
+  page** with `TIME_REF_COUNT`: a 100 ns clock the guest reads with no exit;
+- the **frequency MSRs**: `TSC_FREQUENCY`, and `APIC_FREQUENCY`, which reports
+  WHP's interrupt clock (200 MHz), the rate its LAPIC timer counts at;
+- **TLB-flush and cluster-IPI hypercalls**: Linux flushes remote TLBs and sends
+  IPIs with one hypercall (`Hyper-V: Using hypercall for remote TLB flush`,
+  `Using IPI hypercalls`);
+- the **VP assist page** with lazy EOI (`Using enlightened APIC`): the
+  hypervisor flags the interrupts that need no EOI, and Linux skips the EOI
+  write, an exit that is costly when nested, for them;
+- the **guest idle MSR**: PV spinlock waiters idle instead of spinning;
+- **SynIC and direct-mode synthetic timers**: Linux's clock event device becomes
+  synthetic timer 0 (`Hyper-V clockevent`).
+
+WHP has no invariant-TSC enlightenment, so Linux marks the TSC unstable ("due to
+running on Hyper-V") and keeps time with the reference TSC page, which the
+hypervisor keeps right as the host's TSC rate changes (a restore on another
+host). The state behind all this is the hypervisor's, so save/restore reads it
+out and puts it back through WHP (M7).
+
+What tinyvmm still handles itself:
+
+- `CRASH_P0`–`P4`, `CRASH_CTL` (`0x40000100`–`0x40000105`), which the
+  hypervisor leaves to the VMM, so they exit; tinyvmm advertises them in CPUID
+  `0x40000003` EDX[10]. A read of `CRASH_CTL` offers both report kinds,
   so Linux registers a panic notifier and a kernel-log dumper
   (`hv_common_init`). On a panic it posts a page of its log (P3 = GPA, P4 =
   length) and writes `CRASH_CTL`; the run loop prints that log and stops the VM
   with exit code 2 (`StopReason::GuestCrashed`) instead of leaving a vCPU
   spinning in `panic()`.
-- Unhandled Hyper-V MSR → inject `#GP`. On an AMD host, the model-specific
+- Any other MSR → inject `#GP`. On an AMD host, the model-specific
   configuration MSRs Linux touches at boot (HWCR, NB_CFG, SYSCFG, the legacy
   performance counters, OSVW, LS_CFG..EX_CFG) read as zero (HWCR as TscFreqSel)
   and ignore writes, as in OpenVMM and KVM (`run_loop.rs`, `amd_config_msr`).
@@ -771,7 +782,11 @@ These are optional and don't change the core, but each teaches one more piece:
   ahead, so audio is committed only up to the video written so far.
 - **Save / restore** (`src/whp/snapshot*.rs`, README §13). A self-describing file
   (`"TVMMSAVE"` header + JSON machine description + typed sections + CRC32) holding
-  per-vCPU register/XSAVE/APIC state, the HV MSR cache, the legacy devices, every
+  per-vCPU register/XSAVE/APIC state, the Hyper-V enlightenment state the
+  hypervisor keeps (per vCPU: the VP assist page, SynIC registers and pages,
+  synthetic timers; per partition: the hypercall and reference-TSC MSRs and
+  the reference time, read with partition time suspended so it and every
+  vCPU's TSC are one instant), the legacy devices, every
   PCI device (config/BAR/MSI-X/common-cfg/queues/device-state via the four
   `VirtioDevice` hooks), and **guest RAM last**, sparse (only the 64 KiB chunks
   that aren't all zero; a booted guest's RAM is mostly zero). The crucial discipline:
@@ -833,12 +848,12 @@ useful template because the ordering constraints are real:
 2.  enable SeLockMemoryPrivilege (for 2 MiB large pages)
 3.  Partition::new(vcpus)
       enable_extended_exits(cpuid, msr)          // take CPUID+MSR exits
-      set_cpuid_result_list(static overrides)
       set_local_apic_emulation(X2Apic)           // WHP emulates the LAPIC
+      hv::offload(OpenVMM's enlightenment set)   // the hypervisor runs Hyper-V
       setup()                                     // <-- properties locked here
 4.  GuestMemory::new_split(ram, MMIO_WINDOW_BASE, HIGH_RAM_BASE)   // RAM + SLAT map;
                                                   // SLAT populate runs in the background
-5.  HvEnlightenment::new(ram, tsc_hz, interrupt_clock_hz())        // Reference-TSC + MSRs
+5.  CrashMsrs::new(ram)                           // the guest crash MSRs
 6.  load_pvh(ram, vmlinux, cmdline, initrd)       // ELF + start_info + e820 + ACPI
 7.  for i in 0..vcpus: Vcpu::new(part, i)
     setup_pvh_entry(vcpu0, load)                  // 32-bit PM entry on the BSP;
@@ -850,7 +865,7 @@ useful template because the ordering constraints are real:
        console(0) → net* → rng → snd → blk* → input(kbd,tablet) → 9p* → gpu(last)
     each: PciTransport::new(...) → set IRQ callback (Weak) → pci_bus.add_device → start backend
 10. pci_bus.attach_io_bus(&mut io_bus)            // 0xCF8/0xCFC handlers
-11. one RunLoop per vCPU (sharing io_bus, mmio_bus, hv);
+11. one RunLoop per vCPU (sharing io_bus, mmio_bus, the crash MSRs);
     the BSP's also gets set_ext_int_source(pic)
 12. spawn watchdog (optional), wire interactive console + shutdown sentinel
 13. arm snapshot trigger (if --save)
@@ -920,10 +935,11 @@ real debugging time in this project.
 2. **No legacy timer = no boot.** Without the Hyper-V frequency MSRs, Linux spins
    in `calibrate_delay()` forever — there's no IRQ0/HPET/PM-timer to fall back to.
    (§M3)
-3. **Tell the guest the LAPIC timer's real rate.** With TSC-deadline hidden,
-   Linux takes its LAPIC timer period from `HV_X64_MSR_APIC_FREQUENCY`. Report
-   WHP's interrupt clock (200 MHz), not the TSC (~3 GHz), or every timer the guest
-   arms runs ~16× long. (§M3)
+3. **The LAPIC timer counts at the interrupt clock, not the TSC.** With
+   TSC-deadline hidden, Linux takes its LAPIC timer period from
+   `HV_X64_MSR_APIC_FREQUENCY`. tinyvmm lets the hypervisor serve it; serve it
+   yourself and it must report WHP's interrupt clock (200 MHz), not the TSC
+   (~3 GHz), or every timer the guest arms runs ~16× long. (§M3)
 4. **Legacy PIC IRQs go in as ExtINT, never Fixed.** Linux EOIs 8259 IRQs only at
    the PIC, so a Fixed LAPIC delivery leaves an ISR bit set forever and blocks
    every MSI at or below its priority class — virtio stalls the first time the
@@ -1043,10 +1059,10 @@ The minimum to boot an unmodified PVH Linux to a shell:
 - [ ] ACPI: RSDP → XSDT → MADT (one x2APIC entry per vCPU).
 - [ ] Exit loop: HLT, IO/MMIO via an instruction emulator + device buses,
       CPUID policy, MSR routing, `#GP` on unknown MSR.
-- [ ] Time: measure TSC Hz; CPUID leaves 1/6/0x15/0x16/0x80000007/0x40000000-06
-      (and hide MONITOR/MWAIT: leaf 1 ECX[3], leaf 5);
-      Hyper-V MSRs incl. the frequency MSRs (APIC = the interrupt clock) and
-      reference-TSC page.
+- [ ] Time: measure TSC Hz; CPUID leaves 1/6/0x15/0x16/0x80000007
+      (and hide MONITOR/MWAIT: leaf 1 ECX[3], leaf 5); the Hyper-V
+      enlightenments run by the hypervisor (`SyntheticProcessorFeaturesBanks`),
+      incl. the frequency MSRs, the reference-TSC page and synthetic timers.
 - [ ] Interrupts: the hypervisor's x2APIC (`LocalApicEmulationMode = X2Apic`);
       MSI message decode into `WHvRequestInterrupt`; legacy PIC → ExtINT
       injection gated on interruptibility, with interrupt-window exits.
@@ -1094,8 +1110,7 @@ The minimum to boot an unmodified PVH Linux to a shell:
 | virtio vendor ID | `0x1AF4` (Red Hat) | `src/main.rs` device wiring |
 | virtio BAR0 size | `0x4000` (16 KiB) | `src/virtio/transport.rs` |
 | Snapshot magic / trigger leaf | `"TVMMSAVE"` / `CPUID 0x4000DE57` | `src/whp/snapshot*.rs` |
-| TSC scale | `(10^7 << 64) / tsc_hz` | `src/whp/hv.rs` |
-| LAPIC timer rate told to the guest | WHP interrupt clock (200 MHz) | `src/whp/hv.rs` |
+| Hyper-V enlightenments the hypervisor runs | OpenVMM's set (`hv::OFFLOADED`) | `src/whp/hv.rs` |
 
 **Where each subsystem lives:**
 
@@ -1107,7 +1122,7 @@ crates/winsys/   Win32 FFI: host (privilege/large-page/CNG rng), host/block_file
                            (Winsock+IOCP), etw, fs (9p), audio (WASAPI), wintun,
                            slirp + gvisor (run-time-loaded network stacks),
                            media (Media Foundation MP4 writer)
-src/whp/         run_loop, cpuid (policy), hv (Hyper-V MSRs), snapshot*
+src/whp/         run_loop, cpuid (policy), hv (Hyper-V enlightenments, crash MSRs), snapshot*
 src/boot/        loader (PVH ELF + start_info + e820), acpi (RSDP/XSDT/MADT),
                  bzimage (Linux boot protocol), KernelLoad (picks one)
 src/convenience/ iso9660, grub_cfg, iso_boot (--iso: boot a live ISO)

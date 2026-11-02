@@ -826,6 +826,16 @@ fi
 #       even though there is no ACPI poweroff path in tinyvmm.
 if grep -q 'tinyvmm.test=snapshot' /proc/cmdline 2>/dev/null; then
     log "--- SNAP-TEST start ---"
+    # tinyvmm.snap_load=1 keeps every CPU busy across the snapshot, so it is
+    # taken with timer ticks and IPIs in flight.
+    LOADPIDS=""
+    if grep -q 'tinyvmm.snap_load=1' /proc/cmdline 2>/dev/null; then
+        for c in $(seq 0 $(( $(nproc) - 1 ))); do
+            taskset -c "$c" sh -c 'while :; do :; done' &
+            LOADPIDS="$LOADPIDS $!"
+        done
+        log "SNAP-TEST: load on $(nproc) CPU(s)"
+    fi
     sync
     log "SNAP-TEST: pre-trigger sentinel"
     # Drain the virtio-console TX queue past the sentinel before we
@@ -836,16 +846,26 @@ if grep -q 'tinyvmm.test=snapshot' /proc/cmdline 2>/dev/null; then
     sleep 1
     # tinyvmm.trigger_cpu=N fires the trigger from vCPU N (an AP when N > 0).
     TCPU=$(tr ' ' '\\n' < /proc/cmdline | grep '^tinyvmm.trigger_cpu=' | cut -d= -f2)
+    PRE=$(cut -d' ' -f1 /proc/uptime)
     if [ -n "$TCPU" ]; then
         taskset -c "$TCPU" /bin/cpuid_trigger
     else
         /bin/cpuid_trigger
     fi
     rc=$?
+    POST=$(cut -d' ' -f1 /proc/uptime)
     # Reachable only after restore; the save run captures state at the
     # CPUID instruction boundary and exits the host process before
     # this line ever executes in the save invocation.
     log "SNAP-TEST: POST-RESTORE-CONTINUE rc=$rc"
+    # The guest clock carries on from the save: little guest time passes
+    # between the trigger and here, however long the snapshot sat on disk,
+    # and a timer armed after the restore fires on time.
+    S0=$(cut -d' ' -f1 /proc/uptime)
+    sleep 1
+    S1=$(cut -d' ' -f1 /proc/uptime)
+    log "SNAP-TEST: CLOCK pre=$PRE post=$POST sleep_start=$S0 sleep_end=$S1"
+    [ -n "$LOADPIDS" ] && kill $LOADPIDS
     sync
     sleep 1
     log "=== tinyvmm shutdown requested ==="
@@ -921,11 +941,11 @@ fi
 # Enabled via kernel cmdline marker `tinyvmm.test=tsc`. Spins one busy
 # `yes`-into-/dev/null loop on every online CPU for ~20s to give Linux's
 # clocksource watchdog (`clocksource_watchdog`, fires every 0.5 s) plenty
-# of opportunities to observe TSC vs the secondary clocksource. Then
-# dumps any watchdog/unstable/skew complaints in dmesg and the current
-# clocksource selection, and powers off. With the Hyper-V Reference TSC
-# page + HV_ACCESS_TSC_INVARIANT advertised, the kernel sets
-# X86_FEATURE_TSC_RELIABLE and the watchdog leaves TSC alone.
+# of opportunities to complain. Then dumps any watchdog/skew complaints
+# in dmesg and the current clocksource selection, and powers off. The
+# hypervisor offers no invariant TSC, so Linux marks the TSC unstable at
+# boot ("due to running on Hyper-V", expected) and keeps time with the
+# Hyper-V reference TSC page, which the watchdog doesn't check.
 if grep -q 'tinyvmm.test=tsc' /proc/cmdline 2>/dev/null; then
     log "--- TSC-WATCHDOG-TEST start ---"
     ncpu=$(nproc 2>/dev/null || echo 1)
@@ -941,6 +961,7 @@ if grep -q 'tinyvmm.test=tsc' /proc/cmdline 2>/dev/null; then
     # before applying the substantive regex.
     if dmesg \
             | grep -v 'TSC-WATCHDOG-TEST' \
+            | grep -v 'due to running on Hyper-V' \
             | grep -iE 'clocksource_watchdog|Marking .*tsc.* unstable|skew is too large|tsc: Marking' \
             > /tmp/wd.log 2>&1; then
         log "TSC-WATCHDOG: FAIL (kernel watchdog complaints below)"

@@ -1,63 +1,188 @@
-//! Minimal Hyper-V enlightenment surface: the Reference TSC page + the handful
-//! of MSRs Linux writes once it detects Hyper-V via CPUID. Port of
-//! src/whp/hv_enlightenment.cpp.
+//! Hyper-V enlightenments, implemented by WHP's hypervisor as in OpenVMM.
+//! Before setup tinyvmm names the set it wants ([`OFFLOADED`]); the hypervisor
+//! then serves their MSRs, hypercalls and overlay pages itself, with no exit to
+//! tinyvmm, and describes them in the Hyper-V CPUID leaves, which `cpuid.rs`
+//! passes through. Linux then flushes remote TLBs and sends IPIs with one
+//! hypercall, skips most EOIs (lazy EOI, through the VP assist page), lets
+//! spinlock waiters idle (PV spinlocks), and uses synthetic timer 0 as its
+//! clock event device.
 //!
-//! Both partition reference clocks derive from the guest TSC: the page as
-//! `(tsc * scale) >> 64` with a zero offset, and `TIME_REF_COUNT` by reading
-//! the calling vCPU's TSC and scaling it the same way. They agree to the tick
-//! and share the guest TSC's epoch (about zero when the partition is created,
-//! as the TLFS specifies), and a snapshot restore, which puts every vCPU's TSC
-//! back, resumes both where they stopped.
+//! WHP has no invariant-TSC enlightenment, so Linux marks the TSC unstable and
+//! keeps time with the reference TSC page. The hypervisor maintains that page
+//! from the host's TSC rate, so a restore on a host whose TSC runs at another
+//! rate keeps the guest clock right.
+//!
+//! What stays in tinyvmm: the guest crash MSRs, which WHP passes through
+//! ([`CrashMsrs`]), and saving and restoring the enlightenment state the
+//! hypervisor keeps: [`PartitionState`] here, the per-vCPU SynIC state in
+//! `vcpu_state`.
 
-#![allow(unused_unsafe)]
-
-use crate::whp::GuestMemory;
+use crate::error::{Error, Result};
+use crate::whp::partition::synthetic_processor_features_supported;
+use crate::whp::regs::reg64;
+use crate::whp::{GuestMemory, Partition, Vcpu};
 use core::ffi::c_void;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use windows_sys::Win32::System::Hypervisor::{
-    WHvCapabilityCodeInterruptClockFrequency, WHvCapabilityCodeProcessorClockFrequency,
-    WHvGetCapability,
+    WHV_REGISTER_NAME, WHvCapabilityCodeProcessorClockFrequency, WHvGetCapability,
+    WHvRegisterGuestOsId, WHvRegisterReferenceTsc, WHvX64RegisterHypercall,
 };
 
-pub const MSR_GUEST_OS_ID: u32 = 0x4000_0000;
-pub const MSR_HYPERCALL: u32 = 0x4000_0001;
-pub const MSR_VP_INDEX: u32 = 0x4000_0002;
-pub const MSR_TIME_REF_COUNT: u32 = 0x4000_0020;
-pub const MSR_REFERENCE_TSC: u32 = 0x4000_0021;
-pub const MSR_TSC_FREQUENCY: u32 = 0x4000_0022;
-pub const MSR_APIC_FREQUENCY: u32 = 0x4000_0023;
-pub const MSR_VP_ASSIST_PAGE: u32 = 0x4000_0073;
-pub const MSR_TSC_INVARIANT_CTL: u32 = 0x4000_0118;
-/// Guest crash registers: P0..P4 carry the report, a write of CRASH_CTL with
-/// `CRASH_CTL_NOTIFY` posts it. A read of CRASH_CTL says which report kinds
-/// the hypervisor takes.
-pub const MSR_CRASH_P0: u32 = 0x4000_0100;
-pub const MSR_CRASH_P4: u32 = 0x4000_0104;
-pub const MSR_CRASH_CTL: u32 = 0x4000_0105;
-const CRASH_CTL_NOTIFY: u64 = 1 << 63;
-/// The report is a page of kernel log: P3 = its GPA, P4 = its length.
-const CRASH_CTL_NOTIFY_MSG: u64 = 1 << 62;
-
-const PAGE_SHIFT: u64 = 12;
-const PAGE_SIZE: usize = 4096;
-
-// `mov eax, 2 (HV_STATUS_INVALID_HYPERCALL_CODE); ret`
-const HYPERCALL_STUB: [u8; 6] = [0xB8, 0x02, 0x00, 0x00, 0x00, 0xC3];
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum MsrHandled {
-    Yes,
-    NoInjectGp,
-    /// The guest reported a crash (a kernel panic) through the crash MSRs;
-    /// [`HvEnlightenment::crash_report`] describes it.
-    GuestCrashed,
+/// `WHV_SYNTHETIC_PROCESSOR_FEATURES` bits.
+pub mod feature {
+    pub const HYPERVISOR_PRESENT: u64 = 1 << 0;
+    pub const HV1: u64 = 1 << 1;
+    pub const ACCESS_VP_RUN_TIME_REG: u64 = 1 << 2;
+    pub const ACCESS_PARTITION_REFERENCE_COUNTER: u64 = 1 << 3;
+    pub const ACCESS_SYNIC_REGS: u64 = 1 << 4;
+    pub const ACCESS_SYNTHETIC_TIMER_REGS: u64 = 1 << 5;
+    /// The APIC MSRs and the VP assist page, which carries lazy EOI.
+    pub const ACCESS_INTR_CTRL_REGS: u64 = 1 << 6;
+    pub const ACCESS_HYPERCALL_REGS: u64 = 1 << 7;
+    pub const ACCESS_VP_INDEX: u64 = 1 << 8;
+    pub const ACCESS_PARTITION_REFERENCE_TSC: u64 = 1 << 9;
+    pub const ACCESS_GUEST_IDLE_REG: u64 = 1 << 10;
+    pub const ACCESS_FREQUENCY_REGS: u64 = 1 << 11;
+    pub const EXTENDED_GVA_RANGES_FOR_FLUSH: u64 = 1 << 15;
+    pub const FAST_HYPERCALL_OUTPUT: u64 = 1 << 18;
+    pub const DIRECT_SYNTHETIC_TIMERS: u64 = 1 << 22;
+    pub const EXTENDED_PROCESSOR_MASKS: u64 = 1 << 24;
+    pub const TB_FLUSH_HYPERCALLS: u64 = 1 << 25;
+    pub const SYNTHETIC_CLUSTER_IPI: u64 = 1 << 26;
+    pub const NOTIFY_LONG_SPIN_WAIT: u64 = 1 << 27;
+    pub const QUERY_NUMA_DISTANCE: u64 = 1 << 28;
+    pub const SIGNAL_EVENTS: u64 = 1 << 29;
+    pub const RETARGET_DEVICE_INTERRUPT: u64 = 1 << 30;
 }
 
-pub fn compute_tsc_scale(tsc_hz: u64) -> u64 {
-    if tsc_hz == 0 {
-        return 0;
+/// The enlightenments tinyvmm asks for: OpenVMM's set for an x86 guest with
+/// no VTL2 and no nested virtualization (`virt_whp`'s partition setup).
+pub const OFFLOADED: u64 = feature::HYPERVISOR_PRESENT
+    | feature::HV1
+    | feature::ACCESS_VP_RUN_TIME_REG
+    | feature::ACCESS_PARTITION_REFERENCE_COUNTER
+    | feature::ACCESS_HYPERCALL_REGS
+    | feature::ACCESS_VP_INDEX
+    | feature::ACCESS_PARTITION_REFERENCE_TSC
+    | feature::ACCESS_SYNIC_REGS
+    | feature::ACCESS_SYNTHETIC_TIMER_REGS
+    | feature::FAST_HYPERCALL_OUTPUT
+    | feature::EXTENDED_PROCESSOR_MASKS
+    | feature::SYNTHETIC_CLUSTER_IPI
+    | feature::NOTIFY_LONG_SPIN_WAIT
+    | feature::QUERY_NUMA_DISTANCE
+    | feature::SIGNAL_EVENTS
+    | feature::RETARGET_DEVICE_INTERRUPT
+    | feature::TB_FLUSH_HYPERCALLS
+    | feature::ACCESS_GUEST_IDLE_REG
+    | feature::ACCESS_FREQUENCY_REGS
+    | feature::EXTENDED_GVA_RANGES_FOR_FLUSH
+    | feature::ACCESS_INTR_CTRL_REGS
+    | feature::DIRECT_SYNTHETIC_TIMERS;
+
+/// Have the hypervisor implement the enlightenments; call before
+/// [`Partition::setup`]. A boot asks for [`OFFLOADED`] and gets what of it the
+/// host supports. A restore asks for the set its guest booted with, all of
+/// which the host must support: the guest chose its code paths from it.
+/// Returns the set enabled.
+pub fn offload(part: &Partition, restore: Option<u64>) -> Result<u64> {
+    const BASE: u64 = feature::HYPERVISOR_PRESENT | feature::HV1;
+    let supported = synthetic_processor_features_supported().unwrap_or(0);
+    if supported & BASE != BASE {
+        return Err(Error::msg(format!(
+            "this host's Windows Hypervisor Platform can't implement Hyper-V \
+             enlightenments for a guest (supported synthetic processor features: \
+             0x{supported:x}); tinyvmm needs a newer Windows"
+        )));
     }
-    ((10_000_000u128 << 64) / tsc_hz as u128) as u64
+    let features = match restore {
+        Some(saved) if saved & !supported != 0 => {
+            return Err(Error::msg(format!(
+                "this host can't implement Hyper-V enlightenments 0x{:x}, which the \
+                 snapshot's guest booted with",
+                saved & !supported
+            )));
+        }
+        Some(saved) => saved,
+        None => OFFLOADED & supported,
+    };
+    part.set_synthetic_processor_features(features)?;
+    Ok(features)
+}
+
+/// The partition-wide enlightenment state the hypervisor keeps: the guest OS
+/// ID, the hypercall and reference TSC page MSRs (the hypervisor rebuilds both
+/// pages from them: they overlay guest RAM rather than live in it), and the
+/// reference time. Taken and put back with partition time suspended, so the
+/// reference time and every vCPU's TSC are one instant.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PartitionState {
+    pub guest_os_id: u64,
+    pub hypercall: u64,
+    pub reference_tsc: u64,
+    pub reference_time: u64,
+}
+
+impl PartitionState {
+    const ENCODED_LEN: usize = 32;
+
+    /// The MSRs are partition-wide; like OpenVMM, go through the BSP.
+    pub fn capture(part: &Partition, bsp: &Vcpu) -> Result<Self> {
+        let names: [WHV_REGISTER_NAME; 3] = [
+            WHvRegisterGuestOsId,
+            WHvX64RegisterHypercall,
+            WHvRegisterReferenceTsc,
+        ];
+        let v = bsp.get_registers_bytes(&names)?;
+        let u64_of = |b: &[u8; 16]| u64::from_le_bytes(b[..8].try_into().unwrap());
+        Ok(PartitionState {
+            guest_os_id: u64_of(&v[0]),
+            hypercall: u64_of(&v[1]),
+            reference_tsc: u64_of(&v[2]),
+            reference_time: part.reference_time()?,
+        })
+    }
+
+    /// The guest OS ID goes in before the hypercall MSR, as a guest writes
+    /// them, and the reference time before the reference TSC page, which maps
+    /// the TSC onto it. Partition time must be suspended.
+    pub fn apply(&self, part: &Partition, bsp: &Vcpu) -> Result<()> {
+        bsp.set_registers(
+            &[WHvRegisterGuestOsId, WHvX64RegisterHypercall],
+            &[reg64(self.guest_os_id), reg64(self.hypercall)],
+        )?;
+        part.set_reference_time(self.reference_time)?;
+        bsp.set_registers(&[WHvRegisterReferenceTsc], &[reg64(self.reference_tsc)])
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        [
+            self.guest_os_id,
+            self.hypercall,
+            self.reference_tsc,
+            self.reference_time,
+        ]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect()
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != Self::ENCODED_LEN {
+            return Err(Error::msg(format!(
+                "snapshot: HvPartition section is {} bytes, not {}",
+                bytes.len(),
+                Self::ENCODED_LEN
+            )));
+        }
+        let u64_at = |i: usize| u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
+        Ok(PartitionState {
+            guest_os_id: u64_at(0),
+            hypercall: u64_at(1),
+            reference_tsc: u64_at(2),
+            reference_time: u64_at(3),
+        })
+    }
 }
 
 /// Rate the guest TSC counts at, as the hypervisor reports it (its
@@ -78,168 +203,83 @@ pub fn processor_clock_hz() -> Option<u64> {
     (hr >= 0 && hz != 0).then_some(hz)
 }
 
-/// Rate WHP's LAPIC timer counts at (its "interrupt clock"), which is what the
-/// guest must be told in `HV_X64_MSR_APIC_FREQUENCY`. It is *not* the TSC
-/// frequency (200 MHz vs ~3 GHz on current hosts): a guest told the TSC rate
-/// programs every LAPIC timer ~16x too long. Falls back to 200 MHz, the value
-/// current Hyper-V builds report, if the capability can't be read.
-pub fn interrupt_clock_hz() -> u64 {
-    static HZ: OnceLock<u64> = OnceLock::new();
-    *HZ.get_or_init(|| {
-        let mut hz: u64 = 0;
-        let mut written: u32 = 0;
-        // SAFETY: WHvGetCapability writes at most 8 bytes into `hz`.
-        let hr = unsafe {
-            WHvGetCapability(
-                WHvCapabilityCodeInterruptClockFrequency,
-                &mut hz as *mut u64 as *mut c_void,
-                std::mem::size_of::<u64>() as u32,
-                &mut written,
-            )
-        };
-        if hr >= 0 && hz != 0 {
-            hz
-        } else {
-            eprintln!(
-                "[hv] WARN: WHvGetCapability(InterruptClockFrequency) failed \
-                 (HRESULT 0x{:08x}); assuming a 200 MHz LAPIC timer",
-                hr as u32
-            );
-            200_000_000
-        }
-    })
+/// Guest crash registers: P0..P4 carry the report, a write of CRASH_CTL with
+/// `CRASH_CTL_NOTIFY` posts it. A read of CRASH_CTL says which report kinds
+/// are taken.
+pub const MSR_CRASH_P0: u32 = 0x4000_0100;
+pub const MSR_CRASH_P4: u32 = 0x4000_0104;
+pub const MSR_CRASH_CTL: u32 = 0x4000_0105;
+const CRASH_CTL_NOTIFY: u64 = 1 << 63;
+/// The report is a page of kernel log: P3 = its GPA, P4 = its length.
+const CRASH_CTL_NOTIFY_MSG: u64 = 1 << 62;
+const PAGE_SIZE: usize = 4096;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MsrHandled {
+    Yes,
+    NoInjectGp,
+    /// The guest reported a crash (a kernel panic) through the crash MSRs;
+    /// [`CrashMsrs::crash_report`] describes it.
+    GuestCrashed,
 }
 
-struct MsrCache {
-    guest_os_id: u64,
-    hypercall_msr: u64,
-    reference_tsc_msr: u64,
-    tsc_invariant_ctl: u64,
-    vp_assist_page: u64,
-    crash_p: [u64; 5],
-    crash_ctl: u64,
-}
-
-pub struct HvEnlightenment {
+/// The guest crash MSRs (`0x40000100`-`0x40000105`), which `cpuid.rs`
+/// advertises in CPUID `0x40000003` EDX[10]. WHP's hypervisor leaves them to
+/// the VMM, so they still exit. Linux reports a panic through them, and the
+/// run loop stops the VM with the report instead of leaving a vCPU spinning in
+/// `panic()` forever.
+pub struct CrashMsrs {
     ram: Arc<GuestMemory>,
-    tsc_hz: u64,
-    tsc_scale: u64,
-    apic_hz: u64,
-    cache: Mutex<MsrCache>,
+    regs: Mutex<CrashRegs>,
 }
 
-impl HvEnlightenment {
-    /// `apic_hz` is the LAPIC timer rate the guest calibrates against; pass
-    /// [`interrupt_clock_hz`].
-    pub fn new(ram: Arc<GuestMemory>, tsc_hz: u64, apic_hz: u64) -> Self {
-        HvEnlightenment {
+#[derive(Default)]
+struct CrashRegs {
+    p: [u64; 5],
+    ctl: u64,
+}
+
+impl CrashMsrs {
+    pub fn new(ram: Arc<GuestMemory>) -> Self {
+        CrashMsrs {
             ram,
-            tsc_hz,
-            tsc_scale: compute_tsc_scale(tsc_hz),
-            apic_hz,
-            cache: Mutex::new(MsrCache {
-                guest_os_id: 0,
-                hypercall_msr: 0,
-                reference_tsc_msr: 0,
-                tsc_invariant_ctl: 0,
-                vp_assist_page: 0,
-                crash_p: [0; 5],
-                crash_ctl: 0,
-            }),
+            regs: Mutex::new(CrashRegs::default()),
         }
     }
 
-    pub fn tsc_hz(&self) -> u64 {
-        self.tsc_hz
-    }
-    pub fn apic_hz(&self) -> u64 {
-        self.apic_hz
-    }
-    pub fn tsc_scale(&self) -> u64 {
-        self.tsc_scale
-    }
-
-    /// Partition reference time, in 100 ns units, at guest TSC `guest_tsc`:
-    /// exactly what the guest computes from the reference TSC page.
-    pub fn reference_time(&self, guest_tsc: u64) -> u64 {
-        ((guest_tsc as u128 * self.tsc_scale as u128) >> 64) as u64
-    }
-
-    fn write_reference_tsc_page(&self, guest_pfn: u64) -> bool {
-        // Build the page in a host buffer and write it via the bounds-checked
-        // copy accessor — no `&mut [u8]` aliasing guest-shared memory (the old
-        // `slice_mut` path was unsound: aliasable `&mut` over RAM the guest CPU
-        // can concurrently touch).
-        let gpa = guest_pfn << PAGE_SHIFT;
-        let mut page = [0u8; PAGE_SIZE];
-        page[8..16].copy_from_slice(&self.tsc_scale.to_le_bytes());
-        if !self.ram.write_bytes(gpa, &page) {
-            return false;
-        }
-        // Publish a stable non-zero sequence after the body is visible.
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-        self.ram.write_bytes(gpa, &1u32.to_le_bytes())
-    }
-
-    fn write_hypercall_page(&self, guest_pfn: u64) -> bool {
-        let gpa = guest_pfn << PAGE_SHIFT;
-        let mut page = [0u8; PAGE_SIZE];
-        page[..HYPERCALL_STUB.len()].copy_from_slice(&HYPERCALL_STUB);
-        self.ram.write_bytes(gpa, &page)
-    }
-
-    pub fn handle_wrmsr(&self, _vp_index: u32, msr: u32, value: u64) -> MsrHandled {
-        let mut c = self.cache.lock().unwrap();
+    pub fn handle_wrmsr(&self, msr: u32, value: u64) -> MsrHandled {
+        let mut c = self.regs.lock().unwrap();
         match msr {
-            MSR_GUEST_OS_ID => {
-                c.guest_os_id = value;
-                MsrHandled::Yes
-            }
-            MSR_HYPERCALL => {
-                c.hypercall_msr = value;
-                if value & 1 != 0 {
-                    let pfn = value >> PAGE_SHIFT;
-                    if !self.write_hypercall_page(pfn) {
-                        eprintln!("[hv] WRMSR HYPERCALL: bad PFN=0x{pfn:x}; page left untouched");
-                    }
-                }
-                MsrHandled::Yes
-            }
-            MSR_REFERENCE_TSC => {
-                c.reference_tsc_msr = value;
-                if value & 1 != 0 {
-                    let pfn = value >> PAGE_SHIFT;
-                    if !self.write_reference_tsc_page(pfn) {
-                        eprintln!(
-                            "[hv] WRMSR REFERENCE_TSC: bad PFN=0x{pfn:x}; guest will fall back \
-                             to RDMSR TIME_REF_COUNT"
-                        );
-                    }
-                }
-                MsrHandled::Yes
-            }
-            MSR_TSC_INVARIANT_CTL => {
-                c.tsc_invariant_ctl = value;
-                MsrHandled::Yes
-            }
-            MSR_VP_ASSIST_PAGE => {
-                // We don't implement the assist-page enlightenments (EOI assist,
-                // nested VMCS); the page is guest RAM that stays zeroed, which
-                // Linux reads as "no assist". Accepting the write avoids the
-                // benign-but-noisy `#GP` Linux logs from `hv_cpu_init`.
-                c.vp_assist_page = value;
-                MsrHandled::Yes
-            }
             MSR_CRASH_P0..=MSR_CRASH_P4 => {
-                c.crash_p[(msr - MSR_CRASH_P0) as usize] = value;
+                c.p[(msr - MSR_CRASH_P0) as usize] = value;
                 MsrHandled::Yes
             }
             MSR_CRASH_CTL if value & CRASH_CTL_NOTIFY != 0 => {
-                c.crash_ctl = value;
+                c.ctl = value;
                 MsrHandled::GuestCrashed
             }
             MSR_CRASH_CTL => MsrHandled::Yes,
             _ => MsrHandled::NoInjectGp,
+        }
+    }
+
+    pub fn handle_rdmsr(&self, msr: u32, out: &mut u64) -> MsrHandled {
+        let c = self.regs.lock().unwrap();
+        match msr {
+            MSR_CRASH_P0..=MSR_CRASH_P4 => {
+                *out = c.p[(msr - MSR_CRASH_P0) as usize];
+                MsrHandled::Yes
+            }
+            // Both report kinds are taken, so Linux registers its kernel-log
+            // dumper as well as the panic notifier (`hv_common_init`).
+            MSR_CRASH_CTL => {
+                *out = CRASH_CTL_NOTIFY | CRASH_CTL_NOTIFY_MSG;
+                MsrHandled::Yes
+            }
+            _ => {
+                *out = 0;
+                MsrHandled::NoInjectGp
+            }
         }
     }
 
@@ -249,8 +289,8 @@ impl HvEnlightenment {
     /// terminal.
     pub fn crash_report(&self) -> String {
         let (p, ctl) = {
-            let c = self.cache.lock().unwrap();
-            (c.crash_p, c.crash_ctl)
+            let c = self.regs.lock().unwrap();
+            (c.p, c.ctl)
         };
         if ctl & CRASH_CTL_NOTIFY_MSG != 0 {
             let mut msg = vec![0u8; (p[4] as usize).min(PAGE_SIZE)];
@@ -269,167 +309,11 @@ impl HvEnlightenment {
             p[0], p[1], p[2], p[3], p[4]
         )
     }
-
-    /// `guest_tsc` reads the calling vCPU's TSC; only `TIME_REF_COUNT` needs
-    /// it, and a failed read answers with #GP.
-    pub fn handle_rdmsr(
-        &self,
-        vp_index: u32,
-        msr: u32,
-        guest_tsc: impl FnOnce() -> Option<u64>,
-        out: &mut u64,
-    ) -> MsrHandled {
-        let c = self.cache.lock().unwrap();
-        match msr {
-            MSR_GUEST_OS_ID => {
-                *out = c.guest_os_id;
-                MsrHandled::Yes
-            }
-            MSR_HYPERCALL => {
-                *out = c.hypercall_msr;
-                MsrHandled::Yes
-            }
-            MSR_VP_INDEX => {
-                *out = vp_index as u64;
-                MsrHandled::Yes
-            }
-            MSR_TIME_REF_COUNT => {
-                drop(c);
-                match guest_tsc() {
-                    Some(tsc) => {
-                        *out = self.reference_time(tsc);
-                        MsrHandled::Yes
-                    }
-                    None => {
-                        *out = 0;
-                        MsrHandled::NoInjectGp
-                    }
-                }
-            }
-            MSR_REFERENCE_TSC => {
-                *out = c.reference_tsc_msr;
-                MsrHandled::Yes
-            }
-            // The frequency MSRs are what let Linux's `ms_hyperv_init_platform`
-            // bypass PIT/HPET calibration (it sets `x86_platform.calibrate_tsc
-            // = hv_get_tsc_khz` and takes the LAPIC timer period from the APIC
-            // frequency). Without them the guest falls back to PIT calibration →
-            // fails (no IRQ0/HPET) → `calibrate_delay()` spins forever.
-            MSR_TSC_FREQUENCY => {
-                *out = self.tsc_hz;
-                MsrHandled::Yes
-            }
-            // WHP's LAPIC timer counts at the interrupt clock, not the TSC.
-            MSR_APIC_FREQUENCY => {
-                *out = self.apic_hz;
-                MsrHandled::Yes
-            }
-            MSR_VP_ASSIST_PAGE => {
-                *out = c.vp_assist_page;
-                MsrHandled::Yes
-            }
-            MSR_TSC_INVARIANT_CTL => {
-                *out = c.tsc_invariant_ctl;
-                MsrHandled::Yes
-            }
-            MSR_CRASH_P0..=MSR_CRASH_P4 => {
-                *out = c.crash_p[(msr - MSR_CRASH_P0) as usize];
-                MsrHandled::Yes
-            }
-            // Both report kinds are taken, so Linux registers its kernel-log
-            // dumper as well as the panic notifier (`hv_common_init`).
-            MSR_CRASH_CTL => {
-                *out = CRASH_CTL_NOTIFY | CRASH_CTL_NOTIFY_MSG;
-                MsrHandled::Yes
-            }
-            _ => {
-                *out = 0;
-                MsrHandled::NoInjectGp
-            }
-        }
-    }
-
-    /// Snapshot the Hyper-V MSR cache (5 u64 = 40 bytes). The hypercall +
-    /// reference-TSC guest pages are part of RAM (restored separately).
-    pub fn snapshot_capture(&self) -> Vec<u8> {
-        let c = self.cache.lock().unwrap();
-        let mut b = Vec::with_capacity(40);
-        b.extend_from_slice(&c.guest_os_id.to_le_bytes());
-        b.extend_from_slice(&c.hypercall_msr.to_le_bytes());
-        b.extend_from_slice(&c.reference_tsc_msr.to_le_bytes());
-        b.extend_from_slice(&c.tsc_invariant_ctl.to_le_bytes());
-        b.extend_from_slice(&c.vp_assist_page.to_le_bytes());
-        b
-    }
-
-    /// Restore the MSR cache, then re-publish the hypercall + reference-TSC
-    /// pages with THIS host's tsc_scale (must run AFTER RAM restore so the fresh
-    /// pages win over the snapshot's, in case the restore host has a different
-    /// TSC frequency).
-    pub fn snapshot_apply(&self, bytes: &[u8]) {
-        if bytes.len() < 32 {
-            return;
-        }
-        let guest_os_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-        let hypercall_msr = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        let reference_tsc_msr = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-        let tsc_invariant_ctl = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
-        // vp_assist_page added later; tolerate older 32-byte snapshots.
-        let vp_assist_page = bytes
-            .get(32..40)
-            .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
-            .unwrap_or(0);
-        {
-            let mut c = self.cache.lock().unwrap();
-            c.guest_os_id = guest_os_id;
-            c.hypercall_msr = hypercall_msr;
-            c.reference_tsc_msr = reference_tsc_msr;
-            c.tsc_invariant_ctl = tsc_invariant_ctl;
-            c.vp_assist_page = vp_assist_page;
-        }
-        if hypercall_msr & 1 != 0 {
-            self.write_hypercall_page(hypercall_msr >> PAGE_SHIFT);
-        }
-        if reference_tsc_msr & 1 != 0 {
-            self.write_reference_tsc_page(reference_tsc_msr >> PAGE_SHIFT);
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `TIME_REF_COUNT` and the reference TSC page are one clock: for any guest
-    /// TSC the MSR returns what the guest computes from the page. The MSR used
-    /// to scale the host's TSC instead, about the host's uptime ahead.
-    #[test]
-    fn time_ref_count_matches_the_reference_tsc_page() {
-        let ram = Arc::new(GuestMemory::new_host_only(0x4000).unwrap());
-        let tsc_hz = 3_187_200_000;
-        let hv = HvEnlightenment::new(ram.clone(), tsc_hz, 200_000_000);
-        assert!(hv.handle_wrmsr(0, MSR_REFERENCE_TSC, 0x2000 | 1) == MsrHandled::Yes);
-        let page = ram.read_array::<24>(0x2000).unwrap();
-        assert_eq!(u32::from_le_bytes(page[0..4].try_into().unwrap()), 1);
-        let scale = u64::from_le_bytes(page[8..16].try_into().unwrap());
-        let offset = i64::from_le_bytes(page[16..24].try_into().unwrap());
-        for tsc in [0, 1, tsc_hz, 4_000_000_000_000, u64::MAX / 3] {
-            let mut msr = 0;
-            let r = hv.handle_rdmsr(1, MSR_TIME_REF_COUNT, || Some(tsc), &mut msr);
-            assert!(r == MsrHandled::Yes);
-            let page_time = ((tsc as u128 * scale as u128) >> 64) as i64 + offset;
-            assert_eq!(msr, page_time as u64, "guest tsc {tsc}");
-        }
-        // One second of guest TSC is 10^7 ticks of 100 ns.
-        let mut one_second = 0;
-        let _ = hv.handle_rdmsr(0, MSR_TIME_REF_COUNT, || Some(tsc_hz), &mut one_second);
-        assert!(
-            (9_999_999..=10_000_000).contains(&one_second),
-            "{one_second}"
-        );
-        let r = hv.handle_rdmsr(0, MSR_TIME_REF_COUNT, || None, &mut one_second);
-        assert!(r == MsrHandled::NoInjectGp, "an unreadable TSC answers #GP");
-    }
 
     /// Linux's panic path (`hv_kmsg_dump`): it reads CRASH_CTL at boot for the
     /// report kinds taken, then posts P3 = GPA and P4 = length of a page of
@@ -438,29 +322,32 @@ mod tests {
     #[test]
     fn a_guest_panic_reports_its_kernel_log() {
         let ram = Arc::new(GuestMemory::new_host_only(0x4000).unwrap());
-        let hv = HvEnlightenment::new(ram.clone(), 3_000_000_000, 200_000_000);
+        let crash = CrashMsrs::new(ram.clone());
         let mut ctl = 0;
-        let _ = hv.handle_rdmsr(0, MSR_CRASH_CTL, || None, &mut ctl);
+        let _ = crash.handle_rdmsr(MSR_CRASH_CTL, &mut ctl);
         assert_eq!(ctl, CRASH_CTL_NOTIFY | CRASH_CTL_NOTIFY_MSG);
 
         let log = b"Kernel panic - not syncing: VFS\x1b]0;x\x07\n";
         assert!(ram.write_bytes(0x3000, log));
         for (msr, value) in [(0, 0), (1, 0), (2, 0), (3, 0x3000), (4, log.len() as u64)] {
-            assert!(hv.handle_wrmsr(1, MSR_CRASH_P0 + msr, value) == MsrHandled::Yes);
+            assert!(crash.handle_wrmsr(MSR_CRASH_P0 + msr, value) == MsrHandled::Yes);
         }
         assert!(
-            hv.handle_wrmsr(1, MSR_CRASH_CTL, 0) == MsrHandled::Yes,
+            crash.handle_wrmsr(MSR_CRASH_CTL, 0) == MsrHandled::Yes,
             "no notify bit"
         );
         assert!(
-            hv.handle_wrmsr(1, MSR_CRASH_CTL, CRASH_CTL_NOTIFY | CRASH_CTL_NOTIFY_MSG)
+            crash.handle_wrmsr(MSR_CRASH_CTL, CRASH_CTL_NOTIFY | CRASH_CTL_NOTIFY_MSG)
                 == MsrHandled::GuestCrashed
         );
-        assert_eq!(hv.crash_report(), "Kernel panic - not syncing: VFS.]0;x.\n");
+        assert_eq!(
+            crash.crash_report(),
+            "Kernel panic - not syncing: VFS.]0;x.\n"
+        );
 
         // Without a message, the report is the registers the guest posted.
-        assert!(hv.handle_wrmsr(1, MSR_CRASH_P0 + 2, 0xffff_ffff_8100_0000) == MsrHandled::Yes);
-        assert!(hv.handle_wrmsr(1, MSR_CRASH_CTL, CRASH_CTL_NOTIFY) == MsrHandled::GuestCrashed);
-        assert!(hv.crash_report().contains("RIP 0xffffffff81000000"));
+        assert!(crash.handle_wrmsr(MSR_CRASH_P0 + 2, 0xffff_ffff_8100_0000) == MsrHandled::Yes);
+        assert!(crash.handle_wrmsr(MSR_CRASH_CTL, CRASH_CTL_NOTIFY) == MsrHandled::GuestCrashed);
+        assert!(crash.crash_report().contains("RIP 0xffffffff81000000"));
     }
 }

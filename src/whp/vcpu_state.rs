@@ -1,10 +1,15 @@
 //! Per-vCPU state capture/apply for save/restore. Port of src/whp/vcpu_state.cpp.
 //!
 //! Capture order: arch -> timing -> intr_ctl (per-reg, ok bits) -> sup_msr
-//! (per-reg, ok bits) -> XSAVE blob -> APIC blob (may be empty).
+//! (per-reg, ok bits) -> XSAVE blob -> APIC blob (may be empty) -> SynIC.
 //! Apply order  : arch -> sup_msr (before XSAVE: XRSTORS validates IA32_XSS/CET)
-//! -> XSAVE -> APIC (if non-empty) -> intr_ctl (individually). Timing (Tsc/
-//! TscAux) is applied LAST (separate call) to minimize cross-vCPU skew.
+//! -> XSAVE -> APIC (if non-empty) -> intr_ctl (individually) -> SynIC. Timing
+//! (Tsc/TscAux) is applied LAST (separate call) to minimize cross-vCPU skew.
+//!
+//! SynIC is the Hyper-V enlightenment state the hypervisor keeps per vCPU
+//! (`hv.rs`): the VP assist page (lazy EOI), the SynIC control, page and
+//! interrupt-source registers, the synthetic timers, and the message and
+//! event-flag pages, which overlay guest RAM rather than live in it.
 
 #![allow(dead_code)]
 
@@ -12,8 +17,14 @@ use crate::error::{Error, Result};
 use crate::whp::vcpu::Vcpu;
 use windows_sys::Win32::System::Hypervisor::{
     WHV_REGISTER_NAME, WHvRegisterInternalActivityState, WHvRegisterInterruptState,
-    WHvRegisterPendingInterruption, WHvX64RegisterApicBase, WHvX64RegisterCr0, WHvX64RegisterCr2,
-    WHvX64RegisterCr3, WHvX64RegisterCr4, WHvX64RegisterCr8, WHvX64RegisterCs, WHvX64RegisterCstar,
+    WHvRegisterPendingInterruption, WHvRegisterScontrol, WHvRegisterSiefp, WHvRegisterSimp,
+    WHvRegisterSint0, WHvRegisterSint1, WHvRegisterSint2, WHvRegisterSint3, WHvRegisterSint4,
+    WHvRegisterSint5, WHvRegisterSint6, WHvRegisterSint7, WHvRegisterSint8, WHvRegisterSint9,
+    WHvRegisterSint10, WHvRegisterSint11, WHvRegisterSint12, WHvRegisterSint13, WHvRegisterSint14,
+    WHvRegisterSint15, WHvRegisterVpAssistPage, WHvVirtualProcessorStateTypeSynicEventFlagPage,
+    WHvVirtualProcessorStateTypeSynicMessagePage, WHvVirtualProcessorStateTypeSynicTimerState,
+    WHvX64RegisterApicBase, WHvX64RegisterCr0, WHvX64RegisterCr2, WHvX64RegisterCr3,
+    WHvX64RegisterCr4, WHvX64RegisterCr8, WHvX64RegisterCs, WHvX64RegisterCstar,
     WHvX64RegisterDeliverabilityNotifications, WHvX64RegisterDr0, WHvX64RegisterDr1,
     WHvX64RegisterDr2, WHvX64RegisterDr3, WHvX64RegisterDr6, WHvX64RegisterDr7, WHvX64RegisterDs,
     WHvX64RegisterEfer, WHvX64RegisterEs, WHvX64RegisterFs, WHvX64RegisterGdtr, WHvX64RegisterGs,
@@ -105,6 +116,38 @@ pub const SUP_MSR_REGS: &[WHV_REGISTER_NAME] = &[
     WHvX64RegisterInterruptSspTableAddr,
 ];
 
+/// The SynIC registers the hypervisor keeps per vCPU (OpenVMM's
+/// `SyntheticMsrs`): the VP assist page, SynIC control, the event-flag and
+/// message page MSRs, then the 16 interrupt sources.
+pub const SYNIC_REGS: &[WHV_REGISTER_NAME] = &[
+    WHvRegisterVpAssistPage,
+    WHvRegisterScontrol,
+    WHvRegisterSiefp,
+    WHvRegisterSimp,
+    WHvRegisterSint0,
+    WHvRegisterSint1,
+    WHvRegisterSint2,
+    WHvRegisterSint3,
+    WHvRegisterSint4,
+    WHvRegisterSint5,
+    WHvRegisterSint6,
+    WHvRegisterSint7,
+    WHvRegisterSint8,
+    WHvRegisterSint9,
+    WHvRegisterSint10,
+    WHvRegisterSint11,
+    WHvRegisterSint12,
+    WHvRegisterSint13,
+    WHvRegisterSint14,
+    WHvRegisterSint15,
+];
+const SYNIC_SIEFP: usize = 2;
+const SYNIC_SIMP: usize = 3;
+/// `HV_SYNTHETIC_TIMERS_STATE`: four timers of config, count, adjustment and
+/// an undelivered expiration (40 bytes each), then 40 reserved bytes.
+const SYNIC_TIMERS_BYTES: usize = 200;
+const SYNIC_PAGE_BYTES: usize = 4096;
+
 #[derive(Default)]
 pub struct CapturedVcpuState {
     pub arch: Vec<[u8; 16]>,
@@ -115,6 +158,24 @@ pub struct CapturedVcpuState {
     pub sup_msr_ok: Vec<bool>,
     pub xsave: Vec<u8>,
     pub apic: Vec<u8>,
+    pub synic: Vec<[u8; 16]>,
+    pub synic_timers: Vec<u8>,
+    /// Empty while the guest has the page off.
+    pub synic_message_page: Vec<u8>,
+    /// Empty while the guest has the page off.
+    pub synic_event_flags_page: Vec<u8>,
+}
+
+/// Read one of the vCPU's SynIC state blobs, `capacity` bytes at most.
+fn synic_state(
+    vp: &Vcpu,
+    ty: windows_sys::Win32::System::Hypervisor::WHV_VIRTUAL_PROCESSOR_STATE_TYPE,
+    capacity: usize,
+) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; capacity];
+    let n = vp.get_state(ty, &mut buf)?;
+    buf.truncate(n);
+    Ok(buf)
 }
 
 pub fn capture(vp: &Vcpu) -> Result<CapturedVcpuState> {
@@ -151,6 +212,30 @@ pub fn capture(vp: &Vcpu) -> Result<CapturedVcpuState> {
 
     out.xsave = vp.get_xsave()?;
     out.apic = vp.get_interrupt_controller();
+
+    out.synic = vp.get_registers_bytes(SYNIC_REGS)?;
+    out.synic_timers = synic_state(
+        vp,
+        WHvVirtualProcessorStateTypeSynicTimerState,
+        SYNIC_TIMERS_BYTES,
+    )?;
+    // Bit 0 of SIMP / SIEFP enables the page. Linux turns them on only with
+    // VMBus (direct-mode timers interrupt without a message), so they are
+    // usually off and have nothing to save.
+    if out.synic[SYNIC_SIMP][0] & 1 != 0 {
+        out.synic_message_page = synic_state(
+            vp,
+            WHvVirtualProcessorStateTypeSynicMessagePage,
+            SYNIC_PAGE_BYTES,
+        )?;
+    }
+    if out.synic[SYNIC_SIEFP][0] & 1 != 0 {
+        out.synic_event_flags_page = synic_state(
+            vp,
+            WHvVirtualProcessorStateTypeSynicEventFlagPage,
+            SYNIC_PAGE_BYTES,
+        )?;
+    }
     Ok(out)
 }
 
@@ -189,6 +274,31 @@ pub fn apply_non_timing(vp: &Vcpu, st: &CapturedVcpuState) -> Result<()> {
             eprintln!("[vcpu-state] WARN: set intr_ctl[{i}] (0x{name:08x}) failed: {e}");
         }
     }
+
+    // 5. SynIC, in OpenVMM's order: the registers (which place the pages),
+    // the page contents, then the timers last: setting them can make the
+    // hypervisor deliver an undelivered expiration into the message page,
+    // which must hold its contents by then.
+    if st.synic.len() != SYNIC_REGS.len() {
+        return Err(Error::msg("vcpu-state: SynIC reg count mismatch"));
+    }
+    vp.set_registers_bytes(SYNIC_REGS, &st.synic)?;
+    if !st.synic_message_page.is_empty() {
+        vp.set_state(
+            WHvVirtualProcessorStateTypeSynicMessagePage,
+            &st.synic_message_page,
+        )?;
+    }
+    if !st.synic_event_flags_page.is_empty() {
+        vp.set_state(
+            WHvVirtualProcessorStateTypeSynicEventFlagPage,
+            &st.synic_event_flags_page,
+        )?;
+    }
+    vp.set_state(
+        WHvVirtualProcessorStateTypeSynicTimerState,
+        &st.synic_timers,
+    )?;
     Ok(())
 }
 

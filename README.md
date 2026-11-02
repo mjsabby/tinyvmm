@@ -269,9 +269,7 @@ every VMM thread inherit that; the vCPU threads also pin themselves
 - the same task took 2.7–2.8 s every time (2.80 s on average);
 - TCP request/response p99 through the NAT fell from 398 to 327 µs.
 
-Keeping the vCPUs in one core class also keeps the guest's TSC consistent: vCPUs
-that move between P- and E-cores can make Linux's clocksource watchdog mark the
-TSC unstable. Kernel work done for tinyvmm (interrupts, DPCs, file-system worker
+Kernel work done for tinyvmm (interrupts, DPCs, file-system worker
 threads) is not bound by a process's CPU sets. If a guest has more vCPUs than the
 P-cores have logical processors, they take turns on them and tinyvmm warns. Use
 `--cpu-affinity all` for such a guest, or whenever Windows should place the
@@ -539,17 +537,25 @@ order they are created — that order is fixed (it is also the snapshot
   IRQs only at the PIC, so a Fixed delivery would leave its LAPIC ISR bit set
   and block every MSI at or below its priority class.
 * **8254 PIT** at `0x40–0x43`, `0x61` — counters only; **IRQ0 intentionally not
-  wired** (Linux uses the in-hypervisor LAPIC timer).
+  wired** (Linux uses the hypervisor's synthetic timers).
 * **CMOS/RTC** at `0x70/0x71` reports the host's current time in UTC (read on
   every access, BCD, 24-hour), so the guest boots with a correct wall clock;
   guest writes to it are ignored. POST port `0x80` and port-A `0x92` are stubs
   (`src/devices/legacy.rs`).
 
 The vCPU local APIC is emulated by WHP in **x2APIC mode** — on bare metal and
-nested alike — and delivers MSIs (`WHvRequestInterrupt`), IPIs, the LAPIC timer
-and HLT wake-ups without VM exits; the guest is told its timer rate through
-`HV_X64_MSR_APIC_FREQUENCY`, which reports WHP's interrupt clock
-(`WHvCapabilityCodeInterruptClockFrequency`, 200 MHz), not the TSC. A minimal ACPI
+nested alike — and delivers MSIs (`WHvRequestInterrupt`), IPIs, timer
+interrupts and HLT wake-ups without VM exits. WHP's hypervisor also implements
+the **Hyper-V enlightenments**, with OpenVMM's feature set (`src/whp/hv.rs`):
+Linux flushes remote TLBs and sends IPIs with one hypercall, skips most EOIs
+(lazy EOI through the VP assist page), lets spinlock waiters idle, uses
+synthetic timer 0 as its clock event device, and keeps time with the
+hypervisor's reference TSC page. WHP offers no invariant-TSC enlightenment, so
+Linux marks the TSC unstable at boot ("due to running on Hyper-V"); the page
+keeps the guest clock right even when a restore lands on a host whose TSC runs
+at another rate. On the nested reference host (4 vCPUs) this took a 4-CPU TLB
+shootdown from 16.5 to 11.3 µs (OpenVMM: 10.7), an IPI round trip from 105 to
+99 µs, and a 1 ms timer's wake-up from 84 to 79 µs at the median. A minimal ACPI
 surface (RSDP / XSDT / MADT with one x2APIC entry per vCPU, LAPIC at
 `0xFEE0_0000`) is staged into guest RAM by `src/boot/acpi.rs` (`MAX_VCPUS = 32`).
 
@@ -872,7 +878,8 @@ src/
                NAT), smol (its smoltcp TCP engine), dhcp (the NAT's DHCP
                server), slirp + gvisor (the libslirp and gVisor backends),
                wintun, sys (facade)
-  whp/         run_loop, cpuid, hv (Hyper-V enlightenment),
+  whp/         run_loop, cpuid, hv (Hyper-V enlightenments in the hypervisor,
+               guest crash MSRs),
                snapshot + snapshot_file + vcpu_state (save/restore)
   diag/        boot_timer, etw (facade), alloc_trace (global-allocator ETW shim)
 gvisor/        Go module built into tinyvmm_gvisor.dll (`--net-backend gvisor`)
@@ -1189,7 +1196,7 @@ static mut / Box::leak
 ### What each feature is doing here
 
 * **`Arc<T>` (167)** — shared, refcounted, thread-safe ownership. Guest RAM, the
-  vCPUs, the HV enlightenment, every device, every backend, and the display are
+  vCPUs, the crash MSRs, every device, every backend, and the display are
   `Arc`-shared because multiple host threads (vCPUs, doorbell pumps, IOCP workers,
   the 9p pool, the NAT workers, the window thread, the watchdog) hold them at once.
   This is the C "shared object with a refcount" pattern, but the refcount is
@@ -1465,16 +1472,17 @@ six `AtomicU64` — `io`, `mmio`, `halt`, `cpuid`, `msr`, `other`):
 * **IoPort / Memory** → routed through the WHP instruction emulator
   (`Emulator::try_io` / `try_mmio`) into the IO/MMIO device buses.
 * **Cpuid** → the magic snapshot leaf is intercepted first ([§13](#13-save--restore)),
-  otherwise `resolve_cpuid` applies the static result list (including the Hyper-V
-  leaves `0x4000_0000..0x4000_0006`).
-* **Msr** → handled by the Hyper-V enlightenment (`src/whp/hv.rs`): the hypercall
-  page, Reference-TSC page, `GUEST_OS_ID`, `VP_INDEX`, the TSC/APIC frequency
-  MSRs, the TSC-invariant control, the guest crash MSRs, etc. A guest kernel
-  panic arrives through the crash MSRs: tinyvmm prints the tail of the guest's
-  kernel log and stops the VM. On an AMD host, AMD's configuration MSRs that
-  Linux touches at boot read as zero and ignore writes. Any other unhandled MSR
-  injects `#GP(0)` rather than crashing. The x2APIC MSRs never exit: WHP's LAPIC
-  owns them.
+  otherwise `resolve_cpuid` layers tinyvmm's overrides on WHP's default result.
+  The Hyper-V leaves `0x4000_0000..0x4000_00FF` are the hypervisor's, which
+  implements the enlightenments they describe; tinyvmm adds only the guest crash
+  MSRs.
+* **Msr** → only the guest crash MSRs and unknown MSRs exit: WHP's hypervisor
+  implements the Hyper-V enlightenments, as in OpenVMM (`src/whp/hv.rs`), and
+  WHP's LAPIC owns the x2APIC MSRs. A guest kernel panic arrives through the
+  crash MSRs: tinyvmm prints the tail of the guest's kernel log and stops the
+  VM. On an AMD host, AMD's configuration MSRs that Linux touches at boot read
+  as zero and ignore writes. Any other unhandled MSR injects `#GP(0)` rather
+  than crashing.
 * **Halt** with interrupts enabled just resumes (WHP's LAPIC normally waits out
   HLT in the hypervisor, so this is rare); HLT with `IF=0` is terminal.
 * **InterruptWindow / Canceled** → re-run the BSP's ExtINT delivery pass: a PIC
@@ -1660,22 +1668,26 @@ completed, stops the blk IOCP workers, stops net backends, quiesces 9p) and
 writes a self-describing file (`src/whp/snapshot_file.rs`):
 
 ```
-[24-byte header]  "TVMMSAVE" | version u32 (=2) | reserved u32 | header_json_size u64
-[ JSON header ]   machine description (vcpus, ram, large_pages, with_gpu/width/height,
-                  with_input, device list …)
+[24-byte header]  "TVMMSAVE" | version u32 (=3) | reserved u32 | header_json_size u64
+[ JSON header ]   machine description (vcpus, ram, large_pages, hv_features,
+                  with_gpu/width/height, with_input, device list …)
 [ sections... ]   type u32 | reserved u32 | length u64 | payload[length]
 [ trailer ]       CRC32 (IEEE-802.3, poly 0xEDB88320) over all preceding bytes
 ```
 
 Section types cover per-vCPU register state (GPRs, control/segment/descriptor +
 debug regs, EFER + syscall MSRs, XSAVE, the APIC + interrupt-controller state,
-TSC), the **Hyper-V enlightenment** (4 MSR caches), the **legacy devices**
-(PIC/PIT/serial/ISA-stubs/PCI-bus), every **PCI device**, and **guest RAM last**.
+TSC, and the **SynIC**: VP assist page, SynIC and interrupt-source registers,
+synthetic timers, message and event-flag pages), the partition's **Hyper-V
+state** (guest OS ID, hypercall and reference-TSC page MSRs, reference time),
+the **legacy devices** (PIC/PIT/serial/ISA-stubs/PCI-bus), every **PCI
+device**, and **guest RAM last**.
 RAM is stored **sparse** (`RamSparse`): a bitmap of 64 KiB chunks, then only the
 chunks that aren't all zero, scanned on up to eight threads at save time. A 1 GiB
 guest at a shell prompt is ~95% zero, so its snapshot is ~51 MiB instead of
-1 GiB. Version-1 snapshots, which stored RAM whole, are rejected: the format
-keeps no backward compatibility.
+1 GiB. Older versions (version 2 emulated the Hyper-V enlightenments in tinyvmm;
+version 1 stored RAM whole) are rejected: the format keeps no backward
+compatibility.
 The CRC-32 folds 128 bytes per step with 256-bit `VPCLMULQDQ` where the CPU has
 it alongside AVX2, else 64 bytes per step with `PCLMULQDQ` (Intel's
 carry-less-multiply method, as in Linux and zlib; ~49 and ~25 GB/s per core on
@@ -1727,8 +1739,14 @@ What is and isn't snapshottable:
   showing the whole resource. The GPU is
   added **last** in PCI order specifically so its device_index doesn't perturb the
   others.
-* The Hyper-V hypercall + Reference-TSC pages live *inside* guest RAM, so they
-  restore with it; the enlightenment is then re-applied so a fresh host
-  `tsc_scale` wins.
+* The Hyper-V enlightenment state lives in the hypervisor, not guest RAM: the
+  hypercall, reference-TSC, VP-assist and SynIC pages are overlays the
+  hypervisor rebuilds from their MSRs. The save stops the partition's clocks
+  (`WHvSuspendPartitionTime`) before reading any state, so every vCPU's TSC
+  and the reference time are one instant; the restore sets them back with the
+  clocks stopped and resumes them just before the vCPUs run, so the guest
+  clock carries on from the save. A restore asks WHP for the same
+  enlightenments (`hv_features`) the guest booted with, and fails if the host
+  lacks any.
 * `SnapshotWriter`'s `Drop` deletes a half-written file if `finalize()` (which
   writes the CRC trailer) did not run — no truncated snapshot is ever left behind.

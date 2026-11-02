@@ -1,12 +1,16 @@
 //! CPUID exit policy. Layers tinyvmm overrides (invariant TSC, ARAT, TSC
-//! frequency via leaf 0x15/0x16, per-vCPU x2APIC topology, the Hyper-V
-//! vendor/feature leaves, and hiding MONITOR/MWAIT) on top of the default
-//! result WHP reports with each CPUID exit. Port of src/whp/cpuid.cpp.
+//! frequency via leaf 0x15/0x16, per-vCPU x2APIC topology, the guest crash
+//! MSRs, and hiding MONITOR/MWAIT) on top of the default result WHP reports
+//! with each CPUID exit. Port of src/whp/cpuid.cpp.
 //!
 //! Every CPUID exits (`X64CpuidExit` without a CPUID exit list), so the
 //! partition sets no static CPUID result list: an entry there would replace
 //! that default, which tracks guest state (CPUID.1 OSXSAVE follows CR4) and
 //! hides host-only features, with fixed host values.
+//!
+//! The Hyper-V leaves (`0x40000000`-`0x400000FF`) are the hypervisor's: it
+//! implements the enlightenments (`hv.rs`), and its default result describes
+//! exactly those, so they pass through.
 
 use core::arch::x86_64::{__cpuid, _rdtsc};
 use std::sync::OnceLock;
@@ -37,53 +41,17 @@ const ECX_EXT_MWAITX: u32 = 1 << 29;
 const EAX_ARAT: u32 = 1 << 2;
 const EDX_INVARIANT_TSC: u32 = 1 << 8;
 
-const HV_MAX_LEAF: u32 = 0x4000_0006;
-
-// Hyper-V CPUID.40000003H:EAX feature bits we advertise.
-const HV_FEATURE_TIME_REF_COUNT: u32 = 1 << 1;
-const HV_FEATURE_HYPERCALL: u32 = 1 << 5;
-const HV_FEATURE_VP_INDEX: u32 = 1 << 6;
-const HV_FEATURE_REFERENCE_TSC: u32 = 1 << 9;
-const HV_FEATURE_FREQUENCY_MSRS: u32 = 1 << 11;
-const HV_FEATURE_TSC_INVARIANT: u32 = 1 << 15;
-pub const HV_FEATURES_ADVERTISED: u32 = HV_FEATURE_TIME_REF_COUNT
-    | HV_FEATURE_HYPERCALL
-    | HV_FEATURE_VP_INDEX
-    | HV_FEATURE_REFERENCE_TSC
-    | HV_FEATURE_FREQUENCY_MSRS
-    | HV_FEATURE_TSC_INVARIANT;
-
-// CPUID.40000003H:EDX (`ms_hyperv.misc_features`). Linux gates the
-// HV_X64_MSR_{TSC,APIC}_FREQUENCY read on EAX[11] *and* EDX[8]; without both it
-// falls back to PIT calibration, which (with no IRQ0/HPET/PMTIMER) wedges
-// `calibrate_delay()`. Advertising these and serving the MSRs from `hv.rs`
-// makes Linux take `hv_get_tsc_khz` and skip the legacy calibration entirely.
-const HV_MISC_FREQUENCY_MSRS_AVAILABLE: u32 = 1 << 8;
-// EDX[10]: the guest crash MSRs. Linux then reports a panic (its kernel log
-// tail) through them (`hv_common_init`), and tinyvmm stops the VM with that
-// report instead of leaving a vCPU spinning in `panic()` forever.
+// CPUID.40000003H:EDX[10]: the guest crash MSRs, which tinyvmm implements
+// (`hv::CrashMsrs`) and the hypervisor doesn't report. Linux then reports a
+// panic (its kernel log tail) through them (`hv_common_init`), and tinyvmm
+// stops the VM with that report instead of leaving a vCPU spinning in
+// `panic()` forever.
 const HV_MISC_GUEST_CRASH_MSRS_AVAILABLE: u32 = 1 << 10;
-pub const HV_MISC_FEATURES_ADVERTISED: u32 =
-    HV_MISC_FREQUENCY_MSRS_AVAILABLE | HV_MISC_GUEST_CRASH_MSRS_AVAILABLE;
 
 static HIDE_TSC_DEADLINE: AtomicBool = AtomicBool::new(false);
 
 pub fn set_hide_tsc_deadline(hide: bool) {
     HIDE_TSC_DEADLINE.store(hide, Ordering::Relaxed);
-}
-
-/// "Microsoft Hv" packed across three little-endian dwords (EBX:ECX:EDX).
-pub fn hv_vendor() -> (u32, u32, u32) {
-    let pack = |b: [u8; 4]| {
-        (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24)
-    };
-    (pack(*b"Micr"), pack(*b"osof"), pack(*b"t Hv"))
-}
-
-/// Hyper-V interface signature "Hv#1" packed into CPUID.40000001H:EAX.
-pub fn hv_interface_eax() -> u32 {
-    let b = *b"Hv#1";
-    (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24)
 }
 
 /// The guest TSC rate. WHP's processor clock is what the hypervisor keeps
@@ -233,36 +201,10 @@ pub fn resolve_cpuid(
         0x8000_0007 => {
             r.edx |= EDX_INVARIANT_TSC;
         }
-        0x4000_0000 => {
-            r.eax = HV_MAX_LEAF;
-            let (ebx, ecx, edx) = hv_vendor();
-            r.ebx = ebx;
-            r.ecx = ecx;
-            r.edx = edx;
-        }
-        0x4000_0001 => {
-            r.eax = hv_interface_eax();
-            r.ebx = 0;
-            r.ecx = 0;
-            r.edx = 0;
-        }
-        0x4000_0002 => {
-            r = CpuidResult::default();
-        }
         0x4000_0003 => {
-            r.eax = HV_FEATURES_ADVERTISED;
-            r.ebx = 0;
-            r.ecx = 0;
-            r.edx = HV_MISC_FEATURES_ADVERTISED;
+            r.edx |= HV_MISC_GUEST_CRASH_MSRS_AVAILABLE;
         }
-        0x4000_0004..=0x4000_0006 => {
-            r = CpuidResult::default();
-        }
-        other => {
-            if (0x4000_0007..=0x4000_00FF).contains(&other) {
-                r = CpuidResult::default();
-            }
-        }
+        _ => {}
     }
 
     r
@@ -291,5 +233,35 @@ mod tests {
         let r = resolve_cpuid(0x8000_0001, 0, 0, 0, u32::MAX, u32::MAX, &ctx);
         assert_eq!(r.ecx, !ECX_EXT_MWAITX, "only MWAITX is hidden");
         assert_eq!(r.edx, u32::MAX);
+    }
+
+    /// The Hyper-V leaves describe the enlightenments the hypervisor runs, so
+    /// its values reach the guest untouched; tinyvmm only adds the crash MSRs
+    /// it implements itself. (These are the leaves WHP reported for OpenVMM's
+    /// feature set on a nested AMD host.)
+    #[test]
+    fn hyper_v_leaves_are_the_hypervisors_plus_crash_msrs() {
+        let ctx = CpuidContext {
+            vcpu_index: 0,
+            vcpu_count: 4,
+        };
+        let r = resolve_cpuid(0x4000_0003, 0, 0xe7f, 0x88020, 0x2, 0xec1b0, &ctx);
+        assert_eq!(
+            (r.eax, r.ebx, r.ecx, r.edx),
+            (
+                0xe7f,
+                0x88020,
+                0x2,
+                0xec1b0 | HV_MISC_GUEST_CRASH_MSRS_AVAILABLE
+            )
+        );
+        for leaf in [0x4000_0000, 0x4000_0001, 0x4000_0004, 0x4000_000A] {
+            let r = resolve_cpuid(leaf, 0, 0x4000_000b, 0xe2c, 0x55, 0xaa, &ctx);
+            assert_eq!(
+                (r.eax, r.ebx, r.ecx, r.edx),
+                (0x4000_000b, 0xe2c, 0x55, 0xaa),
+                "leaf {leaf:#x}"
+            );
+        }
     }
 }

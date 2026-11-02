@@ -4,12 +4,48 @@ use crate::error::{Result, check_hr};
 use core::ffi::c_void;
 use windows_sys::Win32::System::Hypervisor::{
     WHV_PARTITION_HANDLE, WHV_PARTITION_PROPERTY_CODE, WHV_X64_CPUID_RESULT,
-    WHV_X64_LOCAL_APIC_EMULATION_MODE, WHvCreatePartition, WHvDeletePartition,
+    WHV_X64_LOCAL_APIC_EMULATION_MODE, WHvCapabilityCodeSyntheticProcessorFeaturesBanks,
+    WHvCreatePartition, WHvDeletePartition, WHvGetCapability, WHvGetPartitionProperty,
     WHvPartitionPropertyCodeAllowDeviceAssignment, WHvPartitionPropertyCodeCpuidResultList,
     WHvPartitionPropertyCodeExceptionExitBitmap, WHvPartitionPropertyCodeExtendedVmExits,
     WHvPartitionPropertyCodeLocalApicEmulationMode, WHvPartitionPropertyCodeProcessorCount,
-    WHvPartitionPropertyCodeX64MsrExitBitmap, WHvSetPartitionProperty, WHvSetupPartition,
+    WHvPartitionPropertyCodeReferenceTime, WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks,
+    WHvPartitionPropertyCodeX64MsrExitBitmap, WHvResumePartitionTime, WHvSetPartitionProperty,
+    WHvSetupPartition, WHvSuspendPartitionTime,
 };
+
+/// `WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS` holding its one bank.
+#[repr(C)]
+#[derive(Default)]
+struct SyntheticFeatureBanks {
+    banks_count: u32,
+    reserved: u32,
+    bank0: u64,
+}
+
+/// The Hyper-V enlightenments (`WHV_SYNTHETIC_PROCESSOR_FEATURES` bits) this
+/// host's hypervisor can implement for a partition.
+pub fn synthetic_processor_features_supported() -> Result<u64> {
+    let mut banks = SyntheticFeatureBanks::default();
+    let mut written: u32 = 0;
+    // SAFETY: WHvGetCapability writes at most size_of::<SyntheticFeatureBanks>() bytes.
+    check_hr(
+        unsafe {
+            WHvGetCapability(
+                WHvCapabilityCodeSyntheticProcessorFeaturesBanks,
+                &mut banks as *mut SyntheticFeatureBanks as *mut c_void,
+                std::mem::size_of::<SyntheticFeatureBanks>() as u32,
+                &mut written,
+            )
+        },
+        "WHvGetCapability(SyntheticProcessorFeaturesBanks)",
+    )?;
+    Ok(if banks.banks_count >= 1 {
+        banks.bank0
+    } else {
+        0
+    })
+}
 
 pub struct Partition {
     handle: WHV_PARTITION_HANDLE,
@@ -82,6 +118,64 @@ impl Partition {
     pub fn set_allow_device_assignment(&self, allow: bool) -> Result<()> {
         let value: i32 = if allow { 1 } else { 0 };
         self.set_property(WHvPartitionPropertyCodeAllowDeviceAssignment, &value)
+    }
+
+    /// Have the hypervisor implement these Hyper-V enlightenments
+    /// (`WHV_SYNTHETIC_PROCESSOR_FEATURES` bits) for the guest: their MSRs,
+    /// hypercalls and overlay pages, and the Hyper-V CPUID leaves describing
+    /// them. MUST be set before [`Self::setup`].
+    pub fn set_synthetic_processor_features(&self, bank0: u64) -> Result<()> {
+        let banks = SyntheticFeatureBanks {
+            banks_count: 1,
+            reserved: 0,
+            bank0,
+        };
+        self.set_property(
+            WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks,
+            &banks,
+        )
+    }
+
+    /// The partition's reference time, in 100 ns units: the clock behind the
+    /// guest's reference TSC page, `TIME_REF_COUNT` and synthetic timers.
+    pub fn reference_time(&self) -> Result<u64> {
+        let mut time: u64 = 0;
+        let mut written: u32 = 0;
+        // SAFETY: the property is a u64; WHP writes at most 8 bytes.
+        check_hr(
+            unsafe {
+                WHvGetPartitionProperty(
+                    self.handle,
+                    WHvPartitionPropertyCodeReferenceTime,
+                    &mut time as *mut u64 as *mut c_void,
+                    std::mem::size_of::<u64>() as u32,
+                    &mut written,
+                )
+            },
+            "WHvGetPartitionProperty(ReferenceTime)",
+        )?;
+        Ok(time)
+    }
+
+    /// Set the partition's reference time; partition time must be suspended.
+    pub fn set_reference_time(&self, time: u64) -> Result<()> {
+        self.set_property(WHvPartitionPropertyCodeReferenceTime, &time)
+    }
+
+    /// Stop the partition's clocks (reference time and every vCPU's TSC), so
+    /// they can be read or set as one consistent instant.
+    pub fn suspend_time(&self) -> Result<()> {
+        check_hr(
+            unsafe { WHvSuspendPartitionTime(self.handle) },
+            "WHvSuspendPartitionTime",
+        )
+    }
+
+    pub fn resume_time(&self) -> Result<()> {
+        check_hr(
+            unsafe { WHvResumePartitionTime(self.handle) },
+            "WHvResumePartitionTime",
+        )
     }
 
     pub fn set_cpuid_result_list(&self, entries: &[WHV_X64_CPUID_RESULT]) -> Result<()> {

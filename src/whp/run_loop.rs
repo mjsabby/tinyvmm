@@ -13,7 +13,7 @@ use crate::devices::pic::Pic8259;
 use crate::whp::GuestMemory;
 use crate::whp::cpuid::{CpuidContext, resolve_cpuid};
 use crate::whp::emulator::{EmuError, Emulator, EmulatorBus};
-use crate::whp::hv::{HvEnlightenment, MsrHandled};
+use crate::whp::hv::{CrashMsrs, MsrHandled};
 use crate::whp::regs::reg64;
 use crate::whp::vcpu::{Exit, ExitReason, Vcpu, exit_reason_name};
 
@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use windows_sys::Win32::System::Hypervisor::{
     WHvRegisterPendingInterruption, WHvX64RegisterRax, WHvX64RegisterRbx, WHvX64RegisterRcx,
-    WHvX64RegisterRdx, WHvX64RegisterRip, WHvX64RegisterTsc,
+    WHvX64RegisterRdx, WHvX64RegisterRip,
 };
 
 const RFLAGS_IF: u64 = 1 << 9;
@@ -135,7 +135,7 @@ pub struct RunLoop {
     ram: Arc<GuestMemory>,
     emulator: Emulator,
     vcpu_count: u32,
-    hv: Option<Arc<HvEnlightenment>>,
+    crash: Option<Arc<CrashMsrs>>,
     /// The PIC whose INT output feeds this vCPU's LINT0 (the BSP only).
     ext_int: Option<Arc<Pic8259>>,
     stop: Arc<AtomicBool>,
@@ -163,7 +163,7 @@ impl RunLoop {
             ram,
             emulator,
             vcpu_count: vcpu_count.max(1),
-            hv: None,
+            crash: None,
             ext_int: None,
             stop: Arc::new(AtomicBool::new(false)),
             counters: Arc::new(Counters::default()),
@@ -171,8 +171,8 @@ impl RunLoop {
         })
     }
 
-    pub fn set_hv(&mut self, hv: Arc<HvEnlightenment>) {
-        self.hv = Some(hv);
+    pub fn set_crash_msrs(&mut self, crash: Arc<CrashMsrs>) {
+        self.crash = Some(crash);
     }
     /// Make this vCPU (the BSP) the target of `pic`'s INT output: whenever the
     /// PIC has a request pending, the loop injects it as an ExtINT event before
@@ -425,11 +425,12 @@ impl RunLoop {
         let is_write = m.is_write;
         let wr_val = ((m.rdx & 0xFFFF_FFFF) << 32) | (m.rax & 0xFFFF_FFFF);
 
-        // WHP's LAPIC owns the x2APIC + APIC_BASE MSRs, so only the Hyper-V
-        // enlightenment MSRs (and genuinely unknown ones) reach us.
-        let Some(hv) = self.hv.as_ref() else {
+        // WHP's LAPIC owns the x2APIC + APIC_BASE MSRs and its hypervisor the
+        // Hyper-V enlightenment MSRs (`hv.rs`), so only the guest crash MSRs
+        // and genuinely unknown ones reach us.
+        let Some(crash) = self.crash.as_ref() else {
             eprintln!(
-                "[loop] MSR exit with no enlightenment wired: {} msr=0x{:08x} at RIP=0x{:x}",
+                "[loop] MSR exit with no crash MSRs wired: {} msr=0x{:08x} at RIP=0x{:x}",
                 if is_write { "WRMSR" } else { "RDMSR" },
                 msr,
                 exit.rip()
@@ -438,16 +439,9 @@ impl RunLoop {
         };
         let mut rd_val: u64 = 0;
         let mut result = if is_write {
-            hv.handle_wrmsr(self.vcpu.index(), msr, wr_val)
+            crash.handle_wrmsr(msr, wr_val)
         } else {
-            let guest_tsc = || match self.vcpu.get_register_u64(WHvX64RegisterTsc) {
-                Ok(tsc) => Some(tsc),
-                Err(e) => {
-                    eprintln!("[loop] guest TSC read failed: {e}");
-                    None
-                }
-            };
-            hv.handle_rdmsr(self.vcpu.index(), msr, guest_tsc, &mut rd_val)
+            crash.handle_rdmsr(msr, &mut rd_val)
         };
         if result == MsrHandled::NoInjectGp
             && let Some(v) = amd_config_msr(msr)
@@ -462,7 +456,7 @@ impl RunLoop {
                 eprintln!(
                     "[pvh-run] vCPU {} reported a guest crash; stopping the VM. Guest report:\n{}",
                     self.vcpu.index(),
-                    hv.crash_report()
+                    crash.crash_report()
                 );
                 return Some(StopReason::GuestCrashed);
             }
