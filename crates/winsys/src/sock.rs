@@ -7,12 +7,13 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
     IcmpCreateFile, IcmpSendEcho,
 };
 use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, FIONBIO, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IPPROTO_TCP, IPPROTO_UDP, LINGER,
-    SD_SEND, SO_LINGER, SO_PROTOCOL_INFOW, SO_RCVBUF, SOCK_DGRAM, SOCK_STREAM, SOCKADDR,
-    SOCKADDR_IN, SOCKET, SOL_SOCKET, WSA_IO_PENDING, WSABUF, WSADATA, WSAGetLastError, WSAIoctl,
-    WSAPROTOCOL_INFOW, WSARecv, WSASend, WSAStartup, XP1_IFS_HANDLES, accept, bind, closesocket,
-    connect, getpeername, getsockname, getsockopt, ioctlsocket, listen, setsockopt, shutdown,
-    socket,
+    AF_INET, AF_INET6, FIONBIO, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0, INVALID_SOCKET,
+    IPPROTO_IPV6, IPPROTO_TCP, IPPROTO_UDP, IPV6_V6ONLY, LINGER, SD_SEND, SO_LINGER,
+    SO_PROTOCOL_INFOW, SO_RCVBUF, SOCK_DGRAM, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
+    SOCKADDR_STORAGE, SOCKET, SOL_SOCKET, WSA_IO_PENDING, WSABUF, WSADATA, WSAGetLastError,
+    WSAIoctl, WSAPROTOCOL_INFOW, WSARecv, WSASend, WSAStartup, XP1_IFS_HANDLES, accept, bind,
+    closesocket, connect, getpeername, getsockname, getsockopt, ioctlsocket, listen, setsockopt,
+    shutdown, socket,
 };
 use windows_sys::Win32::Storage::FileSystem::SetFileCompletionNotificationModes;
 use windows_sys::Win32::System::IO::{
@@ -336,6 +337,50 @@ pub fn new_tcp_listener(addr: [u8; 4], port: u16) -> Option<SOCKET> {
     Some(s)
 }
 
+/// A TCP listener on the IPv6 loopback, `[::1]:port` (IPv6 only), as
+/// [`new_tcp_listener`] makes for IPv4. `Err` carries the WSA error.
+pub fn new_tcp_listener6_loopback(port: u16) -> Result<SOCKET, i32> {
+    let s = unsafe { socket(AF_INET6 as i32, SOCK_STREAM, IPPROTO_TCP) };
+    if s == INVALID_SOCKET {
+        return Err(unsafe { WSAGetLastError() });
+    }
+    let v6only: u32 = 1;
+    let mut loopback = [0u8; 16];
+    loopback[15] = 1;
+    let sa = SOCKADDR_IN6 {
+        sin6_family: AF_INET6,
+        sin6_port: port.to_be(),
+        sin6_flowinfo: 0,
+        sin6_addr: IN6_ADDR {
+            u: IN6_ADDR_0 { Byte: loopback },
+        },
+        Anonymous: unsafe { core::mem::zeroed() },
+    };
+    let ok = unsafe {
+        setsockopt(
+            s,
+            IPPROTO_IPV6,
+            IPV6_V6ONLY,
+            &v6only as *const u32 as *const u8,
+            core::mem::size_of::<u32>() as i32,
+        ) == 0
+            && bind(
+                s,
+                &sa as *const SOCKADDR_IN6 as *const SOCKADDR,
+                core::mem::size_of::<SOCKADDR_IN6>() as i32,
+            ) == 0
+            && listen(s, 64) == 0
+    };
+    if !ok {
+        let err = unsafe { WSAGetLastError() };
+        unsafe {
+            closesocket(s);
+        }
+        return Err(err);
+    }
+    Ok(s)
+}
+
 /// Block until a client connects (or the listener is closed). Returns
 /// INVALID_SOCKET when the listener has been closed for shutdown.
 pub fn accept_one(listener: SOCKET) -> SOCKET {
@@ -354,33 +399,55 @@ pub fn update_connect_ctx(s: SOCKET) {
     }
 }
 
-/// True if a connected IPv4 socket's peer is this host: a loopback address,
-/// or the very address the socket is bound to (a connection to one of the
-/// host's own interface addresses). ConnectEx sockets need
-/// [`update_connect_ctx`] first.
+/// True if a connected socket's peer is this host: a loopback address, or the
+/// very address the socket is bound to (a connection to one of the host's own
+/// interface addresses). IPv4 or IPv6 (an IPv6 port-forward listener's
+/// clients). ConnectEx sockets need [`update_connect_ctx`] first.
 pub fn peer_is_local(s: SOCKET) -> bool {
-    let mut local: SOCKADDR_IN = unsafe { core::mem::zeroed() };
-    let mut peer: SOCKADDR_IN = unsafe { core::mem::zeroed() };
-    let mut local_len = core::mem::size_of::<SOCKADDR_IN>() as i32;
+    let mut local: SOCKADDR_STORAGE = unsafe { core::mem::zeroed() };
+    let mut peer: SOCKADDR_STORAGE = unsafe { core::mem::zeroed() };
+    let mut local_len = core::mem::size_of::<SOCKADDR_STORAGE>() as i32;
     let mut peer_len = local_len;
     let ok = unsafe {
         getsockname(
             s,
-            &mut local as *mut SOCKADDR_IN as *mut SOCKADDR,
+            &mut local as *mut SOCKADDR_STORAGE as *mut SOCKADDR,
             &mut local_len,
         ) == 0
             && getpeername(
                 s,
-                &mut peer as *mut SOCKADDR_IN as *mut SOCKADDR,
+                &mut peer as *mut SOCKADDR_STORAGE as *mut SOCKADDR,
                 &mut peer_len,
             ) == 0
     };
-    if !ok || local.sin_family != AF_INET || peer.sin_family != AF_INET {
+    if !ok || local.ss_family != peer.ss_family {
         return false;
     }
-    // SAFETY: every bit pattern is a valid `S_addr`; octets are in network order.
-    let (l, p) = unsafe { (local.sin_addr.S_un.S_addr, peer.sin_addr.S_un.S_addr) };
-    p.to_ne_bytes()[0] == 127 || p == l
+    match peer.ss_family {
+        AF_INET => {
+            // SAFETY: an AF_INET address is a SOCKADDR_IN; every bit pattern
+            // is a valid `S_addr`, whose octets are in network order.
+            let (l, p) = unsafe {
+                let l = &*(&local as *const SOCKADDR_STORAGE as *const SOCKADDR_IN);
+                let p = &*(&peer as *const SOCKADDR_STORAGE as *const SOCKADDR_IN);
+                (l.sin_addr.S_un.S_addr, p.sin_addr.S_un.S_addr)
+            };
+            p.to_ne_bytes()[0] == 127 || p == l
+        }
+        AF_INET6 => {
+            // SAFETY: an AF_INET6 address is a SOCKADDR_IN6; every bit
+            // pattern is a valid address.
+            let (l, p) = unsafe {
+                let l = &*(&local as *const SOCKADDR_STORAGE as *const SOCKADDR_IN6);
+                let p = &*(&peer as *const SOCKADDR_STORAGE as *const SOCKADDR_IN6);
+                (l.sin6_addr.u.Byte, p.sin6_addr.u.Byte)
+            };
+            let mut loopback = [0u8; 16];
+            loopback[15] = 1;
+            p == loopback || p == l
+        }
+        _ => false,
+    }
 }
 
 /// Fix the socket's receive buffer, and so its advertised TCP window, at

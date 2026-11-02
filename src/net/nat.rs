@@ -30,7 +30,9 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::Instant;
 use tcp_sans_io::{Endpoint, State, Tcb, TcbConfig, TcbStats, TcpError};
-use windows_sys::Win32::Networking::WinSock::{INVALID_SOCKET, SOCKET, WSABUF};
+use windows_sys::Win32::Networking::WinSock::{
+    INVALID_SOCKET, SOCKET, WSABUF, WSAEADDRNOTAVAIL, WSAEAFNOSUPPORT,
+};
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
 const KEY_FRAME: usize = 1;
@@ -3281,7 +3283,11 @@ impl NatBackend {
         // Start a listener (+ accept thread) for each port-forward rule. The
         // accept thread blocks in accept() and hands each connected client to
         // a worker via its IOCP (KEY_ACCEPT), round-robin; closing the
-        // listener socket on shutdown unblocks it.
+        // listener socket on shutdown unblocks it. A rule on the IPv4
+        // loopback also listens on the IPv6 one: clients resolve `localhost`
+        // to ::1 first, and Windows takes ~2 s (its SYN retransmissions) to
+        // refuse a connect to a closed loopback port before they fall back to
+        // 127.0.0.1, so every new `localhost` connection would wait that long.
         let mut listeners = Vec::new();
         let mut listener_threads = Vec::new();
         for pf in &opts.port_forwards {
@@ -3292,16 +3298,31 @@ impl NatBackend {
                 );
                 continue;
             };
-            listeners.push(lsock);
-            let pf = *pf;
-            let ap = accept_pool.clone();
-            let ai = accept_inflight.clone();
-            let targets = iocps.clone();
-            if let Ok(h) = std::thread::Builder::new()
-                .name(format!("nat-listen-{}", pf.host_port))
-                .spawn(move || listener_loop(lsock, &targets, pf, ap, ai))
-            {
-                listener_threads.push(h);
+            let mut socks = vec![(lsock, "")];
+            if pf.host_addr == [127, 0, 0, 1] {
+                match sys::new_tcp_listener6_loopback(pf.host_port) {
+                    Ok(s) => socks.push((s, "6")),
+                    // No IPv6 on this host: `localhost` then means 127.0.0.1.
+                    Err(e) if e == WSAEAFNOSUPPORT || e == WSAEADDRNOTAVAIL => {}
+                    Err(e) => eprintln!(
+                        "[nat] WARN: port-forward listen on [::1]:{} failed (WSA error {e}); \
+                         `localhost:{}` may reach another listener, use 127.0.0.1",
+                        pf.host_port, pf.host_port
+                    ),
+                }
+            }
+            for (lsock, family) in socks {
+                listeners.push(lsock);
+                let pf = *pf;
+                let ap = accept_pool.clone();
+                let ai = accept_inflight.clone();
+                let targets = iocps.clone();
+                if let Ok(h) = std::thread::Builder::new()
+                    .name(format!("nat-listen{family}-{}", pf.host_port))
+                    .spawn(move || listener_loop(lsock, &targets, pf, ap, ai))
+                {
+                    listener_threads.push(h);
+                }
             }
         }
         let default_tier = if opts.default_tier < N_TCB_TIERS {

@@ -19,7 +19,7 @@ twelve guest phases pass (`NATTEST SUMMARY: 12/12`):
   F  uploads of such sizes (to 32 MiB) arrive intact;
   G  8 parallel 8 MiB downloads arrive intact;
   H  the host downloads 24 MiB from the guest's httpd through --portfwd,
-     intact;
+     intact, over 127.0.0.1 and (nat, smoltcp) [::1];
   I  UDP datagrams of 1473 B to 8 KiB, and 4000-byte pings to the gateway,
      echo intact (they cross the NAT in IPv4 fragments, both ways);
   J  a datagram for a multicast group stays on the guest's link: the host,
@@ -76,13 +76,14 @@ def reply(c: socket.socket, body: bytes) -> None:
     c.sendall(body)
 
 
-def serve(listener: socket.socket, mcast_seen: list[int]) -> None:
+def serve(listener: socket.socket, mcast_seen: list[int], backend: str) -> None:
     """GET /ok: a tiny HTTP/1.0 reply, then the server closes first.
     GET /rst: headers and part of a body, then a reset (SO_LINGER 0).
     GET /blob/<size>/<seed>: pseudo-random bytes; /sum/<size>/<seed>: their
     SHA-256. POST /up: the SHA-256 of the body. GET /pf/<port>/<path>: the
     SHA-256 of http://127.0.0.1:<port>/<path> (the NAT's port forward to the
-    guest). GET /mcast: how many datagrams the host got for MCAST_GROUP.
+    guest), fetched over [::1] too for the NAT backends, which must agree.
+    GET /mcast: how many datagrams the host got for MCAST_GROUP.
     GET /hold: headers and 256 KiB, a half-close, then wait for the client to
     end the connection; GET /hold-end: how it did: "reset", "eof" or
     "pending"."""
@@ -121,12 +122,20 @@ def serve(listener: socket.socket, mcast_seen: list[int]) -> None:
                     got += len(d)
                 reply(c, sha.hexdigest().encode())
             elif parts[0] == "pf":
-                url = f"http://127.0.0.1:{parts[1]}/{'/'.join(parts[2:])}"
-                try:
-                    with urllib.request.urlopen(url, timeout=60) as r:
-                        digest = hashlib.sha256(r.read()).hexdigest()
-                except OSError as e:
-                    digest = f"error: {e}"
+                # The NAT forwards both loopbacks, so `localhost` reaches the
+                # guest at once (libslirp and gVisor forward only 127.0.0.1).
+                hosts = ["127.0.0.1"]
+                if backend in ("nat", "smoltcp"):
+                    hosts.append("[::1]")
+                digests = set()
+                for host in hosts:
+                    url = f"http://{host}:{parts[1]}/{'/'.join(parts[2:])}"
+                    try:
+                        with urllib.request.urlopen(url, timeout=60) as r:
+                            digests.add(hashlib.sha256(r.read()).hexdigest())
+                    except OSError as e:
+                        digests.add(f"error: {host}: {e}")
+                digest = digests.pop() if len(digests) == 1 else " / ".join(sorted(digests))
                 reply(c, digest.encode())
             elif parts[0] == "mcast":
                 reply(c, str(mcast_seen[0]).encode())
@@ -227,7 +236,7 @@ def main() -> int:
     listener.listen(64)
     port = listener.getsockname()[1]
     mcast_seen = [0]
-    threading.Thread(target=serve, args=(listener, mcast_seen), daemon=True).start()
+    threading.Thread(target=serve, args=(listener, mcast_seen, args.backend), daemon=True).start()
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp.bind(("127.0.0.1", 0))
     udp_port = udp.getsockname()[1]
