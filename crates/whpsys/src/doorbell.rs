@@ -2,6 +2,14 @@
 //! matching store signals an event instead of taking a VM exit. A safe RAII
 //! wrapper — `new` creates the event + registers the match, `Drop` unregisters
 //! it + closes the event. The caller waits on `event()` from its pump thread.
+//!
+//! Unregistering can block forever. vid.sys waits, non-alertably, until it has
+//! taken as many signals off the doorbell's port as the hypervisor says it
+//! posted, and under heavy doorbell traffic it can take one more than that
+//! count (seen nested: about once per 20 million signals), so the wait never
+//! ends. Deleting the partition runs the same wait, so the process can't exit
+//! and only a host restart frees it. VM teardown therefore frees guest RAM and
+//! closes host sockets before it drops any `Doorbell` (`GuestMemory::release`).
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::System::Hypervisor::{

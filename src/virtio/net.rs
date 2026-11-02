@@ -356,11 +356,15 @@ impl NetDevice {
     pub fn set_backend(&self, b: Arc<dyn NetBackend>) {
         let _ = self.backend.set(b);
     }
-    /// Stop + detach the host backend (drains its worker threads). Used to
-    /// quiesce the data plane before a snapshot capture so no inbound frame
-    /// mutates the RX queue / guest RAM mid-capture.
+    /// Stop + detach the host backend (drains its worker threads; the NAT also
+    /// closes its sockets, port forwards included). Quiesces the data plane
+    /// before a snapshot capture, so no inbound frame mutates the RX queue /
+    /// guest RAM mid-capture, and at teardown before guest RAM is freed.
+    /// Idempotent.
     pub fn quiesce_backend(&self) {
-        self.backend_detached.store(true, Ordering::Release);
+        if self.backend_detached.swap(true, Ordering::AcqRel) {
+            return;
+        }
         if let Some(b) = self.backend.get() {
             b.stop();
         }

@@ -4,6 +4,7 @@
 use crate::error::{Error, Result, check_hr};
 use crate::host;
 use core::ffi::c_void;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use windows_sys::Win32::System::Hypervisor::{
@@ -117,7 +118,9 @@ pub struct GuestMemory {
     large_pages: bool,
     split: Option<Split>,
     /// Background SLAT pre-population; joined before the GPA range is unmapped.
-    populate: Option<JoinHandle<()>>,
+    populate: Mutex<Option<JoinHandle<()>>>,
+    /// Set once the RAM is unmapped and freed ([`Self::release`]).
+    released: AtomicBool,
 }
 
 // `GuestMemory` now AUTO-derives Send + Sync: every field is Send+Sync
@@ -169,7 +172,8 @@ impl GuestMemory {
             size: alloc_size,
             large_pages: large,
             split: None,
-            populate,
+            populate: Mutex::new(populate),
+            released: AtomicBool::new(false),
         })
     }
 
@@ -253,7 +257,8 @@ impl GuestMemory {
                 low_size: low_limit,
                 high_gpa,
             }),
-            populate,
+            populate: Mutex::new(populate),
+            released: AtomicBool::new(false),
         })
     }
 
@@ -329,7 +334,8 @@ impl GuestMemory {
             size: alloc_size,
             large_pages: false,
             split: None,
-            populate: None,
+            populate: Mutex::new(None),
+            released: AtomicBool::new(false),
         })
     }
 
@@ -567,34 +573,50 @@ impl GuestMemory {
         unsafe { AtomicU16::from_ptr(p as *mut u16).store(v, Ordering::Release) };
         true
     }
+
+    /// Unmap guest RAM from the partition and free it, ahead of the rest of VM
+    /// teardown. vid.sys can block a doorbell unregister or the partition
+    /// delete forever (see `crate::doorbell`), leaving a process that can't
+    /// exit; RAM freed first isn't stranded with it. Idempotent: `Drop` frees
+    /// nothing afterwards.
+    ///
+    /// # Safety
+    ///
+    /// Nothing may touch guest memory afterwards, through this object or a
+    /// pointer taken from it: every vCPU and every host thread that reads or
+    /// writes guest RAM must have stopped.
+    pub unsafe fn release(&self) {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(h) = self.populate.lock().unwrap().take() {
+            let _ = h.join();
+        }
+        if self.base.is_null() {
+            return;
+        }
+        unsafe {
+            // part == 0 => host-only slab (new_host_only): no GPA mapping to undo.
+            if self.part != 0 {
+                match &self.split {
+                    Some(s) => {
+                        WHvUnmapGpaRange(self.part, self.gpa, s.low_size as u64);
+                        WHvUnmapGpaRange(self.part, s.high_gpa, (self.size - s.low_size) as u64);
+                    }
+                    None => {
+                        WHvUnmapGpaRange(self.part, self.gpa, self.size as u64);
+                    }
+                }
+            }
+            VirtualFree(self.base.get() as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
 }
 
 impl Drop for GuestMemory {
     fn drop(&mut self) {
-        if let Some(h) = self.populate.take() {
-            let _ = h.join();
-        }
-        if !self.base.is_null() {
-            unsafe {
-                // part == 0 => host-only slab (new_host_only): no GPA mapping to undo.
-                if self.part != 0 {
-                    match &self.split {
-                        Some(s) => {
-                            WHvUnmapGpaRange(self.part, self.gpa, s.low_size as u64);
-                            WHvUnmapGpaRange(
-                                self.part,
-                                s.high_gpa,
-                                (self.size - s.low_size) as u64,
-                            );
-                        }
-                        None => {
-                            WHvUnmapGpaRange(self.part, self.gpa, self.size as u64);
-                        }
-                    }
-                }
-                VirtualFree(self.base.get() as *mut c_void, 0, MEM_RELEASE);
-            }
-        }
+        // SAFETY: the last owner is gone, so nothing uses the memory any more.
+        unsafe { self.release() }
     }
 }
 
@@ -613,7 +635,8 @@ mod tests {
             size,
             large_pages: false,
             split,
-            populate: None,
+            populate: Mutex::new(None),
+            released: AtomicBool::new(false),
         }
     }
 
@@ -687,7 +710,8 @@ mod tests {
                 low_size: low_limit,
                 high_gpa,
             }),
-            populate: None,
+            populate: Mutex::new(None),
+            released: AtomicBool::new(false),
         };
 
         // The "saved RAM image": the contiguous low||high host bytes.

@@ -859,6 +859,19 @@ sequential 9p walk ran no faster than with polling off. Polling trades host
 CPU for latency only while requests come back to back, when the pump spins
 up to a core.
 
+**Teardown can hang in Hyper-V.** Unregistering a doorbell waits in vid.sys
+until it has taken as many signals off the doorbell's port as the hypervisor
+says it posted, and deleting the partition does the same for every doorbell
+left. After tens of millions of doorbell signals (seen nested; a guest kicking
+one queue in a tight loop gets there in about 30 s) vid.sys can have taken one
+more than that count, and the wait never ends: the process can't exit, and only
+a host restart frees it. OpenVMM, which registers its virtio doorbells the same
+way, hangs the same way. tinyvmm can't avoid this, so it makes it cheap: once
+the vCPUs are joined, teardown stops every doorbell pump and device thread,
+closes the NAT's sockets and frees guest RAM before it unregisters a doorbell or
+deletes the partition (`ReleaseBeforeTeardown` in `main.rs`). A stuck process
+then holds a few MB and no ports, and warns after 10 s.
+
 ---
 
 ## 4. Architecture & source layout
@@ -1256,7 +1269,9 @@ static mut / Box::leak
   doorbell pump + join), the `Display` window thread, and `SnapshotWriter` (delete
   a half-written file). Teardown order is explicit in `main.rs` — blk devices are
   quiesced and their IOCP workers stopped *before* their owners drop, so no
-  completion lands on freed memory.
+  completion lands on freed memory; then the doorbell pumps, NIC backends and 9p
+  workers stop and guest RAM is freed before any doorbell or the partition is
+  torn down (see [Doorbells](#doorbells--the-notify-without-a-vm-exit-path)).
 * **`#[repr(C)]` (8) + `transmute` (12)** — ABI control at the FFI line. `repr(C)`
   guarantees field order for the `OVERLAPPED`-first request structs and the NAT
   frame slot. Every `transmute` turns an OS-resolved symbol into a typed function

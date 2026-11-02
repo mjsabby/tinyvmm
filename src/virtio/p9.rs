@@ -941,19 +941,21 @@ impl P9Device {
     }
 
     /// Wait for all in-flight 9p requests to drain (the slot pool becomes fully
-    /// free) so a snapshot captures a consistent device — no reply landing in
-    /// guest RAM / the used ring after the queue + device-state were captured.
+    /// free) so a snapshot captures a consistent device, or teardown can free
+    /// guest RAM — no reply landing in guest RAM / the used ring afterwards.
     /// Bounded spin: the guest is already stopped, so no new requests arrive and
-    /// the worker pool completes the in-flight ones promptly.
-    pub fn quiesce(&self) {
+    /// the worker pool completes the in-flight ones promptly. Returns false if
+    /// requests are still in flight when it gives up.
+    pub fn quiesce(&self) -> bool {
         let total = self.engine.pool.slots.len();
         for _ in 0..5_000 {
             if self.engine.pool.free.lock().unwrap().len() >= total {
-                return;
+                return true;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         eprintln!("[9p] WARN: quiesce timed out with requests still in flight");
+        false
     }
 
     fn raise(&self, qidx: u32) {

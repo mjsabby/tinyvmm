@@ -1619,6 +1619,51 @@ fn finish_recording(recorder: Option<&Arc<Recorder>>, tag: &str) {
     }
 }
 
+/// Frees what a stuck partition teardown would otherwise hold until the host
+/// restarts. Unregistering a doorbell or deleting the partition can block
+/// forever in vid.sys (see `whpsys::doorbell`), and a process stuck there can't
+/// exit: it would keep all guest RAM and its NAT's sockets, port forwards
+/// included. Declared once the vCPUs are joined and blk is quiesced, it drops
+/// before the transports and the partition, on every return path: it stops
+/// every transport, the NICs' backends and 9p, then frees guest RAM.
+struct ReleaseBeforeTeardown<'a> {
+    tag: &'static str,
+    transports: &'a [Arc<PciTransport>],
+    net_devices: &'a [Arc<NetDevice>],
+    p9_devices: &'a [Arc<P9Device>],
+    ram: &'a GuestMemory,
+}
+
+impl Drop for ReleaseBeforeTeardown<'_> {
+    fn drop(&mut self) {
+        for t in self.transports {
+            t.stop();
+        }
+        for nd in self.net_devices {
+            nd.quiesce_backend();
+        }
+        let freed = self.p9_devices.iter().all(|p| p.quiesce());
+        if freed {
+            // SAFETY: the vCPUs are joined, every doorbell pump is stopped and
+            // every queue disabled, and blk, the NICs' backends and 9p have
+            // nothing in flight, so nothing touches guest RAM any more.
+            unsafe { self.ram.release() };
+        }
+        let tag = self.tag;
+        let _ = std::thread::Builder::new()
+            .name("teardown-watch".into())
+            .spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                eprintln!(
+                    "[{tag}] WARN: VM teardown still running after 10 s. If vid.sys is stuck \
+                     unregistering a doorbell, this process can't exit until the host restarts; \
+                     its NAT sockets are closed and guest RAM is {}.",
+                    if freed { "freed" } else { "still allocated" }
+                );
+            });
+    }
+}
+
 fn run_pvh_run(args: &[String]) -> Result<i32> {
     let cfg = parse_pvh_args(args)?;
 
@@ -2402,6 +2447,13 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     for b in &blk_backends {
         b.stop();
     }
+    let _release = ReleaseBeforeTeardown {
+        tag: "pvh-run",
+        transports: &transports,
+        net_devices: &net_devices,
+        p9_devices: &p9_devices,
+        ram: &ram,
+    };
 
     // Snapshot save: if armed and the guest issued the trigger (from any vCPU),
     // capture the now quiesced machine (APs stopped + joined, blk devices
@@ -3438,6 +3490,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
     // is restored from its PciDevice section's device-state, which reopens the
     // host handles). Same creation ORDER as run_pvh_run so PCI/device indices
     // line up: console, nets, rng, blk, input, 9p.
+    let mut p9_devices: Vec<Arc<P9Device>> = Vec::with_capacity(p9_count);
     for i in 0..p9_count {
         let tag = jr.get_str(&format!("p9{i}_tag"))?;
         let root = jr.get_str(&format!("p9{i}_root"))?;
@@ -3483,6 +3536,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
         }));
         pci_bus.add_device(pt.clone() as Arc<dyn PciFunction>);
         transports.push(pt.clone());
+        p9_devices.push(p9);
         println!(
             "[restore] virtio-9p[{i}] tag={tag} host={root} owner={uid}:{gid}{}{}",
             if metadata { " metadata" } else { "" },
@@ -3890,6 +3944,13 @@ fn run_restore(args: &[String]) -> Result<i32> {
     for b in &blk_backends {
         b.stop();
     }
+    let _release = ReleaseBeforeTeardown {
+        tag: "restore",
+        transports: &transports,
+        net_devices: &net_devices,
+        p9_devices: &p9_devices,
+        ram: &ram,
+    };
     if let Some(d) = &display {
         d.shutdown();
     }

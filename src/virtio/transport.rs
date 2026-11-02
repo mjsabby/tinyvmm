@@ -553,6 +553,28 @@ impl PciTransport {
         }
     }
 
+    /// Stop serving the guest, for VM teardown: join the doorbell pump and mark
+    /// every queue not ready, so neither the pump nor a device path that checks
+    /// a queue's readiness under its lock (console input, sound, input) touches
+    /// guest RAM afterwards. The doorbells stay registered until the transport
+    /// drops: unregistering one can block forever (see `whpsys::doorbell`), so
+    /// teardown frees guest RAM first. Devices with work in flight on their own
+    /// threads (blk, net, 9p) need their own quiesce as well.
+    pub fn stop(&self) {
+        let pump = self.doorbell_state.lock().unwrap().as_mut().map(|s| {
+            unsafe {
+                SetEvent(s.stop_event);
+            }
+            s.pump.take()
+        });
+        if let Some(Some(h)) = pump {
+            let _ = h.join();
+        }
+        for q in 0..self.device.queue_count() {
+            self.device.disable_queue(q);
+        }
+    }
+
     fn install_bar_handlers(&self, gpa: u64) {
         let w = self.me.clone();
         self.mmio_bus.register(
