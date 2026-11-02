@@ -97,11 +97,20 @@ pub fn run() -> Result<()> {
             libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
             "",
         )?;
-        unix::write(
-            "/sys/fs/cgroup/cgroup.subtree_control",
-            "+cpu +memory +pids",
-            0o644,
-        )
+        let available = fs::read_to_string("/sys/fs/cgroup/cgroup.controllers")?;
+        let (enable, missing) = subtree_control(&available);
+        if !enable.is_empty() {
+            unix::write("/sys/fs/cgroup/cgroup.subtree_control", &enable, 0o644)?;
+        }
+        Ok(missing)
+    })
+    .map(|missing| {
+        if !missing.is_empty() {
+            log.record(&format!(
+                "cgroup2 controllers missing from the kernel: {}",
+                missing.join(" ")
+            ));
+        }
     })?;
     log.step("applet-links", || {
         for applet in coreutils::APPLETS
@@ -588,6 +597,24 @@ fn identity(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// The controllers tinyinit enables for its services' cgroups, as a
+/// `cgroup.subtree_control` write, from the kernel's `cgroup.controllers`; and
+/// the wanted ones the kernel lacks. A kernel built without one (say
+/// `CONFIG_MEMCG`) still boots: only a service limit that needs the missing
+/// controller fails, when its cgroup is created.
+fn subtree_control(available: &str) -> (String, Vec<&'static str>) {
+    let available: Vec<&str> = available.split_whitespace().collect();
+    let (have, missing): (Vec<&str>, Vec<&str>) = ["cpu", "memory", "pids"]
+        .into_iter()
+        .partition(|c| available.contains(c));
+    let enable = have
+        .iter()
+        .map(|c| format!("+{c}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    (enable, missing)
+}
+
 fn cgroup(name: &str, limits: &Limits) -> Result<File> {
     let dir = format!("/sys/fs/cgroup/{name}");
     fs::create_dir(&dir)?;
@@ -817,6 +844,22 @@ fn link_up(socket: i32, name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_kernels_cgroup_controllers_are_enabled() {
+        assert_eq!(
+            subtree_control("cpuset cpu io memory hugetlb pids rdma misc\n"),
+            ("+cpu +memory +pids".to_string(), vec![])
+        );
+        assert_eq!(
+            subtree_control("cpuset cpu io pids\n"),
+            ("+cpu +pids".to_string(), vec!["memory"])
+        );
+        assert_eq!(
+            subtree_control(""),
+            (String::new(), vec!["cpu", "memory", "pids"])
+        );
+    }
 
     #[test]
     fn service_logs_rotate_within_the_cap() -> Result<()> {

@@ -132,7 +132,10 @@ load public keys, create homes, set static IPv4/DNS, create cgroups,
 then spawn the apps and another process using the same executable inode in `sshd` mode.
 
 Kernel requirements: built-in virtio PCI/net/console/RNG and 9p/9p-virtio,
-proc/sysfs/tmpfs/devtmpfs/devpts, IPv4, cgroup v2 with cpu/memory/pids controllers.
+proc/sysfs/tmpfs/devtmpfs/devpts, IPv4, cgroup v2. tinyinit enables whichever
+of the cpu, memory and pids controllers the kernel has and records the missing
+ones in the boot log; only an application limit that needs a missing controller
+(`memory_max` without `CONFIG_MEMCG`, say) then fails, when its cgroup is created.
 Namespaces need their kernel options, but no additional namespaces are created.
 The root switch is a real mount move, not just chroot.
 This is an ordinary writable, RAM-backed Linux filesystem, not a direct mount
