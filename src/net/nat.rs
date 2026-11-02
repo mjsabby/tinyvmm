@@ -1984,7 +1984,8 @@ impl NatState {
     /// ops, but their completions may still write into the op structs and
     /// buffers (a recv, into the tcb's send ring) after the close returns, so
     /// a flow's boxes are leaked instead of freed while it has an op in
-    /// flight. For UDP the socket lives in the op, so close it here.
+    /// flight. A UDP flow's socket lives in its op, which has a receive in
+    /// flight unless the flow yielded, so its op is always leaked.
     fn shutdown(&mut self) {
         for (_, mut f) in self.tcp.drain() {
             publish_tcb_stats(&mut f, &self.stats);
@@ -2003,10 +2004,12 @@ impl NatState {
             }
         }
         for (_, mut f) in self.udp.drain() {
-            if let Some(op) = f.op.take()
-                && op.sock != INVALID_SOCKET
-            {
-                sys::close_sock(op.sock);
+            if let Some(op) = f.op.take() {
+                if op.sock != INVALID_SOCKET {
+                    sys::close_sock(op.sock);
+                }
+                // The same bounded leak as TCP's: at most MAX_UDP_FLOWS ops.
+                std::mem::forget(op);
             }
         }
     }
