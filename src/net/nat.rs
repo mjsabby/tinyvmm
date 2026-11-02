@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::Instant;
-use tcp_sans_io::{Endpoint, State, Tcb, TcbConfig, TcbStats, TcpError};
+use tcp_sans_io::{Endpoint, State, Tcb, TcbConfig, TcbStats, TcpError, rtx_cap_for, tx_slots_for};
 use windows_sys::Win32::Networking::WinSock::{
     INVALID_SOCKET, SOCKET, WSABUF, WSAEADDRNOTAVAIL, WSAEAFNOSUPPORT,
 };
@@ -98,9 +98,9 @@ const MAX_UDP_FLOWS: usize = 256;
 const MAX_TCP_FLOWS: usize = 4096;
 /// With this many flows open, a new flow takes the smallest Tcb tier
 /// (`TIER_BUF[0]`) unless a port override names one, so a crowd of idle
-/// connections costs about 206 KiB each (two 64 KiB rings and the Tcb's own
-/// ~78 KiB) rather than the default tier's 590 KiB: all MAX_TCP_FLOWS open and
-/// idle hold about 0.9 GiB, and each send in flight to the host adds its
+/// connections costs about 148 KiB each (two 64 KiB rings and the Tcb's own
+/// ~20 KiB) rather than the default tier's 548 KiB: all MAX_TCP_FLOWS open and
+/// idle hold about 0.7 GiB, and each send in flight to the host adds its
 /// 64 KiB send op. The pools keep this many flows' worth of idle boxes per
 /// tier and free the rest, so the memory goes when the flows do.
 const FULL_RING_FLOWS: usize = 256;
@@ -391,13 +391,15 @@ impl FlowRouter {
 /// Number of compile-time Tcb ring-size tiers.
 pub const N_TCB_TIERS: usize = 3;
 /// The tier ring sizes, smallest first. Each is a power of two. Single source
-/// of truth — `TIER_MAKE` builds one `Tcb<{TIER_BUF[i]}>` constructor per entry.
+/// of truth — `TIER_MAKE` builds one `Tcb` constructor per entry, its
+/// retransmission queue and egress ring sized to the ring (`rtx_cap_for`,
+/// `tx_slots_for`): a 64 KiB tier TCB is ~20 KiB, not the 1 MiB tier's ~78 KiB.
 const TIER_BUF: [usize; N_TCB_TIERS] = [64 * 1024, 256 * 1024, 1024 * 1024];
 /// Per-tier constructors (one monomorphization of `make_tcb` per size).
 const TIER_MAKE: [fn() -> Box<dyn TcbDyn>; N_TCB_TIERS] = [
-    make_tcb::<{ TIER_BUF[0] }>,
-    make_tcb::<{ TIER_BUF[1] }>,
-    make_tcb::<{ TIER_BUF[2] }>,
+    make_tcb::<{ TIER_BUF[0] }, { rtx_cap_for(TIER_BUF[0]) }, { tx_slots_for(TIER_BUF[0]) }>,
+    make_tcb::<{ TIER_BUF[1] }, { rtx_cap_for(TIER_BUF[1]) }, { tx_slots_for(TIER_BUF[1]) }>,
+    make_tcb::<{ TIER_BUF[2] }, { rtx_cap_for(TIER_BUF[2]) }, { tx_slots_for(TIER_BUF[2]) }>,
 ];
 /// Default warm counts (cold-start preallocation; pools still grow on demand).
 /// Most flows ride the default 256 KiB tier, and flows past `FULL_RING_FLOWS`
@@ -407,7 +409,7 @@ const TIER_MAKE: [fn() -> Box<dyn TcbDyn>; N_TCB_TIERS] = [
 const DEFAULT_TCB_WARM: [usize; N_TCB_TIERS] = [192, 16, 0];
 /// Default tier index (256 KiB) when no port override matches. On a nested
 /// host its rings cap one connection's guest upload near 4 Gbps (see above),
-/// but a flow costs about 590 KiB rather than the 1 MiB tier's 2.1 MiB, and a
+/// but a flow costs about 548 KiB rather than the 1 MiB tier's 2.1 MiB, and a
 /// server guest under a test harness keeps hundreds of connections open.
 const DEFAULT_TIER: usize = 1;
 
@@ -426,8 +428,8 @@ const TCB_PLACEHOLDER: TcbConfig = TcbConfig {
     initial_rto_ms: 1000,
 };
 
-fn make_tcb<const BUF: usize>() -> Box<dyn TcbDyn> {
-    Box::new(Tcb::<BUF>::new(TCB_PLACEHOLDER).expect("nat: Tcb pool allocation"))
+fn make_tcb<const BUF: usize, const RTX: usize, const TXQ: usize>() -> Box<dyn TcbDyn> {
+    Box::new(Tcb::<BUF, RTX, TXQ>::new(TCB_PLACEHOLDER).expect("nat: Tcb pool allocation"))
 }
 
 fn make_smol<const BUF: usize>() -> Box<dyn TcbDyn> {
@@ -514,7 +516,7 @@ pub(super) trait TcbDyn {
     fn stats(&self) -> TcbStats;
 }
 
-impl<const BUF: usize> TcbDyn for Tcb<BUF> {
+impl<const BUF: usize, const RTX: usize, const TXQ: usize> TcbDyn for Tcb<BUF, RTX, TXQ> {
     fn set_now(&mut self, now: u64) {
         self.set_now(now)
     }
