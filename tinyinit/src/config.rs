@@ -44,6 +44,35 @@ pub struct Share {
     pub target: String,
     #[serde(default = "yes")]
     pub readonly: bool,
+    /// How the guest caches a read-only share; writable shares are uncached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<ShareCache>,
+}
+
+/// The guest's 9p cache mode for a read-only share.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShareCache {
+    /// The default: file data is cached, but a lookup of a file the guest
+    /// doesn't hold open asks the host, so a file the host replaces is seen
+    /// when next opened.
+    Readahead,
+    /// Names and attributes are cached too, so walking and opening files the
+    /// guest has seen takes no host round trip. For a tree the host doesn't
+    /// change while the VM runs, such as published applications.
+    Loose,
+}
+
+impl Share {
+    /// The 9p `cache=` mode the guest mounts this share with. Writable shares
+    /// are uncached, so the guest always reads what the host last wrote.
+    pub fn cache_mode(&self) -> &'static str {
+        match (self.readonly, self.cache) {
+            (false, _) => "none",
+            (true, Some(ShareCache::Loose)) => "loose",
+            (true, _) => "readahead",
+        }
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -557,6 +586,11 @@ impl Config {
                 share.target,
                 RESERVED_PATHS.join(", ")
             );
+            ensure!(
+                share.readonly || share.cache.is_none(),
+                "share {:?}: \"cache\" applies to read-only shares only; writable shares are uncached",
+                share.tag
+            );
         }
         ensure!(
             !self.ssh.logins.is_empty(),
@@ -643,6 +677,24 @@ mod tests {
     }
 
     #[test]
+    fn loose_caching_is_for_read_only_shares() {
+        let mut c = config();
+        c.mounts = serde_json::from_str(
+            r#"[{"tag":"apps","target":"/mnt/apps","cache":"loose"},
+                {"tag":"doc","target":"/mnt/doc","cache":"readahead"},
+                {"tag":"data","target":"/mnt/data","readonly":false}]"#,
+        )
+        .unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.mounts[0].cache, Some(ShareCache::Loose));
+        c.mounts[2].cache = Some(ShareCache::Loose);
+        assert!(c.validate().is_err(), "a writable share stays uncached");
+        let bad: Result<Vec<Share>, _> =
+            serde_json::from_str(r#"[{"tag":"a","target":"/a","cache":"mmap"}]"#);
+        assert!(bad.is_err());
+    }
+
+    #[test]
     fn rejects_colliding_services_and_reserved_or_unclean_mounts() {
         let mut c = config();
         c.apps.push(c.apps[0].clone());
@@ -652,6 +704,7 @@ mod tests {
             tag: "x".into(),
             target: target.into(),
             readonly: true,
+            cache: None,
         };
         for target in ["/srv/data", "/mnt/apps", "/data", "/usr/share/dotnet"] {
             c.mounts = vec![share(target)];

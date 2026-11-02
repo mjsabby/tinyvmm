@@ -278,6 +278,16 @@ round trip; with the 57 MB external rootfs pack this cut `root-unpack` from
 about 540 ms to 265 ms at 2 vCPUs on the reference host. Writable shares stay
 uncached (`cache=none`), so the guest always reads what the host last wrote.
 
+A read-only `mounts` entry can set `"cache": "loose"` to cache names and
+attributes too, so looking up, opening and stat'ing a file the guest has seen
+takes no host round trip. Use it only for a tree the host leaves alone while
+the VM runs, such as a published application: the guest can keep seeing old
+listings and attributes after the host changes them. For a 47k-file ASP.NET
+application this cut the share's 9p requests to reach its first response from
+971k to 379k, and its startup from about 195 s to 113 s at 4 vCPUs.
+`"cache": "readahead"` is the default, and setting `cache` on a writable share
+fails the boot.
+
 A `mounts` target can be any absolute path except `/` and the paths init
 manages: `/bin`, `/dev`, `/etc`, `/mnt/bootstrap`, `/proc`, `/run`, `/sys`,
 `/tmp` and `/usr/bin`, including their parents and children. Parents mount

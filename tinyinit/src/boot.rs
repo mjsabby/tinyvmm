@@ -138,6 +138,7 @@ pub fn run() -> Result<()> {
                 .into(),
             target: "/mnt/bootstrap".into(),
             readonly: true,
+            cache: None,
         };
         log.record(&format!(
             "share tag={} target={} readonly=true",
@@ -182,8 +183,11 @@ pub fn run() -> Result<()> {
     shares.sort_by_key(|share| share.target.matches('/').count());
     for share in shares {
         log.record(&format!(
-            "share tag={} target={} readonly={}",
-            share.tag, share.target, share.readonly
+            "share tag={} target={} readonly={} cache={}",
+            share.tag,
+            share.target,
+            share.readonly,
+            share.cache_mode()
         ));
         log.step(&format!("share:{}", share.tag), || {
             fs::create_dir_all(&share.target)?;
@@ -435,6 +439,7 @@ fn switch_root(log: &mut BootLog, cmdline: &str) -> Result<()> {
                 tag: tag.into(),
                 target: "/rootfs-source".into(),
                 readonly: true,
+                cache: None,
             })
         })?;
         let source = ["rootfs.tar.zst", "rootfs.tar.gz"]
@@ -542,16 +547,17 @@ fn mount_share(share: &Share) -> Result<()> {
     // Read-only shares cache file data (`readahead`): reads go through the page
     // cache in msize-sized Treads instead of one 4 KiB round trip per page, and
     // since lookups of files not held open still go to the host, a file the
-    // host replaces is seen when next opened. Writable shares stay uncached, so
-    // the guest always reads what the host last wrote.
-    let options = if share.readonly {
-        "trans=virtio,version=9p2000.L,msize=512000,cache=readahead"
-    } else {
-        "trans=virtio,version=9p2000.L,msize=512000"
-    };
+    // host replaces is seen when next opened. `"cache": "loose"` caches names
+    // and attributes too, for trees the host leaves alone while the VM runs.
+    // Writable shares stay uncached, so the guest always reads what the host
+    // last wrote.
+    let options = format!(
+        "trans=virtio,version=9p2000.L,msize=512000,cache={}",
+        share.cache_mode()
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match unix::mount(&share.tag, &share.target, "9p", flags, options) {
+        match unix::mount(&share.tag, &share.target, "9p", flags, &options) {
             Ok(()) => return Ok(()),
             Err(error) if Instant::now() >= deadline => return Err(error),
             Err(_) => thread::sleep(Duration::from_millis(100)),
