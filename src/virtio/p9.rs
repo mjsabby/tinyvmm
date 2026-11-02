@@ -45,7 +45,7 @@ use crate::whp::GuestMemory;
 use std::collections::HashMap;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use std::cell::UnsafeCell;
@@ -551,6 +551,35 @@ fn dir_cache_bytes(cache: &[DirEntryCached]) -> usize {
         .sum()
 }
 
+/// A fid's cached directory listing. Its bytes count toward the share's
+/// running total (`Fids::dir_cache_total`) for exactly as long as it lives,
+/// however it goes: clunk, remove, reopen, a walk replacing the fid, eviction
+/// or a reset. Checking the budget is then O(1) rather than a sum over every
+/// fid, which a guest holding many fids paid on each listing.
+struct DirCache {
+    entries: Vec<DirEntryCached>,
+    bytes: usize,
+    total: Arc<AtomicUsize>,
+}
+
+impl DirCache {
+    fn new(entries: Vec<DirEntryCached>, total: &Arc<AtomicUsize>) -> DirCache {
+        let bytes = dir_cache_bytes(&entries);
+        total.fetch_add(bytes, Ordering::Relaxed);
+        DirCache {
+            entries,
+            bytes,
+            total: total.clone(),
+        }
+    }
+}
+
+impl Drop for DirCache {
+    fn drop(&mut self) {
+        self.total.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
 /// Owns a host file HANDLE and closes it exactly once on drop. Stored as an
 /// `Arc<OwnedHandle>` inside a `FidEntry` so a worker can clone the `Arc` under
 /// the `fids` lock and then do its blocking I/O lock-free: a concurrent `Tclunk`
@@ -592,10 +621,9 @@ struct FidEntry {
     handle: Option<Arc<OwnedHandle>>,
     opened: bool,
     open_flags: u32,
-    dir_cache: Vec<DirEntryCached>,
-    dir_cache_built: bool,
-    /// `dir_cache_bytes(&dir_cache)`, kept for the budget.
-    dir_cache_size: usize,
+    /// The listing a readdir from offset 0 built; `None` until then, and
+    /// after the budget drops it.
+    dir_cache: Option<DirCache>,
 }
 
 impl FidEntry {
@@ -608,16 +636,12 @@ impl FidEntry {
             handle: None,
             opened: false,
             open_flags: 0,
-            dir_cache: Vec::new(),
-            dir_cache_built: false,
-            dir_cache_size: 0,
+            dir_cache: None,
         }
     }
 
     fn drop_dir_cache(&mut self) {
-        self.dir_cache = Vec::new();
-        self.dir_cache_built = false;
-        self.dir_cache_size = 0;
+        self.dir_cache = None;
     }
 
     fn close_handle(&mut self) {
@@ -631,8 +655,11 @@ impl FidEntry {
     }
 }
 
+#[derive(Default)]
 struct Fids {
     map: HashMap<u32, FidEntry>,
+    /// Bytes of every fid's `dir_cache`, kept by [`DirCache`].
+    dir_cache_total: Arc<AtomicUsize>,
 }
 
 impl Fids {
@@ -645,28 +672,26 @@ impl Fids {
     }
 
     fn set_dir_cache_within(&mut self, fid: u32, cache: Vec<DirEntryCached>, budget: usize) {
-        let size = dir_cache_bytes(&cache);
-        let mut total: usize = self
-            .map
-            .iter()
-            .filter(|(k, _)| **k != fid)
-            .map(|(_, e)| e.dir_cache_size)
-            .sum();
-        if total + size > budget {
-            for (_, e) in self.map.iter_mut().filter(|(k, _)| **k != fid) {
-                if e.dir_cache_size > 0 {
-                    total -= e.dir_cache_size;
+        let Some(e) = self.map.get_mut(&fid) else {
+            return;
+        };
+        // The listing this one replaces stops counting first, and this fid
+        // then holds none, so the eviction below only drops other fids'.
+        e.drop_dir_cache();
+        let cache = DirCache::new(cache, &self.dir_cache_total);
+        let over = |total: &AtomicUsize| total.load(Ordering::Relaxed) > budget;
+        if over(&self.dir_cache_total) {
+            for e in self.map.values_mut() {
+                if e.dir_cache.is_some() {
                     e.drop_dir_cache();
-                    if total + size <= budget {
+                    if !over(&self.dir_cache_total) {
                         break;
                     }
                 }
             }
         }
         if let Some(e) = self.map.get_mut(&fid) {
-            e.dir_cache = cache;
-            e.dir_cache_built = true;
-            e.dir_cache_size = size;
+            e.dir_cache = Some(cache);
         }
     }
 }
@@ -856,9 +881,7 @@ impl P9Device {
             read_bytes: AtomicU64::new(0),
             writes: AtomicU64::new(0),
             write_bytes: AtomicU64::new(0),
-            fids: Mutex::new(Fids {
-                map: HashMap::new(),
-            }),
+            fids: Mutex::new(Fids::default()),
             irq: OnceLock::new(),
             engine: P9Engine {
                 iocp,
@@ -2084,7 +2107,7 @@ impl P9Device {
             is_dir = e.is_dir;
             opened = e.opened;
             has_handle = e.handle.is_some();
-            cache_built = e.dir_cache_built;
+            cache_built = e.dir_cache.is_some();
         }
         if !is_dir {
             build_rlerror(reply, tag, E_NOTDIR);
@@ -2126,7 +2149,7 @@ impl P9Device {
                 break f;
             }
             let f = self.fids.lock().unwrap();
-            if f.map.get(&fid).is_some_and(|e| !e.dir_cache_built) {
+            if f.map.get(&fid).is_some_and(|e| e.dir_cache.is_none()) {
                 rebuild = true;
                 continue;
             }
@@ -2142,7 +2165,7 @@ impl P9Device {
             build_rlerror(reply, tag, E_BADF);
             return;
         };
-        let cache = &e.dir_cache;
+        let cache: &[DirEntryCached] = e.dir_cache.as_ref().map_or(&[], |c| &c.entries);
 
         reply.clear();
         enc4(reply, 0);
@@ -3458,9 +3481,7 @@ mod tests {
                 .collect()
         };
         let budget = 3 * dir_cache_bytes(&listing(10));
-        let mut f = Fids {
-            map: HashMap::new(),
-        };
+        let mut f = Fids::default();
         for fid in 0..4 {
             f.map
                 .insert(fid, FidEntry::new(PathBuf::new(), true, u64::from(fid), 0));
@@ -3469,11 +3490,23 @@ mod tests {
             let mut v: Vec<u32> = f
                 .map
                 .iter()
-                .filter(|(_, e)| e.dir_cache_built)
+                .filter(|(_, e)| e.dir_cache.is_some())
                 .map(|(k, _)| *k)
                 .collect();
             v.sort();
             v
+        };
+        // The running total is exactly what the fids' listings hold, however
+        // a listing goes.
+        let total = |f: &Fids| -> usize {
+            let sum = f
+                .map
+                .values()
+                .filter_map(|e| e.dir_cache.as_ref())
+                .map(|c| dir_cache_bytes(&c.entries))
+                .sum();
+            assert_eq!(f.dir_cache_total.load(Ordering::Relaxed), sum);
+            sum
         };
         for fid in 0..3 {
             f.set_dir_cache_within(fid, listing(10), budget);
@@ -3483,10 +3516,18 @@ mod tests {
         let now = built(&f);
         assert_eq!(now.len(), 3, "one listing made room: {now:?}");
         assert!(now.contains(&3));
-        let total: usize = f.map.values().map(|e| e.dir_cache_size).sum();
-        assert!(total <= budget, "{total} > {budget}");
+        assert!(total(&f) <= budget, "{} > {budget}", total(&f));
+        f.set_dir_cache_within(3, listing(5), budget);
+        total(&f);
+        f.map.remove(&now[0]);
+        f.map
+            .insert(now[1], FidEntry::new(PathBuf::new(), true, 9, 0));
+        assert_eq!(total(&f), dir_cache_bytes(&listing(5)));
+        f.map.insert(0, FidEntry::new(PathBuf::new(), true, 0, 0));
         f.set_dir_cache_within(0, listing(100), budget);
         assert_eq!(built(&f), [0], "an oversized listing is kept, alone");
+        f.map.clear();
+        assert_eq!(total(&f), 0);
     }
 
     /// A readdir that carries on after the budget dropped its listing lists
