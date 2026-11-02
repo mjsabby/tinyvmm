@@ -961,7 +961,7 @@ impl VirtioDevice for NetDevice {
         if offset as usize >= buf.len() {
             return 0;
         }
-        let mut take = size as usize;
+        let mut take = (size as usize).min(4);
         if offset as usize + take > buf.len() {
             take = buf.len() - offset as usize;
         }

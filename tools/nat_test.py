@@ -3,8 +3,9 @@
 smoltcp, slirp or gvisor via --backend) ends TCP connections.
 
 Boots the `tinyvmm.test=nat` initramfs mode against host servers on
-127.0.0.1 (reached at the guest's gateway, 172.29.255.1) and asserts all
-twelve guest phases pass (`NATTEST SUMMARY: 12/12`):
+127.0.0.1 (reached at the guest's gateway, 172.29.255.1, with
+`--nat-host-local`) and asserts all twelve guest phases pass
+(`NATTEST SUMMARY: 12/12`):
 
   A  connect() to a host port with nothing listening is refused
      (ECONNREFUSED) at once, not accepted and then reset;
@@ -246,6 +247,8 @@ def main() -> int:
 
     argv = [str(args.tinyvmm), "--pvh-run", "--ram-mb", "1024",
             "--net", "--net-backend", args.backend, "--portfwd", f"{fwd}:8080",
+            # The host servers are on the host's loopback, at the gateway.
+            "--nat-host-local",
             "--initrd", str(args.initrd), str(args.vmlinux), "--",
             *h.GUEST_CMDLINE, "tinyvmm.test=nat",
             f"NATTEST_PORT={port}", f"NATTEST_CLOSED_PORT={closed}",

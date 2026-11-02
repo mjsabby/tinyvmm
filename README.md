@@ -311,6 +311,7 @@ Parsed in `parse_pvh_args` (`main.rs:590`). Defaults and clamps are exact.
 | `--net-backend loopback\|nat\|smoltcp\|slirp\|gvisor\|wintun` | `nat` | Backend for the current NIC (see [§3](#virtio-net-backends---net-backend)). `smoltcp` is the NAT with smoltcp as its TCP engine; `slirp` and `gvisor` need their DLLs. |
 | `--portfwd HOSTPORT:GUESTPORT` | — | Forward `127.0.0.1:HOSTPORT` (host) → `172.29.255.2:GUESTPORT` (guest). User-mode backends (`nat`, `smoltcp`, `slirp`, `gvisor`) only. Repeatable per NIC. |
 | `--nat-workers <N>` | a quarter of the host's logical CPUs, 1–4 | NAT worker threads for the current NIC (`nat`, `smoltcp`), **1–16**. Each owns the TCP flows assigned to it; one flow never spans workers, so this scales many-flow traffic, not a single stream (see [§3](#3-devices-in-detail)). Kept across `--save`/`--restore`. |
+| `--nat-host-local` | off | Let the current NIC's guest (`nat`, `smoltcp`) reach host-local destinations: the host's loopback on every port of the gateway `172.29.255.1`, and `127.0.0.0/8`, link-local `169.254.0.0/16` (cloud metadata such as Azure IMDS) and Azure's `168.63.129.16` directly. Off, the NAT refuses them, except DNS: port 53 of the gateway (a resolver on the host's `127.0.0.1`) and of `168.63.129.16` (Azure DNS). See [§3](#virtio-net-backends---net-backend). Kept across `--save`/`--restore`. |
 | `--wintun-name <adapter>` / `--wintun-host <ipv4>` | — | WinTun adapter name / host-side gateway IPv4 (wintun backend). |
 | `--drive <path>[,readonly\|ro]` | — | Add a VHDX-backed virtio-blk disk using the native Windows driver. Raw disk images are not supported, including read-only ones; `--iso` separately attaches read-only installation media. **Repeatable up to 8** (`/dev/vda`, `/dev/vdb`, …). |
 | `--virtio-9p-share <tag>=<host_dir>[,ro][,uid=<n>][,gid=<n>][,metadata]` | — | Share a host directory over virtio-9p (9P2000.L). **Repeatable up to 8.** Tag 1–256 bytes; host path canonicalized and must be a directory; duplicate tags rejected. NTFS has no POSIX owners, so by default every entry reports owner `uid`:`gid` (default `0:0`, root) with a synthesized mode (dirs `0755`, files `0644`, `0444` if read-only on the host). The guest enforces those bits, so set `uid`/`gid` to the guest user that must write; `chmod`/`chown` succeed but aren't stored. With `metadata` (like WSL's drvfs option of the same name), owners and modes live in WSL's `$LXUID`/`$LXGID`/`$LXMOD` NTFS extended attributes: `chmod`/`chown` persist, new files record their creator, group and mode, WSL sees the same values, and `uid`/`gid` apply only to entries without metadata. While the VM runs, the root is held open, so Windows won't rename the folders that contain it (§9). Kept across `--save`/`--restore`. |
@@ -683,6 +684,14 @@ including the audio track.
     (the host's loopback) refuses at once: those connects skip Windows' SYN
     retransmissions (`SIO_TCP_INITIAL_RTO`), which otherwise take ~2 s to
     report a refusal.
+  * Host-local destinations are refused at once, the way a router keeps its
+    clients off its own loopback: the gateway's ports other than DNS (53), and
+    `127.0.0.0/8`, link-local `169.254.0.0/16` (where clouds serve instance
+    metadata and identity tokens, e.g. Azure IMDS at `169.254.169.254`) and
+    Azure's platform address `168.63.129.16` except its DNS port. A guest would
+    otherwise reach them as the host, past the firewall and with the host's
+    cloud identity. `--nat-host-local` lets them through: the gateway then
+    stands for the host's loopback on every port.
   * A host-side reset reaches the guest as a reset, not a clean EOF that would
     make a cut-off stream look complete; and the guest's reset reaches the host
     as one (an abortive close, `SO_LINGER` 0). Only the FIN handshake ends the
@@ -698,8 +707,10 @@ including the audio track.
     such connections in a minute.
 
   And it relays datagrams the way a router would:
-  * UDP to the gateway, like TCP, reaches the host's loopback; a host resolver
-    on 127.0.0.1 is offered by DHCP as the gateway.
+  * UDP to the gateway's DNS port, like TCP, reaches the host's loopback; a
+    host resolver on 127.0.0.1 is offered by DHCP as the gateway. With
+    `--nat-host-local`, every gateway port does. Datagrams and pings for the
+    other host-local destinations above are dropped.
   * A full UDP table (256 flows) ends its least recently used flow for a new
     one, rather than drop the new flow's datagrams (a resolver sends each query
     from a fresh port).
@@ -1356,7 +1367,13 @@ the locking story above.
   itself can still be renamed or moved, and the share follows it. If the root is
   deleted (a build step that deletes and recreates its output folder), the share
   reattaches to the directory then at the share path, provided it lies where the
-  root was rather than behind a link left in its place.
+  root was rather than behind a link left in its place. Every open directory
+  fid's readdir listing counts against one 64 MiB budget: a guest opening
+  thousands of fids on a big directory drops other fids' listings (rebuilt if
+  their readdir carries on) instead of growing host memory without bound.
+* **virtio device config:** devices serve at most a dword at a time; the
+  transport splits a guest's 8-byte config access into two (an 8-byte read of
+  virtio-net's config used to abort the VMM).
 * **Backpressure, not unbounded buffering:** the NAT's per-flow guest→host queue
   caps at `TO_HOST_CAP = 64 KiB` (closing the guest TCP window). Toward the
   guest, while the NIC's RX backlog (frames waiting for guest RX buffers, 64
@@ -1379,6 +1396,14 @@ the locking story above.
   a datagram whose fragments disagree on where it ends. The UDP table's 256
   flows give way least recently used first. UDP and pings to multicast,
   broadcast or reserved addresses aren't relayed to the host's network.
+* **NAT destinations (`src/net/nat.rs`, `host_dest`):** the guest reaches what
+  a router's clients reach, not what only the host should: TCP, UDP and pings
+  to `127.0.0.0/8`, link-local `169.254.0.0/16` (cloud instance metadata and
+  managed-identity tokens, e.g. Azure IMDS) and Azure's `168.63.129.16`
+  (WireServer) are refused, and the gateway stands for the host's loopback on
+  the DNS port only. Otherwise any guest process (or an SSRF bug in a guest
+  web app) could borrow the host's identity and loopback-only services.
+  `--nat-host-local` opts back in.
 
 ---
 
@@ -1444,14 +1469,23 @@ six `AtomicU64` — `io`, `mmio`, `halt`, `cpuid`, `msr`, `other`):
   leaves `0x4000_0000..0x4000_0006`).
 * **Msr** → handled by the Hyper-V enlightenment (`src/whp/hv.rs`): the hypercall
   page, Reference-TSC page, `GUEST_OS_ID`, `VP_INDEX`, the TSC/APIC frequency
-  MSRs, the TSC-invariant control, etc. An unhandled MSR injects `#GP(0)` rather
-  than crashing. The x2APIC MSRs never exit: WHP's LAPIC owns them.
+  MSRs, the TSC-invariant control, the guest crash MSRs, etc. A guest kernel
+  panic arrives through the crash MSRs: tinyvmm prints the tail of the guest's
+  kernel log and stops the VM. On an AMD host, AMD's configuration MSRs that
+  Linux touches at boot read as zero and ignore writes. Any other unhandled MSR
+  injects `#GP(0)` rather than crashing. The x2APIC MSRs never exit: WHP's LAPIC
+  owns them.
 * **Halt** with interrupts enabled just resumes (WHP's LAPIC normally waits out
   HLT in the hypervisor, so this is rare); HLT with `IF=0` is terminal.
 * **InterruptWindow / Canceled** → re-run the BSP's ExtINT delivery pass: a PIC
   request kicks the BSP with `WHvCancelRunVirtualProcessor`, and if the guest
   can't take it yet (`IF=0`, interrupt shadow, event pending) the loop asks for
   an interrupt-window exit and injects then.
+
+A vCPU that stops abnormally (an unhandled exit, an emulation failure, a guest
+crash) stops every vCPU: the guest can't run on without it. The process exits
+with **0** when the VM stopped cleanly, **2** when the guest reported a kernel
+panic, and **1** for any other abnormal stop of any vCPU.
 
 **Why doorbells matter to the counters:** a queue notify that hits a doorbell
 ([§3](#3-devices-in-detail)) signals an OS event and takes **0 VM exits**. The

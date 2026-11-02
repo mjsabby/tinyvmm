@@ -887,19 +887,35 @@ impl PciTransport {
         self.device.notify_queue(qidx);
     }
 
+    /// Device-specific config, which devices serve a dword at most at a time:
+    /// an 8-byte access (`mov rax, [bar+0x2000]`) is two dword accesses, as
+    /// the transport does for common config.
     fn handle_device_cfg(&self, access: &mut MmioAccess) {
         let off = (access.gpa - (self.bar_gpa.load(Ordering::Relaxed) + OFF_DEVICE)) as u32;
+        let size = access.access_size as usize;
+        let dword = |d: &[u8; 8], at: usize| u32::from_le_bytes(d[at..at + 4].try_into().unwrap());
         if access.is_write {
-            let n = (access.access_size as usize).min(4);
+            if size == 8 {
+                self.device.write_config(off, 4, dword(&access.data, 0));
+                self.device.write_config(off + 4, 4, dword(&access.data, 4));
+                return;
+            }
+            let n = size.min(4);
             let mut buf = [0u8; 4];
             buf[..n].copy_from_slice(&access.data[..n]);
             self.device
-                .write_config(off, access.access_size as u32, u32::from_le_bytes(buf));
+                .write_config(off, n as u32, u32::from_le_bytes(buf));
             return;
         }
-        let v = self.device.read_config(off, access.access_size as u32);
+        if size == 8 {
+            let lo = self.device.read_config(off, 4);
+            let hi = self.device.read_config(off + 4, 4);
+            access.data = ((lo as u64) | ((hi as u64) << 32)).to_le_bytes();
+            return;
+        }
+        let n = size.min(4);
+        let v = self.device.read_config(off, n as u32);
         access.data = [0; 8];
-        let n = (access.access_size as usize).min(4);
         access.data[..n].copy_from_slice(&v.to_le_bytes()[..n]);
     }
 }
@@ -1364,5 +1380,81 @@ mod tests {
         dev.pending.store(false, Ordering::Relaxed);
         assert_eq!(common(&t, CC_DEVICE_STATUS, 1, None), 0);
         assert_eq!(dev.resets.load(Ordering::Relaxed), 1);
+    }
+
+    /// Records device-config accesses; config byte `i` reads as `0x10 + i`.
+    #[derive(Default)]
+    struct Cfg {
+        writes: Mutex<Vec<(u32, u32, u32)>>,
+    }
+
+    impl VirtioDevice for Cfg {
+        fn device_id(&self) -> u32 {
+            1
+        }
+        fn device_features(&self) -> u64 {
+            0
+        }
+        fn set_driver_features(&self, _: u64) -> bool {
+            true
+        }
+        fn queue_count(&self) -> u32 {
+            1
+        }
+        fn queue_max(&self, _: u32) -> u32 {
+            8
+        }
+        fn enable_queue(&self, _: u32, _: u64, _: u64, _: u64, _: u16, _: bool) {}
+        fn disable_queue(&self, _: u32) {}
+        fn notify_queue(&self, _: u32) {}
+        fn driver_ok(&self) {}
+        fn reset(&self) {}
+        fn read_config(&self, offset: u32, size: u32) -> u32 {
+            assert!(size <= 4, "a {size}-byte config read reached the device");
+            let b = |i: u32| if i < size { 0x10 + offset + i } else { 0 };
+            u32::from_le_bytes([b(0) as u8, b(1) as u8, b(2) as u8, b(3) as u8])
+        }
+        fn write_config(&self, offset: u32, size: u32, value: u32) {
+            assert!(size <= 4, "a {size}-byte config write reached the device");
+            self.writes.lock().unwrap().push((offset, size, value));
+        }
+    }
+
+    /// A guest can access device config 8 bytes at a time (`mov rax, [bar +
+    /// 0x2000]`); devices serve at most a dword, so the transport splits it.
+    /// Passing the size on made virtio-net slice past a 4-byte buffer and
+    /// abort the VMM.
+    #[test]
+    fn eight_byte_device_config_accesses_are_two_dwords() {
+        let dev = Arc::new(Cfg::default());
+        let opts = Options {
+            vendor_id: 0x1AF4,
+            sub_vendor_id: 0x1AF4,
+            sub_id: 0,
+            num_msix_vectors: 2,
+            pci_class: 0x02,
+            pci_subclass: 0,
+            doorbells: false,
+        };
+        let t = PciTransport::new("test", dev.clone(), opts, Arc::new(MmioBus::new()), 0);
+        let mut a = MmioAccess {
+            gpa: OFF_DEVICE + 2,
+            access_size: 8,
+            is_write: false,
+            data: [0; 8],
+        };
+        t.handle_device_cfg(&mut a);
+        assert_eq!(a.data, [0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19]);
+        a.access_size = 2;
+        t.handle_device_cfg(&mut a);
+        assert_eq!(a.data, [0x12, 0x13, 0, 0, 0, 0, 0, 0]);
+        a.is_write = true;
+        a.access_size = 8;
+        a.data = 0x8877_6655_4433_2211u64.to_le_bytes();
+        t.handle_device_cfg(&mut a);
+        assert_eq!(
+            *dev.writes.lock().unwrap(),
+            [(2, 4, 0x4433_2211), (6, 4, 0x8877_6655)]
+        );
     }
 }

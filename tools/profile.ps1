@@ -49,7 +49,7 @@ $devFlags = @()
 $auto     = ''
 switch ($Workload) {
   'idle' { $auto = 'sh' }                                           # boot to shell, sit idle
-  'net'  { $devFlags += '--net','--net-backend','nat'
+  'net'  { $devFlags += '--net','--net-backend','nat','--nat-host-local'   # iperf3 server on the host's loopback
            $auto = 'iperf3 -c 172.29.255.1 -t 40 -R; iperf3 -c 172.29.255.1 -t 40' }
   'blk'  { if (-not $Disk) { throw "-Disk required for blk workload" }
            $devFlags += '--drive', $Disk

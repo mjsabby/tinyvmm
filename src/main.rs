@@ -118,14 +118,16 @@ impl NetBackendKind {
 }
 
 /// One virtio-net NIC. `--net` (repeatable) appends a NIC; `--net-backend`,
-/// `--portfwd`, `--nat-workers`, `--wintun-name`, `--wintun-host` modify the
-/// most recent NIC.
+/// `--portfwd`, `--nat-workers`, `--nat-host-local`, `--wintun-name`,
+/// `--wintun-host` modify the most recent NIC.
 #[derive(Clone)]
 struct NicSpec {
     backend: NetBackendKind,
     port_forwards: Vec<PortForward>,
     /// NAT worker threads (`NatOptions::workers`); None = the NAT default.
     nat_workers: Option<usize>,
+    /// `NatOptions::host_local` (`--nat-host-local`).
+    nat_host_local: bool,
     wintun_name: Option<String>,
     wintun_host: Option<[u8; 4]>,
 }
@@ -136,6 +138,7 @@ impl NicSpec {
             backend: NetBackendKind::Nat,
             port_forwards: Vec::new(),
             nat_workers: None,
+            nat_host_local: false,
             wintun_name: None,
             wintun_host: None,
         }
@@ -186,7 +189,7 @@ fn print_usage() {
          \x20 tinyvmm --pvh-run [--initrd <cpio>] [--ram-mb N] [--vcpus N] [--rng] [--input] [--sound]\n\
          \x20              [--large-pages|--no-large-pages] [--poll-us N]\n\
          \x20              [--net [--net-backend loopback|nat|smoltcp|slirp|gvisor|wintun]\n\
-         \x20              [--portfwd H:G]... [--nat-workers N]]...\n\
+         \x20              [--portfwd H:G]... [--nat-workers N] [--nat-host-local]]...\n\
          \x20              (repeat --net per NIC)\n\
          \x20              [--drive <path>[,readonly]]... [--cpu-affinity p|p-physical|e|all]\n\
          \x20              (default p: P-cores only on a hybrid CPU)\n\
@@ -1218,6 +1221,12 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
                     nics.push(NicSpec::new());
                 }
                 nics.last_mut().unwrap().nat_workers = Some(n);
+            }
+            "--nat-host-local" => {
+                if nics.is_empty() {
+                    nics.push(NicSpec::new());
+                }
+                nics.last_mut().unwrap().nat_host_local = true;
             }
             "--rng" => with_rng = true,
             "--gpu" => {
@@ -2329,9 +2338,11 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
             .spawn(move || {
                 cpu_affinity::pin_current_thread(&ids);
                 let reason = l.run();
-                // The guest fired the snapshot trigger on this AP: stop the
-                // BSP and the other APs too, so the save below can proceed.
-                if reason == StopReason::SnapshotRequested {
+                // The guest fired the snapshot trigger on this AP, or this AP
+                // can't go on (a guest crash, an unhandled exit): stop the BSP
+                // and the other APs too, so the save below can proceed, or the
+                // VM doesn't run on, hung, without this CPU.
+                if reason == StopReason::SnapshotRequested || reason.is_fatal() {
                     stop_all();
                 }
                 reason
@@ -2532,10 +2543,9 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         dump_guest_ram(&ram, "tinyvmm-guest-ram.bin");
     }
 
-    Ok(match reason {
-        StopReason::GuestHalted | StopReason::Cancelled => 0,
-        _ => 1,
-    })
+    Ok(StopReason::exit_code(
+        std::iter::once(reason).chain(ap_reasons.iter().copied()),
+    ))
 }
 
 /// Serialize a port-forward rule as "hA.hB.hC.hD:hport:gA.gB.gC.gD:gport" for
@@ -2619,6 +2629,7 @@ fn wire_net_backend(net: &Arc<NetDevice>, nic: &NicSpec) -> Result<String> {
             };
             let opts = NatOptions {
                 port_forwards: nic.port_forwards.clone(),
+                host_local: nic.nat_host_local,
                 workers: nic
                     .nat_workers
                     .unwrap_or_else(crate::net::nat::default_workers),
@@ -2760,11 +2771,15 @@ fn parse_restore_nic(
         .get_u64(&format!("{prefix}_nat_workers"))
         .ok()
         .map(|n| n as usize);
+    let nat_host_local = jr
+        .get_bool(&format!("{prefix}_nat_host_local"))
+        .unwrap_or(false);
     (
         NicSpec {
             backend,
             port_forwards,
             nat_workers,
+            nat_host_local,
             wintun_name,
             wintun_host,
         },
@@ -2839,6 +2854,9 @@ fn write_snapshot(
         }
         if let Some(n) = nic.nat_workers {
             jw.u64(&format!("nic{i}_nat_workers"), n as u64);
+        }
+        if nic.nat_host_local {
+            jw.bool(&format!("nic{i}_nat_host_local"), true);
         }
         if nic.backend == NetBackendKind::Wintun {
             let name = nic
@@ -3800,11 +3818,17 @@ fn run_restore(args: &[String]) -> Result<i32> {
     let mut ap_handles = Vec::new();
     for (i, l) in loops.into_iter().enumerate() {
         let ids = cpu_set_ids.clone();
+        let stop_all = stop_all.clone();
         let h = std::thread::Builder::new()
             .name(format!("vcpu-{}", i + 1))
             .spawn(move || {
                 cpu_affinity::pin_current_thread(&ids);
-                l.run()
+                let reason = l.run();
+                // As in run_pvh_run: the VM can't run on without this AP.
+                if reason.is_fatal() {
+                    stop_all();
+                }
+                reason
             })
             .map_err(|e| Error::msg(format!("spawn AP thread: {e}")))?;
         ap_handles.push(h);
@@ -3858,10 +3882,9 @@ fn run_restore(args: &[String]) -> Result<i32> {
     for (i, (nd, nt)) in net_devices.iter().zip(&net_transports).enumerate() {
         println!("[net] nic{i} {}", nd.diag_summary(nt.msix_injected_count()));
     }
-    Ok(match reason {
-        StopReason::GuestHalted | StopReason::Cancelled => 0,
-        _ => 1,
-    })
+    Ok(StopReason::exit_code(
+        std::iter::once(reason).chain(ap_reasons.iter().copied()),
+    ))
 }
 
 struct ConsoleModeRestore {

@@ -33,6 +33,29 @@ pub enum StopReason {
     UnhandledExit,
     EmulationFailure,
     SnapshotRequested,
+    /// The guest reported a kernel panic through the Hyper-V crash MSRs.
+    GuestCrashed,
+}
+
+impl StopReason {
+    /// A vCPU stopped this way leaves the guest without a working CPU (or
+    /// without a working kernel), so the whole VM has to stop.
+    pub fn is_fatal(self) -> bool {
+        matches!(
+            self,
+            StopReason::UnhandledExit | StopReason::EmulationFailure | StopReason::GuestCrashed
+        )
+    }
+
+    /// The process exit code for a VM whose vCPUs stopped for `reasons`: 2 if
+    /// the guest crashed, else 1 if any vCPU stopped abnormally, else 0.
+    pub fn exit_code(reasons: impl IntoIterator<Item = StopReason>) -> i32 {
+        reasons.into_iter().fold(0, |code, r| match r {
+            StopReason::GuestCrashed => 2,
+            StopReason::GuestHalted | StopReason::Cancelled => code,
+            _ => code.max(1),
+        })
+    }
 }
 
 #[derive(Default)]
@@ -414,7 +437,7 @@ impl RunLoop {
             return Some(StopReason::UnhandledExit);
         };
         let mut rd_val: u64 = 0;
-        let result = if is_write {
+        let mut result = if is_write {
             hv.handle_wrmsr(self.vcpu.index(), msr, wr_val)
         } else {
             let guest_tsc = || match self.vcpu.get_register_u64(WHvX64RegisterTsc) {
@@ -426,8 +449,23 @@ impl RunLoop {
             };
             hv.handle_rdmsr(self.vcpu.index(), msr, guest_tsc, &mut rd_val)
         };
-        if result == MsrHandled::NoInjectGp {
-            return self.inject_gp();
+        if result == MsrHandled::NoInjectGp
+            && let Some(v) = amd_config_msr(msr)
+        {
+            rd_val = v;
+            result = MsrHandled::Yes;
+        }
+        match result {
+            MsrHandled::Yes => {}
+            MsrHandled::NoInjectGp => return self.inject_gp(),
+            MsrHandled::GuestCrashed => {
+                eprintln!(
+                    "[pvh-run] vCPU {} reported a guest crash; stopping the VM. Guest report:\n{}",
+                    self.vcpu.index(),
+                    hv.crash_report()
+                );
+                return Some(StopReason::GuestCrashed);
+            }
         }
 
         let next_rip = exit.rip() + exit.instruction_length() as u64;
@@ -466,5 +504,30 @@ impl RunLoop {
             return Some(StopReason::EmulationFailure);
         }
         None
+    }
+}
+
+/// AMD's model-specific configuration MSRs that Linux touches at boot on an
+/// AMD host (HWCR in `bsp_init_amd`, NB_CFG in `amd_bus_cpu_online`, ...).
+/// They hold firmware settings and chicken bits a guest can't act on, so, as
+/// in OpenVMM and KVM, they read as zero and ignore writes instead of drawing
+/// #GP and an `unchecked MSR access` splat. HWCR reads as TscFreqSel (the TSC
+/// counts at the P0 frequency, true of every invariant-TSC part), else Linux
+/// warns that the firmware is broken. None: not one of them (or not AMD).
+fn amd_config_msr(msr: u32) -> Option<u64> {
+    const HWCR: u32 = 0xC001_0015;
+    const HWCR_TSC_FREQ_SEL: u64 = 1 << 24;
+    if !crate::whp::cpuid::host_is_amd() {
+        return None;
+    }
+    match msr {
+        HWCR => Some(HWCR_TSC_FREQ_SEL),
+        0xC001_0000..=0xC001_0007 // PERF_EVT_SEL0..3, PERF_CTR0..3
+        | 0xC001_0010 // SYSCFG
+        | 0xC001_001F // NB_CFG
+        | 0xC001_0115 // IGNNE
+        | 0xC001_0140..=0xC001_0141 // OSVW_ID_LENGTH, OSVW_STATUS
+        | 0xC001_1020..=0xC001_102C => Some(0), // LS_CFG..EX_CFG
+        _ => None,
     }
 }

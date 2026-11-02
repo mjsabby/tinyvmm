@@ -15,7 +15,8 @@ use crate::whp::GuestMemory;
 use core::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock};
 use windows_sys::Win32::System::Hypervisor::{
-    WHvCapabilityCodeInterruptClockFrequency, WHvGetCapability,
+    WHvCapabilityCodeInterruptClockFrequency, WHvCapabilityCodeProcessorClockFrequency,
+    WHvGetCapability,
 };
 
 pub const MSR_GUEST_OS_ID: u32 = 0x4000_0000;
@@ -27,6 +28,15 @@ pub const MSR_TSC_FREQUENCY: u32 = 0x4000_0022;
 pub const MSR_APIC_FREQUENCY: u32 = 0x4000_0023;
 pub const MSR_VP_ASSIST_PAGE: u32 = 0x4000_0073;
 pub const MSR_TSC_INVARIANT_CTL: u32 = 0x4000_0118;
+/// Guest crash registers: P0..P4 carry the report, a write of CRASH_CTL with
+/// `CRASH_CTL_NOTIFY` posts it. A read of CRASH_CTL says which report kinds
+/// the hypervisor takes.
+pub const MSR_CRASH_P0: u32 = 0x4000_0100;
+pub const MSR_CRASH_P4: u32 = 0x4000_0104;
+pub const MSR_CRASH_CTL: u32 = 0x4000_0105;
+const CRASH_CTL_NOTIFY: u64 = 1 << 63;
+/// The report is a page of kernel log: P3 = its GPA, P4 = its length.
+const CRASH_CTL_NOTIFY_MSG: u64 = 1 << 62;
 
 const PAGE_SHIFT: u64 = 12;
 const PAGE_SIZE: usize = 4096;
@@ -34,10 +44,13 @@ const PAGE_SIZE: usize = 4096;
 // `mov eax, 2 (HV_STATUS_INVALID_HYPERCALL_CODE); ret`
 const HYPERCALL_STUB: [u8; 6] = [0xB8, 0x02, 0x00, 0x00, 0x00, 0xC3];
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MsrHandled {
     Yes,
     NoInjectGp,
+    /// The guest reported a crash (a kernel panic) through the crash MSRs;
+    /// [`HvEnlightenment::crash_report`] describes it.
+    GuestCrashed,
 }
 
 pub fn compute_tsc_scale(tsc_hz: u64) -> u64 {
@@ -45,6 +58,24 @@ pub fn compute_tsc_scale(tsc_hz: u64) -> u64 {
         return 0;
     }
     ((10_000_000u128 << 64) / tsc_hz as u128) as u64
+}
+
+/// Rate the guest TSC counts at, as the hypervisor reports it (its
+/// "processor clock"), or None if WHP can't say. This is the rate the
+/// hypervisor itself keeps time by; OpenVMM reads the same value.
+pub fn processor_clock_hz() -> Option<u64> {
+    let mut hz: u64 = 0;
+    let mut written: u32 = 0;
+    // SAFETY: WHvGetCapability writes at most 8 bytes into `hz`.
+    let hr = unsafe {
+        WHvGetCapability(
+            WHvCapabilityCodeProcessorClockFrequency,
+            &mut hz as *mut u64 as *mut c_void,
+            std::mem::size_of::<u64>() as u32,
+            &mut written,
+        )
+    };
+    (hr >= 0 && hz != 0).then_some(hz)
 }
 
 /// Rate WHP's LAPIC timer counts at (its "interrupt clock"), which is what the
@@ -85,6 +116,8 @@ struct MsrCache {
     reference_tsc_msr: u64,
     tsc_invariant_ctl: u64,
     vp_assist_page: u64,
+    crash_p: [u64; 5],
+    crash_ctl: u64,
 }
 
 pub struct HvEnlightenment {
@@ -110,6 +143,8 @@ impl HvEnlightenment {
                 reference_tsc_msr: 0,
                 tsc_invariant_ctl: 0,
                 vp_assist_page: 0,
+                crash_p: [0; 5],
+                crash_ctl: 0,
             }),
         }
     }
@@ -195,8 +230,44 @@ impl HvEnlightenment {
                 c.vp_assist_page = value;
                 MsrHandled::Yes
             }
+            MSR_CRASH_P0..=MSR_CRASH_P4 => {
+                c.crash_p[(msr - MSR_CRASH_P0) as usize] = value;
+                MsrHandled::Yes
+            }
+            MSR_CRASH_CTL if value & CRASH_CTL_NOTIFY != 0 => {
+                c.crash_ctl = value;
+                MsrHandled::GuestCrashed
+            }
+            MSR_CRASH_CTL => MsrHandled::Yes,
             _ => MsrHandled::NoInjectGp,
         }
+    }
+
+    /// The crash the guest last reported (see [`MsrHandled::GuestCrashed`]):
+    /// the tail of its kernel log, or failing that the registers it posted.
+    /// Guest text is reduced to printable ASCII so it can't drive the host's
+    /// terminal.
+    pub fn crash_report(&self) -> String {
+        let (p, ctl) = {
+            let c = self.cache.lock().unwrap();
+            (c.crash_p, c.crash_ctl)
+        };
+        if ctl & CRASH_CTL_NOTIFY_MSG != 0 {
+            let mut msg = vec![0u8; (p[4] as usize).min(PAGE_SIZE)];
+            if !msg.is_empty() && self.ram.read_into(p[3], &mut msg) {
+                return msg
+                    .iter()
+                    .map(|&b| match b {
+                        b'\n' | b'\t' | 0x20..=0x7e => b as char,
+                        _ => '.',
+                    })
+                    .collect();
+            }
+        }
+        format!(
+            "code 0x{:x}, guest OS id 0x{:x}, RIP 0x{:x}, RAX 0x{:x}, RSP 0x{:x}",
+            p[0], p[1], p[2], p[3], p[4]
+        )
     }
 
     /// `guest_tsc` reads the calling vCPU's TSC; only `TIME_REF_COUNT` needs
@@ -259,6 +330,16 @@ impl HvEnlightenment {
             }
             MSR_TSC_INVARIANT_CTL => {
                 *out = c.tsc_invariant_ctl;
+                MsrHandled::Yes
+            }
+            MSR_CRASH_P0..=MSR_CRASH_P4 => {
+                *out = c.crash_p[(msr - MSR_CRASH_P0) as usize];
+                MsrHandled::Yes
+            }
+            // Both report kinds are taken, so Linux registers its kernel-log
+            // dumper as well as the panic notifier (`hv_common_init`).
+            MSR_CRASH_CTL => {
+                *out = CRASH_CTL_NOTIFY | CRASH_CTL_NOTIFY_MSG;
                 MsrHandled::Yes
             }
             _ => {
@@ -348,5 +429,38 @@ mod tests {
         );
         let r = hv.handle_rdmsr(0, MSR_TIME_REF_COUNT, || None, &mut one_second);
         assert!(r == MsrHandled::NoInjectGp, "an unreadable TSC answers #GP");
+    }
+
+    /// Linux's panic path (`hv_kmsg_dump`): it reads CRASH_CTL at boot for the
+    /// report kinds taken, then posts P3 = GPA and P4 = length of a page of
+    /// kernel log and writes CRASH_CTL = NOTIFY | NOTIFY_MSG. That write
+    /// reports the crash; the log comes back with control bytes neutralized.
+    #[test]
+    fn a_guest_panic_reports_its_kernel_log() {
+        let ram = Arc::new(GuestMemory::new_host_only(0x4000).unwrap());
+        let hv = HvEnlightenment::new(ram.clone(), 3_000_000_000, 200_000_000);
+        let mut ctl = 0;
+        let _ = hv.handle_rdmsr(0, MSR_CRASH_CTL, || None, &mut ctl);
+        assert_eq!(ctl, CRASH_CTL_NOTIFY | CRASH_CTL_NOTIFY_MSG);
+
+        let log = b"Kernel panic - not syncing: VFS\x1b]0;x\x07\n";
+        assert!(ram.write_bytes(0x3000, log));
+        for (msr, value) in [(0, 0), (1, 0), (2, 0), (3, 0x3000), (4, log.len() as u64)] {
+            assert!(hv.handle_wrmsr(1, MSR_CRASH_P0 + msr, value) == MsrHandled::Yes);
+        }
+        assert!(
+            hv.handle_wrmsr(1, MSR_CRASH_CTL, 0) == MsrHandled::Yes,
+            "no notify bit"
+        );
+        assert!(
+            hv.handle_wrmsr(1, MSR_CRASH_CTL, CRASH_CTL_NOTIFY | CRASH_CTL_NOTIFY_MSG)
+                == MsrHandled::GuestCrashed
+        );
+        assert_eq!(hv.crash_report(), "Kernel panic - not syncing: VFS.]0;x.\n");
+
+        // Without a message, the report is the registers the guest posted.
+        assert!(hv.handle_wrmsr(1, MSR_CRASH_P0 + 2, 0xffff_ffff_8100_0000) == MsrHandled::Yes);
+        assert!(hv.handle_wrmsr(1, MSR_CRASH_CTL, CRASH_CTL_NOTIFY) == MsrHandled::GuestCrashed);
+        assert!(hv.crash_report().contains("RIP 0xffffffff81000000"));
     }
 }

@@ -148,6 +148,11 @@ pub struct NatOptions {
     /// [`dhcp::usable_dns`]). Usually the host's (`sys::dns_servers`).
     pub dns_servers: Vec<[u8; 4]>,
     pub port_forwards: Vec<PortForward>,
+    /// Let the guest reach host-local destinations (`--nat-host-local`):
+    /// every port of the host's loopback at the gateway, 127/8, link-local
+    /// 169.254/16 and Azure's platform address. Off, only the gateway's DNS
+    /// port reaches the host's loopback; see [`host_dest`].
+    pub host_local: bool,
     /// Per-tier count of Tcbs to preallocate at startup (warm pool). Pools
     /// still grow on demand up to the flow cap and recycle thereafter, so this
     /// only governs cold-start latency, not the hard ceiling.
@@ -174,6 +179,7 @@ impl Default for NatOptions {
             guest_ip: crate::net::GUEST_IP,
             dns_servers: Vec::new(),
             port_forwards: Vec::new(),
+            host_local: false,
             tcb_warm: DEFAULT_TCB_WARM,
             default_tier: DEFAULT_TIER,
             tcb_port_tier: Vec::new(),
@@ -868,6 +874,32 @@ fn relayable(ip: [u8; 4], gw: [u8; 4]) -> bool {
     let mask = crate::net::NETMASK;
     let on_link = (0..4).all(|i| ip[i] & mask[i] == gw[i] & mask[i]);
     ip[0] != 0 && ip[0] < 224 && !on_link
+}
+
+/// Azure's platform address: its DNS resolver on port 53, the WireServer
+/// (goal state, certificates) and health probes on the others.
+const AZURE_PLATFORM_IP: [u8; 4] = [168, 63, 129, 16];
+const DNS_PORT: u16 = 53;
+
+/// Where the host connects for guest traffic to `ip:port`, or None if the
+/// guest may not reach it. Beyond [`relayable`], host-local destinations are
+/// refused unless `host_local` (`--nat-host-local`): a guest must not borrow
+/// the host's identity to reach what only the host should, such as services
+/// bound to its loopback (127/8), cloud instance metadata and the identity
+/// tokens it issues (169.254.169.254, link-local) or the Azure WireServer.
+/// The gateway stands for the host's loopback, on the DNS port only, so a
+/// resolver on the host's 127.0.0.1 keeps working (`dhcp::usable_dns` offers
+/// it as the gateway). `port` is 0 for ICMP.
+fn host_dest(ip: [u8; 4], port: u16, gw: [u8; 4], host_local: bool) -> Option<[u8; 4]> {
+    if ip == gw {
+        return (host_local || port == DNS_PORT).then_some([127, 0, 0, 1]);
+    }
+    if !relayable(ip, gw) {
+        return None;
+    }
+    let host_only =
+        ip[0] == 127 || ip[..2] == [169, 254] || (ip == AZURE_PLATFORM_IP && port != DNS_PORT);
+    (host_local || !host_only).then_some(ip)
 }
 
 /// Most guest datagrams reassembled at once, and how long one may wait for
@@ -1658,6 +1690,8 @@ struct NatState {
     gw_ip: [u8; 4],
     gw_mac: [u8; 6],
     guest_mac: [u8; 6],
+    /// `NatOptions::host_local`.
+    host_local: bool,
     /// What DHCP answers (identical on every shard).
     dhcp: Arc<dhcp::Lease>,
     udp: HashMap<FlowKey, UdpFlow>,
@@ -2106,11 +2140,11 @@ impl NatState {
             }
             return;
         }
-        // Only proxy echo requests, to hosts beyond the guest's link; ignore
-        // other ICMP.
+        // Only proxy echo requests, to hosts the guest may reach beyond its
+        // link; ignore other ICMP.
         if ip.payload.first().copied() != Some(ICMP_ECHO_REQUEST)
             || ip.payload.len() < 8
-            || !relayable(ip.dst, self.gw_ip)
+            || host_dest(ip.dst, 0, self.gw_ip, self.host_local).is_none()
         {
             return;
         }
@@ -2140,10 +2174,12 @@ impl NatState {
             self.handle_dhcp(udp.payload);
             return;
         }
-        if ip.dst != self.gw_ip && !relayable(ip.dst, self.gw_ip) {
+        let Some(host_dip) = host_dest(ip.dst, udp.dst_port, self.gw_ip, self.host_local) else {
             return;
-        }
-        if let Some(sock) = self.ensure_udp_flow(ip.src, udp.src_port, ip.dst, udp.dst_port) {
+        };
+        if let Some(sock) =
+            self.ensure_udp_flow(ip.src, udp.src_port, ip.dst, udp.dst_port, host_dip)
+        {
             // Synchronous is fine for UDP (see wsa_send): datagram sends don't
             // block on peer flow-control, so this can't stall the worker.
             sys::wsa_send(sock, udp.payload);
@@ -2182,12 +2218,16 @@ impl NatState {
         self.inject(&self.l3_scratch);
     }
 
+    /// The UDP flow for the guest's 4-tuple, created on first use with a host
+    /// socket connected to `host_dip` (see [`host_dest`]); datagrams back to
+    /// the guest still come from `dip`.
     fn ensure_udp_flow(
         &mut self,
         gip: [u8; 4],
         gport: u16,
         dip: [u8; 4],
         dport: u16,
+        host_dip: [u8; 4],
     ) -> Option<SOCKET> {
         let key = (gip, gport, dip, dport);
         let now = self.now();
@@ -2199,13 +2239,6 @@ impl NatState {
             return None;
         }
         let sock = sys::new_udp_socket()?;
-        // As for TCP (`new_tcp_flow`), the gateway is the host's loopback;
-        // datagrams back to the guest still come from the gateway (`dst_ip`).
-        let host_dip = if dip == self.gw_ip {
-            [127, 0, 0, 1]
-        } else {
-            dip
-        };
         sys::connect_sock(sock, host_dip, dport);
         if !sys::associate(self.iocp, sock, KEY_UDP) {
             sys::close_sock(sock);
@@ -2453,11 +2486,17 @@ impl NatState {
         if !self.claim_flow(&key) {
             return;
         }
-        // At capacity (or socket setup failed): refuse with a RST so the
-        // guest's connect() fails fast instead of retrying for ~minutes.
-        if self.flows.tcp.load(Ordering::Relaxed) >= MAX_TCP_FLOWS
-            || self.new_tcp_flow(key, ip.datagram).is_none()
-        {
+        // A destination the guest may not reach, at capacity, or socket setup
+        // failed: refuse with a RST so the guest's connect() fails fast instead
+        // of retrying for ~minutes.
+        let refused = match host_dest(key.2, key.3, self.gw_ip, self.host_local) {
+            Some(host_dip) => {
+                self.flows.tcp.load(Ordering::Relaxed) >= MAX_TCP_FLOWS
+                    || self.new_tcp_flow(key, ip.datagram, host_dip).is_none()
+            }
+            None => true,
+        };
+        if refused {
             self.refuse_syn(key, tcp.seq);
             self.release_flow(&key);
         }
@@ -2492,11 +2531,12 @@ impl NatState {
         self.wrap_and_inject(ip.dst, ip.src, IP_PROTO_TCP);
     }
 
-    /// Create the flow for guest SYN `syn` and start the host connect. The
-    /// TCB stays in LISTEN, and `syn` waits in the send op's buffer, until
-    /// the host connect completes ([`Self::on_tcp_connect`]): the guest's
-    /// connect() succeeds only if the host's does, and is refused otherwise.
-    fn new_tcp_flow(&mut self, key: FlowKey, syn: &[u8]) -> Option<()> {
+    /// Create the flow for guest SYN `syn` and start the host connect to
+    /// `host_dip` (see [`host_dest`]). The TCB stays in LISTEN, and `syn`
+    /// waits in the send op's buffer, until the host connect completes
+    /// ([`Self::on_tcp_connect`]): the guest's connect() succeeds only if the
+    /// host's does, and is refused otherwise.
+    fn new_tcp_flow(&mut self, key: FlowKey, syn: &[u8], host_dip: [u8; 4]) -> Option<()> {
         if syn.len() > TCP_BUF {
             return None;
         }
@@ -2546,16 +2586,8 @@ impl NatState {
         send_op.key = key;
         send_op.buf[..syn.len()].copy_from_slice(syn);
         let ovl = &mut op.overlapped as *mut OVERLAPPED;
-        // Slirp convention: connections to the gateway IP target the host
-        // loopback (so the guest can reach host-local services at the gateway).
-        // The remap applies ONLY to the host-side ConnectEx — the guest-facing
-        // Tcb keeps the original `dip` so its packets carry the address the
-        // guest expects.
-        let host_dip = if dip == self.gw_ip {
-            [127, 0, 0, 1]
-        } else {
-            dip
-        };
+        // The guest-facing Tcb keeps the original `dip`, so its packets carry
+        // the address the guest expects; only the host side dials `host_dip`.
         let started = unsafe { sys::connect_ex(sock, host_dip, dport, ovl) };
         if !started {
             sys::close_sock(sock);
@@ -3342,6 +3374,7 @@ impl NatBackend {
                 router: router.clone(),
                 flows: flows.clone(),
                 gw_ip: opts.gateway_ip,
+                host_local: opts.host_local,
                 gw_mac: opts.gateway_mac,
                 guest_mac: net.mac(),
                 dhcp: lease.clone(),
@@ -3667,6 +3700,49 @@ mod tests {
             [172, 29, 255, 3],
         ] {
             assert!(!relayable(ip, gw), "{ip:?}");
+        }
+    }
+
+    /// By default host-local destinations are refused: the host's loopback
+    /// (directly, or at the gateway except its DNS port), link-local cloud
+    /// metadata and Azure's platform address except DNS. `--nat-host-local`
+    /// lets them all through, the gateway reaching the host's loopback.
+    #[test]
+    fn host_local_destinations_need_the_opt_in() {
+        let gw = crate::net::GATEWAY_IP;
+        let loopback = Some([127, 0, 0, 1]);
+        for host_local in [false, true] {
+            assert_eq!(
+                host_dest(gw, 53, gw, host_local),
+                loopback,
+                "the host's resolver"
+            );
+            for ip in [[1, 1, 1, 1], [10, 0, 9, 121], [168, 63, 129, 15]] {
+                assert_eq!(host_dest(ip, 443, gw, host_local), Some(ip), "{ip:?}");
+            }
+            assert_eq!(
+                host_dest(AZURE_PLATFORM_IP, 53, gw, host_local),
+                Some(AZURE_PLATFORM_IP),
+                "Azure DNS"
+            );
+            for ip in [[224, 0, 0, 251], [255; 4], [0, 0, 0, 0], [172, 29, 255, 3]] {
+                assert_eq!(host_dest(ip, 80, gw, host_local), None, "{ip:?}");
+            }
+        }
+        for (ip, port) in [
+            (gw, 8085),
+            (gw, 0),
+            ([127, 0, 0, 1], 22),
+            ([127, 1, 2, 3], 53),
+            ([169, 254, 169, 254], 80),
+            ([169, 254, 1, 1], 53),
+            (AZURE_PLATFORM_IP, 80),
+            (AZURE_PLATFORM_IP, 32526),
+            (AZURE_PLATFORM_IP, 0),
+        ] {
+            assert_eq!(host_dest(ip, port, gw, false), None, "{ip:?}:{port}");
+            let want = if ip == gw { loopback } else { Some(ip) };
+            assert_eq!(host_dest(ip, port, gw, true), want, "{ip:?}:{port}");
         }
     }
 

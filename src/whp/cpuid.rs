@@ -59,7 +59,12 @@ pub const HV_FEATURES_ADVERTISED: u32 = HV_FEATURE_TIME_REF_COUNT
 // `calibrate_delay()`. Advertising these and serving the MSRs from `hv.rs`
 // makes Linux take `hv_get_tsc_khz` and skip the legacy calibration entirely.
 const HV_MISC_FREQUENCY_MSRS_AVAILABLE: u32 = 1 << 8;
-pub const HV_MISC_FEATURES_ADVERTISED: u32 = HV_MISC_FREQUENCY_MSRS_AVAILABLE;
+// EDX[10]: the guest crash MSRs. Linux then reports a panic (its kernel log
+// tail) through them (`hv_common_init`), and tinyvmm stops the VM with that
+// report instead of leaving a vCPU spinning in `panic()` forever.
+const HV_MISC_GUEST_CRASH_MSRS_AVAILABLE: u32 = 1 << 10;
+pub const HV_MISC_FEATURES_ADVERTISED: u32 =
+    HV_MISC_FREQUENCY_MSRS_AVAILABLE | HV_MISC_GUEST_CRASH_MSRS_AVAILABLE;
 
 static HIDE_TSC_DEADLINE: AtomicBool = AtomicBool::new(false);
 
@@ -81,7 +86,15 @@ pub fn hv_interface_eax() -> u32 {
     (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24)
 }
 
+/// The guest TSC rate. WHP's processor clock is what the hypervisor keeps
+/// time by. The fallbacks only guess: leaf 0x15/0x16 report a nominal rate
+/// (leaf 0x16 to the MHz), and a calibration against the host clock is off by
+/// ~10 ppm when the thread runs undisturbed and by much more when it is
+/// preempted, which a guest with no NTP turns into clock drift.
 fn measure_tsc_hz() -> u64 {
+    if let Some(hz) = crate::whp::hv::processor_clock_hz() {
+        return hz;
+    }
     let r = __cpuid(0x15);
     let den = r.eax;
     let num = r.ebx;
@@ -110,6 +123,20 @@ fn measure_tsc_hz() -> u64 {
 pub fn cached_tsc_hz() -> u64 {
     static CACHED: OnceLock<u64> = OnceLock::new();
     *CACHED.get_or_init(measure_tsc_hz)
+}
+
+/// Whether the host CPU is AMD's (or Hygon's): WHP passes the host's vendor
+/// string through to the guest, which then follows AMD's code paths.
+pub fn host_is_amd() -> bool {
+    static AMD: OnceLock<bool> = OnceLock::new();
+    *AMD.get_or_init(|| {
+        let r = __cpuid(0);
+        let mut vendor = [0u8; 12];
+        vendor[0..4].copy_from_slice(&r.ebx.to_le_bytes());
+        vendor[4..8].copy_from_slice(&r.edx.to_le_bytes());
+        vendor[8..12].copy_from_slice(&r.ecx.to_le_bytes());
+        &vendor == b"AuthenticAMD" || &vendor == b"HygonGenuine"
+    })
 }
 
 pub fn resolve_cpuid(

@@ -388,8 +388,13 @@ default result WHP passes with each exit:
 - **Advertise invariant TSC** (leaf `0x80000007` EDX[8]) and **ARAT** (leaf 6
   EAX[2]) so the LAPIC timer is "always running."
 - **Publish the TSC frequency** via leaves `0x15` (TSC/crystal ratio) and `0x16`
-  (base MHz). tinyvmm measures it once at startup (`cpuid.rs:80` — from leaf 0x15,
-  else 0x16, else a 50 ms RDTSC calibration) and caches it in a `OnceLock`.
+  (base MHz). tinyvmm takes it once at startup from WHP
+  (`WHvGetCapability(WHvCapabilityCodeProcessorClockFrequency)`, the rate the
+  hypervisor itself keeps time by and the value OpenVMM uses), else leaf 0x15,
+  else 0x16, else a 50 ms RDTSC calibration, and caches it in a `OnceLock`
+  (`cpuid.rs:80`). The fallbacks only guess: the calibration is ~10 ppm off when
+  the thread runs undisturbed and far more when it is preempted, and a guest
+  with no NTP keeps that error as clock drift.
 - **Emulate the Hyper-V vendor leaves** `0x40000000`–`0x40000006`: vendor
   `"Microsoft Hv"`, interface `"Hv#1"`, and a feature bitmask advertising the
   hypercall page, VP index, reference TSC, and the **frequency MSRs**
@@ -429,14 +434,24 @@ writes once it detects Hyper-V:
   vCPU's TSC times the same scale, so it agrees with the page to the tick and,
   as the TLFS requires, starts near zero with the partition. (It once scaled the
   *host's* TSC, an epoch about the host's uptime away from the page's.)
-- `TSC_FREQUENCY`: the measured TSC Hz (`hv.rs:224`).
+- `TSC_FREQUENCY`: the TSC Hz above (`hv.rs:224`).
 - `APIC_FREQUENCY`: **WHP's interrupt clock** — the rate its LAPIC timer
   actually counts at, read once with
   `WHvGetCapability(WHvCapabilityCodeInterruptClockFrequency)` (200 MHz on
   current builds, also the fallback) — *not* the TSC rate (`hv.rs:49`, `:229`).
   Report the TSC rate (~3 GHz) and every LAPIC timer the guest programs runs
   ~16× too long.
-- Unhandled Hyper-V MSR → inject `#GP`.
+- `CRASH_P0`–`P4`, `CRASH_CTL` (`0x40000100`–`0x40000105`), advertised in
+  CPUID `0x40000003` EDX[10]: a read of `CRASH_CTL` offers both report kinds,
+  so Linux registers a panic notifier and a kernel-log dumper
+  (`hv_common_init`). On a panic it posts a page of its log (P3 = GPA, P4 =
+  length) and writes `CRASH_CTL`; the run loop prints that log and stops the VM
+  with exit code 2 (`StopReason::GuestCrashed`) instead of leaving a vCPU
+  spinning in `panic()`.
+- Unhandled Hyper-V MSR → inject `#GP`. On an AMD host, the model-specific
+  configuration MSRs Linux touches at boot (HWCR, NB_CFG, SYSCFG, the legacy
+  performance counters, OSVW, LS_CFG..EX_CFG) read as zero (HWCR as TscFreqSel)
+  and ignore writes, as in OpenVMM and KVM (`run_loop.rs`, `amd_config_msr`).
 
 **3. The interrupt controller is WHP's.** Set `LocalApicEmulationMode = X2Apic`
 (`src/main.rs:1370`) and the hypervisor emulates every vCPU's local APIC in

@@ -537,6 +537,20 @@ struct DirEntryCached {
     name: String,
 }
 
+/// Most host memory every open directory's readdir listing may hold at once
+/// (`FidEntry::dir_cache`). A guest can open up to `MAX_FIDS` fids on one big
+/// directory and start a readdir on each; past this, the listings of other
+/// fids are dropped, and rebuilt if their readdir carries on.
+const DIR_CACHE_BUDGET: usize = 64 << 20;
+
+/// What a listing costs against [`DIR_CACHE_BUDGET`].
+fn dir_cache_bytes(cache: &[DirEntryCached]) -> usize {
+    cache
+        .iter()
+        .map(|e| std::mem::size_of::<DirEntryCached>() + e.name.len())
+        .sum()
+}
+
 /// Owns a host file HANDLE and closes it exactly once on drop. Stored as an
 /// `Arc<OwnedHandle>` inside a `FidEntry` so a worker can clone the `Arc` under
 /// the `fids` lock and then do its blocking I/O lock-free: a concurrent `Tclunk`
@@ -580,6 +594,8 @@ struct FidEntry {
     open_flags: u32,
     dir_cache: Vec<DirEntryCached>,
     dir_cache_built: bool,
+    /// `dir_cache_bytes(&dir_cache)`, kept for the budget.
+    dir_cache_size: usize,
 }
 
 impl FidEntry {
@@ -594,7 +610,14 @@ impl FidEntry {
             open_flags: 0,
             dir_cache: Vec::new(),
             dir_cache_built: false,
+            dir_cache_size: 0,
         }
+    }
+
+    fn drop_dir_cache(&mut self) {
+        self.dir_cache = Vec::new();
+        self.dir_cache_built = false;
+        self.dir_cache_size = 0;
     }
 
     fn close_handle(&mut self) {
@@ -604,13 +627,48 @@ impl FidEntry {
         // manual `Drop for FidEntry`.
         self.handle = None;
         self.opened = false;
-        self.dir_cache.clear();
-        self.dir_cache_built = false;
+        self.drop_dir_cache();
     }
 }
 
 struct Fids {
     map: HashMap<u32, FidEntry>,
+}
+
+impl Fids {
+    /// Give fid `fid` the listing `cache`, first dropping other fids'
+    /// listings as needed to keep them all within [`DIR_CACHE_BUDGET`]. A
+    /// single listing bigger than the budget is still kept: its readdir needs
+    /// it.
+    fn set_dir_cache(&mut self, fid: u32, cache: Vec<DirEntryCached>) {
+        self.set_dir_cache_within(fid, cache, DIR_CACHE_BUDGET);
+    }
+
+    fn set_dir_cache_within(&mut self, fid: u32, cache: Vec<DirEntryCached>, budget: usize) {
+        let size = dir_cache_bytes(&cache);
+        let mut total: usize = self
+            .map
+            .iter()
+            .filter(|(k, _)| **k != fid)
+            .map(|(_, e)| e.dir_cache_size)
+            .sum();
+        if total + size > budget {
+            for (_, e) in self.map.iter_mut().filter(|(k, _)| **k != fid) {
+                if e.dir_cache_size > 0 {
+                    total -= e.dir_cache_size;
+                    e.drop_dir_cache();
+                    if total + size <= budget {
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(e) = self.map.get_mut(&fid) {
+            e.dir_cache = cache;
+            e.dir_cache_built = true;
+            e.dir_cache_size = size;
+        }
+    }
 }
 
 /// The pinned share root: its handle, and its real path (normalized, NT volume
@@ -2016,7 +2074,7 @@ impl P9Device {
             build_rlerror(reply, tag, E_PROTO);
             return;
         };
-        let (is_dir, opened, has_handle);
+        let (is_dir, opened, has_handle, cache_built);
         {
             let f = self.fids.lock().unwrap();
             let Some(e) = f.map.get(&fid) else {
@@ -2026,6 +2084,7 @@ impl P9Device {
             is_dir = e.is_dir;
             opened = e.opened;
             has_handle = e.handle.is_some();
+            cache_built = e.dir_cache_built;
         }
         if !is_dir {
             build_rlerror(reply, tag, E_NOTDIR);
@@ -2044,31 +2103,41 @@ impl P9Device {
             count = max_payload;
         }
 
-        if req_offset == 0 {
-            // Clone the fid's already-open directory handle and enumerate by
-            // HANDLE — no per-entry open.
-            let dir_h = {
-                let f = self.fids.lock().unwrap();
-                f.map.get(&fid).and_then(|e| e.handle.clone())
-            };
-            let Some(dir_h) = dir_h else {
-                build_rlerror(reply, tag, E_BADF);
-                return;
-            };
-            let cache = self.build_dir_cache(dir_h.get());
-            let mut f = self.fids.lock().unwrap();
-            if let Some(e) = f.map.get_mut(&fid) {
-                e.dir_cache = cache;
-                e.dir_cache_built = true;
+        // A readdir from the start lists the directory afresh; one carrying on
+        // after the budget dropped this fid's listing lists it again. The
+        // chunk is encoded under the same lock hold that found or stored the
+        // listing, so another fid's readdir can't drop it in between.
+        let mut rebuild = req_offset == 0 || !cache_built;
+        let f = loop {
+            if rebuild {
+                // Clone the fid's already-open directory handle and enumerate
+                // by HANDLE — no per-entry open.
+                let dir_h = {
+                    let f = self.fids.lock().unwrap();
+                    f.map.get(&fid).and_then(|e| e.handle.clone())
+                };
+                let Some(dir_h) = dir_h else {
+                    build_rlerror(reply, tag, E_BADF);
+                    return;
+                };
+                let cache = self.build_dir_cache(dir_h.get());
+                let mut f = self.fids.lock().unwrap();
+                f.set_dir_cache(fid, cache);
+                break f;
             }
-        }
+            let f = self.fids.lock().unwrap();
+            if f.map.get(&fid).is_some_and(|e| !e.dir_cache_built) {
+                rebuild = true;
+                continue;
+            }
+            break f;
+        };
 
         // Encode the requested chunk directly from the cached entries under the
         // fids lock — no per-call clone of the whole directory (that made a
         // multi-chunk readdir O(N^2) in the entry count). The encode loop is pure
         // CPU bounded by `count` (<= msize), so the lock hold is short and in fact
         // shorter than the previous O(N) clone.
-        let f = self.fids.lock().unwrap();
         let Some(e) = f.map.get(&fid) else {
             build_rlerror(reply, tag, E_BADF);
             return;
@@ -3373,6 +3442,124 @@ mod tests {
             enc4(t, mode);
             enc4(t, gid);
         });
+    }
+
+    /// Every directory fid's readdir listing shares one memory budget: a new
+    /// listing drops other fids' listings as needed, never its own, and is
+    /// kept even when it alone exceeds the budget.
+    #[test]
+    fn directory_listings_share_a_memory_budget() {
+        let listing = |n: usize| -> Vec<DirEntryCached> {
+            (0..n)
+                .map(|i| DirEntryCached {
+                    name: format!("f{i:03}"),
+                    ..Default::default()
+                })
+                .collect()
+        };
+        let budget = 3 * dir_cache_bytes(&listing(10));
+        let mut f = Fids {
+            map: HashMap::new(),
+        };
+        for fid in 0..4 {
+            f.map
+                .insert(fid, FidEntry::new(PathBuf::new(), true, u64::from(fid), 0));
+        }
+        let built = |f: &Fids| -> Vec<u32> {
+            let mut v: Vec<u32> = f
+                .map
+                .iter()
+                .filter(|(_, e)| e.dir_cache_built)
+                .map(|(k, _)| *k)
+                .collect();
+            v.sort();
+            v
+        };
+        for fid in 0..3 {
+            f.set_dir_cache_within(fid, listing(10), budget);
+        }
+        assert_eq!(built(&f), [0, 1, 2]);
+        f.set_dir_cache_within(3, listing(10), budget);
+        let now = built(&f);
+        assert_eq!(now.len(), 3, "one listing made room: {now:?}");
+        assert!(now.contains(&3));
+        let total: usize = f.map.values().map(|e| e.dir_cache_size).sum();
+        assert!(total <= budget, "{total} > {budget}");
+        f.set_dir_cache_within(0, listing(100), budget);
+        assert_eq!(built(&f), [0], "an oversized listing is kept, alone");
+    }
+
+    /// A readdir that carries on after the budget dropped its listing lists
+    /// the directory again and resumes at its offset, instead of ending the
+    /// listing early.
+    #[test]
+    fn readdir_carries_on_after_its_listing_is_dropped() {
+        let base = std::env::temp_dir().join(format!("tinyvmm_p9_rd_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let mut want: Vec<String> = vec![".".into(), "..".into()];
+        for i in 0..40 {
+            let name = format!("file{i:02}");
+            std::fs::write(base.join(&name), b"x").unwrap();
+            want.push(name);
+        }
+        let root = std::fs::canonicalize(&base).unwrap();
+        let mem = std::sync::Arc::new(whpsys::memory::GuestMemory::new_host_only(4096).unwrap());
+        let dev = P9Device::new(mem, "t".into(), root, ShareOptions::default());
+        connect(&dev, 0);
+        walk(&dev, 0, 1, &[]);
+        call(&dev, T_LOPEN, |t| {
+            enc4(t, 1);
+            enc4(t, O_RDONLY);
+        });
+        // Rreaddir: size[4] type[1] tag[2] count[4], then entries of qid[13]
+        // offset[8] type[1] name[2+n].
+        let readdir = |offset: u64| -> Vec<(u64, String)> {
+            let r = call(&dev, T_READDIR, |t| {
+                enc4(t, 1);
+                enc8(t, offset);
+                enc4(t, 256);
+            });
+            let end = 11 + u32::from_le_bytes(r[7..11].try_into().unwrap()) as usize;
+            let mut out = Vec::new();
+            let mut p = 11;
+            while p < end {
+                let off = u64::from_le_bytes(r[p + 13..p + 21].try_into().unwrap());
+                let len = u16::from_le_bytes(r[p + 22..p + 24].try_into().unwrap()) as usize;
+                out.push((
+                    off,
+                    String::from_utf8(r[p + 24..p + 24 + len].to_vec()).unwrap(),
+                ));
+                p += 24 + len;
+            }
+            out
+        };
+        let mut names = Vec::new();
+        let mut offset = 0;
+        loop {
+            let chunk = readdir(offset);
+            let Some(&(last, _)) = chunk.last() else {
+                break;
+            };
+            assert!(
+                chunk.len() < want.len(),
+                "the listing should take several chunks"
+            );
+            offset = last;
+            names.extend(chunk.into_iter().map(|(_, n)| n));
+            // The budget drops this fid's listing between chunks.
+            dev.fids
+                .lock()
+                .unwrap()
+                .map
+                .get_mut(&1)
+                .unwrap()
+                .drop_dir_cache();
+        }
+        names.sort();
+        want.sort();
+        assert_eq!(names, want);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Rgetattr must report the share's configured owner for the root and for
