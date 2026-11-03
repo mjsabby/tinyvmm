@@ -22,6 +22,11 @@
 //! to the scanout framebuffer (non-resizable), so pointer client coordinates map
 //! 1:1 onto guest-framebuffer pixels — convenient for an absolute-pointer
 //! (`EV_ABS`) virtio-input backend.
+//!
+//! The window thread is per-monitor DPI aware (v2): on a scaled display Windows
+//! neither stretches the window nor scales its coordinates, so one guest pixel
+//! is one screen pixel at any scale, and the frame is resized when the window
+//! moves to a monitor with another scale.
 
 #![allow(non_snake_case)]
 
@@ -38,22 +43,31 @@ use windows_sys::Win32::Graphics::Gdi::{
     EndPaint, InvalidateRect, PAINTSTRUCT, PatBlt, SRCCOPY, SetStretchBltMode, StretchDIBits,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::HiDpi::{
+    AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
+    SetThreadDpiAwarenessContext,
+};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
-    DispatchMessageW, GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MSG,
-    PostMessageW, PostQuitMessage, RegisterClassW, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WM_APP, WM_CLOSE,
-    WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DispatchMessageW, GWLP_USERDATA,
+    GetMessageW, GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MSG, PostMessageW, PostQuitMessage,
+    RegisterClassW, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, TranslateMessage, WM_APP, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
     WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP,
     WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
-    WS_VISIBLE,
 };
 
 /// Custom message posted from the present thread to the window thread: the
 /// scanout has a new picture.
 const WM_APP_PAINT: u32 = WM_APP + 1;
+
+/// A fixed-size window: the client area tracks the framebuffer exactly.
+const WINDOW_STYLE: u32 = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+
+/// The DPI of a monitor at 100% scale.
+const DEFAULT_DPI: u32 = 96;
 
 /// A mouse button, as reported in [`WindowEvent::Button`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,6 +256,9 @@ fn window_thread(
     ready: std::sync::mpsc::Sender<isize>,
 ) {
     unsafe {
+        // Must precede the window's creation; see the module docs. Before
+        // Windows 10 1703 this fails and the window is DPI-virtualized instead.
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let hinstance = GetModuleHandleW(std::ptr::null());
         let class_name = wide("tinyvmm_virtio_gpu_window");
         let cursor = LoadCursorW(std::ptr::null_mut(), IDC_ARROW);
@@ -264,16 +281,16 @@ fn window_thread(
         // that already exists (e.g. a second display), which is fine.
         RegisterClassW(&wc);
 
-        // Fixed-size window: client area tracks the framebuffer exactly.
-        let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE;
-        let (ww, wh) = outer_size(width, height, style);
+        // The frame's size depends on the DPI of the monitor the window lands
+        // on, known only once it exists: create it hidden, then size it.
+        let (ww, wh) = outer_size(width, height, DEFAULT_DPI);
 
         let title_w = wide(&title);
         let hwnd = CreateWindowExW(
             0,
             class_name.as_ptr(),
             title_w.as_ptr(),
-            style,
+            WINDOW_STYLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             ww,
@@ -289,6 +306,16 @@ fn window_thread(
             return;
         }
 
+        let (ww, wh) = outer_size(width, height, GetDpiForWindow(hwnd));
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            ww,
+            wh,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
         shared.hwnd.store(hwnd as isize, Ordering::Release);
         ShowWindow(hwnd, SW_SHOW);
         let _ = ready.send(hwnd as isize);
@@ -309,8 +336,9 @@ fn window_thread(
     }
 }
 
-/// Compute the outer window size needed for a `cw`x`ch` client area.
-fn outer_size(cw: u32, ch: u32, style: u32) -> (i32, i32) {
+/// Compute the outer window size needed for a `cw`x`ch` client area on a
+/// monitor at `dpi`.
+fn outer_size(cw: u32, ch: u32, dpi: u32) -> (i32, i32) {
     let mut r = RECT {
         left: 0,
         top: 0,
@@ -318,7 +346,7 @@ fn outer_size(cw: u32, ch: u32, style: u32) -> (i32, i32) {
         bottom: ch as i32,
     };
     unsafe {
-        AdjustWindowRectEx(&mut r, style, 0, 0);
+        AdjustWindowRectExForDpi(&mut r, WINDOW_STYLE, 0, 0, dpi);
     }
     (r.right - r.left, r.bottom - r.top)
 }
@@ -362,17 +390,19 @@ unsafe extern "system" fn wnd_proc(
         match msg {
             WM_APP_PAINT => {
                 shared.paint_pending.store(false, Ordering::Release);
-                let mut size = shared.size.lock().unwrap();
-                let old = *size;
-                let Some(area) = shared.scanout.window_update(&mut size) else {
-                    return 0;
+                // Release the lock before SetWindowPos, which can re-enter
+                // this procedure (WM_DPICHANGED takes the lock too).
+                let (size, resized, area) = {
+                    let mut size = shared.size.lock().unwrap();
+                    let old = *size;
+                    let Some(area) = shared.scanout.window_update(&mut size) else {
+                        return 0;
+                    };
+                    (*size, *size != old, area)
                 };
-                let size = *size;
-                if size != old {
+                if resized {
                     // Keep the client area equal to the scanout.
-                    let style =
-                        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE;
-                    let (ww, wh) = outer_size(size.0, size.1, style);
+                    let (ww, wh) = outer_size(size.0, size.1, GetDpiForWindow(hwnd));
                     SetWindowPos(
                         hwnd,
                         std::ptr::null_mut(),
@@ -556,6 +586,24 @@ unsafe extern "system" fn wnd_proc(
                 );
                 0
             }
+            WM_DPICHANGED => {
+                // Moved to a monitor with another scale. Windows suggests a
+                // rectangle scaled for it; keep its position but size the
+                // frame so the client area stays the framebuffer's size.
+                let suggested = &*(lparam as *const RECT);
+                let size = *shared.size.lock().unwrap();
+                let (ww, wh) = outer_size(size.0, size.1, (wparam & 0xFFFF) as u32);
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    suggested.left,
+                    suggested.top,
+                    ww,
+                    wh,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                0
+            }
             WM_CLOSE => {
                 shared.open.store(false, Ordering::Release);
                 emit(shared, WindowEvent::CloseRequested);
@@ -583,6 +631,11 @@ mod tests {
     #[test]
     fn window_present_and_shutdown() {
         use windows_sys::Win32::Graphics::Gdi::{GetDC, GetPixel, ReleaseDC};
+        use windows_sys::Win32::UI::HiDpi::{
+            DPI_AWARENESS_PER_MONITOR_AWARE, GetAwarenessFromDpiAwarenessContext,
+            GetWindowDpiAwarenessContext,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect;
         if std::env::var_os("TINYVMM_DISPLAY_SELFTEST").is_none() {
             return;
         }
@@ -593,9 +646,20 @@ mod tests {
             return;
         };
         assert!(d.is_open());
+        let hwnd = d.shared.hwnd.load(Ordering::Acquire) as HWND;
+        // Pixel for pixel at any display scale: not DPI-virtualized, and the
+        // client area (in this thread's units, physical pixels once aware) is
+        // the framebuffer's size.
+        unsafe {
+            let awareness = GetAwarenessFromDpiAwarenessContext(GetWindowDpiAwarenessContext(hwnd));
+            assert_eq!(awareness, DPI_AWARENESS_PER_MONITOR_AWARE);
+            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            let mut client: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut client);
+            assert_eq!((client.right, client.bottom), (w as i32, h as i32));
+        }
         // The window's pixel at (x, y), as a COLORREF (0x00BBGGRR).
         let pixel = |x, y| unsafe {
-            let hwnd = d.shared.hwnd.load(Ordering::Acquire) as HWND;
             let dc = GetDC(hwnd);
             let c = GetPixel(dc, x, y);
             ReleaseDC(hwnd, dc);
