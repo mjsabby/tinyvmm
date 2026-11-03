@@ -122,7 +122,8 @@ mod tests {
         assert_eq!(drives, [("live.iso", true), ("disk.vhdx", false)]);
         assert!(config.drives[0].iso);
         assert!(!config.drives[1].iso);
-        assert_eq!(config.iso_extra_args, "debug x=1");
+        assert!(!config.disk_boot);
+        assert_eq!(config.extra_args, "debug x=1");
         assert!(config.cmdline.starts_with("console=hvc0 "));
 
         for conflicting in [
@@ -133,5 +134,27 @@ mod tests {
             parts.extend_from_slice(conflicting);
             assert!(parse_pvh_args(&args(&parts)).is_err(), "{conflicting:?}");
         }
+    }
+
+    #[test]
+    fn a_drive_without_a_kernel_boots_the_installed_system() {
+        let parse = |extra: &[&str]| {
+            let mut parts = vec!["tinyvmm", "--pvh-run", "--drive", "disk.vhdx"];
+            parts.extend_from_slice(extra);
+            parse_pvh_args(&args(&parts))
+        };
+        let config = parse(&["--", "quiet", "x=1"]).unwrap();
+        assert!(config.vmlinux.is_none());
+        // Appliance builds boot their embedded kernel instead.
+        assert_eq!(config.disk_boot, !BUNDLED);
+        if !BUNDLED {
+            assert_eq!(config.extra_args, "quiet x=1");
+            assert!(config.cmdline.starts_with("console=hvc0 "));
+            assert!(parse(&["--initrd", "i.cpio"]).is_err());
+        }
+        // A kernel path still boots that kernel, with the cmdline as given.
+        let config = parse(&["vmlinux", "--", "console=hvc0", "tinyinit.epoch=42"]).unwrap();
+        assert!(!config.disk_boot);
+        assert_eq!(config.cmdline, "console=hvc0 tinyinit.epoch=42");
     }
 }

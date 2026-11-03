@@ -4,9 +4,13 @@
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_INVALID_PARAMETER, HANDLE,
+    ERROR_GEN_FAILURE, ERROR_HANDLE_EOF, ERROR_INVALID_DATA, ERROR_INVALID_PARAMETER,
+    ERROR_IO_PENDING, GetLastError, HANDLE,
 };
+use windows_sys::Win32::Storage::FileSystem::ReadFile;
 use windows_sys::Win32::Storage::Vhd::*;
+use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+use windows_sys::Win32::System::Threading::CreateEventW;
 use windows_sys::core::GUID;
 
 use super::{random_fill, wide};
@@ -268,6 +272,83 @@ impl VirtualDisk {
     }
 }
 
+/// A VHDX opened read-only for synchronous reads on the host, such as reading
+/// a boot configuration before a VM starts. VHDMP refuses a writable open of
+/// the disk while this one is open, so drop it before the VM opens the disk.
+pub struct ReadOnlyDisk {
+    disk: VirtualDisk,
+    /// Signaled when a read completes.
+    event: OwnedHandle,
+}
+
+impl ReadOnlyDisk {
+    /// The largest single read handed to VHDMP.
+    const CHUNK: usize = 1 << 20;
+
+    pub fn open(path: &str) -> Result<Self, u32> {
+        let disk = VirtualDisk::open(path, true)?;
+        let event = unsafe { CreateEventW(core::ptr::null(), 1, 0, core::ptr::null()) };
+        if event.is_null() {
+            return Err(unsafe { GetLastError() });
+        }
+        Ok(Self {
+            disk,
+            event: unsafe { OwnedHandle::from_raw_handle(event) },
+        })
+    }
+
+    /// The virtual size in bytes.
+    pub fn size(&self) -> u64 {
+        self.disk.size
+    }
+
+    /// Fill `buf` from `offset`. Both must be multiples of the 512-byte sector.
+    pub fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), u32> {
+        if !offset.is_multiple_of(512) || !buf.len().is_multiple_of(512) {
+            return Err(ERROR_INVALID_PARAMETER);
+        }
+        if offset
+            .checked_add(buf.len() as u64)
+            .is_none_or(|end| end > self.disk.size)
+        {
+            return Err(ERROR_HANDLE_EOF);
+        }
+        let mut at = offset;
+        for chunk in buf.chunks_mut(Self::CHUNK) {
+            let mut ov: OVERLAPPED = unsafe { core::mem::zeroed() };
+            ov.Anonymous.Anonymous.Offset = at as u32;
+            ov.Anonymous.Anonymous.OffsetHigh = (at >> 32) as u32;
+            ov.hEvent = self.event.as_raw_handle();
+            let mut done = 0u32;
+            // SAFETY: `chunk` and `ov` outlive the read, which
+            // GetOverlappedResult waits for.
+            unsafe {
+                let started = ReadFile(
+                    self.disk.handle(),
+                    chunk.as_mut_ptr(),
+                    chunk.len() as u32,
+                    core::ptr::null_mut(),
+                    &mut ov,
+                );
+                if started == 0 {
+                    let err = GetLastError();
+                    if err != ERROR_IO_PENDING {
+                        return Err(err);
+                    }
+                }
+                if GetOverlappedResult(self.disk.handle(), &ov, &mut done, 1) == 0 {
+                    return Err(GetLastError());
+                }
+            }
+            if done as usize != chunk.len() {
+                return Err(ERROR_HANDLE_EOF);
+            }
+            at += chunk.len() as u64;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +377,50 @@ mod tests {
             assert_eq!(disk.command(&mut read, &mut back, true), Ok(1024));
             assert_eq!(back, bytes);
         }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn read_only_disk_reads_sectors() {
+        let path = std::env::temp_dir().join(format!(
+            "tinyvmm-vhdx-ro-{}-{}.vhdx",
+            std::process::id(),
+            unique_guid().unwrap().data1
+        ));
+        let path_str = path.to_str().unwrap();
+        let size = 8 * 1024 * 1024;
+        create(path_str, size).unwrap();
+        // Sector 2 written through SCSI WRITE(16), as in the test above.
+        {
+            let disk = VirtualDisk::open(path_str, false).unwrap();
+            let mut bytes: Vec<u8> = (0..512).map(|i| i as u8).collect();
+            let mut write = [0; 16];
+            write[0] = 0x8a;
+            write[9] = 2;
+            write[13] = 1;
+            assert_eq!(disk.command(&mut write, &mut bytes, false), Ok(512));
+        }
+        {
+            let disk = ReadOnlyDisk::open(path_str).unwrap();
+            assert_eq!(disk.size(), size);
+            let mut buf = vec![0xffu8; 1536];
+            disk.read_exact_at(512, &mut buf).unwrap();
+            assert!(buf[..512].iter().all(|&b| b == 0));
+            assert!(
+                buf[512..1024]
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &b)| b == i as u8)
+            );
+            // The disk's last sector, and nothing past it or unaligned.
+            disk.read_exact_at(size - 512, &mut buf[..512]).unwrap();
+            assert!(disk.read_exact_at(size, &mut buf[..512]).is_err());
+            assert!(disk.read_exact_at(100, &mut buf[..512]).is_err());
+            assert!(disk.read_exact_at(0, &mut buf[..100]).is_err());
+            // The VM's writable open fails until this one closes.
+            assert!(VirtualDisk::open(path_str, false).is_err());
+        }
+        assert!(VirtualDisk::open(path_str, false).is_ok());
         std::fs::remove_file(path).unwrap();
     }
 }

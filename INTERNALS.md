@@ -296,7 +296,10 @@ entry with flat segments at `__BOOT_CS`/`__BOOT_DS` (`0x10`/`0x18`) and
 `ESI` = the zero page; the kernel's own decompressor runs from there, so no
 decompression happens on the host and `CONFIG_PVH` isn't needed. `--iso`
 (`src/convenience/`) builds on it: it reads a live ISO's GRUB entry with a small
-ISO 9660 reader and boots that kernel and initrd straight from memory.
+ISO 9660 reader and boots that kernel and initrd straight from memory. A
+`--drive` with no kernel path does the same with the installed system's own
+`grub.cfg`, found through a partition-table reader and a read-only ext4 reader
+that replays the journal of a filesystem that wasn't cleanly unmounted.
 
 To *see* it, you need M2's serial port: add the default cmdline
 `console=hvc0 ...` (or `--debug-boot` to prepend `earlyprintk=ttyS0,115200` so the
@@ -1125,7 +1128,8 @@ crates/winsys/   Win32 FFI: host (privilege/large-page/CNG rng), host/block_file
 src/whp/         run_loop, cpuid (policy), hv (Hyper-V enlightenments, crash MSRs), snapshot*
 src/boot/        loader (PVH ELF + start_info + e820), acpi (RSDP/XSDT/MADT),
                  bzimage (Linux boot protocol), KernelLoad (picks one)
-src/convenience/ iso9660, grub_cfg, iso_boot (--iso: boot a live ISO)
+src/convenience/ iso9660, grub_cfg, iso_boot (--iso: boot a live ISO),
+                 partition, ext4, disk_boot (boot a --drive's installed Linux)
 src/devices/     io_bus, mmio_bus, serial (8250), pic (i8259), pit (8254), legacy
 src/pci/         mod (CF8/CFC), bus, config (Type-0 + BAR), msix, passthrough
 src/virtio/      device (trait), transport (virtio-pci), queue (virtqueue),

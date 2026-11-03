@@ -199,10 +199,14 @@ fn print_usage() {
          \x20              display + --sound playback to a fragmented H.264/AAC MP4; default 30 fps)\n\
          \x20              [--save <path> [--unsafe-save-mutable-drive]]\n\
          \x20              [--watchdog-secs N] [--debug-boot] [vmlinux] [-- <cmdline>]\n\
-         \x20              Kernel path is required in plain builds; appliance builds embed defaults.\n\
+         \x20              Kernel path is required in plain builds unless a --drive holds an\n\
+         \x20              installed Linux (below); appliance builds embed defaults.\n\
          \x20              The kernel may be a PVH ELF vmlinux or a bzImage (vmlinuz).\n\
          \x20 tinyvmm --pvh-run --iso <image> [flags as above] [-- <extra kernel args>]\n\
          \x20              Boot a live/install ISO's default GRUB entry; the ISO becomes drive 0.\n\
+         \x20 tinyvmm --pvh-run --drive <disk.vhdx> [flags as above] [-- <extra kernel args>]\n\
+         \x20              No kernel path: boot the default GRUB entry of the Linux installed on\n\
+         \x20              the first drive with one (ext2/3/4 /boot, read before the VM starts).\n\
          \x20 tinyvmm --restore <path> [--drive <path>[,ro|rw]]... [--cpu-affinity p|p-physical|e|all]\n\
          \x20              [--watchdog-secs N] [--unsafe-restore-mutable-drive] [--poll-us N]\n\
          \x20              [--record <file.mp4>[,fps=N][,kbps=N]]\n\
@@ -1012,8 +1016,12 @@ struct PvhArgs {
     initrd: Option<String>,
     /// `--iso`: boot this ISO's default GRUB entry; the ISO is also drive 0.
     iso: Option<String>,
-    /// With `--iso`, the arguments after `--`, appended to the ISO's own.
-    iso_extra_args: String,
+    /// No kernel and no `--iso`, but `--drive`s: boot the default GRUB entry
+    /// of the Linux installed on the first drive that has one.
+    disk_boot: bool,
+    /// With `--iso` or a disk boot, the arguments after `--`, appended to the
+    /// boot entry's own.
+    extra_args: String,
     ram_mb: u32,
     vcpus: u32,
     watchdog_secs: u32,
@@ -1393,15 +1401,24 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
         }
         i += 1;
         Some(path.clone())
-    } else if boot::payload::BUNDLED || iso.is_some() {
+    } else if boot::payload::BUNDLED || iso.is_some() || !drives.is_empty() {
         None
     } else {
         return Err(Error::msg(
-            "--pvh-run: expected path to vmlinux (or --iso <image>)",
+            "--pvh-run: expected path to vmlinux (or --iso <image>, or a --drive with Linux \
+             installed)",
         ));
     };
+    // With neither a kernel nor an ISO, a plain build boots the Linux
+    // installed on a drive (appliance builds boot their embedded kernel).
+    let disk_boot = vmlinux.is_none() && iso.is_none() && !boot::payload::BUNDLED;
     if iso.is_some() && initrd.is_some() {
         return Err(Error::msg("--iso supplies the initrd; drop --initrd"));
+    }
+    if disk_boot && initrd.is_some() {
+        return Err(Error::msg(
+            "--initrd needs a kernel path (booting a --drive takes its initrd from the disk)",
+        ));
     }
     if record.is_some() && !with_gpu {
         return Err(Error::msg(
@@ -1409,14 +1426,15 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
         ));
     }
 
-    // Everything after a bare "--" is the kernel cmdline. With --iso it is
-    // appended to the default cmdline and the ISO's own arguments instead.
+    // Everything after a bare "--" is the kernel cmdline. With --iso or a
+    // disk boot it is appended to the default cmdline and the boot entry's
+    // own arguments instead.
     let mut cmdline = String::new();
     if i < args.len() && args[i] == "--" {
         i += 1;
         cmdline = args[i..].join(" ");
     }
-    let iso_extra_args = if iso.is_some() {
+    let extra_args = if iso.is_some() || disk_boot {
         std::mem::take(&mut cmdline)
     } else {
         String::new()
@@ -1470,7 +1488,8 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
         cmdline,
         initrd,
         iso,
-        iso_extra_args,
+        disk_boot,
+        extra_args,
         ram_mb,
         vcpus: vcpus.clamp(1, MAX_VCPUS),
         watchdog_secs,
@@ -1701,7 +1720,11 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
             cfg.iso
                 .as_deref()
                 .or(cfg.vmlinux.as_deref())
-                .unwrap_or("<embedded>"),
+                .unwrap_or(if cfg.disk_boot {
+                    "<drive>"
+                } else {
+                    "<embedded>"
+                }),
         )
         .u64("ram_mb", cfg.ram_mb as u64)
         .u32("vcpus", cfg.vcpus)
@@ -1773,27 +1796,48 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     btimer.mark("guest RAM mapped");
 
     // File mappings and embedded PE data are borrowed, without a payload Vec;
-    // --iso reads the kernel and initrd out of the image. The loader copies
-    // into writable, reclaimable guest RAM.
+    // --iso and a disk boot read the kernel and initrd out of the image. The
+    // loader copies into writable, reclaimable guest RAM.
     let mut cmdline = cfg.cmdline.clone();
     let load = {
-        let (kernel_name, vmlinux, initrd_name, initramfs) = if let Some(iso) = &cfg.iso {
+        let entry = if let Some(iso) = &cfg.iso {
             let found = convenience::iso_boot::resolve(iso)?;
             println!(
                 "[iso] {iso}: booting \"{}\" from {}",
-                found.title, found.config
+                found.entry.title, found.config
             );
-            for args in [found.args.as_str(), cfg.iso_extra_args.as_str()] {
+            Some((iso.clone(), found.entry))
+        } else if cfg.disk_boot {
+            let drives: Vec<&str> = cfg.drives.iter().map(|d| d.path.as_str()).collect();
+            let found = convenience::disk_boot::resolve(&drives)?;
+            let partition = match found.partition {
+                0 => "the whole disk".to_string(),
+                n => format!("partition {n}"),
+            };
+            let journal = match found.journal_blocks {
+                0 => String::new(),
+                n => format!(" ({n} blocks from the ext4 journal: not cleanly unmounted)"),
+            };
+            println!(
+                "[disk-boot] {}: booting \"{}\" from {partition}:/{}{journal}",
+                found.drive, found.entry.title, found.config
+            );
+            Some((found.drive, found.entry))
+        } else {
+            None
+        };
+        let (kernel_name, vmlinux, initrd_name, initramfs) = if let Some((source, entry)) = entry {
+            for args in [entry.args.as_str(), cfg.extra_args.as_str()] {
                 if !args.is_empty() {
                     cmdline.push(' ');
                     cmdline.push_str(args);
                 }
             }
             (
-                format!("{iso}:{}", found.kernel_path),
-                boot::payload::Image::Owned(found.kernel),
-                found.initrd_paths.join(" "),
-                found.initrd.map(boot::payload::Image::Owned),
+                format!("{source}:{}", entry.kernel_path),
+                boot::payload::Image::Owned(entry.kernel),
+                entry.initrd_paths.join(" "),
+                entry.initrd.map(boot::payload::Image::Owned),
             )
         } else {
             let vmlinux = boot::payload::kernel(cfg.vmlinux.as_deref())?;

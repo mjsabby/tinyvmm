@@ -7,6 +7,8 @@ Example:
 
 tinyvmm loads the ISO's kernel and initrd directly. No extraction or host
 ISO mount is needed. The ISO appears as /dev/vda; the target is /dev/vdb.
+Once the installation is done, run tinyvmm with the same --drive and no --iso
+to boot the installed system from its own GRUB entry.
 """
 from __future__ import annotations
 

@@ -2,6 +2,7 @@
 //! Rock Ridge names when the image has them. Every field read from the image
 //! is bounds-checked; a malformed image yields an error, not a panic.
 
+use crate::convenience::ReadAt;
 use crate::error::{Error, Result};
 
 const SECTOR: u64 = 2048;
@@ -18,39 +19,6 @@ const FLAG_MULTI_EXTENT: u8 = 1 << 7;
 const MAX_DIR_BYTES: u32 = 16 << 20;
 const MAX_FILE_BYTES: u32 = 1 << 30;
 const MAX_DEPTH: usize = 32;
-
-/// Positioned reads from the image.
-pub trait ReadAt {
-    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()>;
-}
-
-impl ReadAt for std::fs::File {
-    fn read_exact_at(&self, mut offset: u64, mut buf: &mut [u8]) -> std::io::Result<()> {
-        use std::os::windows::fs::FileExt;
-        while !buf.is_empty() {
-            match self.seek_read(buf, offset)? {
-                0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
-                n => {
-                    offset += n as u64;
-                    buf = &mut buf[n..];
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-impl ReadAt for Vec<u8> {
-    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
-        let src = usize::try_from(offset)
-            .ok()
-            .and_then(|start| self.get(start..start.checked_add(buf.len())?))
-            .ok_or(std::io::ErrorKind::UnexpectedEof)?;
-        buf.copy_from_slice(src);
-        Ok(())
-    }
-}
 
 /// A file or directory: its extent on the image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

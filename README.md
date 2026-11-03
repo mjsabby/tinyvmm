@@ -25,7 +25,8 @@ microVM needs *that* and nothing more — that is what "opinionated" means here.
 * **Guest:** an unmodified PVH-capable `vmlinux` (`CONFIG_PVH=y`) or a compressed
   `bzImage`/`vmlinuz` (Linux boot protocol), plus an initramfs; or a
   distribution's live/install ISO, booted straight from its GRUB entry with
-  `--iso`.
+  `--iso`; or the Linux installed on a `--drive`, booted from its own GRUB
+  entry.
 * **External dependencies:** `windows-sys` (which only pulls `windows-link`),
   `tcp-sans-io` (a git dependency, `github.com/mjsabby/tcp-sans-io`) that supplies
   the NAT's TCP state machine, and `smoltcp` (with seven small crates of its
@@ -290,6 +291,7 @@ The first argument selects a **mode** (`main.rs:3500`):
 | `--pvh-info <vmlinux\|bzImage>` | Parse and print a kernel's PVH ELF-Note entry point, or a bzImage's boot protocol header. |
 | `--pvh-run [flags] <kernel> [-- <cmdline>]` | Boot a microVM (the main mode). The kernel is a PVH ELF `vmlinux` or a `bzImage`, detected by content. |
 | `--pvh-run --iso <image> [flags] [-- <args>]` | Boot a distribution's live/install ISO (see `--iso` below). |
+| `--pvh-run --drive <disk.vhdx> [flags] [-- <args>]` | No kernel path and no `--iso`: boot the Linux installed on a drive (see `--drive` below). |
 | `--restore <path> [flags]` | Resume a microVM from a snapshot file (instant resume). |
 | `--dda-probe <PnpInstanceId>` | **Experimental** — probe a host PCI device for Discrete Device Assignment (PCI passthrough): allocate the WHP VPCI resource, dump IDs/BARs/MSI-X/ECAM, and test direct guest MMIO mapping. Boots no VM. |
 
@@ -311,7 +313,7 @@ Parsed in `parse_pvh_args` (`main.rs:590`). Defaults and clamps are exact.
 | `--nat-workers <N>` | a quarter of the host's logical CPUs, 1–4 | NAT worker threads for the current NIC (`nat`, `smoltcp`), **1–16**. Each owns the TCP flows assigned to it; one flow never spans workers, so this scales many-flow traffic, not a single stream (see [§3](#3-devices-in-detail)). Kept across `--save`/`--restore`. |
 | `--nat-host-local` | off | Let the current NIC's guest (`nat`, `smoltcp`) reach host-local destinations: the host's loopback on every port of the gateway `172.29.255.1`, and `127.0.0.0/8`, link-local `169.254.0.0/16` (cloud metadata such as Azure IMDS) and Azure's `168.63.129.16` directly. Off, the NAT refuses them, except DNS: port 53 of the gateway (a resolver on the host's `127.0.0.1`) and of `168.63.129.16` (Azure DNS). See [§3](#virtio-net-backends---net-backend). Kept across `--save`/`--restore`. |
 | `--wintun-name <adapter>` / `--wintun-host <ipv4>` | — | WinTun adapter name / host-side gateway IPv4 (wintun backend). |
-| `--drive <path>[,readonly\|ro]` | — | Add a VHDX-backed virtio-blk disk using the native Windows driver. Raw disk images are not supported, including read-only ones; `--iso` separately attaches read-only installation media. **Repeatable up to 8** (`/dev/vda`, `/dev/vdb`, …). |
+| `--drive <path>[,readonly\|ro]` | — | Add a VHDX-backed virtio-blk disk using the native Windows driver. Raw disk images are not supported, including read-only ones; `--iso` separately attaches read-only installation media. **Repeatable up to 8** (`/dev/vda`, `/dev/vdb`, …). With no kernel path and no `--iso` (plain builds), tinyvmm boots the Linux installed on the first drive that has one, before the VM starts: it reads the partition table (GPT or MBR), finds an ext2/3/4 filesystem with `boot/grub/grub.cfg` or `boot/grub2/grub.cfg` (or `grub/`/`grub2/` on a separate `/boot`), and boots that configuration's first `menuentry` with a `linux` line, as `--iso` does. So drop `--iso` once an installation finishes, and a kernel the guest installs boots next time. A filesystem that wasn't cleanly unmounted (a VM killed rather than shut down) is read as Linux sees it after recovery: the journal's committed transactions are replayed in memory. Code in `src/convenience/`. |
 | `--virtio-9p-share <tag>=<host_dir>[,ro][,uid=<n>][,gid=<n>][,metadata]` | — | Share a host directory over virtio-9p (9P2000.L). **Repeatable up to 8.** Tag 1–256 bytes; host path canonicalized and must be a directory; duplicate tags rejected. NTFS has no POSIX owners, so by default every entry reports owner `uid`:`gid` (default `0:0`, root) with a synthesized mode (dirs `0755`, files `0644`, `0444` if read-only on the host). The guest enforces those bits, so set `uid`/`gid` to the guest user that must write; `chmod`/`chown` succeed but aren't stored. With `metadata` (like WSL's drvfs option of the same name), owners and modes live in WSL's `$LXUID`/`$LXGID`/`$LXMOD` NTFS extended attributes: `chmod`/`chown` persist, new files record their creator, group and mode, WSL sees the same values, and `uid`/`gid` apply only to entries without metadata. While the VM runs, the root is held open, so Windows won't rename the folders that contain it (§9). Kept across `--save`/`--restore`. |
 | `--gpu [WxH]` | off | Add a virtio-gpu 2D device and open a Win32 window showing its scanout (CPU blit). Optional `WxH` (e.g. `--gpu 1024x768`) sets the preferred size (default **1280×800**). The window is per-monitor DPI aware, so on a scaled display it shows the guest pixel for pixel rather than stretched. Dropping `nofb nomodeset` from the default cmdline so the guest DRM driver mode-sets. With `--input`, the window is also the host input source. |
 | `--input` | off | Add **two** virtio-input devices — a keyboard and an absolute tablet (pointer + scroll + buttons). With `--gpu`, the host source is the GPU window (1:1 pixel coordinates); otherwise it falls back to the interactive console. Needs a guest kernel with `CONFIG_VIRTIO_INPUT`. |
@@ -323,7 +325,7 @@ Parsed in `parse_pvh_args` (`main.rs:590`). Defaults and clamps are exact.
 | `--unsafe-save-mutable-drive` | off | Allow `--save` with a *writable* `--drive` attached (otherwise refused — the disk is not part of the snapshot, so a mutated disk would diverge from restored RAM). |
 | `--watchdog-secs <N>` | `0` | `0` = run until stopped; else stop after N seconds, printing `io/cpuid/msr` exit counters each second. |
 | `--debug-boot` | off | Prepend `earlyprintk=ttyS0,115200` so early boot streams to the 8250 UART before hvc0 is up. |
-| `-- <cmdline>` | see below | Everything after a bare `--` becomes the kernel command line (with `--iso`, it is appended instead). |
+| `-- <cmdline>` | see below | Everything after a bare `--` becomes the kernel command line (with `--iso` or a `--drive` boot, it is appended instead). |
 
 **Default kernel cmdline** (`main.rs:842`): `console=hvc0 pci=conf1,nocrs,lastbus=0
 nofb nomodeset` — routes the console to virtio-console (hvc0) so `/init` lands an
@@ -361,6 +363,9 @@ tinyvmm --restore vm.snap --drive disk.vhdx,ro
 tinyvmm --create-vhdx disk.vhdx 65536
 tinyvmm --pvh-run --iso ubuntu-26.04.1-desktop-amd64.iso --drive disk.vhdx ^
     --vcpus 8 --ram-mb 8192 --rng --net --gpu 1600x900 --input
+
+:: then boot the installed system: the same, without --iso (its own GRUB entry)
+tinyvmm --pvh-run --drive disk.vhdx --vcpus 8 --ram-mb 8192 --rng --net --gpu 1600x900 --input
 
 :: the same desktop with sound, recorded (picture + guest audio) to an MP4
 tinyvmm --pvh-run --iso ubuntu-26.04.1-desktop-amd64.iso --vcpus 8 --ram-mb 8192 ^
@@ -903,7 +908,9 @@ src/
   boot/        acpi (RSDP/XSDT/MADT), loader (PVH ELF + hvm_start_info + e820),
                bzimage (Linux boot protocol: zero page + 32-bit entry)
   convenience/ iso9660 (read-only ISO reader), grub_cfg (default menuentry),
-               iso_boot (`--iso`); nothing here is needed to run a VM
+               iso_boot (`--iso`), partition (GPT/MBR), ext4 (read-only, with
+               journal replay), disk_boot (booting a `--drive`'s installed
+               Linux); nothing here is needed to run a VM
   devices/     io_bus, mmio_bus, serial(8250), pic(i8259), pit(8254), legacy
   pci/         config (Type-0 space), bus (0xCF8/0xCFC), msix
   virtio/      queue, device(trait), transport(virtio-pci modern),
@@ -1074,7 +1081,7 @@ malloc-free hot path never stalls.
 | Path | Allocation behaviour |
 |------|----------------------|
 | Boot / device setup | Allocates freely (`Vec`/`String`/`Box`). One-time. |
-| Kernel + initramfs load | **Memory-mapped** (`MapViewOfFile`) and copied straight into guest RAM via `GuestMemory::write_at` — *no* read-into-`Vec`. The mappings are dropped right after (`src/boot/loader.rs`, wired at `main.rs:980`). With `--iso` they are read out of the image into `Vec`s first (`src/convenience/iso_boot.rs`), freed once copied. |
+| Kernel + initramfs load | **Memory-mapped** (`MapViewOfFile`) and copied straight into guest RAM via `GuestMemory::write_at` — *no* read-into-`Vec`. The mappings are dropped right after (`src/boot/loader.rs`, wired at `main.rs:980`). With `--iso` or a `--drive` boot they are read out of the image into `Vec`s first (`src/convenience/iso_boot.rs`, `disk_boot.rs`), freed once copied. |
 | virtio TX/RX, blk submit+complete, 9p dispatch, input frames, gpu present | **Zero heap allocation on the steady-state hot path** — preallocated pools and reused scratch buffers (below). |
 | NAT cold paths (ARP, ICMP/ping, DHCP, RST, new-flow creation) | Still allocate (`Box<UdpOp>`, `Box<TcpOp>`, `Box<dyn TcbDyn>`, an ICMP `to_vec()`, a DHCP reply `Vec`). Rare, not worth pooling. |
 | gpu resource lifecycle (`RESOURCE_CREATE_2D`, attach-backing) | Allocates the per-resource pixel store + SG list once per resource (a control-plane op), not per frame. |
