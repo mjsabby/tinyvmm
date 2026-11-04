@@ -60,6 +60,7 @@ pub enum SectionType {
     LegacyPit8254 = 0x0062,
     LegacyPciBus = 0x0063,
     LegacyIsaStubs = 0x0064,
+    AcpiPm = 0x0065,
 }
 
 impl SectionType {
@@ -90,6 +91,7 @@ impl SectionType {
             0x0062 => LegacyPit8254,
             0x0063 => LegacyPciBus,
             0x0064 => LegacyIsaStubs,
+            0x0065 => AcpiPm,
             _ => return None,
         })
     }

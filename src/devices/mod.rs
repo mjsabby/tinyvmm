@@ -5,4 +5,5 @@ pub mod legacy;
 pub mod mmio_bus;
 pub mod pic;
 pub mod pit;
+pub mod power;
 pub mod serial;

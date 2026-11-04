@@ -117,6 +117,7 @@ pub enum WindowEvent {
 }
 
 type InputSink = Box<dyn FnMut(WindowEvent) + Send>;
+type CloseHandler = Box<dyn FnOnce() + Send>;
 
 /// State shared between the window thread (via the `HWND`'s user-data pointer)
 /// and the present/control threads.
@@ -127,6 +128,8 @@ struct Shared {
     /// thread touches it.
     size: Mutex<(u32, u32)>,
     input: Mutex<Option<InputSink>>,
+    /// Runs when the user closes the window (not on [`Display::shutdown`]).
+    on_close: Mutex<Option<CloseHandler>>,
     hwnd: AtomicIsize,
     open: AtomicBool,
     /// True while a `WM_APP_PAINT` is already queued; bounds the post rate.
@@ -169,6 +172,7 @@ impl Display {
             scanout,
             size: Mutex::new((width, height)),
             input: Mutex::new(None),
+            on_close: Mutex::new(None),
             hwnd: AtomicIsize::new(0),
             open: AtomicBool::new(false),
             paint_pending: AtomicBool::new(false),
@@ -205,6 +209,12 @@ impl Display {
     /// [`WindowEvent`]s. Intended for the virtio-input device.
     pub fn set_input_sink(&self, sink: InputSink) {
         *self.shared.input.lock().unwrap() = Some(sink);
+    }
+
+    /// Install what to do when the user closes the window. It runs on the
+    /// window thread, once.
+    pub fn set_close_handler(&self, f: impl FnOnce() + Send + 'static) {
+        *self.shared.on_close.lock().unwrap() = Some(Box::new(f));
     }
 
     /// The scanout has a new picture: have the window thread repaint. Only
@@ -605,7 +615,14 @@ unsafe extern "system" fn wnd_proc(
                 0
             }
             WM_CLOSE => {
-                shared.open.store(false, Ordering::Release);
+                // `shutdown` clears `open` before posting WM_CLOSE, so only a
+                // close by the user finds it still set.
+                if shared.open.swap(false, Ordering::AcqRel) {
+                    let on_close = shared.on_close.lock().unwrap().take();
+                    if let Some(f) = on_close {
+                        f();
+                    }
+                }
                 emit(shared, WindowEvent::CloseRequested);
                 // Destroy the window -> WM_DESTROY -> PostQuitMessage -> pump exits.
                 DefWindowProcW(hwnd, msg, wparam, lparam)

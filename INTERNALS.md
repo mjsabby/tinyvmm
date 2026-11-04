@@ -43,8 +43,9 @@ A **VMM** (virtual machine monitor / hypervisor) presents a synthetic machine to
 a guest OS: some RAM, one or more CPUs, a clock, an interrupt controller, and a
 handful of devices. A **microVM monitor** (firecracker, cloud-hypervisor, and
 tinyvmm) deliberately presents the *smallest* such machine that a modern Linux
-needs to reach its `init` — no BIOS, no legacy real-mode boot, no ACPI power
-management, no PCI enumeration of physical hardware, no SMM. Everything is
+needs to reach its `init` — no BIOS, no legacy real-mode boot, no PCI
+enumeration of physical hardware, no SMM, and only enough ACPI to find the CPUs
+and power off. Everything is
 paravirtual (virtio) and the host-side setup is measured in tens of milliseconds.
 
 The feature set, framed as capabilities you must provide:
@@ -54,7 +55,7 @@ The feature set, framed as capabilities you must provide:
 | **CPU virtualization** | Create vCPUs, run them, field the exits they take (IO/MMIO/CPUID/MSR/HLT) | `crates/whpsys/src/vcpu.rs`, `src/whp/run_loop.rs` |
 | **Guest physical memory** | A flat slab of host RAM mapped into the guest's physical address space | `crates/whpsys/src/memory.rs` |
 | **Boot protocol** | Get a kernel image into RAM and the CPU pointed at its entry point with the right machine state | `src/boot/loader.rs` (PVH), `src/boot/bzimage.rs` (bzImage) |
-| **Firmware tables** | The minimal ACPI a modern Linux expects (so it finds the LAPIC) | `src/boot/acpi.rs` |
+| **Firmware tables** | The minimal ACPI a modern Linux expects (so it finds the LAPIC), plus power-off and reset | `src/boot/acpi.rs`, `src/devices/power.rs` |
 | **A clock** | The guest must be able to calibrate time without legacy timers | `src/whp/cpuid.rs`, `src/whp/hv.rs` (Hyper-V enlightenments, run by the hypervisor) |
 | **An interrupt controller** | Deliver device interrupts to the guest (x2APIC + MSI, plus the legacy PIC) | WHP's in-hypervisor LAPIC, `crates/whpsys/src/msi.rs`, `src/devices/pic.rs` |
 | **A PCI host bridge** | The `0xCF8/0xCFC` config mechanism and a BAR allocator | `src/pci/` |
@@ -261,18 +262,26 @@ at a `hvm_start_info`." tinyvmm lays them out at fixed low GPAs (`loader.rs:18`)
 0x2100  e820 memmap  (array of 24-byte entries)
 0x2400  module list  (initramfs descriptor: paddr, size)
 0x2800  kernel cmdline (NUL-terminated)
-0x3000  ACPI tables  (RSDP/XSDT/MADT — see below)
+0x3000  ACPI tables  (RSDP/XSDT/FADT/FACS/MADT/DSDT — see below)
 ```
 
 The `hvm_start_info` fields you must fill (`loader.rs:351`): magic
 `0x336ec578`, version 1, `nr_modules`, `modlist_paddr`, `cmdline_paddr`,
 `rsdp_paddr`, `memmap_paddr`, `memmap_entries`.
 
-The **ACPI tables** (`src/boot/acpi.rs:52`) are the minimum Linux needs to find
-its CPUs and their LAPIC: an RSDP (revision 2) pointing at an XSDT with a single
-entry, a MADT with one **x2APIC** entry (type 9) per vCPU (`MAX_VCPUS = 32`) and
-the LAPIC at `0xFEE0_0000`. There is no FADT/DSDT (so no ACPI power-off, §7) and
-no IOAPIC entry. `rsdp_paddr` points at the RSDP.
+The **ACPI tables** (`src/boot/acpi.rs`) are about the minimum Linux needs to
+find its CPUs and their LAPIC, and to power off: an RSDP (revision 2) pointing
+at an XSDT with two entries, a MADT with one **x2APIC** entry (type 9) per vCPU
+(`MAX_VCPUS = 32`) and the LAPIC at `0xFEE0_0000`, and a FADT pointing at a
+FACS, a DSDT, and the PM1 and reset registers of `src/devices/power.rs`. The
+DSDT is hand-encoded AML: `\_S5` and a PCI host bridge, `\_SB.PCI0` (`PNP0A03`),
+whose `_CRS` gives bus 0, the config ports and the BAR window. A DSDT makes
+Linux enable ACPI, which changes two things. It then finds PCI only through the
+host bridges the DSDT declares, rather than by probing. And it would drop the
+8259 PIC for a hardware-reduced FADT (one without PM registers), so the FADT
+describes fixed ACPI hardware with no events: no buttons, GPEs or PM timer, and
+the SCI (IRQ 9) never fires. There is no IOAPIC entry. `rsdp_paddr` points at
+the RSDP.
 
 The **e820 map** (`loader.rs:313`) is the guest's view of physical RAM. tinyvmm
 emits: reserved `[0,0x10000)` (boot artifacts), RAM `[0x10000,0xA0000)`, reserved
@@ -862,7 +871,7 @@ useful template because the ordering constraints are real:
     setup_pvh_entry(vcpu0, load)                  // 32-bit PM entry on the BSP;
                                                   // APs wait for the guest's INIT/SIPI
 8.  build IO bus + MMIO bus
-    attach 8250 UART, 8254 PIT, CMOS/POST stubs,
+    attach 8250 UART, 8254 PIT, CMOS/POST stubs, ACPI PM1 + reset registers,
     i8259 PIC (notify = cancel the BSP's run)     // UART IRQ -> pic.raise
 9.  PciBus::new(); add virtio devices in FIXED order:
        console(0) → net* → rng → snd → blk* → input(kbd,tablet) → 9p* → gpu(last)
@@ -870,7 +879,9 @@ useful template because the ordering constraints are real:
 10. pci_bus.attach_io_bus(&mut io_bus)            // 0xCF8/0xCFC handlers
 11. one RunLoop per vCPU (sharing io_bus, mmio_bus, the crash MSRs);
     the BSP's also gets set_ext_int_source(pic)
-12. spawn watchdog (optional), wire interactive console + shutdown sentinel
+12. power-off/reboot -> stop_all; gpu window close -> SysRq s,u on hvc0, wait
+    for the disks to go idle, stop_all; spawn watchdog (optional), wire
+    interactive console + shutdown sentinel
 13. arm snapshot trigger (if --save)
 14. BSP runs on the main thread; each AP runs on its own thread (pinned per --cpu-affinity;
        the whole process was confined to the mode's core class before step 3, so every
@@ -970,9 +981,11 @@ real debugging time in this project.
     snapshot holds a request nothing will ever complete. (§5)
 12. **Snapshot device order is load-bearing.** Construct devices in the same fixed
     order on save and restore, or the per-device snapshot indices misalign. (§M7)
-13. **A microVM can't `poweroff` cleanly.** With no ACPI power management (no
-    FADT), Linux's `poweroff` falls back to `STI;HLT` and produces no terminal
-    exit; tinyvmm watches the hvc0 stream for a shutdown sentinel instead. (§5)
+13. **`poweroff` needs ACPI power management.** Without a FADT, Linux's
+    `poweroff` falls back to `STI;HLT` and produces no terminal exit, and a
+    reboot ends in a triple fault. PM1 registers and `\_S5` give it soft-off,
+    and the FADT's reset register a reboot: port writes the VMM can stop on.
+    The harnesses' hvc0 shutdown sentinel predates them and still works. (§M1)
 14. **Release/Acquire isn't enough for EVENT_IDX.** The device's "store my index,
     then load yours" handshakes need a full fence that pairs with the driver's
     barrier; without it a kick or interrupt is occasionally lost and the queue
@@ -1059,7 +1072,8 @@ The minimum to boot an unmodified PVH Linux to a shell:
       inject interrupts.
 - [ ] PVH loader: ELF parse + PHYS32 note, `PT_LOAD` copy, `hvm_start_info` +
       e820 + cmdline + GDT, 32-bit PM entry on the BSP.
-- [ ] ACPI: RSDP → XSDT → MADT (one x2APIC entry per vCPU).
+- [ ] ACPI: RSDP → XSDT → MADT (one x2APIC entry per vCPU), and a FADT + DSDT
+      (`\_S5`, the PCI host bridge) for power-off and reset.
 - [ ] Exit loop: HLT, IO/MMIO via an instruction emulator + device buses,
       CPUID policy, MSR routing, `#GP` on unknown MSR.
 - [ ] Time: measure TSC Hz; CPUID leaves 1/6/0x15/0x16/0x80000007
@@ -1126,11 +1140,12 @@ crates/winsys/   Win32 FFI: host (privilege/large-page/CNG rng), host/block_file
                            slirp + gvisor (run-time-loaded network stacks),
                            media (Media Foundation MP4 writer)
 src/whp/         run_loop, cpuid (policy), hv (Hyper-V enlightenments, crash MSRs), snapshot*
-src/boot/        loader (PVH ELF + start_info + e820), acpi (RSDP/XSDT/MADT),
+src/boot/        loader (PVH ELF + start_info + e820), acpi (RSDP/XSDT/FADT/MADT/DSDT),
                  bzimage (Linux boot protocol), KernelLoad (picks one)
 src/convenience/ iso9660, grub_cfg, iso_boot (--iso: boot a live ISO),
                  partition, ext4, disk_boot (boot a --drive's installed Linux)
-src/devices/     io_bus, mmio_bus, serial (8250), pic (i8259), pit (8254), legacy
+src/devices/     io_bus, mmio_bus, serial (8250), pic (i8259), pit (8254), legacy,
+                 power (ACPI PM1 + reset registers, keyboard-controller reset)
 src/pci/         mod (CF8/CFC), bus, config (Type-0 + BAR), msix, passthrough
 src/virtio/      device (trait), transport (virtio-pci), queue (virtqueue),
                  console, net, rng, blk, p9, input, gpu, snd

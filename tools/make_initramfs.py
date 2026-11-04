@@ -823,7 +823,7 @@ fi
 #       wait() returns rc=0; /init prints POST-RESTORE-CONTINUE.
 #     - /init prints the shutdown sentinel so the host's serial
 #       watcher (see main.cpp:2585 and 3744) tears down gracefully
-#       even though there is no ACPI poweroff path in tinyvmm.
+#       whether or not the kernel powers off through ACPI.
 if grep -q 'tinyvmm.test=snapshot' /proc/cmdline 2>/dev/null; then
     log "--- SNAP-TEST start ---"
     # tinyvmm.snap_load=1 keeps every CPU busy across the snapshot, so it is

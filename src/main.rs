@@ -30,6 +30,7 @@ use crate::devices::legacy::LegacyIsaStubs;
 use crate::devices::mmio_bus::MmioBus;
 use crate::devices::pic::Pic8259;
 use crate::devices::pit::Pit8254;
+use crate::devices::power::PowerDevice;
 use crate::devices::serial::Serial8250;
 use crate::display::Display;
 use crate::error::{Error, Result, check_hr};
@@ -219,6 +220,10 @@ fn print_usage() {
          \x20              Assignment (no VM boot): dump IDs/BARs/MSI-X, test direct MMIO mapping.\n\
          \x20              Get the id from Device Manager (Details -> Device instance path) or\n\
          \x20              `Get-PnpDevice`. Dismount it first: Dismount-VMHostAssignableDevice.\n\
+         \n\
+         The guest powering off or rebooting stops the VM (exit code 0). Closing the\n\
+         --gpu window has the guest sync and remount its filesystems read-only (SysRq\n\
+         on hvc0), then stops it. Ctrl+A X stops at once.\n\
          \n\
          An @file argument is replaced by the arguments in that file: split at\n\
          whitespace, \"double quotes\" keep spaces, # starts a comment line. Its\n\
@@ -1924,6 +1929,10 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     let legacy = LegacyIsaStubs::new();
     legacy.attach(&mut io_bus);
 
+    // ACPI power-off and reboot (the FADT points here) stop the VM.
+    let power = PowerDevice::new();
+    power.attach(&mut io_bus);
+
     // Legacy PIC: the only ISA-IRQ -> guest-IDT path in virtual-wire mode.
     let pic = new_pic(&vcpus[0]);
     pic.attach(&mut io_bus);
@@ -2344,6 +2353,16 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
             }
         }
     };
+    power.set_on_request(stop_all.clone());
+    if let Some(d) = &display {
+        d.set_close_handler(stop_on_window_close(
+            "pvh-run",
+            console.clone(),
+            blk_devices.clone(),
+            hvc0_is_console(&cmdline),
+            stop_all.clone(),
+        ));
+    }
 
     // Watchdog (optional): stop everything after N seconds. Teardown hangs up
     // `watchdog_done`, which wakes it at once rather than after its sleep.
@@ -2396,9 +2415,9 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         setup_interactive_console(console.clone(), console_input, stop_all.clone());
 
     // Shutdown sentinel watcher: the guest prints this marker on hvc0 to
-    // request a clean stop. Harnesses rely on it because an ACPI-less
-    // `poweroff` falls back to STI;HLT and never produces a halt VM-exit,
-    // which would otherwise leave us spinning idle. We scan the console TX
+    // request a clean stop. Harnesses use it: it predates ACPI power-off, and
+    // it still stops a kernel built without ACPI, whose `poweroff` falls back
+    // to STI;HLT and never produces a halt VM-exit. We scan the console TX
     // byte stream (guest -> host) for the sentinel and stop every vCPU.
     {
         const SENTINEL: &[u8] = b"=== tinyvmm shutdown requested ===";
@@ -2489,6 +2508,9 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
             eprintln!("[pvh-run] vCPU {} (AP) stopped abnormally: {:?}", i + 1, r);
         }
     }
+    if let Some(r) = power.request() {
+        println!("[pvh-run] {}", r.describe());
+    }
     if let Some(w) = watchdog {
         let _ = w.join();
     }
@@ -2559,6 +2581,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
                 &pit,
                 &com1,
                 &legacy,
+                &power,
                 &pci_bus,
                 &transports,
                 &blk_backends,
@@ -2923,6 +2946,7 @@ fn write_snapshot(
     pit: &Arc<Pit8254>,
     com1: &Arc<Serial8250>,
     legacy: &Arc<LegacyIsaStubs>,
+    power: &Arc<PowerDevice>,
     pci_bus: &Arc<PciBus>,
     transports: &[Arc<PciTransport>],
     blk_backends: &[Arc<BlockFile>],
@@ -3065,6 +3089,7 @@ fn write_snapshot(
     w.write_section(SectionType::LegacyPit8254, &pit.snapshot_capture())?;
     w.write_section(SectionType::LegacySerial8250, &com1.snapshot_capture())?;
     w.write_section(SectionType::LegacyIsaStubs, &legacy.snapshot_capture())?;
+    w.write_section(SectionType::AcpiPm, &power.snapshot_capture())?;
     w.write_section(SectionType::LegacyPciBus, &pci_bus.snapshot_capture())?;
 
     // Per-PCI-device sections: [u16 device_index][DeviceSnapshot]. One blob per
@@ -3306,6 +3331,8 @@ fn run_restore(args: &[String]) -> Result<i32> {
     pit.attach(&mut io_bus);
     let legacy = LegacyIsaStubs::new();
     legacy.attach(&mut io_bus);
+    let power = PowerDevice::new();
+    power.attach(&mut io_bus);
     let pic = new_pic(&vcpus[0]);
     pic.attach(&mut io_bus);
     {
@@ -3679,6 +3706,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
     let mut sec_pit: Option<Vec<u8>> = None;
     let mut sec_serial: Option<Vec<u8>> = None;
     let mut sec_isa: Option<Vec<u8>> = None;
+    let mut sec_pm: Option<Vec<u8>> = None;
     let mut sec_bus: Option<Vec<u8>> = None;
     let mut sec_devices: Vec<(u16, Vec<u8>)> = Vec::new();
     let mut caps: Vec<vs::CapturedVcpuState> = (0..vcpu_count)
@@ -3702,6 +3730,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
             SectionType::LegacyPit8254 => sec_pit = Some(s.payload.to_vec()),
             SectionType::LegacySerial8250 => sec_serial = Some(s.payload.to_vec()),
             SectionType::LegacyIsaStubs => sec_isa = Some(s.payload.to_vec()),
+            SectionType::AcpiPm => sec_pm = Some(s.payload.to_vec()),
             SectionType::LegacyPciBus => sec_bus = Some(s.payload.to_vec()),
             SectionType::PciDevice => {
                 if s.payload.len() < 2 {
@@ -3784,7 +3813,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
 
     // Validate section cardinality before touching device state: a Rust-written
     // snapshot always carries exactly one RAM section, one VcpuRegs per vCPU, all
-    // six HV/legacy singletons, and one PciDevice section per device. A mismatch
+    // seven HV/legacy singletons, and one PciDevice section per device. A mismatch
     // means a truncated, corrupt, or foreign (e.g. C++-written) file.
     if n_ram != 1 {
         return Err(Error::msg(format!(
@@ -3801,6 +3830,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
         || sec_pit.is_none()
         || sec_serial.is_none()
         || sec_isa.is_none()
+        || sec_pm.is_none()
         || sec_bus.is_none()
     {
         return Err(Error::msg(
@@ -3827,6 +3857,9 @@ fn run_restore(args: &[String]) -> Result<i32> {
     }
     if let Some(b) = sec_isa {
         legacy.snapshot_apply(&b);
+    }
+    if let Some(b) = sec_pm {
+        power.snapshot_apply(&b);
     }
     if let Some(b) = sec_bus {
         pci_bus.snapshot_apply(&b);
@@ -3894,6 +3927,18 @@ fn run_restore(args: &[String]) -> Result<i32> {
             }
         }
     };
+    power.set_on_request(stop_all.clone());
+    if let Some(d) = &display {
+        // A snapshot doesn't record the kernel command line; the default one
+        // makes hvc0 the console.
+        d.set_close_handler(stop_on_window_close(
+            "restore",
+            console.clone(),
+            blk_devices.clone(),
+            true,
+            stop_all.clone(),
+        ));
+    }
 
     let window_owns_input = display.is_some() && input_devices.is_some();
     if window_owns_input {
@@ -4008,6 +4053,9 @@ fn run_restore(args: &[String]) -> Result<i32> {
         if !matches!(r, StopReason::GuestHalted | StopReason::Cancelled) {
             eprintln!("[restore] vCPU {} (AP) stopped abnormally: {:?}", i + 1, r);
         }
+    }
+    if let Some(r) = power.request() {
+        println!("[restore] {}", r.describe());
     }
     if let Some(w) = watchdog {
         let _ = w.join();
@@ -4146,6 +4194,81 @@ fn add_input_devices(
     transports.push(tt);
 
     InputDevices { keyboard, tablet }
+}
+
+/// Whether `cmdline` makes hvc0 a kernel console, which its ^O SysRq hook
+/// needs.
+fn hvc0_is_console(cmdline: &str) -> bool {
+    cmdline
+        .split_ascii_whitespace()
+        .any(|a| a == "console=hvc0" || a.starts_with("console=hvc0,"))
+}
+
+/// What closing the GPU window does: through hvc0's SysRq hook, ask the guest
+/// kernel to sync and remount its filesystems read-only (SysRq s, u), wait for
+/// its disks to go quiet, then stop the VM. With `sysrq` false (hvc0 isn't a
+/// console, so the bytes would reach its tty instead) it just stops. Runs on a
+/// thread of its own, so the window thread doesn't wait.
+fn stop_on_window_close(
+    tag: &'static str,
+    console: Arc<ConsoleDevice>,
+    disks: Vec<Arc<BlockDevice>>,
+    sysrq: bool,
+    stop_all: impl Fn() + Send + 'static,
+) -> impl FnOnce() + Send + 'static {
+    move || {
+        let _ = std::thread::Builder::new()
+            .name("window-close".to_string())
+            .spawn(move || {
+                if sysrq {
+                    eprintln!(
+                        "\r\n[{tag}] window closed -- remounting the guest's filesystems \
+                         read-only (SysRq s, u), then stopping"
+                    );
+                    console.write_host_input(b"\x0fs\x0fu");
+                    wait_for_disks_to_settle(&disks);
+                } else {
+                    eprintln!(
+                        "\r\n[{tag}] window closed -- stopping (hvc0 is not a kernel console, \
+                         so no SysRq sync)"
+                    );
+                }
+                stop_all();
+            });
+    }
+}
+
+/// Wait until the guest's disks have settled: nothing in flight and no write,
+/// flush, discard or write-zeroes for a second. The SysRq work runs
+/// asynchronously in the guest, so wait at least half a second first, and at
+/// most 15 seconds in all.
+fn wait_for_disks_to_settle(disks: &[Arc<BlockDevice>]) {
+    use std::time::{Duration, Instant};
+    const MIN_WAIT: Duration = Duration::from_millis(500);
+    const QUIET: Duration = Duration::from_secs(1);
+    const MAX_WAIT: Duration = Duration::from_secs(15);
+    let writes = || -> u64 {
+        disks
+            .iter()
+            .map(|d| d.ops_out() + d.ops_flush() + d.ops_discard() + d.ops_write_zeroes())
+            .sum()
+    };
+    let start = Instant::now();
+    let mut last = writes();
+    let mut quiet_since = start;
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        let now = Instant::now();
+        let w = writes();
+        if w != last || disks.iter().any(|d| d.pending_count() > 0) {
+            last = w;
+            quiet_since = now;
+        }
+        let waited = now - start;
+        if waited >= MAX_WAIT || (waited >= MIN_WAIT && now - quiet_since >= QUIET) {
+            return;
+        }
+    }
 }
 
 /// Route the GPU window's input events into the virtio-input devices: keyboard

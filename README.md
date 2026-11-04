@@ -403,6 +403,17 @@ The text console forwards raw stdin to the virtio-console RX queue; **Ctrl+A the
 X** quits. The guest can also request a clean shutdown by printing a sentinel on
 hvc0, which a watcher thread detects to stop the VM.
 
+The guest powering off (ACPI S5) or rebooting (the ACPI reset register, or the
+keyboard controller's reset) stops the VM with exit code 0; tinyvmm never
+restarts a guest, so run it again to boot again. Closing the `--gpu` window asks
+the guest kernel, through hvc0's SysRq hook (`^O`), to sync and remount its
+filesystems read-only (SysRq `s` and `u`, which Ubuntu's `kernel.sysrq=176`
+allows), waits until its disks have been idle for a second (at most 15 s), and
+stops the VM, so the next boot finds them clean. That takes hvc0 being a kernel
+console, as the default command line makes it, held open by a process (a getty,
+or the initramfs shell); without `console=hvc0`, closing the window just stops
+the VM.
+
 ### Discrete Device Assignment / PCI passthrough (experimental, `--dda-probe`)
 
 tinyvmm can drive the Windows Hypervisor Platform **VPCI** APIs
@@ -576,8 +587,15 @@ keeps the guest clock right even when a restore lands on a host whose TSC runs
 at another rate. On the nested reference host (4 vCPUs) this took a 4-CPU TLB
 shootdown from 16.5 to 11.3 µs (OpenVMM: 10.7), an IPI round trip from 105 to
 99 µs, and a 1 ms timer's wake-up from 84 to 79 µs at the median. A minimal ACPI
-surface (RSDP / XSDT / MADT with one x2APIC entry per vCPU, LAPIC at
-`0xFEE0_0000`) is staged into guest RAM by `src/boot/acpi.rs` (`MAX_VCPUS = 32`).
+surface is staged into guest RAM by `src/boot/acpi.rs`: RSDP / XSDT / MADT with
+one x2APIC entry per vCPU (`MAX_VCPUS = 32`, LAPIC at `0xFEE0_0000`), and a FADT,
+FACS and DSDT for power management. The DSDT declares `\_S5` and the PCI host
+bridge (`\_SB.PCI0`), through which Linux then finds PCI. The FADT's PM1 and
+reset registers are I/O ports `0x600`–`0x60C` (`src/devices/power.rs`); writing
+S5 or the reset value there stops the VM, as does the keyboard controller's
+reset command. It is fixed-hardware ACPI with no events (no buttons, GPEs or PM
+timer, so the SCI never fires) rather than hardware-reduced ACPI, which would
+make Linux drop the 8259 PIC, the only path for ISA interrupts without an IOAPIC.
 
 ### The GPU window & host input (`src/display.rs`)
 
@@ -921,13 +939,15 @@ src/
   display.rs   Win32 GDI window host for virtio-gpu + host-input seam
   scanout.rs   the GPU's published BGRA pictures, shared by the window + recorder
   record.rs    --record: GPU frames + sound playback -> MP4 encoder thread
-  boot/        acpi (RSDP/XSDT/MADT), loader (PVH ELF + hvm_start_info + e820),
-               bzimage (Linux boot protocol: zero page + 32-bit entry)
+  boot/        acpi (RSDP/XSDT/FADT/FACS/MADT/DSDT), loader (PVH ELF +
+               hvm_start_info + e820), bzimage (Linux boot protocol: zero page +
+               32-bit entry)
   convenience/ iso9660 (read-only ISO reader), grub_cfg (default menuentry),
                iso_boot (`--iso`), partition (GPT/MBR), ext4 (read-only, with
                journal replay), disk_boot (booting a `--drive`'s installed
                Linux); nothing here is needed to run a VM
-  devices/     io_bus, mmio_bus, serial(8250), pic(i8259), pit(8254), legacy
+  devices/     io_bus, mmio_bus, serial(8250), pic(i8259), pit(8254), legacy,
+               power (ACPI PM1 + reset registers, keyboard-controller reset)
   pci/         config (Type-0 space), bus (0xCF8/0xCFC), msix
   virtio/      queue, device(trait), transport(virtio-pci modern),
                console, net, rng, blk, p9, input, gpu, snd
@@ -1743,7 +1763,7 @@ debug regs, EFER + syscall MSRs, XSAVE, the APIC + interrupt-controller state,
 TSC, and the **SynIC**: VP assist page, SynIC and interrupt-source registers,
 synthetic timers, message and event-flag pages), the partition's **Hyper-V
 state** (guest OS ID, hypercall and reference-TSC page MSRs, reference time),
-the **legacy devices** (PIC/PIT/serial/ISA-stubs/PCI-bus), every **PCI
+the **legacy devices** (PIC/PIT/serial/ISA-stubs/ACPI-PM1/PCI-bus), every **PCI
 device**, and **guest RAM last**.
 RAM is stored **sparse** (`RamSparse`): a bitmap of 64 KiB chunks, then only the
 chunks that aren't all zero, scanned on up to eight threads at save time. A 1 GiB
