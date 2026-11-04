@@ -1142,6 +1142,7 @@ src/display.rs   Win32 GDI window for virtio-gpu + host-input seam
 src/scanout.rs   the GPU's published BGRA pictures, shared by the window + recorder
 src/record.rs    --record: GPU frames + snd playback -> H.264/AAC MP4
 src/main.rs      CLI dispatch, the full machine wiring, save/restore driver
+src/cli.rs       @file argument files, disk sizes with units
 ```
 
 For the *reference* angle — exhaustive CLI, the safety/perf/concurrency

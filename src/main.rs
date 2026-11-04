@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 mod boot;
+mod cli;
 mod convenience;
 mod devices;
 mod diag;
@@ -183,7 +184,8 @@ fn print_usage() {
          \x20 tinyvmm --smoke\n\
          \x20 tinyvmm --blk-selftest        host-side virtio-blk DISCARD/WRITE_ZEROES test\n\
          \x20 tinyvmm --blk-stress          host-side virtio-blk concurrency stress + failure-path test\n\
-         \x20 tinyvmm --create-vhdx <path.vhdx> <size-mb>   create a dynamic disk (no elevation)\n\
+         \x20 tinyvmm --create-vhdx <path.vhdx> <size>   create a dynamic disk (no elevation);\n\
+         \x20              size in MiB, or with a K/M/G/T unit (binary), e.g. 256G\n\
          \x20 tinyvmm --pci-selftest        host-side PCI host-bridge + BAR + sizing test\n\
          \x20 tinyvmm --pvh-info <vmlinux|bzImage>\n\
          \x20 tinyvmm --pvh-run [--initrd <cpio>] [--ram-mb N] [--vcpus N] [--rng] [--input] [--sound]\n\
@@ -198,7 +200,10 @@ fn print_usage() {
          \x20              [--record <file.mp4>[,fps=N][,kbps=N]]  (needs --gpu; records the\n\
          \x20              display + --sound playback to a fragmented H.264/AAC MP4; default 30 fps)\n\
          \x20              [--save <path> [--unsafe-save-mutable-drive]]\n\
-         \x20              [--watchdog-secs N] [--debug-boot] [vmlinux] [-- <cmdline>]\n\
+         \x20              [--watchdog-secs N] [--debug-boot] [--no-default-cmdline]\n\
+         \x20              [vmlinux] [-- <kernel args>]\n\
+         \x20              Kernel args are added to the defaults (console=hvc0 pci=conf1,...);\n\
+         \x20              --no-default-cmdline makes them the whole command line instead.\n\
          \x20              Kernel path is required in plain builds unless a --drive holds an\n\
          \x20              installed Linux (below); appliance builds embed defaults.\n\
          \x20              The kernel may be a PVH ELF vmlinux or a bzImage (vmlinuz).\n\
@@ -213,7 +218,12 @@ fn print_usage() {
          \x20 tinyvmm --dda-probe <PnpInstanceId>   probe a host PCI device for Discrete Device\n\
          \x20              Assignment (no VM boot): dump IDs/BARs/MSI-X, test direct MMIO mapping.\n\
          \x20              Get the id from Device Manager (Details -> Device instance path) or\n\
-         \x20              `Get-PnpDevice`. Dismount it first: Dismount-VMHostAssignableDevice.\n"
+         \x20              `Get-PnpDevice`. Dismount it first: Dismount-VMHostAssignableDevice.\n\
+         \n\
+         An @file argument is replaced by the arguments in that file: split at\n\
+         whitespace, \"double quotes\" keep spaces, # starts a comment line. Its\n\
+         kernel args (after --) go last, so flags may follow it. Quote it in\n\
+         PowerShell, where @ means splatting: tinyvmm '@vm.args' --sound\n"
     );
 }
 
@@ -1093,6 +1103,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
     let mut vcpus = 1u32;
     let mut watchdog_secs = 0u32;
     let mut debug_boot = false;
+    let mut default_cmdline = true;
     let mut nics: Vec<NicSpec> = Vec::new();
     let mut with_rng = false;
     let mut with_gpu = false;
@@ -1110,8 +1121,22 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
     // hundreds of milliseconds, so latency-oriented appliance builds opt in.
     let mut large_pages = !boot::payload::BUNDLED;
 
+    // Flags may come before or after the kernel path; only "--" ends them.
+    let mut kernel_path: Option<String> = None;
     let mut i = 2;
-    while i < args.len() && args[i].starts_with("--") && args[i] != "--" {
+    while i < args.len() && args[i] != "--" {
+        if !args[i].starts_with("--") {
+            if let Some(first) = &kernel_path {
+                return Err(Error::msg(format!(
+                    "--pvh-run: unexpected '{}' after the kernel path '{first}' (kernel \
+                     arguments go after --)",
+                    args[i]
+                )));
+            }
+            kernel_path = Some(args[i].clone());
+            i += 1;
+            continue;
+        }
         match args[i].as_str() {
             "--initrd" => {
                 i += 1;
@@ -1163,6 +1188,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
                     .ok_or_else(|| Error::msg("--watchdog-secs wants an integer"))?;
             }
             "--debug-boot" => debug_boot = true,
+            "--no-default-cmdline" => default_cmdline = false,
             "--net" => nics.push(NicSpec::new()),
             "--net-backend" => {
                 i += 1;
@@ -1393,14 +1419,13 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
         i += 1;
     }
 
-    let vmlinux = if let Some(path) = args.get(i).filter(|path| path.as_str() != "--") {
+    let vmlinux = if let Some(path) = kernel_path {
         if iso.is_some() {
             return Err(Error::msg(
                 "--iso boots the ISO's own kernel; drop the kernel path",
             ));
         }
-        i += 1;
-        Some(path.clone())
+        Some(path)
     } else if boot::payload::BUNDLED || iso.is_some() || !drives.is_empty() {
         None
     } else {
@@ -1426,18 +1451,19 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
         ));
     }
 
-    // Everything after a bare "--" is the kernel cmdline. With --iso or a
-    // disk boot it is appended to the default cmdline and the boot entry's
-    // own arguments instead.
-    let mut cmdline = String::new();
+    // Everything after a bare "--" is added to the kernel command line: to the
+    // defaults for a kernel path (or, with --no-default-cmdline, it is the
+    // whole command line), and after the boot entry's own arguments with --iso
+    // or a disk boot.
+    let mut user_args = String::new();
     if i < args.len() && args[i] == "--" {
         i += 1;
-        cmdline = args[i..].join(" ");
+        user_args = args[i..].join(" ");
     }
-    let extra_args = if iso.is_some() || disk_boot {
-        std::mem::take(&mut cmdline)
+    let (mut cmdline, extra_args) = if iso.is_some() || disk_boot {
+        (String::new(), user_args)
     } else {
-        String::new()
+        (user_args, String::new())
     };
     if let Some(path) = &iso {
         if drives.len() >= 8 {
@@ -1454,24 +1480,30 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
             },
         );
     }
-    if cmdline.is_empty() {
-        // Phase 2 default: route the kernel console to the virtio-console
-        // (hvc0) so the initramfs /init drops to an interactive shell. With
-        // --debug-boot, also stream early boot to ttyS0 (the 8250) before
-        // hvc0 comes up. pci=conf1 forces our 0xCF8/0xCFC mechanism. Without a
-        // GPU we also disable the kernel framebuffer/KMS (`nofb nomodeset`);
-        // with --gpu we drop those so the virtio-gpu DRM driver can mode-set.
+    if default_cmdline {
+        // Route the kernel console to the virtio-console (hvc0) so the
+        // initramfs /init drops to an interactive shell. With --debug-boot,
+        // also stream early boot to ttyS0 (the 8250) before hvc0 comes up.
+        // pci=conf1 forces our 0xCF8/0xCFC mechanism. Without a GPU we also
+        // disable the kernel framebuffer/KMS (`nofb nomodeset`); with --gpu we
+        // drop those so the virtio-gpu DRM driver can mode-set.
         let fb = if with_gpu { "" } else { " nofb nomodeset" };
-        cmdline = if debug_boot {
+        let mut defaults = if debug_boot {
             format!("earlyprintk=ttyS0,115200 console=hvc0 pci=conf1,nocrs,lastbus=0{fb}")
         } else {
             format!("console=hvc0 pci=conf1,nocrs,lastbus=0{fb}")
         };
         if boot::payload::BUNDLED {
-            cmdline.push_str(" idle=halt");
+            defaults.push_str(" idle=halt");
         }
+        if !cmdline.is_empty() {
+            defaults.push(' ');
+            defaults.push_str(&cmdline);
+        }
+        cmdline = defaults;
     }
-    if boot::payload::BUNDLED
+    if default_cmdline
+        && boot::payload::BUNDLED
         && !cmdline
             .split_whitespace()
             .any(|arg| arg.starts_with("tinyinit.epoch="))
@@ -5068,17 +5100,18 @@ fn run_create_vhdx(args: &[String]) -> Result<i32> {
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("vhdx"))
     {
-        return Err(Error::msg("--create-vhdx expects <path.vhdx> <size-mb>"));
+        return Err(Error::msg(
+            "--create-vhdx expects <path.vhdx> <size> (MiB, or with a K/M/G/T unit, e.g. 256G)",
+        ));
     }
     let min_mb = winsys::host::vhdx::MIN_SIZE / (1024 * 1024);
-    let size = args[3]
-        .parse::<u64>()
-        .ok()
-        .and_then(|mb| mb.checked_mul(1024 * 1024))
+    let size = cli::parse_disk_size(&args[3])
         .filter(|size| *size >= winsys::host::vhdx::MIN_SIZE)
         .ok_or_else(|| {
             Error::msg(format!(
-                "--create-vhdx size-mb must be an integer of at least {min_mb} (the VHDX minimum)"
+                "--create-vhdx: bad size '{}': want MiB, or a K/M/G/T unit (e.g. 256G), \
+                 of at least {min_mb} MiB (the VHDX minimum)",
+                args[3]
             ))
         })?;
     if std::path::Path::new(&args[2]).exists() {
@@ -5090,15 +5123,21 @@ fn run_create_vhdx(args: &[String]) -> Result<i32> {
     winsys::host::vhdx::create(&args[2], size)
         .map_err(|err| Error::msg(format!("--create-vhdx: '{}' failed: err={err}", args[2])))?;
     println!(
-        "Created '{}' ({} MiB, dynamic VHDX)",
+        "Created '{}' ({}, dynamic VHDX)",
         args[2],
-        size / (1024 * 1024)
+        cli::format_size(size)
     );
     Ok(0)
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let args = match cli::expand_arg_files(std::env::args().collect()) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("tinyvmm error: {e}");
+            std::process::exit(1);
+        }
+    };
     if args.len() < 2 {
         print_usage();
         std::process::exit(1);

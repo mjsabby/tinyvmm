@@ -82,7 +82,67 @@ mod tests {
         .unwrap();
         assert_eq!(config.vmlinux.as_deref(), Some("custom-vmlinux"));
         assert_eq!(config.initrd.as_deref(), Some("custom.cpio"));
-        assert_eq!(config.cmdline, "console=hvc0 tinyinit.epoch=42");
+        // The arguments follow the defaults, which a bundled build ends with
+        // idle=halt.
+        let defaults = if BUNDLED {
+            "console=hvc0 pci=conf1,nocrs,lastbus=0 nofb nomodeset idle=halt"
+        } else {
+            "console=hvc0 pci=conf1,nocrs,lastbus=0 nofb nomodeset"
+        };
+        assert_eq!(
+            config.cmdline,
+            format!("{defaults} console=hvc0 tinyinit.epoch=42")
+        );
+    }
+
+    #[test]
+    fn no_default_cmdline_makes_the_arguments_the_whole_cmdline() {
+        let parse = |extra: &[&str]| {
+            let mut parts = vec!["tinyvmm", "--pvh-run"];
+            parts.extend_from_slice(extra);
+            parse_pvh_args(&args(&parts)).unwrap()
+        };
+        let config = parse(&[
+            "--no-default-cmdline",
+            "vmlinux",
+            "--",
+            "console=ttyS0",
+            "x=1",
+        ]);
+        assert_eq!(config.cmdline, "console=ttyS0 x=1");
+        // --gpu and --debug-boot shape the defaults, given or not.
+        let config = parse(&["--gpu", "--debug-boot", "vmlinux", "--", "x=1"]);
+        assert!(
+            config
+                .cmdline
+                .starts_with("earlyprintk=ttyS0,115200 console=hvc0 pci=conf1,nocrs,lastbus=0 ")
+        );
+        assert!(!config.cmdline.contains("nomodeset"));
+        assert!(config.cmdline.split_whitespace().any(|arg| arg == "x=1"));
+    }
+
+    #[test]
+    fn flags_may_follow_the_kernel_path() {
+        // As when an @file ends with the kernel path and more flags follow it.
+        let config = parse_pvh_args(&args(&[
+            "tinyvmm",
+            "--pvh-run",
+            "--vcpus",
+            "2",
+            "vmlinux",
+            "--watchdog-secs",
+            "3",
+            "--",
+            "quiet",
+        ]))
+        .unwrap();
+        assert_eq!(config.vmlinux.as_deref(), Some("vmlinux"));
+        assert_eq!((config.vcpus, config.watchdog_secs), (2, 3));
+        assert!(config.cmdline.ends_with(" quiet"));
+        // A second path is a mistake (kernel arguments belong after --), not
+        // something to drop silently.
+        let err = parse_pvh_args(&args(&["tinyvmm", "--pvh-run", "vmlinux", "quiet"]));
+        assert!(err.is_err());
     }
 
     #[test]
@@ -152,9 +212,15 @@ mod tests {
             assert!(config.cmdline.starts_with("console=hvc0 "));
             assert!(parse(&["--initrd", "i.cpio"]).is_err());
         }
-        // A kernel path still boots that kernel, with the cmdline as given.
+        // A kernel path still boots that kernel, its arguments after the
+        // defaults.
         let config = parse(&["vmlinux", "--", "console=hvc0", "tinyinit.epoch=42"]).unwrap();
         assert!(!config.disk_boot);
-        assert_eq!(config.cmdline, "console=hvc0 tinyinit.epoch=42");
+        assert!(
+            config
+                .cmdline
+                .starts_with("console=hvc0 pci=conf1,nocrs,lastbus=0 ")
+        );
+        assert!(config.cmdline.ends_with(" console=hvc0 tinyinit.epoch=42"));
     }
 }

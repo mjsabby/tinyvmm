@@ -192,7 +192,7 @@ For an external rootfs, put a **trusted** archive named `rootfs.tar.zst`
     --virtio-9p-share bootstrap=C:\vm\bootstrap,ro `
     --virtio-9p-share apps=C:\vm\apps,ro `
     --virtio-9p-share rootfs=C:\vm\rootfs,ro `
-    -- console=hvc0 pci=conf1,nocrs,lastbus=0 idle=halt tinyinit.rootfs=9p:rootfs
+    -- tinyinit.rootfs=9p:rootfs
 ```
 
 The existing rootfs fetcher produces a suitable parallel archive at
@@ -287,7 +287,7 @@ The first argument selects a **mode** (`main.rs:3500`):
 | `--smoke` | Probe WHP; create a throwaway partition + 16 MiB RAM + 1 vCPU and run to `HLT`. |
 | `--pci-selftest` | Host-side PCI host-bridge + BAR-sizing self-test (no guest). |
 | `--blk-selftest` | Host-side virtio-blk DISCARD/WRITE_ZEROES self-test (no guest). |
-| `--create-vhdx <path.vhdx> <size-mb>` | Create a new dynamic VHDX; size is in MiB (at least 3). Refuses existing files. No elevation required. |
+| `--create-vhdx <path.vhdx> <size>` | Create a new dynamic VHDX. The size is in MiB, or has a binary unit: `K`, `M`, `G` or `T`, optionally followed by `B` or `iB`, in any case (`256G` is 256 GiB). At least 3 MiB. Refuses existing files. No elevation required. |
 | `--pvh-info <vmlinux\|bzImage>` | Parse and print a kernel's PVH ELF-Note entry point, or a bzImage's boot protocol header. |
 | `--pvh-run [flags] <kernel> [-- <cmdline>]` | Boot a microVM (the main mode). The kernel is a PVH ELF `vmlinux` or a `bzImage`, detected by content. |
 | `--pvh-run --iso <image> [flags] [-- <args>]` | Boot a distribution's live/install ISO (see `--iso` below). |
@@ -297,7 +297,8 @@ The first argument selects a **mode** (`main.rs:3500`):
 
 ### `--pvh-run` flags
 
-Parsed in `parse_pvh_args` (`main.rs:590`). Defaults and clamps are exact.
+Parsed in `parse_pvh_args` (`main.rs:590`). Defaults and clamps are exact. Flags
+may come before or after the kernel path; a bare `--` ends them.
 
 | Flag | Default | Range / behaviour |
 |------|---------|-------------------|
@@ -325,13 +326,24 @@ Parsed in `parse_pvh_args` (`main.rs:590`). Defaults and clamps are exact.
 | `--unsafe-save-mutable-drive` | off | Allow `--save` with a *writable* `--drive` attached (otherwise refused — the disk is not part of the snapshot, so a mutated disk would diverge from restored RAM). |
 | `--watchdog-secs <N>` | `0` | `0` = run until stopped; else stop after N seconds, printing `io/cpuid/msr` exit counters each second. |
 | `--debug-boot` | off | Prepend `earlyprintk=ttyS0,115200` so early boot streams to the 8250 UART before hvc0 is up. |
-| `-- <cmdline>` | see below | Everything after a bare `--` becomes the kernel command line (with `--iso` or a `--drive` boot, it is appended instead). |
+| `--no-default-cmdline` | off | Leave out the default kernel command line (below). |
+| `-- <cmdline>` | see below | Everything after a bare `--` is added to the kernel command line: after the defaults, or, with `--iso` or a `--drive` boot, after the boot entry's own arguments. |
 
 **Default kernel cmdline** (`main.rs:842`): `console=hvc0 pci=conf1,nocrs,lastbus=0
 nofb nomodeset` — routes the console to virtio-console (hvc0) so `/init` lands an
 interactive shell and forces PCI Configuration-Mechanism-#1 access. With `--gpu`
 the `nofb nomodeset` suffix is dropped so the guest's virtio-gpu DRM driver can
-mode-set; with `--debug-boot` the `earlyprintk` prefix is added.
+mode-set; with `--debug-boot` the `earlyprintk` prefix is added. Arguments after
+`--` follow the defaults (`-- quiet` adds `quiet`), so they never need repeating;
+`--no-default-cmdline` leaves the defaults out.
+
+Any argument `@<file>` is replaced by the arguments in that file, so a VM's flags
+can live in one: each line is split at whitespace, `"double quotes"` keep spaces
+(nothing is escaped, so Windows paths stay as typed), and blank lines and lines
+starting with `#` are skipped. PowerShell reads a bare `@` as splatting, so quote
+it there: `tinyvmm '@ubuntu.args'`. Kernel arguments in a file (after its `--`)
+move to the end, ahead of any after `--` on the command line, so flags can still
+follow the `@file`: `tinyvmm '@ubuntu.args' --sound -- nosplash`.
 
 ### `--restore` flags
 
@@ -360,12 +372,15 @@ tinyvmm --pvh-run --save vm.snap --drive disk.vhdx,ro --initrd initramfs.cpio vm
 tinyvmm --restore vm.snap --drive disk.vhdx,ro
 
 :: create a 64 GiB dynamic VHDX, then install onto it (/dev/vdb)
-tinyvmm --create-vhdx disk.vhdx 65536
+tinyvmm --create-vhdx disk.vhdx 64G
 tinyvmm --pvh-run --iso ubuntu-26.04.1-desktop-amd64.iso --drive disk.vhdx ^
     --vcpus 8 --ram-mb 8192 --rng --net --gpu 1600x900 --input
 
 :: then boot the installed system: the same, without --iso (its own GRUB entry)
 tinyvmm --pvh-run --drive disk.vhdx --vcpus 8 --ram-mb 8192 --rng --net --gpu 1600x900 --input
+
+:: or keep those flags in a file (in PowerShell, quote it: '@ubuntu.args')
+tinyvmm @ubuntu.args
 
 :: the same desktop with sound, recorded (picture + guest audio) to an MP4
 tinyvmm --pvh-run --iso ubuntu-26.04.1-desktop-amd64.iso --vcpus 8 --ram-mb 8192 ^
@@ -902,6 +917,7 @@ crates/
     EmulatorBus trait), doorbell
 src/
   main.rs      CLI dispatch, device wiring, interactive console, save/restore
+  cli.rs       @file argument files, disk sizes with units
   display.rs   Win32 GDI window host for virtio-gpu + host-input seam
   scanout.rs   the GPU's published BGRA pictures, shared by the window + recorder
   record.rs    --record: GPU frames + sound playback -> MP4 encoder thread
