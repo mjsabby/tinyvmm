@@ -724,7 +724,10 @@ done. Build them in this order:
   and `Rgetattr` reads them back through
   `NtQueryInformationFile(FileStatLxInformation)`, NTFS's own decoder of those
   attributes (`crates/winsys/src/fs.rs`). Each fid
-  remembers its attacher's `n_uname`, the owner of what it creates. Give files a
+  remembers its attacher's `n_uname`, the owner of what it creates. Messages it
+  doesn't implement get `ENOSYS`, except the xattr ones, which get `EOPNOTSUPP`:
+  copy tools take that as "no extended attributes here", but some (uutils' cp)
+  fail a copy on `ENOSYS`. Give files a
   **non-zero `qid.version`** (here, as in QEMU, derived from the last write time
   and size): Linux treats version 0 as a synthetic file and bypasses its page
   cache for it whatever the mount's `cache=` mode, which turns a big read into

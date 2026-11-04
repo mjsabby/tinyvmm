@@ -821,8 +821,17 @@ fn network(config: Option<&crate::config::Network>) -> Result<()> {
         let _: std::net::IpAddr = ip.parse()?;
         dns += &format!("nameserver {ip}\n");
     }
-    unix::write("/etc/resolv.conf", dns, 0o644)?;
-    Ok(())
+    write_resolv_conf("/etc/resolv.conf", &dns)
+}
+
+/// Write `path` as a regular file. A rootfs image may link it into a resolver
+/// daemon's directory under /run (Ubuntu's ../run/systemd/resolve/stub-resolv.conf),
+/// which nothing creates here, and writing through that link fails with ENOENT.
+fn write_resolv_conf(path: &str, contents: &str) -> Result<()> {
+    if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        fs::remove_file(path).with_context(|| format!("remove link {path}"))?;
+    }
+    unix::write(path, contents, 0o644)
 }
 
 fn ifreq(name: &str) -> Result<[u8; 40]> {
@@ -873,6 +882,21 @@ mod tests {
         fs::remove_dir_all(&dir)?;
         assert_eq!(current, output[8192..]);
         assert_eq!(previous, output[4096..8192]);
+        Ok(())
+    }
+
+    #[test]
+    fn resolv_conf_replaces_a_link_into_a_missing_directory() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("tinyinit-resolv-{}", std::process::id()));
+        fs::create_dir(&dir)?;
+        let path = dir.join("resolv.conf").to_string_lossy().into_owned();
+        symlink(dir.join("run/systemd/resolve/stub-resolv.conf"), &path)?;
+        write_resolv_conf(&path, "nameserver 172.29.255.1\n")?;
+        let is_file = fs::symlink_metadata(&path)?.file_type().is_file();
+        let contents = fs::read_to_string(&path)?;
+        fs::remove_dir_all(&dir)?;
+        assert!(is_file);
+        assert_eq!(contents, "nameserver 172.29.255.1\n");
         Ok(())
     }
 

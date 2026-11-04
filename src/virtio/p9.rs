@@ -79,6 +79,8 @@ const T_GETATTR: u8 = 24;
 const R_GETATTR: u8 = 25;
 const T_SETATTR: u8 = 26;
 const R_SETATTR: u8 = 27;
+const T_XATTRWALK: u8 = 30;
+const T_XATTRCREATE: u8 = 32;
 const T_READDIR: u8 = 40;
 const R_READDIR: u8 = 41;
 const T_FSYNC: u8 = 50;
@@ -1432,6 +1434,9 @@ impl P9Device {
             T_RENAMEAT => self.h_renameat(tag, body, reply),
             T_UNLINKAT => self.h_unlinkat(tag, body, reply),
             T_STATFS => self.h_statfs(tag, body, reply),
+            // Shares have no extended attributes. Say so as such a filesystem
+            // does: `cp -a` skips EOPNOTSUPP, but uutils' cp fails on ENOSYS.
+            T_XATTRWALK | T_XATTRCREATE => build_rlerror(reply, tag, E_OPNOTSUPP),
             _ => build_rlerror(reply, tag, E_NOSYS),
         }
         if reply.len() >= 5 && reply[4] == R_LERROR {
@@ -3100,6 +3105,42 @@ mod tests {
 
         drop(dev);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Extended attributes get EOPNOTSUPP, as from a filesystem without them,
+    /// so copy tools skip them: uutils' cp, Ubuntu's default, fails `cp -a`
+    /// out of a share on any other error. No xattr fid is created.
+    #[test]
+    fn extended_attributes_are_unsupported() {
+        let share = std::env::temp_dir().join(format!("tinyvmm_p9_xattr_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&share);
+        std::fs::create_dir_all(&share).unwrap();
+        let root = std::fs::canonicalize(&share).unwrap();
+        let mem = std::sync::Arc::new(whpsys::memory::GuestMemory::new_host_only(4096).unwrap());
+        let dev = P9Device::new(mem, "test".into(), root, ShareOptions::default());
+        connect(&dev, 0);
+
+        // listxattr, then getxattr: Txattrwalk with an empty name, then a name.
+        for name in ["", "user.mime_type"] {
+            let errno = call_err(&dev, T_XATTRWALK, |t| {
+                enc4(t, 0);
+                enc4(t, 1);
+                enc_str(t, name);
+            });
+            assert_eq!(errno, E_OPNOTSUPP, "Txattrwalk {name:?}");
+        }
+        // setxattr.
+        let errno = call_err(&dev, T_XATTRCREATE, |t| {
+            enc4(t, 0);
+            enc_str(t, "user.mime_type");
+            enc8(t, 4);
+            enc4(t, 0);
+        });
+        assert_eq!(errno, E_OPNOTSUPP);
+        assert!(!dev.fids.lock().unwrap().map.contains_key(&1));
+
+        drop(dev);
+        let _ = std::fs::remove_dir_all(&share);
     }
 
     /// A directory a fid names can turn into a junction to somewhere outside

@@ -276,11 +276,17 @@ impl RlimitValue {
     }
 }
 
-/// Resolve named limits to `(resource, soft, hard)`.
+/// `nofile` for what init starts, unless configured: systemd's default. Linux's
+/// own hard limit of 4096 is too low for .NET, which raises its soft limit to
+/// the hard limit and can still run out loading assemblies.
+const DEFAULT_NOFILE: (u64, u64) = (1024, 524_288);
+
+/// Resolve named limits to `(resource, soft, hard)`, adding [`DEFAULT_NOFILE`]
+/// when they don't name `nofile`.
 pub fn rlimits<'a>(
     entries: impl IntoIterator<Item = (&'a String, &'a Rlimit)>,
 ) -> Result<Vec<(u32, u64, u64)>> {
-    entries
+    let mut limits = entries
         .into_iter()
         .map(|(name, limit)| {
             let resource = RLIMITS
@@ -295,7 +301,12 @@ pub fn rlimits<'a>(
             ensure!(soft <= hard, "rlimit {name} soft value exceeds hard value");
             Ok((resource, soft, hard))
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    let nofile = libc::RLIMIT_NOFILE as u32;
+    if !limits.iter().any(|&(resource, ..)| resource == nofile) {
+        limits.push((nofile, DEFAULT_NOFILE.0, DEFAULT_NOFILE.1));
+    }
+    Ok(limits)
 }
 
 impl App {
@@ -741,6 +752,34 @@ mod tests {
         c.ssh.logins[0].user = "root".into();
         c.ssh.logins[0].public_keys.clear();
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn nofile_defaults_to_systemds_limits() {
+        let c: Config = serde_json::from_str(
+            r#"{
+          "rlimits":{"core":0},
+          "apps":[{"name":"a","user":"root","argv":["/bin/sleep","1"]},
+            {"name":"b","user":"root","argv":["/bin/sleep","1"],"rlimits":{"nofile":4096}}],
+          "ssh":{"logins":[{"user":"root","public_keys":["key"]}]}
+        }"#,
+        )
+        .unwrap();
+        let core = (libc::RLIMIT_CORE as u32, 0, 0);
+        let nofile = libc::RLIMIT_NOFILE as u32;
+        assert_eq!(
+            c.app_rlimits(&c.apps[0]).unwrap(),
+            [core, (nofile, 1024, 524_288)]
+        );
+        assert_eq!(
+            c.app_rlimits(&c.apps[1]).unwrap(),
+            [core, (nofile, 4096, 4096)]
+        );
+        // sshd's, which SSH sessions inherit.
+        assert_eq!(
+            rlimits(&c.rlimits).unwrap(),
+            [core, (nofile, 1024, 524_288)]
+        );
     }
 
     #[test]

@@ -156,7 +156,9 @@ applied: init.json controls identities and services. Like Docker, init leaves
 the image's `/etc/passwd`, `/etc/group` and `/etc/shadow` as shipped, and looks
 up a `user` that `users` doesn't declare in the image's `/etc/passwd`: for
 example, `"user": "app"` gets the ASP.NET base's uid 1654. Init supplies
-DNS/hosts/NSS configuration and the host-derived clock. Timezone data is
+DNS/hosts/NSS configuration and the host-derived clock; a `network` replaces an
+image's `/etc/resolv.conf` even where it links into a resolver daemon's
+directory under `/run`, as Ubuntu's does. Timezone data is
 present; set `TZ` to choose a local timezone rather than the default UTC.
 
 All applications share one root filesystem from one rootfs source. Running
@@ -220,10 +222,11 @@ Optional process and memory settings:
   `nproc`, `core`, `memlock` and `stack`. A number or `"unlimited"` sets both
   limits; `{"soft": 4096, "hard": 65536}` sets each. Top-level limits apply to
   applications and sshd, so SSH sessions inherit them; an application's entry
-  replaces the same resource. Init itself is unaffected. Linux otherwise starts
-  with a `nofile` soft limit of 1024 and a hard limit of 4096 (.NET raises its
-  soft limit to the hard limit); values above 1048576 also need a larger
-  `fs.nr_open`.
+  replaces the same resource. Init itself is unaffected. Without a `nofile`
+  entry they get systemd's default, a soft limit of 1024 and a hard limit of
+  524288, rather than Linux's own hard limit of 4096, which .NET (it raises its
+  soft limit to the hard limit) can run out of while loading assemblies;
+  values above 1048576 also need a larger `fs.nr_open`.
 - `groups`: supplementary numeric GIDs for an application, never 0. Init names
   only users' primary groups in `/etc/group`, so tools such as `id` warn about
   other GIDs.

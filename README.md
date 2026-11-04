@@ -481,16 +481,18 @@ order they are created — that order is fixed (it is also the snapshot
   workers), backed by Win32 file APIs through `winsys::fs`. Every entry reports
   the share's `uid=`/`gid=` owner (default root) and a synthesized mode, or, on a
   `metadata` share, the per-file owner and mode WSL keeps in NTFS extended
-  attributes. A request the guest is waiting on alone runs on the doorbell pump
-  itself; Tread/Twrite payloads move between the host file and the guest's
-  buffers directly, or through a reused bounce buffer when the buffers are
-  scattered pages. Files report a non-zero `qid.version` derived from the last
-  write time and size (as QEMU does), so the guest's cache modes work: Linux
-  treats version 0 as a synthetic file and bypasses its page cache for it. For
-  big sequential reads mount with `cache=readahead` (coherent at open) or
-  `cache=loose`: the default `cache=none` path in Linux 7.3 pins one page per
-  Tread, so every 4 KiB is a round trip, while the cached modes read up to
-  `msize` per Tread.
+  attributes. Linux extended attributes aren't supported: `Txattrwalk` and
+  `Txattrcreate` get `EOPNOTSUPP`, as from a filesystem without them, so
+  `cp -a` out of a share skips them. A request the guest is waiting on alone
+  runs on the doorbell pump itself; Tread/Twrite payloads move between the host
+  file and the guest's buffers directly, or through a reused bounce buffer when
+  the buffers are scattered pages. Files report a non-zero `qid.version` derived
+  from the last write time and size (as QEMU does), so the guest's cache modes
+  work: Linux treats version 0 as a synthetic file and bypasses its page cache
+  for it. For big sequential reads mount with `cache=readahead` (coherent at
+  open) or `cache=loose`: the default `cache=none` path in Linux 7.3 pins one
+  page per Tread, so every 4 KiB is a round trip, while the cached modes read up
+  to `msize` per Tread.
 * **virtio-gpu** — basic 2D scanout (`src/virtio/gpu.rs`). Two queues
   (`controlq=0`, `cursorq=1`); single scanout (`NUM_SCANOUTS=1`); 32-bpp
   resources. It handles `GET_DISPLAY_INFO`, `RESOURCE_CREATE_2D` / `UNREF`,
