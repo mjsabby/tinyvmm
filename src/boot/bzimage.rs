@@ -162,6 +162,7 @@ pub fn load(
     ram_bytes: u64,
     initramfs: Option<&[u8]>,
     vcpu_count: u32,
+    vmbus: bool,
 ) -> Result<BzImageLoad> {
     let hdr = parse_header(image)?;
     let kernel = &image[hdr.setup_size..];
@@ -218,7 +219,7 @@ pub fn load(
     gdt[BOOT_DS as usize..BOOT_DS as usize + 8].copy_from_slice(&GDT_DATA32.to_le_bytes());
     ram.write_at(GDT_GPA, &gdt)?;
     loader::write_cmdline(ram, cmdline)?;
-    let rsdp = loader::write_acpi(ram, vcpu_count)?;
+    let rsdp = loader::write_acpi(ram, vcpu_count, vmbus)?;
 
     let mut zp = vec![0u8; ZERO_PAGE_SIZE];
     zp[SETUP_SECTS..hdr.header_end].copy_from_slice(&image[SETUP_SECTS..hdr.header_end]);
@@ -376,7 +377,16 @@ mod tests {
         let ram = GuestMemory::new_host_only(ram_bytes as usize).unwrap();
         let image = bzimage(b"KERNEL", 4 * MIB as u32);
         let initrd = vec![0x5Au8; 3 * 4096 + 100];
-        let load = load(&ram, &image, "console=hvc0", ram_bytes, Some(&initrd), 2).unwrap();
+        let load = load(
+            &ram,
+            &image,
+            "console=hvc0",
+            ram_bytes,
+            Some(&initrd),
+            2,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(load.entry_point, 0x100_0000);
         assert_eq!(read(&ram, 0x100_0000, 6), b"KERNEL");
@@ -411,13 +421,13 @@ mod tests {
         let ram = GuestMemory::new_host_only(ram_bytes as usize).unwrap();
         // The decompressor's area (16 + 24 MiB) runs past RAM.
         let image = bzimage(b"K", 24 * MIB as u32);
-        assert!(load(&ram, &image, "", ram_bytes, None, 1).is_err());
+        assert!(load(&ram, &image, "", ram_bytes, None, 1, false).is_err());
         // The kernel fits, but the initramfs would overlap its area.
         let image = bzimage(b"K", 8 * MIB as u32);
         let initrd = vec![1u8; 9 * MIB as usize];
-        assert!(load(&ram, &image, "", ram_bytes, Some(&initrd), 1).is_err());
-        assert!(load(&ram, &image, &"x".repeat(2048), ram_bytes, None, 1).is_err());
-        assert!(load(&ram, &image, "", ram_bytes, None, 1).is_ok());
+        assert!(load(&ram, &image, "", ram_bytes, Some(&initrd), 1, false).is_err());
+        assert!(load(&ram, &image, &"x".repeat(2048), ram_bytes, None, 1, false).is_err());
+        assert!(load(&ram, &image, "", ram_bytes, None, 1, false).is_ok());
     }
 
     #[test]
@@ -425,7 +435,7 @@ mod tests {
         let ram = GuestMemory::new_host_only(32 << 20).unwrap();
         let mut image = bzimage(b"OLD", 4 << 20);
         image[RELOCATABLE_KERNEL] = 0;
-        let load = load(&ram, &image, "", 32 << 20, None, 1).unwrap();
+        let load = load(&ram, &image, "", 32 << 20, None, 1, false).unwrap();
         assert_eq!(load.entry_point, 0x10_0000);
         assert_eq!(read(&ram, 0x10_0000, 3), b"OLD");
     }
@@ -436,6 +446,6 @@ mod tests {
         assert!(!is_bzimage(b"\x7fELF"));
         let mut image = bzimage(b"K", 1 << 20);
         image[VERSION..VERSION + 2].copy_from_slice(&0x0209u16.to_le_bytes());
-        assert!(load(&ram, &image, "", 32 << 20, None, 1).is_err());
+        assert!(load(&ram, &image, "", 32 << 20, None, 1, false).is_err());
     }
 }

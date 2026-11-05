@@ -61,6 +61,9 @@ pub enum SectionType {
     LegacyPciBus = 0x0063,
     LegacyIsaStubs = 0x0064,
     AcpiPm = 0x0065,
+    /// The VMBus host's state (`crate::vmbus`); only in snapshots of a VM with
+    /// it on.
+    Vmbus = 0x0066,
 }
 
 impl SectionType {
@@ -92,6 +95,7 @@ impl SectionType {
             0x0063 => LegacyPciBus,
             0x0064 => LegacyIsaStubs,
             0x0065 => AcpiPm,
+            0x0066 => Vmbus,
             _ => return None,
         })
     }

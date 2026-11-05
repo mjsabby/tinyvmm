@@ -8,7 +8,8 @@
 //! no PM timer, so nothing ever raises the SCI. It is not hardware-reduced,
 //! because that mode makes Linux drop the 8259 PIC, the only path for ISA
 //! interrupts here (the MADT lists no IOAPIC). With ACPI enabled, Linux finds
-//! PCI through the DSDT's host bridge (`\_SB.PCI0`) instead of probing for it.
+//! PCI through the DSDT's host bridge (`\_SB.PCI0`) instead of probing for it,
+//! and VMBus (`crate::vmbus`), when on, through `\_SB.VMBS`.
 
 use crate::devices::power::{
     PM1_CNT_LEN, PM1_EVT_LEN, PM1A_CNT_PORT, PM1A_EVT_PORT, RESET_PORT, RESET_VALUE, SLP_TYP_S5,
@@ -110,8 +111,9 @@ fn seal(buf: &mut [u8], off: usize, len: usize) {
 }
 
 /// Build the tables into a `FOOTPRINT`-byte buffer where the guest physical
-/// address of byte 0 equals `gpa_base`. The RSDP is at offset 0.
-pub fn build(gpa_base: u64, vcpu_count: u32) -> Vec<u8> {
+/// address of byte 0 equals `gpa_base`. The RSDP is at offset 0. `vmbus` adds
+/// the VMBus device.
+pub fn build(gpa_base: u64, vcpu_count: u32, vmbus: bool) -> Vec<u8> {
     assert!(gpa_base.is_multiple_of(64) && gpa_base + FOOTPRINT as u64 <= 1 << 32);
     let vcpu_count = vcpu_count.clamp(1, MAX_VCPUS);
     let gpa = |off: usize| gpa_base + off as u64;
@@ -141,7 +143,7 @@ pub fn build(gpa_base: u64, vcpu_count: u32) -> Vec<u8> {
     seal(&mut buf, MADT_OFFSET, madt_len);
 
     // ---- DSDT ----
-    let aml = dsdt_aml();
+    let aml = dsdt_aml(vmbus);
     let dsdt_len = HEADER_LEN + aml.len();
     assert!(DSDT_OFFSET + dsdt_len <= FOOTPRINT);
     fill_header(
@@ -224,12 +226,18 @@ pub fn build(gpa_base: u64, vcpu_count: u32) -> Vec<u8> {
 ///         Name (_CRS, ResourceTemplate () { bus 0, ports 0xCF8-0xCFF,
 ///             I/O windows around them, the 32-bit BAR window })
 ///     }
+///     Device (VMBS) {                 // with `vmbus`
+///         Name (_HID, "VMBus")
+///         Name (_UID, 0)
+///         Name (_CRS, ResourceTemplate () {})
+///     }
 /// }
 /// ```
 ///
 /// No `_PRT`: every PCI function here interrupts through MSI-X, with no
-/// interrupt pin.
-fn dsdt_aml() -> Vec<u8> {
+/// interrupt pin. VMBus needs no resources: Linux's driver walks `_CRS` but
+/// takes its interrupt from the SynIC, and offers no device MMIO.
+fn dsdt_aml(vmbus: bool) -> Vec<u8> {
     let s5 = u64::from(SLP_TYP_S5);
     let pci0 = [
         b"PCI0".to_vec(),
@@ -238,7 +246,17 @@ fn dsdt_aml() -> Vec<u8> {
         aml::name(b"_CRS", &aml::buffer(&pci_root_resources())),
     ]
     .concat();
-    let sb = [b"\\_SB_".to_vec(), aml::device(&pci0)].concat();
+    let mut sb = [b"\\_SB_".to_vec(), aml::device(&pci0)].concat();
+    if vmbus {
+        let vmbs = [
+            b"VMBS".to_vec(),
+            aml::name(b"_HID", &aml::string(b"VMBus")),
+            aml::name(b"_UID", &aml::integer(0)),
+            aml::name(b"_CRS", &aml::buffer(&aml::END_TAG)),
+        ]
+        .concat();
+        sb.extend(aml::device(&vmbs));
+    }
     [
         aml::name(b"_S5_", &aml::package(&[s5, s5, 0, 0])),
         aml::scope(&sb),
@@ -269,6 +287,7 @@ fn pci_root_resources() -> Vec<u8> {
 /// (chapter 6.4) for the DSDT.
 mod aml {
     const NAME_OP: u8 = 0x08;
+    const STRING_PREFIX: u8 = 0x0D;
     const SCOPE_OP: u8 = 0x10;
     const BUFFER_OP: u8 = 0x11;
     const PACKAGE_OP: u8 = 0x12;
@@ -312,6 +331,11 @@ mod aml {
 
     pub fn name(seg: &[u8; 4], value: &[u8]) -> Vec<u8> {
         [&[NAME_OP][..], seg, value].concat()
+    }
+
+    /// A string constant: `StringPrefix`, the ASCII bytes, a NUL.
+    pub fn string(s: &[u8]) -> Vec<u8> {
+        [&[STRING_PREFIX][..], s, &[0]].concat()
     }
 
     pub fn package(elements: &[u64]) -> Vec<u8> {
@@ -392,7 +416,7 @@ mod tests {
 
     #[test]
     fn tables_link_from_the_rsdp_to_the_power_registers() {
-        let buf = build(BASE, 4);
+        let buf = build(BASE, 4, false);
         assert_eq!(buf.len(), FOOTPRINT);
         assert_eq!(&buf[..8], b"RSD PTR ");
         assert_eq!(checksum(&buf[..20]), 0);
@@ -454,7 +478,7 @@ mod tests {
 
     #[test]
     fn dsdt_declares_s5_and_the_pci_host_bridge() {
-        let aml = dsdt_aml();
+        let aml = dsdt_aml(false);
         // The same bytes iasl emits for these declarations.
         let s5 = [
             0x08, b'_', b'S', b'5', b'_', 0x12, 0x08, 0x04, 0x0A, 0x05, 0x0A, 0x05, 0, 0,
@@ -502,5 +526,38 @@ mod tests {
         }
         assert_eq!(at + 2, resources.len());
         assert_eq!(window, Some((0xE000_0000, 0xFEBF_FFFF)));
+    }
+
+    #[test]
+    fn dsdt_declares_vmbus_after_pci0_when_asked() {
+        let without = dsdt_aml(false);
+        let aml = dsdt_aml(true);
+        assert!(!without.windows(4).any(|w| w == b"VMBS"));
+        // The same bytes iasl emits for Device (VMBS) { Name (_HID, "VMBus")
+        // Name (_UID, 0) Name (_CRS, ResourceTemplate () {}) }.
+        let vmbs = [
+            &[0x5B, 0x82, 0x22][..],
+            b"VMBS",
+            &[0x08],
+            b"_HID",
+            &[0x0D],
+            b"VMBus\0",
+            &[0x08],
+            b"_UID",
+            &[0x00, 0x08],
+            b"_CRS",
+            &[0x11, 0x05, 0x0A, 0x02, 0x79, 0x00],
+        ]
+        .concat();
+        assert!(aml.ends_with(&vmbs), "the last thing in \\_SB");
+        // \_SB grew by the device; its PkgLength covers it.
+        let (len, n) = read_pkg_length(&aml, 15);
+        assert_eq!(15 + len, aml.len());
+        assert_eq!(&aml[15 + n..][..5], b"\\_SB_");
+        assert_eq!(
+            &aml[..aml.len() - vmbs.len()][14 + 1 + n..],
+            &without[14 + 1 + n..]
+        );
+        assert!(build(BASE, 2, true).windows(4).any(|w| w == b"VMBS"));
     }
 }

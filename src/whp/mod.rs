@@ -33,6 +33,9 @@ pub mod regs {
 pub mod msi {
     pub use whpsys::msi::*;
 }
+pub mod synic {
+    pub use whpsys::synic::*;
+}
 pub mod emulator {
     pub use whpsys::emulator::*;
 }

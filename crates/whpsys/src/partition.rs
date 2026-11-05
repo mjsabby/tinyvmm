@@ -4,12 +4,13 @@ use crate::error::{Result, check_hr};
 use core::ffi::c_void;
 use windows_sys::Win32::System::Hypervisor::{
     WHV_PARTITION_HANDLE, WHV_PARTITION_PROPERTY_CODE, WHV_X64_CPUID_RESULT,
-    WHV_X64_LOCAL_APIC_EMULATION_MODE, WHvCapabilityCodeSyntheticProcessorFeaturesBanks,
-    WHvCreatePartition, WHvDeletePartition, WHvGetCapability, WHvGetPartitionProperty,
-    WHvPartitionPropertyCodeAllowDeviceAssignment, WHvPartitionPropertyCodeCpuidResultList,
-    WHvPartitionPropertyCodeExceptionExitBitmap, WHvPartitionPropertyCodeExtendedVmExits,
-    WHvPartitionPropertyCodeLocalApicEmulationMode, WHvPartitionPropertyCodeProcessorCount,
-    WHvPartitionPropertyCodeReferenceTime, WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks,
+    WHV_X64_LOCAL_APIC_EMULATION_MODE, WHvCapabilityCodeExtendedVmExits,
+    WHvCapabilityCodeSyntheticProcessorFeaturesBanks, WHvCreatePartition, WHvDeletePartition,
+    WHvGetCapability, WHvGetPartitionProperty, WHvPartitionPropertyCodeAllowDeviceAssignment,
+    WHvPartitionPropertyCodeCpuidResultList, WHvPartitionPropertyCodeExceptionExitBitmap,
+    WHvPartitionPropertyCodeExtendedVmExits, WHvPartitionPropertyCodeLocalApicEmulationMode,
+    WHvPartitionPropertyCodeProcessorCount, WHvPartitionPropertyCodeReferenceTime,
+    WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks,
     WHvPartitionPropertyCodeX64MsrExitBitmap, WHvResumePartitionTime, WHvSetPartitionProperty,
     WHvSetupPartition, WHvSuspendPartitionTime,
 };
@@ -45,6 +46,58 @@ pub fn synthetic_processor_features_supported() -> Result<u64> {
     } else {
         0
     })
+}
+
+/// `WHV_EXTENDED_VM_EXITS` bits: the exits a partition can ask WHP for on top
+/// of the basic ones.
+pub mod exits {
+    pub const CPUID: u64 = 1 << 0;
+    pub const MSR: u64 = 1 << 1;
+    pub const EXCEPTION: u64 = 1 << 2;
+    /// Hypercalls the hypervisor doesn't handle itself, such as HvPostMessage.
+    pub const HYPERCALL: u64 = 1 << 5;
+    /// HvSignalEvent to a connection the hypervisor has no port for.
+    pub const UNKNOWN_SYNIC_CONNECTION: u64 = 1 << 10;
+}
+
+/// The extended exits ([`exits`]) this host's WHP can deliver.
+pub fn extended_exits_supported() -> Result<u64> {
+    let mut bits: u64 = 0;
+    let mut written: u32 = 0;
+    // SAFETY: the capability is a u64; WHvGetCapability writes at most 8 bytes.
+    check_hr(
+        unsafe {
+            WHvGetCapability(
+                WHvCapabilityCodeExtendedVmExits,
+                &mut bits as *mut u64 as *mut c_void,
+                std::mem::size_of::<u64>() as u32,
+                &mut written,
+            )
+        },
+        "WHvGetCapability(ExtendedVmExits)",
+    )?;
+    Ok(bits)
+}
+
+/// The reference time ([`Partition::reference_time`]) of the partition behind
+/// `handle`, for threads that hold only the handle.
+pub fn reference_time(handle: WHV_PARTITION_HANDLE) -> Result<u64> {
+    let mut time: u64 = 0;
+    let mut written: u32 = 0;
+    // SAFETY: the property is a u64; WHP writes at most 8 bytes.
+    check_hr(
+        unsafe {
+            WHvGetPartitionProperty(
+                handle,
+                WHvPartitionPropertyCodeReferenceTime,
+                &mut time as *mut u64 as *mut c_void,
+                std::mem::size_of::<u64>() as u32,
+                &mut written,
+            )
+        },
+        "WHvGetPartitionProperty(ReferenceTime)",
+    )?;
+    Ok(time)
 }
 
 pub struct Partition {
@@ -83,19 +136,8 @@ impl Partition {
         )
     }
 
-    /// Bit layout mirrors `WHV_EXTENDED_VM_EXITS`: bit0 cpuid, bit1 msr,
-    /// bit2 exception, bit3 hypercall, bit4 gpa-access-fault.
-    pub fn enable_extended_exits(&self, cpuid: bool, msr: bool, exception: bool) -> Result<()> {
-        let mut bits: u64 = 0;
-        if cpuid {
-            bits |= 1 << 0;
-        }
-        if msr {
-            bits |= 1 << 1;
-        }
-        if exception {
-            bits |= 1 << 2;
-        }
+    /// Bit layout mirrors `WHV_EXTENDED_VM_EXITS`; see [`exits`].
+    pub fn enable_extended_exits(&self, bits: u64) -> Result<()> {
         self.set_property(WHvPartitionPropertyCodeExtendedVmExits, &bits)
     }
 
@@ -139,22 +181,7 @@ impl Partition {
     /// The partition's reference time, in 100 ns units: the clock behind the
     /// guest's reference TSC page, `TIME_REF_COUNT` and synthetic timers.
     pub fn reference_time(&self) -> Result<u64> {
-        let mut time: u64 = 0;
-        let mut written: u32 = 0;
-        // SAFETY: the property is a u64; WHP writes at most 8 bytes.
-        check_hr(
-            unsafe {
-                WHvGetPartitionProperty(
-                    self.handle,
-                    WHvPartitionPropertyCodeReferenceTime,
-                    &mut time as *mut u64 as *mut c_void,
-                    std::mem::size_of::<u64>() as u32,
-                    &mut written,
-                )
-            },
-            "WHvGetPartitionProperty(ReferenceTime)",
-        )?;
-        Ok(time)
+        reference_time(self.handle)
     }
 
     /// Set the partition's reference time; partition time must be suspended.

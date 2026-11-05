@@ -4,8 +4,8 @@
 //! security-sensitive FFI in the project) into one small, separately-auditable
 //! place: the partition, guest-physical memory mapping + typed accessors,
 //! virtual processors (register/XSAVE/APIC/interrupt-controller get-set, run,
-//! cancel), and MSI injection. The main binary's device + dispatch logic
-//! consumes these safe APIs.
+//! cancel), MSI injection, and the host's side of the guest's SynIC. The main
+//! binary's device + dispatch logic consumes these safe APIs.
 //!
 //! `crate::error` / `crate::host` are re-exported from `winsys` so the moved
 //! modules compile unchanged.
@@ -19,6 +19,7 @@ pub mod memory;
 pub mod msi;
 pub mod partition;
 pub mod regs;
+pub mod synic;
 pub mod vcpu;
 pub mod vpci;
 pub use memory::GuestMemory;

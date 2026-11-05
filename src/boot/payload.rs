@@ -68,10 +68,33 @@ mod tests {
     }
 
     #[test]
+    fn vmbus_is_on_unless_turned_off() {
+        let parse = |extra: &[&str]| {
+            let mut parts = vec!["tinyvmm", "--pvh-run"];
+            parts.extend_from_slice(extra);
+            parts.push("vmlinux");
+            parse_pvh_args(&args(&parts)).unwrap()
+        };
+        let off = parse(&["--no-vmbus"]);
+        assert!(!off.vmbus);
+        assert!(!off.cmdline.contains("hv_utils."));
+        // On wherever the host's WHP can run it.
+        let on = parse(&[]);
+        assert_eq!(on.vmbus, crate::vmbus::supported());
+        assert_eq!(
+            on.cmdline
+                .split_whitespace()
+                .any(|arg| arg == "hv_utils.timesync_implicit=1"),
+            on.vmbus
+        );
+    }
+
+    #[test]
     fn explicit_boot_assets_override_embedded_defaults() {
         let config = parse_pvh_args(&args(&[
             "tinyvmm",
             "--pvh-run",
+            "--no-vmbus",
             "--initrd",
             "custom.cpio",
             "custom-vmlinux",

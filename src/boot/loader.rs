@@ -280,6 +280,7 @@ pub fn load_pvh(
     ram_bytes: u64,
     initramfs: Option<&[u8]>,
     vcpu_count: u32,
+    vmbus: bool,
 ) -> Result<PvhLoadResult> {
     let info = inspect(vmlinux)?;
     let Some(entry) = info.phys32_entry else {
@@ -340,7 +341,7 @@ pub fn load_pvh(
     ram.write_at(GDT_GPA, &gdt)?;
 
     write_cmdline(ram, cmdline)?;
-    let rsdp_gpa = write_acpi(ram, vcpu_count)?;
+    let rsdp_gpa = write_acpi(ram, vcpu_count, vmbus)?;
 
     // e820 memmap: hvm_memmap_table_entry is the e820 entry plus 4 reserved bytes.
     let mm = e820_map(ram_bytes);
@@ -389,8 +390,8 @@ pub(super) fn write_cmdline(ram: &GuestMemory, cmdline: &str) -> Result<()> {
 }
 
 /// Write the ACPI tables and return the RSDP's guest-physical address.
-pub(super) fn write_acpi(ram: &GuestMemory, vcpu_count: u32) -> Result<u64> {
-    ram.write_at(ACPI_GPA, &acpi::build(ACPI_GPA, vcpu_count))?;
+pub(super) fn write_acpi(ram: &GuestMemory, vcpu_count: u32, vmbus: bool) -> Result<u64> {
+    ram.write_at(ACPI_GPA, &acpi::build(ACPI_GPA, vcpu_count, vmbus))?;
     Ok(ACPI_GPA)
 }
 

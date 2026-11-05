@@ -5,7 +5,7 @@ use crate::error::{Error, Result, check_hr};
 use crate::host;
 use core::ffi::c_void;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use windows_sys::Win32::System::Hypervisor::{
     WHV_ADVISE_GPA_RANGE_POPULATE, WHV_MEMORY_RANGE_ENTRY, WHV_PARTITION_HANDLE, WHvAdviseGpaRange,
@@ -571,6 +571,33 @@ impl GuestMemory {
         };
         // SAFETY: as above.
         unsafe { AtomicU16::from_ptr(p as *mut u16).store(v, Ordering::Release) };
+        true
+    }
+
+    /// Atomic acquire-load of a `u32` at `gpa` (a VMBus ring index shared with
+    /// the guest). None if out of bounds or not 4-byte aligned.
+    pub fn load_acquire_u32(&self, gpa: u64) -> Option<u32> {
+        if !gpa.is_multiple_of(4) {
+            return None;
+        }
+        let p = self.host_range(gpa, 4)?;
+        // SAFETY: host_range validated [gpa, gpa+4) is inside the mapping, and
+        // the mapping is page aligned, so an aligned GPA is an aligned pointer.
+        Some(unsafe { AtomicU32::from_ptr(p as *mut u32).load(Ordering::Acquire) })
+    }
+
+    /// Atomic release-store of a `u32` at `gpa`. Returns false if out of bounds
+    /// or not 4-byte aligned.
+    #[must_use]
+    pub fn store_release_u32(&self, gpa: u64, v: u32) -> bool {
+        if !gpa.is_multiple_of(4) {
+            return false;
+        }
+        let Some(p) = self.host_range(gpa, 4) else {
+            return false;
+        };
+        // SAFETY: as above.
+        unsafe { AtomicU32::from_ptr(p as *mut u32).store(v, Ordering::Release) };
         true
     }
 

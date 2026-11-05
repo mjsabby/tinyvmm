@@ -1,6 +1,7 @@
 //! Drives a single vCPU's exit loop. Routes IO/MMIO accesses through the IO and
-//! MMIO buses via the WHP emulator (`whpsys::emulator`), and handles CPUID/MSR/
-//! HLT exits. Port of src/whp/run_loop.cpp.
+//! MMIO buses via the WHP emulator (`whpsys::emulator`), handles CPUID/MSR/
+//! HLT exits, and hands VMBus its hypercalls (`crate::vmbus`). Port of
+//! src/whp/run_loop.cpp.
 //!
 //! Interrupts are WHP's job: its in-hypervisor LAPIC (x2APIC mode) delivers
 //! MSIs, IPIs and the LAPIC timer and handles HLT, on bare metal and nested
@@ -10,6 +11,7 @@
 use crate::devices::io_bus::{IoAccess, IoBus};
 use crate::devices::mmio_bus::{MmioAccess, MmioBus};
 use crate::devices::pic::Pic8259;
+use crate::vmbus;
 use crate::whp::GuestMemory;
 use crate::whp::cpuid::{CpuidContext, resolve_cpuid};
 use crate::whp::emulator::{EmuError, Emulator, EmulatorBus};
@@ -138,6 +140,7 @@ pub struct RunLoop {
     crash: Option<Arc<CrashMsrs>>,
     /// The PIC whose INT output feeds this vCPU's LINT0 (the BSP only).
     ext_int: Option<Arc<Pic8259>>,
+    vmbus: Option<Arc<vmbus::Host>>,
     stop: Arc<AtomicBool>,
     counters: Arc<Counters>,
     verbose_io: bool,
@@ -165,6 +168,7 @@ impl RunLoop {
             vcpu_count: vcpu_count.max(1),
             crash: None,
             ext_int: None,
+            vmbus: None,
             stop: Arc::new(AtomicBool::new(false)),
             counters: Arc::new(Counters::default()),
             verbose_io: false,
@@ -181,6 +185,11 @@ impl RunLoop {
     /// halts is noticed promptly.
     pub fn set_ext_int_source(&mut self, pic: Arc<Pic8259>) {
         self.ext_int = Some(pic);
+    }
+    /// Serve the VMBus host's hypercalls on this vCPU, and post its messages
+    /// if the guest takes them here.
+    pub fn set_vmbus(&mut self, host: Arc<vmbus::Host>) {
+        self.vmbus = Some(host);
     }
     pub fn set_verbose_io(&mut self, v: bool) {
         self.verbose_io = v;
@@ -221,6 +230,9 @@ impl RunLoop {
             // Canceled kick and the interrupt-window exit -- so a PIC request is
             // never stranded.
             self.deliver_ext_int();
+            if let Some(host) = &self.vmbus {
+                host.flush(&self.vcpu);
+            }
 
             let exit = match self.vcpu.run_exit() {
                 Ok(e) => e,
@@ -286,6 +298,16 @@ impl RunLoop {
                 // Canceled kick (the PIC's notify, or a stop) just re-runs the
                 // delivery pass at the top of the loop.
                 ExitReason::ApicEoi | ExitReason::InterruptWindow | ExitReason::Canceled => {}
+                ExitReason::Hypercall => {
+                    if let Some(stop) = self.handle_hypercall(&exit) {
+                        return stop;
+                    }
+                }
+                ExitReason::SintDeliverable => {
+                    if let Some(host) = &self.vmbus {
+                        host.sints_deliverable(&self.vcpu, exit.deliverable_sints());
+                    }
+                }
                 ExitReason::Other(other) => {
                     self.counters.other.fetch_add(1, Ordering::Relaxed);
                     eprintln!(
@@ -417,6 +439,28 @@ impl RunLoop {
         {
             eprintln!("[loop] ExtINT 0x{vector:02x} injection failed: {e}");
         }
+    }
+
+    /// A hypercall the hypervisor left to tinyvmm (only VMBus's are enabled):
+    /// answer it in RAX and step past the 3-byte VMCALL / VMMCALL.
+    fn handle_hypercall(&self, exit: &Exit) -> Option<StopReason> {
+        let h = exit.hypercall();
+        let status = match &self.vmbus {
+            Some(host) if h.long_mode => host.hypercall(self.vcpu.index(), h.rcx, h.rdx),
+            _ => vmbus::HV_STATUS_INVALID_HYPERCALL_CODE,
+        };
+        let len = match exit.instruction_length() {
+            0 => 3,
+            n => u64::from(n),
+        };
+        if let Err(e) = self.vcpu.set_registers(
+            &[WHvX64RegisterRax, WHvX64RegisterRip],
+            &[reg64(status), reg64(exit.rip() + len)],
+        ) {
+            eprintln!("[loop] hypercall set-regs failed: {e}");
+            return Some(StopReason::EmulationFailure);
+        }
+        None
     }
 
     fn handle_msr(&self, exit: &Exit) -> Option<StopReason> {

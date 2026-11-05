@@ -10,15 +10,15 @@ use windows_sys::Win32::System::Hypervisor::{
     WHvGetVirtualProcessorInterruptControllerState2, WHvGetVirtualProcessorRegisters,
     WHvGetVirtualProcessorState, WHvGetVirtualProcessorXsaveState, WHvRegisterInterruptState,
     WHvRegisterPendingEvent, WHvRegisterPendingInterruption, WHvRunVirtualProcessor,
-    WHvRunVpExitReasonCanceled, WHvRunVpExitReasonException,
+    WHvRunVpExitReasonCanceled, WHvRunVpExitReasonException, WHvRunVpExitReasonHypercall,
     WHvRunVpExitReasonInvalidVpRegisterValue, WHvRunVpExitReasonMemoryAccess,
-    WHvRunVpExitReasonNone, WHvRunVpExitReasonUnrecoverableException,
-    WHvRunVpExitReasonUnsupportedFeature, WHvRunVpExitReasonX64ApicEoi, WHvRunVpExitReasonX64Cpuid,
-    WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64InterruptWindow,
-    WHvRunVpExitReasonX64IoPortAccess, WHvRunVpExitReasonX64MsrAccess,
-    WHvSetVirtualProcessorInterruptControllerState2, WHvSetVirtualProcessorRegisters,
-    WHvSetVirtualProcessorState, WHvSetVirtualProcessorXsaveState, WHvX64PendingEventExtInt,
-    WHvX64RegisterDeliverabilityNotifications, WHvX64RegisterRflags,
+    WHvRunVpExitReasonNone, WHvRunVpExitReasonSynicSintDeliverable,
+    WHvRunVpExitReasonUnrecoverableException, WHvRunVpExitReasonUnsupportedFeature,
+    WHvRunVpExitReasonX64ApicEoi, WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt,
+    WHvRunVpExitReasonX64InterruptWindow, WHvRunVpExitReasonX64IoPortAccess,
+    WHvRunVpExitReasonX64MsrAccess, WHvSetVirtualProcessorInterruptControllerState2,
+    WHvSetVirtualProcessorRegisters, WHvSetVirtualProcessorState, WHvSetVirtualProcessorXsaveState,
+    WHvX64PendingEventExtInt, WHvX64RegisterDeliverabilityNotifications, WHvX64RegisterRflags,
 };
 
 /// `WHV_REGISTER_VALUE` carries `DECLSPEC_ALIGN(16)` in the WHP headers (WHP
@@ -235,9 +235,25 @@ impl Vcpu {
         // WHV_X64_DELIVERABILITY_NOTIFICATIONS_REGISTER: bit0 NmiNotification,
         // bit1 InterruptNotification, bits2..5 InterruptPriority (0 = notify for
         // any deliverable interrupt). We want the interrupt notification.
+        self.request_notifications(1 << 1)
+    }
+
+    /// Exit with `ExitReason::SintDeliverable` once any of `sints` (a SINT
+    /// bitmask) can take a message again: its message slot is free.
+    pub fn request_sint_deliverable(&self, sints: u16) -> Result<()> {
+        // The register's top 16 bits are the SINT notifications.
+        self.request_notifications(u64::from(sints) << 48)
+    }
+
+    /// Add `bits` to the deliverability notifications, keeping the ones still
+    /// pending: each is one-shot, cleared by the exit it causes.
+    fn request_notifications(&self, bits: u64) -> Result<()> {
+        let current = self.get_register_u64(WHvX64RegisterDeliverabilityNotifications)?;
         self.set_register(
             WHvX64RegisterDeliverabilityNotifications,
-            WHV_REGISTER_VALUE { Reg64: 1 << 1 },
+            WHV_REGISTER_VALUE {
+                Reg64: current | bits,
+            },
         )
     }
 
@@ -476,7 +492,21 @@ pub enum ExitReason {
     InterruptWindow,
     ApicEoi,
     Canceled,
+    /// A hypercall the hypervisor left to us (extended exit `HYPERCALL`).
+    Hypercall,
+    /// A SINT asked for with [`Vcpu::request_sint_deliverable`] is free.
+    SintDeliverable,
     Other(u32),
+}
+
+/// A hypercall exit's registers: in 64-bit mode RCX is the control word, RDX
+/// the input (its GPA, or the value of a fast call) and R8 the output.
+pub struct HypercallExit {
+    pub rcx: u64,
+    pub rdx: u64,
+    pub r8: u64,
+    /// Long mode, the only one whose calling convention we decode.
+    pub long_mode: bool,
 }
 
 /// CPUID exit payload (leaf/subleaf + WHP's default result registers).
@@ -523,9 +553,31 @@ impl Exit {
             ExitReason::ApicEoi
         } else if r == WHvRunVpExitReasonCanceled {
             ExitReason::Canceled
+        } else if r == WHvRunVpExitReasonHypercall {
+            ExitReason::Hypercall
+        } else if r == WHvRunVpExitReasonSynicSintDeliverable {
+            ExitReason::SintDeliverable
         } else {
             ExitReason::Other(r as u32)
         }
+    }
+
+    /// Decode a hypercall exit. Only meaningful when `reason() == Hypercall`.
+    pub fn hypercall(&self) -> HypercallExit {
+        let h = unsafe { &self.raw.Anonymous.Hypercall };
+        // WHV_X64_VP_EXECUTION_STATE: bit 2 CR0.PE, bit 4 EFER.LMA.
+        let state = unsafe { self.raw.VpContext.ExecutionState.AsUINT16 };
+        HypercallExit {
+            rcx: h.Rcx,
+            rdx: h.Rdx,
+            r8: h.R8,
+            long_mode: state & (1 << 2) != 0 && state & (1 << 4) != 0,
+        }
+    }
+
+    /// The SINTs (a bitmask) a `SintDeliverable` exit reports free.
+    pub fn deliverable_sints(&self) -> u16 {
+        unsafe { self.raw.Anonymous.SynicSintDeliverable.DeliverableSints }
     }
 
     /// The raw WHP exit-reason code (for diagnostics / ETW).
@@ -614,6 +666,10 @@ pub fn exit_reason_name(reason: u32) -> &'static str {
         "Exception"
     } else if r == WHvRunVpExitReasonCanceled {
         "Canceled"
+    } else if r == WHvRunVpExitReasonHypercall {
+        "Hypercall"
+    } else if r == WHvRunVpExitReasonSynicSintDeliverable {
+        "SynicSintDeliverable"
     } else {
         "<unknown>"
     }

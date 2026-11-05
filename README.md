@@ -4,7 +4,7 @@ A **tiny, opinionated, user-mode Virtual Machine Monitor** (a *microVM* monitor)
 for Windows. It does exactly one thing: bring up a single 64-bit Linux microVM on
 the **Windows Hypervisor Platform** (WHP), boot it through the **PVH** entry
 point, hand it a curated set of paravirtualized (virtio) devices on one PCI bus
-with MSI-X — and then get out of the way.
+with MSI-X, and Hyper-V's time sync over VMBus — and then get out of the way.
 
 It is deliberately **not** a general-purpose machine emulator. There is no BIOS,
 no legacy/real-mode boot, no ACPI power management, no device hot-plug, no PCI
@@ -327,13 +327,15 @@ may come before or after the kernel path; a bare `--` ends them.
 | `--watchdog-secs <N>` | `0` | `0` = run until stopped; else stop after N seconds, printing `io/cpuid/msr` exit counters each second. |
 | `--debug-boot` | off | Prepend `earlyprintk=ttyS0,115200` so early boot streams to the 8250 UART before hvc0 is up. |
 | `--no-default-cmdline` | off | Leave out the default kernel command line (below). |
+| `--no-vmbus` | off | Leave out VMBus and its time-sync service, which keep the guest's clock on the host's as in WSL (see [VMBus & time sync](#vmbus--time-sync-srcvmbus)). Off on its own where the host's WHP can't run it. |
 | `-- <cmdline>` | see below | Everything after a bare `--` is added to the kernel command line: after the defaults, or, with `--iso` or a `--drive` boot, after the boot entry's own arguments. |
 
 **Default kernel cmdline** (`main.rs:842`): `console=hvc0 pci=conf1,nocrs,lastbus=0
 nofb nomodeset` — routes the console to virtio-console (hvc0) so `/init` lands an
 interactive shell and forces PCI Configuration-Mechanism-#1 access. With `--gpu`
 the `nofb nomodeset` suffix is dropped so the guest's virtio-gpu DRM driver can
-mode-set; with `--debug-boot` the `earlyprintk` prefix is added. Arguments after
+mode-set; with `--debug-boot` the `earlyprintk` prefix is added. With VMBus,
+`hv_utils.timesync_implicit=1` is added (as WSL's kernel has it). Arguments after
 `--` follow the defaults (`-- quiet` adds `quiet`), so they never need repeating;
 `--no-default-cmdline` leaves the defaults out.
 
@@ -598,6 +600,35 @@ S5 or the reset value there stops the VM, as does the keyboard controller's
 reset command. It is fixed-hardware ACPI with no events (no buttons, GPEs or PM
 timer, so the SCI never fires) rather than hardware-reduced ACPI, which would
 make Linux drop the 8259 PIC, the only path for ISA interrupts without an IOAPIC.
+With VMBus on, the DSDT also declares `\_SB.VMBS`, where Linux finds VMBus.
+
+### VMBus & time sync (`src/vmbus/`)
+
+The CMOS clock gives the guest the host's time to the second, and nothing
+corrects it afterwards. So tinyvmm offers what WSL's guests get: VMBus with
+Hyper-V's **time-sync integration component**, whose driver (`hv_utils`) is in
+every Hyper-V-capable Linux kernel, the bundled one included. The host pushes
+the time and the guest's kernel sets it, with no daemon:
+
+* a **SYNC** when the guest opens the channel, and again after a restore, which
+  the guest sets its clock to at once. It pairs the host's UTC with the
+  partition reference time read alongside it, so the guest adds the time the
+  message took to arrive: on the nested reference host the guest's clock
+  is within a millisecond of the host's at boot and after a restore (the same
+  check without VMBus: 50 ms to 1 s behind);
+* a **SAMPLE** every 5 s, which keeps the guest's `hyperv` PTP clock
+  (`/dev/ptp0`) fresh for chrony, and which `hv_utils.timesync_implicit=1`
+  makes the guest apply too once it has fallen 5 s behind (after the host
+  slept, say).
+
+tinyvmm implements only the host's end of VMBus, just enough of it for Linux
+(protocol 5.0 to 5.3). The guest posts control messages with the HvPostMessage
+hypercall and signals channels with HvSignalEvent, both of which WHP hands
+tinyvmm as hypercall exits; tinyvmm answers on the guest's SynIC message page
+and event flags, which the hypervisor implements. Each device gets a channel: a
+pair of ring buffers in pages the guest shares. Without VMBus (`--no-vmbus`, or
+a host whose WHP lacks those exits), the guest keeps the time it read from the
+CMOS clock as it booted.
 
 ### The GPU window & host input (`src/display.rs`)
 
@@ -953,6 +984,8 @@ src/
   pci/         config (Type-0 space), bus (0xCF8/0xCFC), msix
   virtio/      queue, device(trait), transport(virtio-pci modern),
                console, net, rng, blk, p9, input, gpu, snd
+  vmbus/       the host's end of VMBus (control messages, channels), ring
+               buffers, integration-component framing, timesync
   net/         wire (parse/build), csum (RFC 1071 checksum, AVX2), nat (user-mode
                NAT), smol (its smoltcp TCP engine), dhcp (the NAT's DHCP
                server), slirp + gvisor (the libslirp and gVisor backends),

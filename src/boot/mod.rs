@@ -19,7 +19,8 @@ pub enum KernelLoad {
 
 impl KernelLoad {
     /// Load `image` (a bzImage, or else a PVH ELF) with its initramfs and the
-    /// boot data that describe the machine.
+    /// boot data that describe the machine; `vmbus` puts VMBus in its ACPI
+    /// tables.
     pub fn load(
         ram: &GuestMemory,
         image: &[u8],
@@ -27,11 +28,14 @@ impl KernelLoad {
         ram_bytes: u64,
         initramfs: Option<&[u8]>,
         vcpu_count: u32,
+        vmbus: bool,
     ) -> Result<Self> {
         if bzimage::is_bzimage(image) {
-            bzimage::load(ram, image, cmdline, ram_bytes, initramfs, vcpu_count).map(Self::BzImage)
+            bzimage::load(ram, image, cmdline, ram_bytes, initramfs, vcpu_count, vmbus)
+                .map(Self::BzImage)
         } else {
-            loader::load_pvh(ram, image, cmdline, ram_bytes, initramfs, vcpu_count).map(Self::Pvh)
+            loader::load_pvh(ram, image, cmdline, ram_bytes, initramfs, vcpu_count, vmbus)
+                .map(Self::Pvh)
         }
     }
 

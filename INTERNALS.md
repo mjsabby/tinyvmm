@@ -56,7 +56,7 @@ The feature set, framed as capabilities you must provide:
 | **Guest physical memory** | A flat slab of host RAM mapped into the guest's physical address space | `crates/whpsys/src/memory.rs` |
 | **Boot protocol** | Get a kernel image into RAM and the CPU pointed at its entry point with the right machine state | `src/boot/loader.rs` (PVH), `src/boot/bzimage.rs` (bzImage) |
 | **Firmware tables** | The minimal ACPI a modern Linux expects (so it finds the LAPIC), plus power-off and reset | `src/boot/acpi.rs`, `src/devices/power.rs` |
-| **A clock** | The guest must be able to calibrate time without legacy timers | `src/whp/cpuid.rs`, `src/whp/hv.rs` (Hyper-V enlightenments, run by the hypervisor) |
+| **A clock** | The guest must be able to calibrate time without legacy timers, and keep its wall clock on the host's | `src/whp/cpuid.rs`, `src/whp/hv.rs` (Hyper-V enlightenments, run by the hypervisor), `src/vmbus/` (VMBus time sync) |
 | **An interrupt controller** | Deliver device interrupts to the guest (x2APIC + MSI, plus the legacy PIC) | WHP's in-hypervisor LAPIC, `crates/whpsys/src/msi.rs`, `src/devices/pic.rs` |
 | **A PCI host bridge** | The `0xCF8/0xCFC` config mechanism and a BAR allocator | `src/pci/` |
 | **A device transport** | virtio-PCI "modern" + the virtqueue ring protocol | `src/virtio/transport.rs`, `src/virtio/queue.rs` |
@@ -280,8 +280,9 @@ Linux enable ACPI, which changes two things. It then finds PCI only through the
 host bridges the DSDT declares, rather than by probing. And it would drop the
 8259 PIC for a hardware-reduced FADT (one without PM registers), so the FADT
 describes fixed ACPI hardware with no events: no buttons, GPEs or PM timer, and
-the SCI (IRQ 9) never fires. There is no IOAPIC entry. `rsdp_paddr` points at
-the RSDP.
+the SCI (IRQ 9) never fires. There is no IOAPIC entry. With VMBus on (M7), the
+DSDT also declares `\_SB.VMBS` (`_HID "VMBus"`, an empty `_CRS`), the device
+Linux's VMBus driver binds to. `rsdp_paddr` points at the RSDP.
 
 The **e820 map** (`loader.rs:313`) is the guest's view of physical RAM. tinyvmm
 emits: reserved `[0,0x10000)` (boot artifacts), RAM `[0x10000,0xA0000)`, reserved
@@ -811,6 +812,43 @@ These are optional and don't change the core, but each teaches one more piece:
   `transport.rs:1122` documents the per-device restore steps). The trigger is a
   magic `CPUID(0x4000DE57)` from the guest, caught in the run loop
   (`run_loop.rs:285`).
+- **VMBus & time sync** (`src/vmbus/`) — the host's end of Hyper-V's device bus,
+  for its one device: the time-sync integration component, which sets the
+  guest's clock from the host's the way WSL's is set. Most of VMBus is already
+  there: the guest's SynIC (message page, event flags, SINTs) is the
+  hypervisor's (M3). What remains is a control plane and channels.
+  - *Transport.* The guest posts control messages with **HvPostMessage** and
+    signals a channel with **HvSignalEvent**. WHP passes both on as
+    `WHvRunVpExitReasonHypercall` once you enable the `HYPERCALL` and
+    `UNKNOWN_SYNIC_CONNECTION` extended exits, and the run loop answers in
+    RAX and steps past the 3-byte VMCALL. Answers go back with
+    `WHvPostVirtualProcessorSynicMessage` to SINT 2 of the vCPU the guest
+    named. The guest's message slot holds one message, so they queue
+    (`Host::flush`). The target vCPU's own run loop posts them before it
+    enters the guest; on a full slot it sets the SINT bit of its
+    deliverability-notifications register and posts the rest on the
+    `SynicSintDeliverable` exit. The host signals a channel with
+    `WHvSignalVirtualProcessorSynicEvent` (flag = the channel's relid).
+  - *Control plane* (`mod.rs`, `protocol.rs`). Versions 5.0 to 5.3 (Linux tries
+    6.0 first and falls back), one offer per device, GPADLs (the PFN lists of
+    pages the guest shares, which can take several messages), opening (a
+    GPADL split into two rings at the page the guest names), closing,
+    retargeting, unloading. **Always answer**: Linux waits for the version
+    response and the offers with no timeout, so a dropped message hangs its
+    boot.
+  - *Rings* (`ring.rs`). A control page (write and read indices, the reader's
+    interrupt mask) and a circular buffer of packets (descriptor, payload
+    padded to 8, an 8-byte trailer). Signal the reader only if its mask is clear
+    and it had read up to the new packet. Validate every index and length the
+    guest wrote.
+  - *Time sync* (`ic.rs`, `timesync.rs`). Integration components are message
+    pipes: a pipe header, an IC header and a body; the host starts each
+    transaction and the guest answers in place. After negotiating framework 3.0
+    and time sync 4.0, the host sends a SYNC (the host's UTC in 100 ns since
+    1601, paired with the partition reference time it read, so the guest can
+    add the delivery delay), then a SAMPLE every 5 s. A snapshot saves the bus
+    but no IC state: a restored channel negotiates again and sends a fresh SYNC,
+    which is what corrects a clock stopped for the snapshot's age.
 
 ---
 
@@ -862,9 +900,12 @@ useful template because the ordering constraints are real:
 1.  parse args; validate snapshot preconditions
 2.  enable SeLockMemoryPrivilege (for 2 MiB large pages)
 3.  Partition::new(vcpus)
-      enable_extended_exits(cpuid, msr)          // take CPUID+MSR exits
       set_local_apic_emulation(X2Apic)           // WHP emulates the LAPIC
       hv::offload(OpenVMM's enlightenment set)   // the hypervisor runs Hyper-V
+      enable_extended_exits(cpuid, msr          // take CPUID+MSR exits, and
+                            [, hypercall, unknown SynIC connection])
+                                                  // VMBus's -- only once the SynIC
+                                                  // is the hypervisor's
       setup()                                     // <-- properties locked here
 4.  GuestMemory::new_split(ram, MMIO_WINDOW_BASE, HIGH_RAM_BASE)   // RAM + SLAT map;
                                                   // SLAT populate runs in the background
@@ -873,6 +914,7 @@ useful template because the ordering constraints are real:
 7.  for i in 0..vcpus: Vcpu::new(part, i)
     setup_pvh_entry(vcpu0, load)                  // 32-bit PM entry on the BSP;
                                                   // APs wait for the guest's INIT/SIPI
+    vmbus::Host::new(timesync)                    // with VMBus
 8.  build IO bus + MMIO bus
     attach 8250 UART, 8254 PIT, CMOS/POST stubs, ACPI PM1 + reset registers,
     i8259 PIC (notify = cancel the BSP's run)     // UART IRQ -> pic.raise
@@ -880,8 +922,9 @@ useful template because the ordering constraints are real:
        console(0) → net* → rng → snd → blk* → input(kbd,tablet) → 9p* → gpu(last)
     each: PciTransport::new(...) → set IRQ callback (Weak) → pci_bus.add_device → start backend
 10. pci_bus.attach_io_bus(&mut io_bus)            // 0xCF8/0xCFC handlers
-11. one RunLoop per vCPU (sharing io_bus, mmio_bus, the crash MSRs);
-    the BSP's also gets set_ext_int_source(pic)
+11. one RunLoop per vCPU (sharing io_bus, mmio_bus, the crash MSRs, and the
+    VMBus host, whose hypercalls each serves and whose messages the guest's
+    chosen vCPU posts); the BSP's also gets set_ext_int_source(pic)
 12. power-off/reboot -> stop_all; gpu window close -> SysRq s,u on hvc0, wait
     for the disks to go idle, stop_all; spawn watchdog (optional), wire
     interactive console + shutdown sentinel
@@ -892,6 +935,7 @@ useful template because the ordering constraints are real:
 15. teardown: stop_all → cancel + join APs → join watchdog → close the gpu window
        quiesce each blk device (take what's left in its ring, stop taking
          requests, wait for every one it took), then stop its IOCP worker
+       stop VMBus's devices (the time-sync thread writes guest RAM)
        if snapshot armed+requested: quiesce net backends + 9p pool, write the file
        else: print device stats + exit counters
 ```
@@ -1059,6 +1103,11 @@ real debugging time in this project.
     `SIO_TCP_INITIAL_RTO` set to send no SYN retransmissions (as Go does),
     it fails at once, and so does the guest's connect to a closed port on the
     gateway. (§M6)
+25. **Ask for VMBus's exits after the enlightenments.** WHP refuses the
+    `UNKNOWN_SYNIC_CONNECTION` extended exit (`ERROR_NOT_SUPPORTED`) while the
+    SynIC isn't yet the hypervisor's, though its capability lists it: set the
+    synthetic processor features first. And never leave a VMBus message
+    unanswered: Linux waits for most answers without a timeout. (§M7)
 
 ---
 

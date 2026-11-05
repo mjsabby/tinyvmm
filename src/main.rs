@@ -23,6 +23,7 @@ mod pci;
 mod record;
 mod scanout;
 mod virtio;
+mod vmbus;
 mod whp;
 
 use crate::devices::io_bus::IoBus;
@@ -52,6 +53,7 @@ use crate::virtio::transport::{self, PciTransport};
 use crate::whp::cpu_affinity::{self, AffinityMode};
 use crate::whp::cpuid::{cached_tsc_hz, set_hide_tsc_deadline};
 use crate::whp::hv::{self, CrashMsrs};
+use crate::whp::partition::exits;
 use crate::whp::run_loop::{RunLoop, StopReason};
 use crate::whp::{GuestMemory, Partition, Vcpu};
 
@@ -201,10 +203,12 @@ fn print_usage() {
          \x20              [--record <file.mp4>[,fps=N][,kbps=N]]  (needs --gpu; records the\n\
          \x20              display + --sound playback to a fragmented H.264/AAC MP4; default 30 fps)\n\
          \x20              [--save <path> [--unsafe-save-mutable-drive]]\n\
-         \x20              [--watchdog-secs N] [--debug-boot] [--no-default-cmdline]\n\
+         \x20              [--watchdog-secs N] [--debug-boot] [--no-default-cmdline] [--no-vmbus]\n\
          \x20              [vmlinux] [-- <kernel args>]\n\
          \x20              Kernel args are added to the defaults (console=hvc0 pci=conf1,...);\n\
          \x20              --no-default-cmdline makes them the whole command line instead.\n\
+         \x20              --no-vmbus leaves out VMBus, whose time-sync service keeps the\n\
+         \x20              guest's clock on the host's (as in WSL).\n\
          \x20              Kernel path is required in plain builds unless a --drive holds an\n\
          \x20              installed Linux (below); appliance builds embed defaults.\n\
          \x20              The kernel may be a PVH ELF vmlinux or a bzImage (vmlinuz).\n\
@@ -383,7 +387,7 @@ fn run_blk_selftest() -> Result<i32> {
 
     check_whp_available()?;
     let mut part = Partition::new(1)?;
-    part.enable_extended_exits(true, true, false)?;
+    part.enable_extended_exits(exits::CPUID | exits::MSR)?;
     set_hide_tsc_deadline(true);
     part.set_local_apic_emulation(WHvX64LocalApicEmulationModeX2Apic)?;
     part.setup()?;
@@ -684,7 +688,7 @@ fn run_blk_stresstest() -> Result<i32> {
 
     check_whp_available()?;
     let mut part = Partition::new(1)?;
-    part.enable_extended_exits(true, true, false)?;
+    part.enable_extended_exits(exits::CPUID | exits::MSR)?;
     set_hide_tsc_deadline(true);
     part.set_local_apic_emulation(WHvX64LocalApicEmulationModeX2Apic)?;
     part.setup()?;
@@ -1055,6 +1059,9 @@ struct PvhArgs {
     large_pages: bool,
     /// `--record`: tee the GPU scanout (+ sound) into an MP4.
     record: Option<RecordSpec>,
+    /// VMBus with the time-sync IC (`vmbus`): on unless `--no-vmbus`, or the
+    /// host's WHP can't run it.
+    vmbus: bool,
 }
 
 /// Parse a `--portfwd HOSTPORT:GUESTPORT` rule. The host side binds 127.0.0.1
@@ -1109,6 +1116,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
     let mut watchdog_secs = 0u32;
     let mut debug_boot = false;
     let mut default_cmdline = true;
+    let mut vmbus = true;
     let mut nics: Vec<NicSpec> = Vec::new();
     let mut with_rng = false;
     let mut with_gpu = false;
@@ -1194,6 +1202,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
             }
             "--debug-boot" => debug_boot = true,
             "--no-default-cmdline" => default_cmdline = false,
+            "--no-vmbus" => vmbus = false,
             "--net" => nics.push(NicSpec::new()),
             "--net-backend" => {
                 i += 1;
@@ -1485,6 +1494,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
             },
         );
     }
+    let vmbus = vmbus && vmbus::supported();
     if default_cmdline {
         // Route the kernel console to the virtio-console (hvc0) so the
         // initramfs /init drops to an interactive shell. With --debug-boot,
@@ -1500,6 +1510,12 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
         };
         if boot::payload::BUNDLED {
             defaults.push_str(" idle=halt");
+        }
+        // The time-sync IC sets the clock as the kernel boots; this has its
+        // later samples also catch up a guest that fell 5 s behind (after the
+        // host slept, say), as WSL's kernel does.
+        if vmbus {
+            defaults.push_str(" hv_utils.timesync_implicit=1");
         }
         if !cmdline.is_empty() {
             defaults.push(' ');
@@ -1544,6 +1560,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
         with_sound,
         large_pages,
         record,
+        vmbus,
     })
 }
 
@@ -1555,6 +1572,34 @@ fn new_pic(bsp: &Arc<Vcpu>) -> Arc<Pic8259> {
     Pic8259::new(Box::new(move || {
         let _ = bsp.cancel();
     }))
+}
+
+/// VMBus and its one device, the time-sync IC, which keeps the guest's clock on
+/// the host's.
+fn new_vmbus(
+    part: WHV_PARTITION_HANDLE,
+    ram: &Arc<GuestMemory>,
+    vcpus: &[Arc<Vcpu>],
+) -> Arc<vmbus::Host> {
+    let clock = vmbus::timesync::partition_clock(part);
+    let timesync: Arc<dyn vmbus::Device> = vmbus::timesync::Timesync::new(clock);
+    println!("[vmbus] offering the time-sync IC");
+    vmbus::Host::new(part, ram.clone(), vcpus, vec![timesync])
+}
+
+/// Ask WHP for the CPUID and MSR exits, plus VMBus's if `vmbus`; returns
+/// whether VMBus got them. Call after the enlightenments: WHP takes the
+/// unknown-SynIC-connection exit only once the SynIC is its hypervisor's.
+fn enable_exits(part: &Partition, vmbus: bool) -> Result<bool> {
+    let base = exits::CPUID | exits::MSR;
+    if vmbus {
+        match part.enable_extended_exits(base | vmbus::EXITS) {
+            Ok(()) => return Ok(true),
+            Err(e) => eprintln!("[vmbus] WHP refused its hypercall exits ({e}); running without"),
+        }
+    }
+    part.enable_extended_exits(base)?;
+    Ok(false)
 }
 
 /// TINYVMM_DIAG post-mortem view of each vCPU's WHP LAPIC: TPR/PPR plus the
@@ -1681,17 +1726,22 @@ fn finish_recording(recorder: Option<&Arc<Recorder>>, tag: &str) {
 /// exit: it would keep all guest RAM and its NAT's sockets, port forwards
 /// included. Declared once the vCPUs are joined and blk is quiesced, it drops
 /// before the transports and the partition, on every return path: it stops
-/// every transport, the NICs' backends and 9p, then frees guest RAM.
+/// VMBus's devices, every transport, the NICs' backends and 9p, then frees
+/// guest RAM.
 struct ReleaseBeforeTeardown<'a> {
     tag: &'static str,
     transports: &'a [Arc<PciTransport>],
     net_devices: &'a [Arc<NetDevice>],
     p9_devices: &'a [Arc<P9Device>],
+    vmbus: Option<&'a vmbus::Host>,
     ram: &'a GuestMemory,
 }
 
 impl Drop for ReleaseBeforeTeardown<'_> {
     fn drop(&mut self) {
+        if let Some(host) = self.vmbus {
+            host.stop();
+        }
         for t in self.transports {
             t.stop();
         }
@@ -1770,6 +1820,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         .u32("drives", cfg.drives.len() as u32)
         .u32("gpu", cfg.with_gpu as u32)
         .u32("sound", cfg.with_sound as u32)
+        .u32("vmbus", cfg.vmbus as u32)
         .write();
 
     if host::enable_lock_memory_privilege() {
@@ -1780,7 +1831,6 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
 
     // --- Partition ---
     let mut part = Partition::new(cfg.vcpus)?;
-    part.enable_extended_exits(true, true, false)?;
     set_hide_tsc_deadline(true);
     // No static CPUID result list: every CPUID exits (`whp::cpuid`), and a
     // static entry would replace the guest-state-aware default WHP passes the
@@ -1790,6 +1840,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     part.set_local_apic_emulation(WHvX64LocalApicEmulationModeX2Apic)?;
     // The hypervisor implements the Hyper-V enlightenments (`whp::hv`).
     let hv_features = hv::offload(&part, None)?;
+    let vmbus_on = enable_exits(&part, cfg.vmbus)?;
     part.setup()?;
     let part_handle = part.handle();
     println!("[pvh-run] Hyper-V enlightenments run in the hypervisor (features 0x{hv_features:x})");
@@ -1899,6 +1950,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
             ram.size() as u64,
             initramfs.as_ref().map(|m| m.bytes()),
             cfg.vcpus,
+            vmbus_on,
         )?
     };
     println!("[pvh-run] {}", load.describe());
@@ -1915,6 +1967,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         vcpus.push(Arc::new(Vcpu::new(part_handle, i)?));
     }
     load.setup_entry(&vcpus[0])?;
+    let vmbus_host = vmbus_on.then(|| new_vmbus(part_handle, &ram, &vcpus));
 
     // --- Device model ---
     let mut io_bus = IoBus::new();
@@ -2338,6 +2391,9 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         if vp.index() == 0 {
             rl.set_ext_int_source(pic.clone());
         }
+        if let Some(host) = &vmbus_host {
+            rl.set_vmbus(host.clone());
+        }
         loops.push(rl);
     }
 
@@ -2545,11 +2601,16 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     for b in &blk_backends {
         b.stop();
     }
+    // VMBus's devices stop writing guest RAM before a snapshot captures it.
+    if let Some(host) = &vmbus_host {
+        host.stop();
+    }
     let _release = ReleaseBeforeTeardown {
         tag: "pvh-run",
         transports: &transports,
         net_devices: &net_devices,
         p9_devices: &p9_devices,
+        vmbus: vmbus_host.as_deref(),
         ram: &ram,
     };
 
@@ -2582,6 +2643,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
                 &com1,
                 &legacy,
                 &power,
+                vmbus_host.as_deref(),
                 &pci_bus,
                 &transports,
                 &blk_backends,
@@ -2947,6 +3009,7 @@ fn write_snapshot(
     com1: &Arc<Serial8250>,
     legacy: &Arc<LegacyIsaStubs>,
     power: &Arc<PowerDevice>,
+    vmbus: Option<&vmbus::Host>,
     pci_bus: &Arc<PciBus>,
     transports: &[Arc<PciTransport>],
     blk_backends: &[Arc<BlockFile>],
@@ -2976,6 +3039,7 @@ fn write_snapshot(
         .bool("large_pages", ram.large_pages())
         .u64("hv_features", hv_features)
         .bool("hide_tsc_deadline", true)
+        .bool("vmbus", vmbus.is_some())
         .bool("with_rng", cfg.with_rng)
         .bool("with_gpu", cfg.with_gpu)
         .bool("with_sound", cfg.with_sound)
@@ -3090,6 +3154,9 @@ fn write_snapshot(
     w.write_section(SectionType::LegacySerial8250, &com1.snapshot_capture())?;
     w.write_section(SectionType::LegacyIsaStubs, &legacy.snapshot_capture())?;
     w.write_section(SectionType::AcpiPm, &power.snapshot_capture())?;
+    if let Some(host) = vmbus {
+        w.write_section(SectionType::Vmbus, &host.save())?;
+    }
     w.write_section(SectionType::LegacyPciBus, &pci_bus.snapshot_capture())?;
 
     // Per-PCI-device sections: [u16 device_index][DeviceSnapshot]. One blob per
@@ -3254,6 +3321,13 @@ fn run_restore(args: &[String]) -> Result<i32> {
     let gpu_width = jr.get_u64("gpu_width").unwrap_or(1280) as u32;
     let gpu_height = jr.get_u64("gpu_height").unwrap_or(800) as u32;
     let with_input = jr.get_bool("with_input").unwrap_or(false);
+    let with_vmbus = jr.get_bool("vmbus").unwrap_or(false);
+    if with_vmbus && !vmbus::supported() {
+        return Err(Error::msg(
+            "the snapshot's guest uses VMBus, which this host's Windows Hypervisor Platform \
+             can't run",
+        ));
+    }
     if record.is_some() && !with_gpu {
         return Err(Error::msg(
             "--record captures the virtio-gpu display, but this snapshot has no GPU",
@@ -3290,12 +3364,16 @@ fn run_restore(args: &[String]) -> Result<i32> {
 
     // --- Partition (same setup as a fresh boot, minus the kernel load) ---
     let mut part = Partition::new(vcpu_count)?;
-    part.enable_extended_exits(true, true, false)?;
     set_hide_tsc_deadline(true);
     part.set_local_apic_emulation(WHvX64LocalApicEmulationModeX2Apic)?;
     // The same enlightenments the guest booted with: it chose its code paths
     // from them.
     hv::offload(&part, Some(saved_hv_features))?;
+    if enable_exits(&part, with_vmbus)? != with_vmbus {
+        return Err(Error::msg(
+            "the snapshot's guest uses VMBus, which this host's WHP won't run",
+        ));
+    }
     part.setup()?;
     // Keep the clocks stopped until every vCPU's TSC and the reference time
     // are back, then resume them together from the saved instant.
@@ -3707,6 +3785,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
     let mut sec_serial: Option<Vec<u8>> = None;
     let mut sec_isa: Option<Vec<u8>> = None;
     let mut sec_pm: Option<Vec<u8>> = None;
+    let mut sec_vmbus: Option<Vec<u8>> = None;
     let mut sec_bus: Option<Vec<u8>> = None;
     let mut sec_devices: Vec<(u16, Vec<u8>)> = Vec::new();
     let mut caps: Vec<vs::CapturedVcpuState> = (0..vcpu_count)
@@ -3731,6 +3810,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
             SectionType::LegacySerial8250 => sec_serial = Some(s.payload.to_vec()),
             SectionType::LegacyIsaStubs => sec_isa = Some(s.payload.to_vec()),
             SectionType::AcpiPm => sec_pm = Some(s.payload.to_vec()),
+            SectionType::Vmbus => sec_vmbus = Some(s.payload.to_vec()),
             SectionType::LegacyPciBus => sec_bus = Some(s.payload.to_vec()),
             SectionType::PciDevice => {
                 if s.payload.len() < 2 {
@@ -3899,6 +3979,16 @@ fn run_restore(args: &[String]) -> Result<i32> {
         vs::apply_non_timing(vp, &caps[i])?;
     }
 
+    // VMBus, once the SynIC is back: a device whose channel was open starts
+    // its protocol over on it, signaling the restored event page.
+    let vmbus_host = with_vmbus.then(|| new_vmbus(part_handle, &ram, &vcpus));
+    if let Some(host) = &vmbus_host {
+        let saved = sec_vmbus
+            .as_deref()
+            .ok_or_else(|| Error::msg("snapshot: VMBus is on but its section is missing"))?;
+        host.restore(saved)?;
+    }
+
     // --- Run loops ---
     let mut loops: Vec<RunLoop> = Vec::with_capacity(vcpu_count as usize);
     for vp in &vcpus {
@@ -3912,6 +4002,9 @@ fn run_restore(args: &[String]) -> Result<i32> {
         rl.set_crash_msrs(crash.clone());
         if vp.index() == 0 {
             rl.set_ext_int_source(pic.clone());
+        }
+        if let Some(host) = &vmbus_host {
+            rl.set_vmbus(host.clone());
         }
         loops.push(rl);
     }
@@ -4073,6 +4166,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
         transports: &transports,
         net_devices: &net_devices,
         p9_devices: &p9_devices,
+        vmbus: vmbus_host.as_deref(),
         ram: &ram,
     };
     if let Some(d) = &display {
