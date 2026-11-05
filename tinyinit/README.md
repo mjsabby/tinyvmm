@@ -261,7 +261,9 @@ options or certificates.
 SSH supports interactive PTYs, resizing, non-interactive commands, stdin,
 stderr, and exit status; not SFTP/SCP subsystems or port/agent forwarding.
 Brush supplies shell syntax and builtins; selected uutils applets supply
-external tools, not an entire distro. `poweroff` signals PID 1.
+external tools, not an entire distro. `poweroff` signals PID 1, and is also
+what the kernel runs (`kernel.poweroff_cmd`) when tinyvmm asks the guest to
+shut down.
 
 By default the SSH host key is ephemeral, so its fingerprint changes each boot.
 For a stable identity, set `ssh.host_key` to a protected persistent Linux

@@ -812,9 +812,10 @@ These are optional and don't change the core, but each teaches one more piece:
   `transport.rs:1122` documents the per-device restore steps). The trigger is a
   magic `CPUID(0x4000DE57)` from the guest, caught in the run loop
   (`run_loop.rs:285`).
-- **VMBus & time sync** (`src/vmbus/`) — the host's end of Hyper-V's device bus,
-  for its one device: the time-sync integration component, which sets the
-  guest's clock from the host's the way WSL's is set. Most of VMBus is already
+- **VMBus: time sync & shutdown** (`src/vmbus/`) — the host's end of Hyper-V's
+  device bus, for two integration components: time sync, which sets the
+  guest's clock from the host's the way WSL's is set, and shutdown, which asks
+  the guest to shut down. Most of VMBus is already
   there: the guest's SynIC (message page, event flags, SINTs) is the
   hypervisor's (M3). What remains is a control plane and channels.
   - *Transport.* The guest posts control messages with **HvPostMessage** and
@@ -841,14 +842,27 @@ These are optional and don't change the core, but each teaches one more piece:
     padded to 8, an 8-byte trailer). Signal the reader only if its mask is clear
     and it had read up to the new packet. Validate every index and length the
     guest wrote.
-  - *Time sync* (`ic.rs`, `timesync.rs`). Integration components are message
-    pipes: a pipe header, an IC header and a body; the host starts each
-    transaction and the guest answers in place. After negotiating framework 3.0
-    and time sync 4.0, the host sends a SYNC (the host's UTC in 100 ns since
-    1601, paired with the partition reference time it read, so the guest can
-    add the delivery delay), then a SAMPLE every 5 s. A snapshot saves the bus
-    but no IC state: a restored channel negotiates again and sends a fresh SYNC,
-    which is what corrects a clock stopped for the snapshot's age.
+  - *Integration components* (`ic.rs`). Message pipes: a pipe header, an IC
+    header and a body; the host starts each transaction and the guest answers
+    in place. Each IC is a `Service` (its GUIDs, versions and messages) that a
+    `Runner` runs on a thread of its own: on every open it negotiates
+    framework 3.0 and one of the service's versions, re-signaling the guest
+    each second until it answers, then passes the service the guest's answers
+    and ticks it when the guest signals, when its deadline comes, or when the
+    host has work. A snapshot saves the bus but no IC state: a restored
+    channel negotiates again.
+  - *Time sync* (`timesync.rs`). After time sync 4.0 is agreed, the host sends
+    a SYNC (the host's UTC in 100 ns since 1601, paired with the partition
+    reference time it read, so the guest can add the delivery delay), then a
+    SAMPLE every 5 s. A restore sends a fresh SYNC, which is what corrects a
+    clock stopped for the snapshot's age.
+  - *Shutdown* (`shutdown.rs`, and `src/stop.rs` for when to ask). One
+    request, Linux's `shutdown_msg_data` with flags 0 (shut down) and the
+    planned reason, which the guest must get whole (2060 bytes of body). Its
+    `hv_utils` answers with a status, then runs `orderly_poweroff`, that is
+    `/proc/sys/kernel/poweroff_cmd`, which tinyinit points at its own
+    `poweroff`. tinyvmm gives the guest 5 s to answer and a minute to stop
+    before falling back to SysRq.
 
 ---
 
@@ -914,7 +928,7 @@ useful template because the ordering constraints are real:
 7.  for i in 0..vcpus: Vcpu::new(part, i)
     setup_pvh_entry(vcpu0, load)                  // 32-bit PM entry on the BSP;
                                                   // APs wait for the guest's INIT/SIPI
-    vmbus::Host::new(timesync)                    // with VMBus
+    vmbus::Host::new(timesync, shutdown)          // with VMBus
 8.  build IO bus + MMIO bus
     attach 8250 UART, 8254 PIT, CMOS/POST stubs, ACPI PM1 + reset registers,
     i8259 PIC (notify = cancel the BSP's run)     // UART IRQ -> pic.raise
@@ -925,17 +939,19 @@ useful template because the ordering constraints are real:
 11. one RunLoop per vCPU (sharing io_bus, mmio_bus, the crash MSRs, and the
     VMBus host, whose hypercalls each serves and whose messages the guest's
     chosen vCPU posts); the BSP's also gets set_ext_int_source(pic)
-12. power-off/reboot -> stop_all; gpu window close -> SysRq s,u on hvc0, wait
-    for the disks to go idle, stop_all; spawn watchdog (optional), wire
-    interactive console + shutdown sentinel
+12. power-off/reboot -> stop_all; gpu window close, Ctrl+A S, Ctrl+C/Break or
+    closing the console -> GracefulStop: shutdown IC, else SysRq s,u on hvc0
+    and a wait for the disks to go idle, then stop_all; spawn watchdog
+    (optional), wire interactive console + shutdown sentinel
 13. arm snapshot trigger (if --save)
 14. BSP runs on the main thread; each AP runs on its own thread (pinned per --cpu-affinity;
        the whole process was confined to the mode's core class before step 3, so every
        thread it starts inherits that)
-15. teardown: stop_all → cancel + join APs → join watchdog → close the gpu window
+15. teardown: stop_all → disarm GracefulStop (nothing stops a partition being
+       deleted) → cancel + join APs → join watchdog → close the gpu window
        quiesce each blk device (take what's left in its ring, stop taking
          requests, wait for every one it took), then stop its IOCP worker
-       stop VMBus's devices (the time-sync thread writes guest RAM)
+       stop VMBus's devices (their IC threads write guest RAM)
        if snapshot armed+requested: quiesce net backends + 9p pool, write the file
        else: print device stats + exit counters
 ```
@@ -1209,6 +1225,7 @@ src/display.rs   Win32 GDI window for virtio-gpu + host-input seam
 src/scanout.rs   the GPU's published BGRA pictures, shared by the window + recorder
 src/record.rs    --record: GPU frames + snd playback -> H.264/AAC MP4
 src/main.rs      CLI dispatch, the full machine wiring, save/restore driver
+src/stop.rs      stopping the VM when the user asks: shutdown IC, then SysRq
 src/cli.rs       @file argument files, disk sizes with units
 ```
 

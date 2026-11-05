@@ -327,7 +327,7 @@ may come before or after the kernel path; a bare `--` ends them.
 | `--watchdog-secs <N>` | `0` | `0` = run until stopped; else stop after N seconds, printing `io/cpuid/msr` exit counters each second. |
 | `--debug-boot` | off | Prepend `earlyprintk=ttyS0,115200` so early boot streams to the 8250 UART before hvc0 is up. |
 | `--no-default-cmdline` | off | Leave out the default kernel command line (below). |
-| `--no-vmbus` | off | Leave out VMBus and its time-sync service, which keep the guest's clock on the host's as in WSL (see [VMBus & time sync](#vmbus--time-sync-srcvmbus)). Off on its own where the host's WHP can't run it. |
+| `--no-vmbus` | off | Leave out VMBus and its services: time sync, which keeps the guest's clock on the host's as in WSL, and shutdown, which lets tinyvmm ask the guest to shut down (see [VMBus: time sync & shutdown](#vmbus-time-sync--shutdown-srcvmbus)). Off on its own where the host's WHP can't run it. |
 | `-- <cmdline>` | see below | Everything after a bare `--` is added to the kernel command line: after the defaults, or, with `--iso` or a `--drive` boot, after the boot entry's own arguments. |
 
 **Default kernel cmdline** (`main.rs:842`): `console=hvc0 pci=conf1,nocrs,lastbus=0
@@ -402,19 +402,28 @@ Close the VM before mounting its VHDX in WSL for offline
 editing; flush, unmount, and detach it from WSL before booting the VM again.
 
 The text console forwards raw stdin to the virtio-console RX queue; **Ctrl+A then
-X** quits. The guest can also request a clean shutdown by printing a sentinel on
-hvc0, which a watcher thread detects to stop the VM.
+S** asks the guest to shut down and **Ctrl+A then X** quits at once. The guest can
+also request a clean shutdown by printing a sentinel on hvc0, which a watcher
+thread detects to stop the VM.
 
 The guest powering off (ACPI S5) or rebooting (the ACPI reset register, or the
 keyboard controller's reset) stops the VM with exit code 0; tinyvmm never
-restarts a guest, so run it again to boot again. Closing the `--gpu` window asks
-the guest kernel, through hvc0's SysRq hook (`^O`), to sync and remount its
+restarts a guest, so run it again to boot again. Closing the `--gpu` window,
+Ctrl+A S, and Ctrl+C (when stdin isn't a console, which passes Ctrl+C to the
+guest) or Ctrl+Break ask the guest to shut down, as Hyper-V's `Stop-VM` does:
+through VMBus's shutdown integration component
+([below](#vmbus-time-sync--shutdown-srcvmbus)), after which the guest stops its
+programs, syncs and powers off. A guest that can't be asked (`--no-vmbus`, or a
+kernel that hasn't opened the IC yet) or that is still running a minute later is
+asked instead, through hvc0's SysRq hook (`^O`), to sync and remount its
 filesystems read-only (SysRq `s` and `u`, which Ubuntu's `kernel.sysrq=176`
-allows), waits until its disks have been idle for a second (at most 15 s), and
-stops the VM, so the next boot finds them clean. That takes hvc0 being a kernel
-console, as the default command line makes it, held open by a process (a getty,
-or the initramfs shell); without `console=hvc0`, closing the window just stops
-the VM.
+allows); tinyvmm waits until its disks have been idle for a second (at most
+15 s) and stops the VM, so the next boot finds them clean. That takes hvc0 being
+a kernel console, as the default command line makes it, held open by a process
+(a getty, or the initramfs shell); without `console=hvc0`, the fallback just
+stops the VM. Asking twice stops at once, as Ctrl+A X does. Closing the console
+window gives the guest the 5 s Windows allows: a second to answer and two to
+stop, then SysRq.
 
 ### Discrete Device Assignment / PCI passthrough (experimental, `--dda-probe`)
 
@@ -602,7 +611,7 @@ timer, so the SCI never fires) rather than hardware-reduced ACPI, which would
 make Linux drop the 8259 PIC, the only path for ISA interrupts without an IOAPIC.
 With VMBus on, the DSDT also declares `\_SB.VMBS`, where Linux finds VMBus.
 
-### VMBus & time sync (`src/vmbus/`)
+### VMBus: time sync & shutdown (`src/vmbus/`)
 
 The CMOS clock gives the guest the host's time to the second, and nothing
 corrects it afterwards. So tinyvmm offers what WSL's guests get: VMBus with
@@ -621,6 +630,14 @@ the time and the guest's kernel sets it, with no daemon:
   makes the guest apply too once it has fallen 5 s behind (after the host
   slept, say).
 
+It also offers Hyper-V's **shutdown integration component**, which tinyvmm asks
+through when the user stops the VM: closing the `--gpu` window, Ctrl+A S, Ctrl+C
+or Ctrl+Break, falling back to SysRq on hvc0 (see [Examples](#examples)).
+The same `hv_utils` answers at once and starts the kernel's orderly power-off,
+which runs `/proc/sys/kernel/poweroff_cmd`: tinyinit points it at its own
+`poweroff`, which has PID 1 stop every process, sync and power off. A guest
+whose init is systemd keeps the default, `/sbin/poweroff`.
+
 tinyvmm implements only the host's end of VMBus, just enough of it for Linux
 (protocol 5.0 to 5.3). The guest posts control messages with the HvPostMessage
 hypercall and signals channels with HvSignalEvent, both of which WHP hands
@@ -628,7 +645,7 @@ tinyvmm as hypercall exits; tinyvmm answers on the guest's SynIC message page
 and event flags, which the hypervisor implements. Each device gets a channel: a
 pair of ring buffers in pages the guest shares. Without VMBus (`--no-vmbus`, or
 a host whose WHP lacks those exits), the guest keeps the time it read from the
-CMOS clock as it booted.
+CMOS clock as it booted, and stopping the VM falls back to SysRq.
 
 ### The GPU window & host input (`src/display.rs`)
 
@@ -968,6 +985,7 @@ crates/
     EmulatorBus trait), doorbell
 src/
   main.rs      CLI dispatch, device wiring, interactive console, save/restore
+  stop.rs      stopping the VM when the user asks: shutdown IC, then SysRq
   cli.rs       @file argument files, disk sizes with units
   display.rs   Win32 GDI window host for virtio-gpu + host-input seam
   scanout.rs   the GPU's published BGRA pictures, shared by the window + recorder
@@ -985,7 +1003,8 @@ src/
   virtio/      queue, device(trait), transport(virtio-pci modern),
                console, net, rng, blk, p9, input, gpu, snd
   vmbus/       the host's end of VMBus (control messages, channels), ring
-               buffers, integration-component framing, timesync
+               buffers, integration components (framing and their thread),
+               timesync, shutdown
   net/         wire (parse/build), csum (RFC 1071 checksum, AVX2), nat (user-mode
                NAT), smol (its smoltcp TCP engine), dhcp (the NAT's DHCP
                server), slirp + gvisor (the libslirp and gVisor backends),

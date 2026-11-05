@@ -22,6 +22,7 @@ mod net;
 mod pci;
 mod record;
 mod scanout;
+mod stop;
 mod virtio;
 mod vmbus;
 mod whp;
@@ -208,7 +209,8 @@ fn print_usage() {
          \x20              Kernel args are added to the defaults (console=hvc0 pci=conf1,...);\n\
          \x20              --no-default-cmdline makes them the whole command line instead.\n\
          \x20              --no-vmbus leaves out VMBus, whose time-sync service keeps the\n\
-         \x20              guest's clock on the host's (as in WSL).\n\
+         \x20              guest's clock on the host's (as in WSL), and whose shutdown\n\
+         \x20              service lets tinyvmm ask the guest to shut down.\n\
          \x20              Kernel path is required in plain builds unless a --drive holds an\n\
          \x20              installed Linux (below); appliance builds embed defaults.\n\
          \x20              The kernel may be a PVH ELF vmlinux or a bzImage (vmlinuz).\n\
@@ -226,8 +228,11 @@ fn print_usage() {
          \x20              `Get-PnpDevice`. Dismount it first: Dismount-VMHostAssignableDevice.\n\
          \n\
          The guest powering off or rebooting stops the VM (exit code 0). Closing the\n\
-         --gpu window has the guest sync and remount its filesystems read-only (SysRq\n\
-         on hvc0), then stops it. Ctrl+A X stops at once.\n\
+         --gpu window, Ctrl+A S, or Ctrl+C (when stdin isn't a console) or Ctrl+Break\n\
+         asks the guest to shut down (VMBus's shutdown IC). A guest that can't be\n\
+         asked, or hasn't stopped a minute later, syncs and remounts its filesystems\n\
+         read-only instead (SysRq on hvc0), then the VM stops. Ctrl+A X, or asking\n\
+         twice, stops at once.\n\
          \n\
          An @file argument is replaced by the arguments in that file: split at\n\
          whitespace, \"double quotes\" keep spaces, # starts a comment line. Its\n\
@@ -1059,8 +1064,8 @@ struct PvhArgs {
     large_pages: bool,
     /// `--record`: tee the GPU scanout (+ sound) into an MP4.
     record: Option<RecordSpec>,
-    /// VMBus with the time-sync IC (`vmbus`): on unless `--no-vmbus`, or the
-    /// host's WHP can't run it.
+    /// VMBus with the time-sync and shutdown ICs (`vmbus`): on unless
+    /// `--no-vmbus`, or the host's WHP can't run it.
     vmbus: bool,
 }
 
@@ -1562,17 +1567,18 @@ fn new_pic(bsp: &Arc<Vcpu>) -> Arc<Pic8259> {
     }))
 }
 
-/// VMBus and its one device, the time-sync IC, which keeps the guest's clock on
-/// the host's.
+/// VMBus and its devices: the time-sync IC, which keeps the guest's clock on
+/// the host's, and the shutdown IC, with the handle that asks through it.
 fn new_vmbus(
     part: WHV_PARTITION_HANDLE,
     ram: &Arc<GuestMemory>,
     vcpus: &[Arc<Vcpu>],
-) -> Arc<vmbus::Host> {
-    let clock = vmbus::timesync::partition_clock(part);
-    let timesync: Arc<dyn vmbus::Device> = vmbus::timesync::Timesync::new(clock);
-    println!("[vmbus] offering the time-sync IC");
-    vmbus::Host::new(part, ram.clone(), vcpus, vec![timesync])
+) -> (Arc<vmbus::Host>, vmbus::shutdown::Shutdown) {
+    let timesync = vmbus::timesync::new(vmbus::timesync::partition_clock(part));
+    let (shutdown, ask) = vmbus::shutdown::new();
+    println!("[vmbus] offering the time-sync and shutdown ICs");
+    let host = vmbus::Host::new(part, ram.clone(), vcpus, vec![timesync, shutdown]);
+    (host, ask)
 }
 
 /// Ask WHP for the CPUID and MSR exits, plus VMBus's if `vmbus`; returns
@@ -1955,7 +1961,9 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         vcpus.push(Arc::new(Vcpu::new(part_handle, i)?));
     }
     load.setup_entry(&vcpus[0])?;
-    let vmbus_host = vmbus_on.then(|| new_vmbus(part_handle, &ram, &vcpus));
+    let (vmbus_host, shutdown) = vmbus_on
+        .then(|| new_vmbus(part_handle, &ram, &vcpus))
+        .unzip();
 
     // --- Device model ---
     let mut io_bus = IoBus::new();
@@ -2398,14 +2406,20 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         }
     };
     power.set_on_request(stop_all.clone());
+    let graceful = stop::GracefulStop::new(
+        "pvh-run",
+        shutdown,
+        hvc0_is_console(&cmdline).then(|| stop::SysRq {
+            console: console.clone(),
+            disks: blk_devices.clone(),
+        }),
+        stoppers.iter().map(|(flag, _)| flag.clone()).collect(),
+        stop_all.clone(),
+    );
+    graceful.take_console_events();
     if let Some(d) = &display {
-        d.set_close_handler(stop_on_window_close(
-            "pvh-run",
-            console.clone(),
-            blk_devices.clone(),
-            hvc0_is_console(&cmdline),
-            stop_all.clone(),
-        ));
+        let graceful = graceful.clone();
+        d.set_close_handler(move || graceful.begin("window closed"));
     }
 
     // Watchdog (optional): stop everything after N seconds. Teardown hangs up
@@ -2437,7 +2451,8 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         None
     };
 
-    // Interactive console: raw stdin -> virtio-console RX. Ctrl+A X quits.
+    // Interactive console: raw stdin -> virtio-console RX. Ctrl+A S shuts the
+    // guest down, Ctrl+A X quits.
     // When both --gpu and --input are active, the GPU window is the host input
     // source (1:1 pixel coords for the tablet); the console reader then just
     // forwards hvc0 bytes. Otherwise --input falls back to the console source.
@@ -2456,7 +2471,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         input_devices
     };
     let console_restore =
-        setup_interactive_console(console.clone(), console_input, stop_all.clone());
+        setup_interactive_console(console.clone(), console_input, graceful.clone());
 
     // Shutdown sentinel watcher: the guest prints this marker on hvc0 to
     // request a clean stop. Harnesses use it: it predates ACPI power-off, and
@@ -2536,6 +2551,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     // and surface any abnormal one — otherwise an AP that died on an exception /
     // unhandled exit is invisible (only the BSP's reason is the process result).
     stop_all();
+    graceful.disarm();
     drop(watchdog_done);
     let mut ap_reasons: Vec<StopReason> = Vec::with_capacity(ap_handles.len());
     for h in ap_handles {
@@ -3969,7 +3985,9 @@ fn run_restore(args: &[String]) -> Result<i32> {
 
     // VMBus, once the SynIC is back: a device whose channel was open starts
     // its protocol over on it, signaling the restored event page.
-    let vmbus_host = with_vmbus.then(|| new_vmbus(part_handle, &ram, &vcpus));
+    let (vmbus_host, shutdown) = with_vmbus
+        .then(|| new_vmbus(part_handle, &ram, &vcpus))
+        .unzip();
     if let Some(host) = &vmbus_host {
         let saved = sec_vmbus
             .as_deref()
@@ -4009,16 +4027,22 @@ fn run_restore(args: &[String]) -> Result<i32> {
         }
     };
     power.set_on_request(stop_all.clone());
+    // A snapshot doesn't record the kernel command line; the default one
+    // makes hvc0 the console.
+    let graceful = stop::GracefulStop::new(
+        "restore",
+        shutdown,
+        Some(stop::SysRq {
+            console: console.clone(),
+            disks: blk_devices.clone(),
+        }),
+        stoppers.iter().map(|(flag, _)| flag.clone()).collect(),
+        stop_all.clone(),
+    );
+    graceful.take_console_events();
     if let Some(d) = &display {
-        // A snapshot doesn't record the kernel command line; the default one
-        // makes hvc0 the console.
-        d.set_close_handler(stop_on_window_close(
-            "restore",
-            console.clone(),
-            blk_devices.clone(),
-            true,
-            stop_all.clone(),
-        ));
+        let graceful = graceful.clone();
+        d.set_close_handler(move || graceful.begin("window closed"));
     }
 
     let window_owns_input = display.is_some() && input_devices.is_some();
@@ -4036,7 +4060,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
         input_devices
     };
     let console_restore =
-        setup_interactive_console(console.clone(), console_input, stop_all.clone());
+        setup_interactive_console(console.clone(), console_input, graceful.clone());
     {
         const SENTINEL: &[u8] = b"=== tinyvmm shutdown requested ===";
         let stop_all = stop_all.clone();
@@ -4121,6 +4145,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
     let reason = bsp.run();
 
     stop_all();
+    graceful.disarm();
     drop(watchdog_done);
     // Surface any AP that stopped abnormally (exception / unhandled exit).
     let mut ap_reasons: Vec<StopReason> = Vec::with_capacity(ap_handles.len());
@@ -4286,73 +4311,6 @@ fn hvc0_is_console(cmdline: &str) -> bool {
         .any(|a| a == "console=hvc0" || a.starts_with("console=hvc0,"))
 }
 
-/// What closing the GPU window does: through hvc0's SysRq hook, ask the guest
-/// kernel to sync and remount its filesystems read-only (SysRq s, u), wait for
-/// its disks to go quiet, then stop the VM. With `sysrq` false (hvc0 isn't a
-/// console, so the bytes would reach its tty instead) it just stops. Runs on a
-/// thread of its own, so the window thread doesn't wait.
-fn stop_on_window_close(
-    tag: &'static str,
-    console: Arc<ConsoleDevice>,
-    disks: Vec<Arc<BlockDevice>>,
-    sysrq: bool,
-    stop_all: impl Fn() + Send + 'static,
-) -> impl FnOnce() + Send + 'static {
-    move || {
-        let _ = std::thread::Builder::new()
-            .name("window-close".to_string())
-            .spawn(move || {
-                if sysrq {
-                    eprintln!(
-                        "\r\n[{tag}] window closed -- remounting the guest's filesystems \
-                         read-only (SysRq s, u), then stopping"
-                    );
-                    console.write_host_input(b"\x0fs\x0fu");
-                    wait_for_disks_to_settle(&disks);
-                } else {
-                    eprintln!(
-                        "\r\n[{tag}] window closed -- stopping (hvc0 is not a kernel console, \
-                         so no SysRq sync)"
-                    );
-                }
-                stop_all();
-            });
-    }
-}
-
-/// Wait until the guest's disks have settled: nothing in flight and no write,
-/// flush, discard or write-zeroes for a second. The SysRq work runs
-/// asynchronously in the guest, so wait at least half a second first, and at
-/// most 15 seconds in all.
-fn wait_for_disks_to_settle(disks: &[Arc<BlockDevice>]) {
-    use std::time::{Duration, Instant};
-    const MIN_WAIT: Duration = Duration::from_millis(500);
-    const QUIET: Duration = Duration::from_secs(1);
-    const MAX_WAIT: Duration = Duration::from_secs(15);
-    let writes = || -> u64 {
-        disks
-            .iter()
-            .map(|d| d.ops_out() + d.ops_flush() + d.ops_discard() + d.ops_write_zeroes())
-            .sum()
-    };
-    let start = Instant::now();
-    let mut last = writes();
-    let mut quiet_since = start;
-    loop {
-        std::thread::sleep(Duration::from_millis(50));
-        let now = Instant::now();
-        let w = writes();
-        if w != last || disks.iter().any(|d| d.pending_count() > 0) {
-            last = w;
-            quiet_since = now;
-        }
-        let waited = now - start;
-        if waited >= MAX_WAIT || (waited >= MIN_WAIT && now - quiet_since >= QUIET) {
-            return;
-        }
-    }
-}
-
 /// Route the GPU window's input events into the virtio-input devices: keyboard
 /// keys to the keyboard, pointer motion/buttons/wheel to the absolute tablet.
 /// The window client area equals the scanout, so pointer pixels map straight
@@ -4481,8 +4439,9 @@ fn wheel_notches(delta: i32) -> i32 {
 }
 
 /// Put the console into raw VT mode and spawn a detached reader thread that
-/// forwards keystrokes into the guest's virtio-console RX. Ctrl+A X quits.
-/// When stdin is redirected (not a console), input forwarding is skipped.
+/// forwards keystrokes into the guest's virtio-console RX. Ctrl+A S asks the
+/// guest to shut down; Ctrl+A X quits. When stdin is redirected (not a
+/// console), input forwarding is skipped.
 ///
 /// When `input` is supplied and stdin is a real console, the reader switches to
 /// `ReadConsoleInputW` with mouse input enabled: keystrokes still drive hvc0
@@ -4491,7 +4450,7 @@ fn wheel_notches(delta: i32) -> i32 {
 fn setup_interactive_console(
     console: Arc<ConsoleDevice>,
     input: Option<InputDevices>,
-    stop_all: impl Fn() + Send + 'static,
+    stop: stop::GracefulStop,
 ) -> ConsoleModeRestore {
     unsafe {
         let hin = GetStdHandle(STD_INPUT_HANDLE);
@@ -4528,10 +4487,12 @@ fn setup_interactive_console(
             if want_mouse {
                 eprintln!(
                     "[pvh-run] interactive console + virtio-input -- mouse & keyboard forwarded; \
-                     Ctrl+A then X to quit"
+                     Ctrl+A then S to shut down, X to quit"
                 );
             } else {
-                eprintln!("[pvh-run] interactive console -- press Ctrl+A then X to quit");
+                eprintln!(
+                    "[pvh-run] interactive console -- press Ctrl+A then S to shut down, X to quit"
+                );
             }
         }
 
@@ -4540,11 +4501,11 @@ fn setup_interactive_console(
         let hout_addr = hout as usize;
         match input {
             Some(devs) if want_mouse => {
-                spawn_input_reader(hin_addr, hout_addr, console, devs, stop_all);
+                spawn_input_reader(hin_addr, hout_addr, console, devs, stop);
             }
             // No input devices, or stdin is redirected (no console records):
             // forward raw bytes from a real console (VT mode) or a pipe/file.
-            _ => spawn_byte_reader(hin_addr, console, stop_all),
+            _ => spawn_byte_reader(hin_addr, console, stop),
         }
 
         ConsoleModeRestore {
@@ -4559,12 +4520,9 @@ fn setup_interactive_console(
 
 /// Byte-stream reader: forwards stdin bytes to hvc0. Used when there are no
 /// virtio-input devices, or when stdin is a redirected pipe/file (so
-/// `echo cmd | tinyvmm ...` drives the shell). Ctrl+A X quits.
-fn spawn_byte_reader(
-    hin_addr: usize,
-    console: Arc<ConsoleDevice>,
-    stop_all: impl Fn() + Send + 'static,
-) {
+/// `echo cmd | tinyvmm ...` drives the shell). Ctrl+A S asks the guest to
+/// shut down; Ctrl+A X quits.
+fn spawn_byte_reader(hin_addr: usize, console: Arc<ConsoleDevice>, stop: stop::GracefulStop) {
     std::thread::spawn(move || {
         let hin = hin_addr as HANDLE;
         let mut escape = false;
@@ -4587,13 +4545,15 @@ fn spawn_byte_reader(
             for &b in &buf[..read as usize] {
                 if escape {
                     escape = false;
-                    if b == b'x' || b == b'X' {
-                        eprintln!("\r\n[pvh-run] Ctrl+A X -- quitting");
-                        stop_all();
-                        return;
-                    }
-                    if b == 0x01 {
-                        out.push(0x01);
+                    match HostKey::after_ctrl_a(u16::from(b)) {
+                        Some(HostKey::Quit) => {
+                            eprintln!("\r\n[pvh-run] Ctrl+A X -- quitting");
+                            stop.now();
+                            return;
+                        }
+                        Some(HostKey::Shutdown) => stop.begin("Ctrl+A S"),
+                        None if b == 0x01 => out.push(0x01),
+                        None => {}
                     }
                     continue;
                 }
@@ -4612,20 +4572,21 @@ fn spawn_byte_reader(
 
 /// Console-record reader (mouse + keyboard). Drives hvc0 (VT-translated keys),
 /// the virtio-input keyboard (key down/up), and the virtio-input tablet
-/// (absolute motion, buttons, wheel). Ctrl+A X quits.
+/// (absolute motion, buttons, wheel). Ctrl+A S asks the guest to shut down;
+/// Ctrl+A X quits.
 fn spawn_input_reader(
     hin_addr: usize,
     hout_addr: usize,
     console: Arc<ConsoleDevice>,
     devs: InputDevices,
-    stop_all: impl Fn() + Send + 'static,
+    stop: stop::GracefulStop,
 ) {
     std::thread::spawn(move || {
         let hin = hin_addr as HANDLE;
         let hout = hout_addr as HANDLE;
         let keyboard = devs.keyboard;
         let tablet = devs.tablet;
-        let mut escape = false; // Ctrl+A escape state for the hvc0 quit shortcut
+        let mut escape = false; // Ctrl+A escape state for the hvc0 host keys
         let mut pressed = [false; 256]; // per-keycode state for the kbd device
         let mut prev_buttons: u32 = 0; // last LEFT|RIGHT|MIDDLE button mask
         let mut recs: [INPUT_RECORD; 64] = unsafe { std::mem::zeroed() };
@@ -4645,6 +4606,7 @@ fn spawn_input_reader(
             kbd.clear();
             tab.clear();
             let mut quit = false;
+            let mut shut_down = false;
             for r in &recs[..read as usize] {
                 match r.EventType as u32 {
                     KEY_EVENT => {
@@ -4667,17 +4629,22 @@ fn spawn_input_reader(
                             }
                         }
                         // hvc0 text console: key-down only, VT-translated.
-                        if down
-                            && append_hvc0_bytes(
+                        if down {
+                            let key = append_hvc0_bytes(
                                 &mut hvc0,
                                 &mut escape,
                                 wc,
                                 k.wVirtualKeyCode,
                                 reps,
-                            )
-                        {
-                            quit = true;
-                            break;
+                            );
+                            match key {
+                                Some(HostKey::Quit) => {
+                                    quit = true;
+                                    break;
+                                }
+                                Some(HostKey::Shutdown) => shut_down = true,
+                                None => {}
+                            }
                         }
                     }
                     MOUSE_EVENT => {
@@ -4696,9 +4663,12 @@ fn spawn_input_reader(
             if !tab.is_empty() {
                 tablet.submit_frame(&tab);
             }
+            if shut_down {
+                stop.begin("Ctrl+A S");
+            }
             if quit {
                 eprintln!("\r\n[pvh-run] Ctrl+A X -- quitting");
-                stop_all();
+                stop.now();
                 return;
             }
         }
@@ -4712,30 +4682,52 @@ fn push_repeated(out: &mut Vec<u8>, bytes: &[u8], reps: u16) {
     }
 }
 
+/// What the key after Ctrl+A asks of tinyvmm itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostKey {
+    /// X: stop at once.
+    Quit,
+    /// S: ask the guest to shut down.
+    Shutdown,
+}
+
+impl HostKey {
+    fn after_ctrl_a(key: u16) -> Option<Self> {
+        match u8::try_from(key).ok()?.to_ascii_lowercase() {
+            b'x' => Some(HostKey::Quit),
+            b's' => Some(HostKey::Shutdown),
+            _ => None,
+        }
+    }
+}
+
 /// Translate one key-down record into hvc0 bytes (VT sequences for navigation
 /// keys, UTF-8 for printable characters), honoring the Ctrl+A escape. Returns
-/// true if the user asked to quit (Ctrl+A then X).
-fn append_hvc0_bytes(out: &mut Vec<u8>, escape: &mut bool, wc: u16, vk: u16, reps: u16) -> bool {
+/// the host key the user pressed after Ctrl+A, if any.
+fn append_hvc0_bytes(
+    out: &mut Vec<u8>,
+    escape: &mut bool,
+    wc: u16,
+    vk: u16,
+    reps: u16,
+) -> Option<HostKey> {
     if *escape {
         *escape = false;
-        if wc == u16::from(b'x') || wc == u16::from(b'X') {
-            return true;
-        }
         if wc == 0x01 {
             out.push(0x01); // literal Ctrl+A
         }
-        return false;
+        return HostKey::after_ctrl_a(wc);
     }
     if wc == 0x01 {
         *escape = true; // arm escape, swallow
-        return false;
+        return None;
     }
     // Navigation / function keys arrive with UnicodeChar == 0; emit xterm/VT.
     if wc == 0 {
         if let Some(seq) = vk_to_vt_sequence(vk) {
             push_repeated(out, seq, reps);
         }
-        return false;
+        return None;
     }
     if wc == u16::from(b'\r') {
         push_repeated(out, b"\n", reps);
@@ -4745,7 +4737,7 @@ fn append_hvc0_bytes(out: &mut Vec<u8>, escape: &mut bool, wc: u16, vk: u16, rep
         let mut tmp = [0u8; 4];
         push_repeated(out, c.encode_utf8(&mut tmp).as_bytes(), reps);
     }
-    false
+    None
 }
 
 /// Convert a Windows mouse record into tablet events: absolute position

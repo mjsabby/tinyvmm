@@ -126,6 +126,13 @@ pub fn run() -> Result<()> {
         }
         Ok(())
     })?;
+    // What the kernel runs when the host asks it to shut down (Hyper-V's
+    // shutdown IC): tinyinit's poweroff, rather than the root's own, which may
+    // want an init that isn't running. Best effort: without it the host falls
+    // back to SysRq.
+    let _ = log.step("poweroff-command", || {
+        Ok(fs::write("/proc/sys/kernel/poweroff_cmd", "/bin/poweroff")?)
+    });
     let path = argument(&cmdline, "tinyinit.config").unwrap_or("/mnt/bootstrap/init.json");
     if path.starts_with("/mnt/bootstrap/") {
         let share = Share {

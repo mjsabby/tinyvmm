@@ -1,7 +1,8 @@
 //! A minimal VMBus host: the channel protocol Hyper-V guests find and talk to
 //! synthetic devices over, with just enough of it for Linux's vmbus driver.
-//! Its one device is the time-sync integration component ([`timesync`]),
-//! which keeps the guest's clock on the host's as WSL's is kept.
+//! Its devices are integration components ([`ic`]): time sync ([`timesync`]),
+//! which keeps the guest's clock on the host's as WSL's is kept, and shutdown
+//! ([`shutdown`]), which asks the guest to shut down.
 //!
 //! The guest finds the bus through the ACPI device `\_SB.VMBS`, and reaches it
 //! through the SynIC the hypervisor already implements for it
@@ -20,11 +21,13 @@
 //!   signals the guest by setting the channel's flag in its SynIC event page.
 //!
 //! A snapshot holds the bus's state; a restored device starts its own protocol
-//! over on the channel it finds open.
+//! over on the channel it finds open. A snapshot from a tinyvmm that offered
+//! fewer devices restores too, and the guest never learns of the rest.
 
 mod ic;
 mod protocol;
 mod ring;
+pub mod shutdown;
 pub mod timesync;
 
 use crate::error::{Error, Result};
@@ -640,7 +643,7 @@ impl Host {
         let (Some(outbox), Some(gpadls), Some(devices)) = (outbox, gpadls, devices) else {
             return Err(bad());
         };
-        if devices as usize != self.devices.len() {
+        if devices as usize > self.devices.len() {
             return Err(Error::msg(format!(
                 "the snapshot's VMBus has {devices} devices; this tinyvmm offers {}",
                 self.devices.len()
@@ -664,7 +667,7 @@ impl Host {
             st.gpadls.insert(id, Gpadl { relid, pages, pfns });
         }
         let mut reopen = Vec::new();
-        for i in 0..self.devices.len() {
+        for i in 0..devices as usize {
             let fields = [r.u32(), r.u32(), r.u32(), r.u32()];
             let [Some(flag), Some(gpadl), Some(target), Some(downstream)] = fields else {
                 return Err(bad());
@@ -687,6 +690,7 @@ impl Host {
             }));
             reopen.push((i, incoming, outgoing, target_vp));
         }
+        st.open.resize_with(self.devices.len(), || None);
         let mut cur = self.state.lock().unwrap();
         *cur = st;
         self.outbox_ready
@@ -976,6 +980,15 @@ mod tests {
         other[20] = 2; // the device count
         assert!(c.host.restore(&other).is_err());
         assert!(c.host.restore(&saved[..30]).is_err());
+
+        // Into a tinyvmm that offers more devices.
+        let (old, new) = (Arc::new(Fake::default()), Arc::new(Fake::default()));
+        let devices: Vec<Arc<dyn Device>> = vec![old.clone(), new.clone()];
+        let d = Host::build(0, c.mem.clone(), 2, Box::new(|_| {}), devices);
+        d.restore(&saved).unwrap();
+        assert_eq!(*old.events.lock().unwrap(), ["open 1"]);
+        assert!(new.events.lock().unwrap().is_empty());
+        assert_eq!(u32_at(&d.save(), 20), Some(2));
     }
 
     #[test]
