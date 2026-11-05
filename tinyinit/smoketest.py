@@ -61,8 +61,7 @@ class VM:
             argv += ["--virtio-9p-share", f"rootfs={args.external_rootfs.resolve()},ro"]
         if not args.embedded:
             argv += ["--initrd", str(OUT / "initrd.cpio"), str(OUT / "vmlinux")]
-        argv += ["--", "console=hvc0", "pci=conf1,nocrs,lastbus=0", "idle=halt",
-                 f"tinyinit.epoch={int(time.time())}"]
+        argv += ["--", "console=hvc0", "pci=conf1,nocrs,lastbus=0", "idle=halt"]
         if args.external_rootfs:
             argv += ["tinyinit.rootfs=9p:rootfs"]
         self.started_at = time.perf_counter()

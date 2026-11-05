@@ -26,7 +26,6 @@ $vmArgs = @(
     '--virtio-9p-share', "bootstrap=$((Resolve-Path $Bootstrap).Path),ro"
 )
 foreach ($share in $Shares) { $vmArgs += @('--virtio-9p-share', $share) }
-$vmArgs += @('--initrd', $initrd, $kernelCopy, '--', 'console=hvc0', 'pci=conf1,nocrs,lastbus=0', 'idle=halt',
-    "tinyinit.epoch=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())")
+$vmArgs += @('--initrd', $initrd, $kernelCopy, '--', 'console=hvc0', 'pci=conf1,nocrs,lastbus=0', 'idle=halt')
 & $vmm @vmArgs
 if ($LASTEXITCODE -ne 0) { throw "tinyvmm exited with code $LASTEXITCODE" }

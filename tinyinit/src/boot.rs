@@ -126,19 +126,6 @@ pub fn run() -> Result<()> {
         }
         Ok(())
     })?;
-
-    log.step("clock", || {
-        if let Some(epoch) = argument(&cmdline, "tinyinit.epoch") {
-            let epoch: i64 = epoch.parse().context("invalid tinyinit.epoch")?;
-            ensure!(epoch > 0, "tinyinit.epoch must be positive");
-            let time = libc::timespec {
-                tv_sec: epoch,
-                tv_nsec: 0,
-            };
-            unix::check(unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &time) })?;
-        }
-        Ok(())
-    })?;
     let path = argument(&cmdline, "tinyinit.config").unwrap_or("/mnt/bootstrap/init.json");
     if path.starts_with("/mnt/bootstrap/") {
         let share = Share {

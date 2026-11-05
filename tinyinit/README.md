@@ -156,7 +156,7 @@ applied: init.json controls identities and services. Like Docker, init leaves
 the image's `/etc/passwd`, `/etc/group` and `/etc/shadow` as shipped, and looks
 up a `user` that `users` doesn't declare in the image's `/etc/passwd`: for
 example, `"user": "app"` gets the ASP.NET base's uid 1654. Init supplies
-DNS/hosts/NSS configuration and the host-derived clock; a `network` replaces an
+DNS/hosts/NSS configuration; a `network` replaces an
 image's `/etc/resolv.conf` even where it links into a resolver daemon's
 directory under `/run`, as Ubuntu's does. Timezone data is
 present; set `TZ` to choose a local timezone rather than the default UTC.
@@ -170,9 +170,11 @@ Boot arguments:
 
 - `tinyinit.bootstrap=bootstrap`: initial 9p tag, default `bootstrap`.
 - `tinyinit.config=/mnt/bootstrap/init.json`: configuration path, default shown.
-- `tinyinit.epoch=SECONDS`: set guest wall time before applications start.
 - `tinyinit.rootfs=9p:TAG`: extract `rootfs.tar.zst` or `rootfs.tar.gz` from an
   early read-only share into the new root instead of using the embedded base.
+
+The guest's clock is the kernel's: it reads the host's time from tinyvmm's
+CMOS clock as it boots.
 
 ## Trusted rootfs metadata policy
 

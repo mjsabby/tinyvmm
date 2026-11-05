@@ -1507,18 +1507,6 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
         }
         cmdline = defaults;
     }
-    if default_cmdline
-        && boot::payload::BUNDLED
-        && !cmdline
-            .split_whitespace()
-            .any(|arg| arg.starts_with("tinyinit.epoch="))
-    {
-        let epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| Error::msg(format!("host Unix time: {error}")))?
-            .as_secs();
-        cmdline.push_str(&format!(" tinyinit.epoch={epoch}"));
-    }
 
     Ok(PvhArgs {
         vmlinux,

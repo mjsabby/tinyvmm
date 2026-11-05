@@ -60,7 +60,6 @@ mod tests {
         if BUNDLED {
             let config = result.unwrap();
             assert!(config.vmlinux.is_none());
-            assert!(config.cmdline.contains("tinyinit.epoch="));
             assert_eq!(config.ram_mb, 1024);
         } else {
             assert!(result.is_err());
@@ -77,7 +76,7 @@ mod tests {
             "custom-vmlinux",
             "--",
             "console=hvc0",
-            "tinyinit.epoch=42",
+            "quiet",
         ]))
         .unwrap();
         assert_eq!(config.vmlinux.as_deref(), Some("custom-vmlinux"));
@@ -89,10 +88,7 @@ mod tests {
         } else {
             "console=hvc0 pci=conf1,nocrs,lastbus=0 nofb nomodeset"
         };
-        assert_eq!(
-            config.cmdline,
-            format!("{defaults} console=hvc0 tinyinit.epoch=42")
-        );
+        assert_eq!(config.cmdline, format!("{defaults} console=hvc0 quiet"));
     }
 
     #[test]
@@ -214,13 +210,13 @@ mod tests {
         }
         // A kernel path still boots that kernel, its arguments after the
         // defaults.
-        let config = parse(&["vmlinux", "--", "console=hvc0", "tinyinit.epoch=42"]).unwrap();
+        let config = parse(&["vmlinux", "--", "console=hvc0", "quiet"]).unwrap();
         assert!(!config.disk_boot);
         assert!(
             config
                 .cmdline
                 .starts_with("console=hvc0 pci=conf1,nocrs,lastbus=0 ")
         );
-        assert!(config.cmdline.ends_with(" console=hvc0 tinyinit.epoch=42"));
+        assert!(config.cmdline.ends_with(" console=hvc0 quiet"));
     }
 }
