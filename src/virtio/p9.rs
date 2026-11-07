@@ -22,6 +22,17 @@
 //! check can race the operation. A path through a link takes
 //! `P9Device::open_linked`, which follows links only to places inside the share.
 //!
+//! Names: Windows looks names up ignoring case, while Linux programs expect
+//! `a.cs` and `A.cs` to be different names. So a walk finds only the entry
+//! spelled exactly as asked, case included: it opens the name as Windows does,
+//! then compares the last component with the name the file system reports for
+//! what it opened, as its directory stores it. That name comes in the same
+//! call as the attributes the walk reads anyway, so the check costs nothing.
+//! For a link, the link's own name counts; an 8.3 short name still finds its
+//! file when spelled as stored. A `nocase` share looks names up as Windows
+//! does. Only lookups are exact: Windows can't hold two names that differ only
+//! in case, and creating, renaming or deleting by name matches as it does.
+//!
 //! Ownership: NTFS has no POSIX owner or mode bits, so every entry reports the
 //! share's configured `uid`/`gid` (default 0, root) and a synthesized mode
 //! (dirs 0755, files 0644, or 0444 when read-only on the host). The guest
@@ -235,6 +246,9 @@ pub struct ShareOptions {
     pub gid: u32,
     /// Read and write WSL's `$LXUID`/`$LXGID`/`$LXMOD` metadata.
     pub metadata: bool,
+    /// Look names up ignoring case, as Windows does. By default a name finds
+    /// only the entry spelled exactly so (see the module docs).
+    pub nocase: bool,
 }
 
 // ============================================================
@@ -705,6 +719,16 @@ struct Root {
     real: Vec<u16>,
 }
 
+/// A file [`P9Device::open_rel_ex`] opened.
+struct Opened {
+    handle: OwnedHandle,
+    /// This open created the file.
+    created: bool,
+    /// The path's last component is a symlink or junction, and `handle` is
+    /// what it points at, not the link.
+    followed: bool,
+}
+
 // ============================================================
 // P9Device
 // ============================================================
@@ -832,6 +856,7 @@ pub struct P9Device {
     uid: u32,
     gid: u32,
     metadata: bool,
+    nocase: bool,
     config_bytes: Vec<u8>,
     driver_ok: AtomicBool,
     acked_features: AtomicU64,
@@ -872,6 +897,7 @@ impl P9Device {
             uid: opts.uid,
             gid: opts.gid,
             metadata: opts.metadata,
+            nocase: opts.nocase,
             config_bytes,
             driver_ok: AtomicBool::new(false),
             acked_features: AtomicU64::new(0),
@@ -1046,6 +1072,12 @@ impl P9Device {
     /// [`Self::open_linked`]. Returns the handle and whether this call created
     /// the file.
     fn open_rel(&self, rel: &Path, how: fs::Open) -> Result<(OwnedHandle, bool), u32> {
+        self.open_rel_ex(rel, how).map(|o| (o.handle, o.created))
+    }
+
+    /// [`Self::open_rel`], also telling whether a link at the end of `rel` was
+    /// followed.
+    fn open_rel_ex(&self, rel: &Path, how: fs::Open) -> Result<Opened, u32> {
         let root = self.root()?;
         let r = self.open_below(root.handle.get(), rel, how);
         // A root deleted on the host fails every open below it as delete
@@ -1064,14 +1096,13 @@ impl P9Device {
         self.open_below(root.handle.get(), rel, how)
     }
 
-    fn open_below(
-        &self,
-        root: HANDLE,
-        rel: &Path,
-        how: fs::Open,
-    ) -> Result<(OwnedHandle, bool), u32> {
+    fn open_below(&self, root: HANDLE, rel: &Path, how: fs::Open) -> Result<Opened, u32> {
         match fs::open_relative(root, &rel_wide(rel), how) {
-            Ok((h, created)) => Ok((OwnedHandle(h), created)),
+            Ok((h, created)) => Ok(Opened {
+                handle: OwnedHandle(h),
+                created,
+                followed: false,
+            }),
             Err(ERROR_REPARSE_POINT_ENCOUNTERED) => self.open_linked(root, rel, how),
             Err(e) => Err(e),
         }
@@ -1086,12 +1117,7 @@ impl P9Device {
     /// at opens with attribute access only and is checked the same way before
     /// it gets `how.access`. So nothing outside the share is created, deleted,
     /// truncated or opened for data.
-    fn open_linked(
-        &self,
-        root: HANDLE,
-        rel: &Path,
-        how: fs::Open,
-    ) -> Result<(OwnedHandle, bool), u32> {
+    fn open_linked(&self, root: HANDLE, rel: &Path, how: fs::Open) -> Result<Opened, u32> {
         // The root itself is not reached through a link.
         let (Some(parent), Some(name)) = (rel.parent(), rel.file_name()) else {
             return Err(ERROR_ACCESS_DENIED);
@@ -1099,14 +1125,22 @@ impl P9Device {
         let dir = self.open_followed(root, &rel_wide(parent), fs::Kind::Directory)?;
         let name: Vec<u16> = name.encode_wide().collect();
         match fs::open_relative(dir.get(), &name, how) {
-            Ok((h, created)) => Ok((OwnedHandle(h), created)),
+            Ok((h, created)) => Ok(Opened {
+                handle: OwnedHandle(h),
+                created,
+                followed: false,
+            }),
             // The name exists, as a link: O_EXCL and mkdir must fail.
             Err(ERROR_REPARSE_POINT_ENCOUNTERED) if how.create == fs::Create::New => {
                 Err(ERROR_ALREADY_EXISTS)
             }
             Err(ERROR_REPARSE_POINT_ENCOUNTERED) => {
                 let target = self.open_followed(dir.get(), &name, how.kind)?;
-                Ok((OwnedHandle(fs::reopen(target.get(), how.access)?), false))
+                Ok(Opened {
+                    handle: OwnedHandle(fs::reopen(target.get(), how.access)?),
+                    created: false,
+                    followed: true,
+                })
             }
             Err(e) => Err(e),
         }
@@ -1232,12 +1266,35 @@ impl P9Device {
         (qt, qid_version(info), qp)
     }
 
-    // Stat a path (no kept handle): fill qid type/version/path + is_dir.
+    /// Stat a path for Twalk and Tattach, keeping no handle: qid type, version
+    /// and path, and whether it is a directory. Unless the share is `nocase`,
+    /// the last component must be spelled exactly as the entry it opened,
+    /// case included (see the module docs).
     fn stat_rel(&self, rel: &Path) -> Result<(u8, u32, u64, bool), u32> {
-        let (h, _) = self
-            .open_rel(rel, fs::Open::existing(0))
+        let opened = self
+            .open_rel_ex(rel, fs::Open::existing(0))
             .map_err(errno_from_win32)?;
-        let info = fs::file_info(h.get()).map_err(errno_from_win32)?;
+        let (info, mut name) =
+            fs::file_info_and_name(opened.handle.get()).map_err(errno_from_win32)?;
+        if !self.nocase
+            && let Some(want) = rel.file_name()
+        {
+            if opened.followed {
+                // The link's target may have any name; the link's own counts.
+                let how = fs::Open::existing(0).as_entry();
+                let (link, _) = self.open_rel(rel, how).map_err(errno_from_win32)?;
+                name = fs::file_info_and_name(link.get())
+                    .map_err(errno_from_win32)?
+                    .1;
+            }
+            let found = name
+                .rsplit(|&c| c == u16::from(b'\\'))
+                .next()
+                .unwrap_or(&[]);
+            if !want.encode_wide().eq(found.iter().copied()) {
+                return Err(E_NOENT);
+            }
+        }
         let (qt, qv, qp) = self.qid_of(&info);
         Ok((qt, qv, qp, qt == QT_DIR))
     }
@@ -3102,6 +3159,71 @@ mod tests {
             enc4(t, 64);
         });
         assert_eq!(&r[RREAD_HEADER_SIZE..], b"inside");
+
+        drop(dev);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A walk finds only the entry spelled exactly as asked, case included, as
+    /// on Linux, though Windows opens `a.cs` for `A.cs`. For a junction, its
+    /// own name counts, not its target's. A `nocase` share ignores case.
+    #[test]
+    fn lookups_match_case_exactly() {
+        let base = std::env::temp_dir().join(format!("tinyvmm_p9_case_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("Src")).unwrap();
+        std::fs::create_dir_all(base.join("deep").join("foo")).unwrap();
+        std::fs::write(base.join("a.cs"), b"lower").unwrap();
+        std::fs::write(base.join("Src").join("Main.cs"), b"main").unwrap();
+        let root = std::fs::canonicalize(&base).unwrap();
+        let mem = std::sync::Arc::new(whpsys::memory::GuestMemory::new_host_only(4096).unwrap());
+        let dev = P9Device::new(
+            mem.clone(),
+            "t".into(),
+            root.clone(),
+            ShareOptions::default(),
+        );
+        connect(&dev, 0);
+
+        assert_eq!(walk_err(&dev, 0, 1, &["A.cs"]), E_NOENT);
+        walk(&dev, 0, 1, &["a.cs"]);
+        call(&dev, T_LOPEN, |t| {
+            enc4(t, 1);
+            enc4(t, O_RDONLY);
+        });
+        let r = call(&dev, T_READ, |t| {
+            enc4(t, 1);
+            enc8(t, 0);
+            enc4(t, 64);
+        });
+        assert_eq!(&r[RREAD_HEADER_SIZE..], b"lower");
+        walk(&dev, 0, 2, &["Src", "Main.cs"]);
+        assert_eq!(walk_err(&dev, 0, 3, &["src", "Main.cs"]), E_NOENT);
+        // A later name spelled otherwise ends the walk there, as a missing one.
+        let r = call(&dev, T_WALK, |t| walk_body(t, 0, 3, &["Src", "main.cs"]));
+        assert_eq!(u16::from_le_bytes([r[7], r[8]]), 1, "nwqid");
+
+        // "Foo" leads to a directory named "foo", which "foo" must not reach.
+        if junction(&base.join("Lnk"), &base.join("Src"))
+            && junction(&base.join("Foo"), &base.join("deep").join("foo"))
+        {
+            walk(&dev, 0, 3, &["Lnk", "Main.cs"]);
+            assert_eq!(walk_err(&dev, 0, 4, &["lnk"]), E_NOENT);
+            walk(&dev, 0, 4, &["Foo"]);
+            assert_eq!(walk_err(&dev, 0, 5, &["foo"]), E_NOENT);
+        } else {
+            eprintln!("[p9-test] skipping the junction cases: could not create a junction");
+        }
+        drop(dev);
+
+        let opts = ShareOptions {
+            nocase: true,
+            ..Default::default()
+        };
+        let dev = P9Device::new(mem, "t".into(), root, opts);
+        connect(&dev, 0);
+        walk(&dev, 0, 1, &["A.CS"]);
+        walk(&dev, 0, 2, &["src", "MAIN.cs"]);
 
         drop(dev);
         let _ = std::fs::remove_dir_all(&base);

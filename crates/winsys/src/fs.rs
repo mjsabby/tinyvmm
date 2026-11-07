@@ -17,10 +17,11 @@ use core::mem::{offset_of, size_of};
 use core::ptr::{null, null_mut};
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_DELETE, FILE_DISPOSITION_INFORMATION_EX,
-    FILE_DISPOSITION_POSIX_SEMANTICS, FILE_INFORMATION_CLASS, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
-    FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS,
-    FILE_RENAME_REPLACE_IF_EXISTS, FILE_STAT_LX_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
+    FILE_ALL_INFORMATION, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_DELETE,
+    FILE_DISPOSITION_INFORMATION_EX, FILE_DISPOSITION_POSIX_SEMANTICS, FILE_INFORMATION_CLASS,
+    FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
+    FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS,
+    FILE_STAT_LX_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT, FileAllInformation,
     FileDispositionInformation, FileDispositionInformationEx, FileFsFullSizeInformation,
     FileRenameInformation, FileRenameInformationEx, FileStatLxInformation,
     LX_FILE_METADATA_HAS_GID, LX_FILE_METADATA_HAS_MODE, LX_FILE_METADATA_HAS_UID, NtCreateFile,
@@ -29,8 +30,9 @@ use windows_sys::Wdk::Storage::FileSystem::{
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_DELETE_PENDING, ERROR_DIRECTORY_NOT_SUPPORTED, ERROR_FILENAME_EXCED_RANGE,
     FILETIME, GetLastError, INVALID_HANDLE_VALUE, NTSTATUS, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE,
-    RtlNtStatusToDosError, STATUS_DELETE_PENDING, STATUS_FILE_IS_A_DIRECTORY,
-    STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED, UNICODE_STRING,
+    RtlNtStatusToDosError, STATUS_BUFFER_OVERFLOW, STATUS_DELETE_PENDING,
+    STATUS_FILE_IS_A_DIRECTORY, STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER,
+    STATUS_NOT_SUPPORTED, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
@@ -59,7 +61,6 @@ pub struct FileInfo {
     pub size: u64,
     pub nlink: u32,
     pub file_index: u64,
-    pub vol_serial: u32,
     pub creation_ticks: u64,
     pub last_access_ticks: u64,
     pub last_write_ticks: u64,
@@ -427,11 +428,70 @@ pub fn file_info(h: HANDLE) -> Result<FileInfo, u32> {
         size: ((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64,
         nlink: info.nNumberOfLinks,
         file_index: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
-        vol_serial: info.dwVolumeSerialNumber,
         creation_ticks: ft_to_ticks(&info.ftCreationTime),
         last_access_ticks: ft_to_ticks(&info.ftLastAccessTime),
         last_write_ticks: ft_to_ticks(&info.ftLastWriteTime),
     })
+}
+
+/// [`file_info`] and the file's name, from one
+/// `NtQueryInformationFile(FileAllInformation)`: cheaper than
+/// `GetFileInformationByHandle`, which also queries the volume. The name is
+/// the path from the root of the file's volume (`\dir\file`), each component
+/// spelled as its directory stores it, whatever case the open used (NTFS,
+/// ReFS). A file opened by its 8.3 short name reports that name.
+pub fn file_info_and_name(h: HANDLE) -> Result<(FileInfo, Vec<u16>), u32> {
+    const NAME: usize = offset_of!(FILE_ALL_INFORMATION, NameInformation.FileName);
+    // The longest name a UNICODE_STRING holds, in bytes.
+    const MAX_NAME: usize = 0x1_0000;
+    // u64s align the buffer for FILE_ALL_INFORMATION. It fits a 1024-unit
+    // name, so nearly every path takes one call.
+    let mut buf = vec![0u64; (NAME + 2048).div_ceil(8)];
+    loop {
+        let len = buf.len() * 8;
+        let mut iosb: IO_STATUS_BLOCK = unsafe { core::mem::zeroed() };
+        let status = unsafe {
+            NtQueryInformationFile(
+                h,
+                &mut iosb,
+                buf.as_mut_ptr().cast(),
+                len as u32,
+                FileAllInformation,
+            )
+        };
+        // SAFETY: the buffer is aligned for, and larger than, the structure,
+        // whose fixed part the call fills even when the name doesn't fit.
+        let all = unsafe { buf.as_ptr().cast::<FILE_ALL_INFORMATION>().read() };
+        let name_len = all.NameInformation.FileNameLength as usize;
+        if status == STATUS_BUFFER_OVERFLOW || (status >= 0 && NAME + name_len > len) {
+            if name_len > MAX_NAME || len >= NAME + MAX_NAME {
+                return Err(ERROR_FILENAME_EXCED_RANGE);
+            }
+            let want = (NAME + name_len).max(2 * len).min(NAME + MAX_NAME);
+            buf.resize(want.div_ceil(8), 0);
+            continue;
+        }
+        nt_result(status)?;
+        // SAFETY: the name's bytes lie inside the buffer (checked above), at an
+        // even offset of an 8-byte-aligned buffer.
+        let name = unsafe {
+            core::slice::from_raw_parts(
+                buf.as_ptr().cast::<u8>().add(NAME).cast::<u16>(),
+                name_len / 2,
+            )
+        };
+        let (basic, standard) = (&all.BasicInformation, &all.StandardInformation);
+        let info = FileInfo {
+            attributes: basic.FileAttributes,
+            size: standard.EndOfFile as u64,
+            nlink: standard.NumberOfLinks,
+            file_index: all.InternalInformation.IndexNumber as u64,
+            creation_ticks: basic.CreationTime as u64,
+            last_access_ticks: basic.LastAccessTime as u64,
+            last_write_ticks: basic.LastWriteTime as u64,
+        };
+        return Ok((info, name.to_vec()));
+    }
 }
 
 /// A file's WSL Linux metadata: the `$LXUID` / `$LXGID` / `$LXMOD` NTFS

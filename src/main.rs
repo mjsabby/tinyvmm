@@ -167,6 +167,8 @@ struct P9ShareSpec {
     gid: u32,
     // WSL-style `$LXUID`/`$LXGID`/`$LXMOD` metadata (`metadata`).
     metadata: bool,
+    // Look names up ignoring case, as Windows does (`nocase`).
+    nocase: bool,
 }
 
 impl P9ShareSpec {
@@ -176,6 +178,7 @@ impl P9ShareSpec {
             uid: self.uid,
             gid: self.gid,
             metadata: self.metadata,
+            nocase: self.nocase,
         }
     }
 }
@@ -199,7 +202,8 @@ fn print_usage() {
          \x20              (repeat --net per NIC)\n\
          \x20              [--drive <path>[,readonly]]... [--cpu-affinity p|p-physical|e|all]\n\
          \x20              (default p: P-cores only on a hybrid CPU)\n\
-         \x20              [--virtio-9p-share <tag>=<host_path>[,ro][,uid=N][,gid=N][,metadata]]...\n\
+         \x20              [--virtio-9p-share <tag>=<host_path>[,ro][,uid=N][,gid=N][,metadata][,nocase]]...\n\
+         \x20              (names match case exactly, as on Linux; nocase: as on Windows)\n\
          \x20              [--gpu [WxH]]  (virtio-gpu 2D scanout to a window; default 1280x800)\n\
          \x20              [--record <file.mp4>[,fps=N][,kbps=N]]  (needs --gpu; records the\n\
          \x20              display + --sound playback to a fragmented H.264/AAC MP4; default 30 fps)\n\
@@ -1354,7 +1358,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
                 });
             }
             "--virtio-9p-share" => {
-                const WANT: &str = "<tag>=<host_path>[,ro][,uid=N][,gid=N][,metadata]";
+                const WANT: &str = "<tag>=<host_path>[,ro][,uid=N][,gid=N][,metadata][,nocase]";
                 i += 1;
                 let spec = args
                     .get(i)
@@ -1370,6 +1374,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
                 let path = parts.next().unwrap_or("");
                 let mut readonly = false;
                 let mut metadata = false;
+                let mut nocase = false;
                 let (mut uid, mut gid) = (0u32, 0u32);
                 if let Some(opts) = parts.next() {
                     for kv in opts.split(',') {
@@ -1388,10 +1393,12 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
                             readonly = true;
                         } else if kv == "metadata" {
                             metadata = true;
+                        } else if kv == "nocase" {
+                            nocase = true;
                         } else {
                             return Err(Error::msg(format!(
                                 "--virtio-9p-share: unknown option '{kv}' \
-                                 (want ro, uid=N, gid=N, metadata)"
+                                 (want ro, uid=N, gid=N, metadata, nocase)"
                             )));
                         }
                     }
@@ -1425,6 +1432,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
                     uid,
                     gid,
                     metadata,
+                    nocase,
                 });
             }
             "--save" => {
@@ -2302,7 +2310,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         p9_transports.push(pt.clone());
         p9_devices.push(p9.clone());
         println!(
-            "[pvh-run] virtio-9p[{}] on PCI 00:{:02x}.0 tag={} host={} owner={}:{}{}{}",
+            "[pvh-run] virtio-9p[{}] on PCI 00:{:02x}.0 tag={} host={} owner={}:{}{}{}{}",
             i,
             pbdf.device,
             s.tag,
@@ -2310,6 +2318,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
             s.uid,
             s.gid,
             if s.metadata { " metadata" } else { "" },
+            if s.nocase { " nocase" } else { "" },
             if s.readonly { " (ro)" } else { "" }
         );
     }
@@ -3103,15 +3112,16 @@ fn write_snapshot(
             .bool(&format!("drive{i}_iso"), d.iso);
     }
     // Per-9p-share config so restore rebuilds each virtio-9p device with the same
-    // tag/root/RO/owner/metadata. The device's own fid table is captured in its
-    // PciDevice section.
+    // tag/root/RO/owner/metadata/nocase. The device's own fid table is captured
+    // in its PciDevice section.
     for (i, s) in cfg.p9_shares.iter().enumerate() {
         jw.str(&format!("p9{i}_tag"), &s.tag)
             .str(&format!("p9{i}_root"), &s.host_root.to_string_lossy())
             .bool(&format!("p9{i}_readonly"), s.readonly)
             .u64(&format!("p9{i}_uid"), s.uid as u64)
             .u64(&format!("p9{i}_gid"), s.gid as u64)
-            .bool(&format!("p9{i}_metadata"), s.metadata);
+            .bool(&format!("p9{i}_metadata"), s.metadata)
+            .bool(&format!("p9{i}_nocase"), s.nocase);
     }
 
     let mut w = SnapshotWriter::create(path)?;
@@ -3697,11 +3707,14 @@ fn run_restore(args: &[String]) -> Result<i32> {
         let uid = jr.get_u64(&format!("p9{i}_uid")).unwrap_or(0) as u32;
         let gid = jr.get_u64(&format!("p9{i}_gid")).unwrap_or(0) as u32;
         let metadata = jr.get_bool(&format!("p9{i}_metadata")).unwrap_or(false);
+        // Snapshots from before exact-case lookups ignore case, as those builds did.
+        let nocase = jr.get_bool(&format!("p9{i}_nocase")).unwrap_or(true);
         let opts = virtio::p9::ShareOptions {
             readonly: ro,
             uid,
             gid,
             metadata,
+            nocase,
         };
         let p9 = P9Device::new(
             ram.clone(),
@@ -3736,8 +3749,9 @@ fn run_restore(args: &[String]) -> Result<i32> {
         transports.push(pt.clone());
         p9_devices.push(p9);
         println!(
-            "[restore] virtio-9p[{i}] tag={tag} host={root} owner={uid}:{gid}{}{}",
+            "[restore] virtio-9p[{i}] tag={tag} host={root} owner={uid}:{gid}{}{}{}",
             if metadata { " metadata" } else { "" },
+            if nocase { " nocase" } else { "" },
             if ro { " (ro)" } else { "" }
         );
     }
