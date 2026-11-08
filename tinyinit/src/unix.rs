@@ -116,11 +116,14 @@ pub struct Spawn {
     pub rlimits: Vec<(u32, u64, u64)>,
 }
 
+/// Set up `cmd`'s process before it runs: in `cgroup`, with `spawn`'s
+/// settings, as `user`. `new_session` makes it a session leader; tinyssh does
+/// that itself for SSH sessions, after these steps, with their terminal.
 pub fn child_setup(
     cmd: &mut Command,
     user: &User,
     cgroup: Option<File>,
-    tty: bool,
+    new_session: bool,
     no_new_privs: bool,
     spawn: Spawn,
 ) {
@@ -135,9 +138,8 @@ pub fn child_setup(
                 &mask,
                 std::ptr::null_mut(),
             ))?;
-            check(libc::setsid())?;
-            if tty {
-                check(libc::ioctl(0, libc::TIOCSCTTY, 0))?;
+            if new_session {
+                check(libc::setsid())?;
             }
             if let Some(ref file) = cgroup
                 && libc::write(file.as_raw_fd(), b"0".as_ptr().cast(), 1) != 1

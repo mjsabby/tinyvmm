@@ -1,28 +1,16 @@
+//! The SSH server: tinyssh, with init.json's logins, accounts and environment.
+
 use crate::{
     config::{Config, User},
     unix,
 };
-use anyhow::{Context, Result, ensure};
-use russh::{
-    Channel, ChannelId, Pty,
-    keys::{Algorithm, HashAlg, PrivateKey, PublicKey},
-    server::{self, Auth, ChannelOpenHandle, Msg, Server as _, Session, VerifiedPublicKey},
-};
-use std::{
-    collections::{BTreeMap, HashMap},
-    fs::File,
-    io,
-    net::SocketAddr,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
-    process::Stdio,
-    sync::Arc,
-    time::{Duration, Instant},
-};
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt, unix::AsyncFd},
-    process::Child,
-    sync::watch,
-};
+use anyhow::{Context, Result, bail, ensure};
+use data_encoding::{BASE64, BASE64_NOPAD};
+use sha2::{Digest, Sha256};
+use std::{collections::BTreeMap, ffi::OsStr, fs, io, os::unix::ffi::OsStrExt, time::Instant};
+use tinyssh::{HostKey, Launch, Launcher, PublicKey, SpawnRequest};
+
+const ED25519: &[u8] = b"ssh-ed25519";
 
 struct Authorized {
     user: User,
@@ -30,13 +18,32 @@ struct Authorized {
 }
 
 fn authorized(config: &Config) -> Result<Vec<Authorized>> {
-    config.ssh.logins.iter().map(|login| {
-        ensure!(!login.public_keys.is_empty(), "no keys for SSH user {}", login.user);
-        let keys = login.public_keys.iter().map(|key| {
-            PublicKey::from_openssh(key).context("invalid SSH public key (use plain OpenSSH public keys, without authorized_keys options)")
-        }).collect::<Result<_>>()?;
-        Ok(Authorized { user: config.user(&login.user)?, keys })
-    }).collect()
+    config
+        .ssh
+        .logins
+        .iter()
+        .map(|login| {
+            ensure!(
+                !login.public_keys.is_empty(),
+                "no keys for SSH user {}",
+                login.user
+            );
+            let keys = login
+                .public_keys
+                .iter()
+                .map(|key| {
+                    public_key(key).context(
+                        "invalid SSH public key (use plain OpenSSH ssh-ed25519 public keys, \
+                         without authorized_keys options)",
+                    )
+                })
+                .collect::<Result<_>>()?;
+            Ok(Authorized {
+                user: config.user(&login.user)?,
+                keys,
+            })
+        })
+        .collect()
 }
 
 pub fn validate_keys(config: &Config) -> Result<()> {
@@ -45,466 +52,266 @@ pub fn validate_keys(config: &Config) -> Result<()> {
 
 pub async fn run(config: Config) -> Result<()> {
     let started = Instant::now();
-    let users = Arc::new(authorized(&config)?);
+    let logins: &'static [Authorized] = Box::leak(authorized(&config)?.into_boxed_slice());
     eprintln!(
         "tinyinit sshd: stage=authorization elapsed_ms={:.3}",
         started.elapsed().as_secs_f64() * 1000.0
     );
     let key_started = Instant::now();
-    let host_key = match config.ssh.host_key {
-        Some(path) => russh::keys::load_secret_key(&path, None)
-            .with_context(|| format!("load host key {path}"))?,
+    let host_key = match &config.ssh.host_key {
+        Some(path) => {
+            host_key(&fs::read_to_string(path).with_context(|| format!("read host key {path}"))?)
+                .with_context(|| format!("load host key {path}"))?
+        }
         None => {
             eprintln!("tinyinit sshd: using an ephemeral host key (changes on every boot)");
-            PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?
+            HostKey::generate().context("generate host key")?
         }
     };
     eprintln!(
         "tinyinit sshd: host key {} duration_ms={:.3}",
-        host_key.public_key().fingerprint(HashAlg::Sha256),
+        fingerprint(&host_key.public_key()),
         key_started.elapsed().as_secs_f64() * 1000.0
     );
-    let server_config = Arc::new(server::Config {
-        keys: vec![host_key],
-        inactivity_timeout: None,
-        nodelay: true,
-        // Clients probe with "none" before offering keys. Rejecting that probe
-        // immediately reveals nothing; failed key attempts keep the default delay.
-        auth_rejection_time_initial: Some(Duration::ZERO),
-        ..Default::default()
+    let mut server = tinyssh::Config::new(host_key, move |name: &str, key: &PublicKey| {
+        logins
+            .iter()
+            .any(|login| login.user.name == name && login.keys.contains(key))
     });
+    server.launcher = Some(Box::new(Sessions {
+        logins,
+        env: config.env,
+    }));
     eprintln!(
-        "tinyinit sshd: auth_rejection_time_ms={} initial_auth_rejection_time_ms={}",
-        server_config.auth_rejection_time.as_millis(),
-        server_config
-            .auth_rejection_time_initial
-            .unwrap_or(server_config.auth_rejection_time)
-            .as_millis()
+        "tinyinit sshd: max_auth_attempts={} login_timeout_ms={} max_connections={}",
+        server.max_auth_attempts,
+        server.login_timeout.as_millis(),
+        server.max_connections
     );
-    let socket = tokio::net::TcpListener::bind(&config.ssh.listen).await?;
+    let server: &'static tinyssh::Config = Box::leak(Box::new(server));
+    let listener = tokio::net::TcpListener::bind(&config.ssh.listen).await?;
     eprintln!(
         "tinyinit sshd: listening on {} event=listener-ready startup_ms={:.3} kernel_uptime_ms={:.3}",
         config.ssh.listen,
         started.elapsed().as_secs_f64() * 1000.0,
         unix::uptime_ms()?
     );
-    SshServer {
-        users,
-        env: Arc::new(config.env),
-    }
-    .run_on_socket(server_config, &socket)
-    .await?;
-    Ok(())
+    tinyssh::serve(listener, server).await
 }
 
-struct SshServer {
-    users: Arc<Vec<Authorized>>,
-    env: Arc<BTreeMap<String, String>>,
+/// Starts SSH sessions as init.json resolves the login's account, with its
+/// environment, rather than as the image's /etc/passwd says.
+struct Sessions {
+    logins: &'static [Authorized],
+    env: BTreeMap<String, String>,
 }
 
-impl server::Server for SshServer {
-    type Handler = Connection;
-
-    fn new_client(&mut self, _: Option<SocketAddr>) -> Connection {
-        Connection {
-            users: self.users.clone(),
-            env: self.env.clone(),
-            user: None,
-            channels: HashMap::new(),
+impl Launcher for Sessions {
+    fn launch(&self, request: &SpawnRequest<'_>) -> io::Result<Launch> {
+        let user = &self
+            .logins
+            .iter()
+            .find(|login| login.user.name == request.user)
+            .ok_or_else(|| io::Error::other("unknown user"))?
+            .user;
+        let mut command = unix::command(user, "/bin/tinyinit", &user.home, &self.env);
+        command.arg("shell");
+        if let Some(line) = request.command {
+            command.arg("-c").arg(OsStr::from_bytes(line));
         }
-    }
-
-    fn handle_session_error(&mut self, error: anyhow::Error) {
-        eprintln!("tinyinit sshd: connection: {error:#}");
-    }
-}
-
-struct Connection {
-    users: Arc<Vec<Authorized>>,
-    env: Arc<BTreeMap<String, String>>,
-    user: Option<User>,
-    channels: HashMap<ChannelId, ChannelState>,
-}
-
-#[derive(Default)]
-struct ChannelState {
-    channel: Option<Channel<Msg>>,
-    pty: Option<Terminal>,
-    cancel: Option<watch::Sender<bool>>,
-}
-
-impl Drop for ChannelState {
-    fn drop(&mut self) {
-        if let Some(cancel) = &self.cancel {
-            let _ = cancel.send(true);
-        }
-    }
-}
-
-struct Terminal {
-    master: Arc<AsyncFd<OwnedFd>>,
-    slave: Option<File>,
-    term: String,
-}
-
-impl Connection {
-    fn start(&mut self, id: ChannelId, command: Option<&str>, session: &mut Session) -> Result<()> {
-        let user = self.user.as_ref().context("not authenticated")?;
-        let state = self.channels.get_mut(&id).context("unknown channel")?;
-        let Some(channel) = state.channel.take() else {
-            session.channel_failure(id)?;
-            return Ok(());
-        };
-        let mut cmd = unix::command(user, "/bin/tinyinit", &user.home, &self.env);
-        cmd.arg("shell");
-        if let Some(command) = command {
-            cmd.args(["-c", command]);
-        }
-        let master = state.pty.as_ref().map(|p| p.master.clone());
-        if let Some(pty) = &state.pty {
-            let slave = pty.slave.as_ref().context("missing PTY slave")?;
-            cmd.env("TERM", &pty.term);
-            cmd.stdin(slave.try_clone()?)
-                .stdout(slave.try_clone()?)
-                .stderr(slave.try_clone()?);
-        } else {
-            cmd.stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-        }
+        // No new session here: tinyssh makes the shell a session leader, with
+        // its terminal, after these steps.
         unix::child_setup(
-            &mut cmd,
+            &mut command,
             user,
             None,
-            master.is_some(),
+            false,
             user.uid != 0,
             unix::Spawn::default(),
         );
-        let mut cmd = tokio::process::Command::from(cmd);
-        cmd.kill_on_drop(true);
-        let child = cmd.spawn()?;
-        // Only the child should hold the slave; otherwise the master never reaches EOF.
-        if let Some(pty) = &mut state.pty {
-            pty.slave.take();
-        }
-        let (cancel, receiver) = watch::channel(false);
-        state.cancel = Some(cancel);
-        let handle = session.handle();
-        session.channel_success(id)?;
-        tokio::spawn(async move {
-            if let Err(error) =
-                serve_process(child, master, channel, handle.clone(), id, receiver).await
-            {
-                eprintln!("tinyinit sshd: session: {error:#}");
-                let _ = handle.exit_status_request(id, 1).await;
-                let _ = handle.close(id).await;
-            }
-        });
-        Ok(())
-    }
-}
-
-impl server::Handler for Connection {
-    type Error = anyhow::Error;
-
-    async fn auth_publickey(&mut self, name: &str, key: VerifiedPublicKey<'_>) -> Result<Auth> {
-        self.user = self
-            .users
-            .iter()
-            .find(|u| {
-                u.user.name == name
-                    && u.keys
-                        .iter()
-                        .any(|k| k.key_data() == key.public_key.key_data())
-            })
-            .map(|u| u.user.clone());
-        Ok(if self.user.is_some() {
-            Auth::Accept
-        } else {
-            Auth::reject()
+        Ok(Launch {
+            command,
+            terminal_owner: Some(user.uid),
         })
     }
-
-    async fn channel_open_session(
-        &mut self,
-        channel: Channel<Msg>,
-        reply: ChannelOpenHandle,
-        _: &mut Session,
-    ) -> Result<()> {
-        if self.user.is_some() && self.channels.len() < 16 {
-            self.channels.insert(
-                channel.id(),
-                ChannelState {
-                    channel: Some(channel),
-                    pty: None,
-                    cancel: None,
-                },
-            );
-            reply.accept().await;
-        }
-        Ok(())
-    }
-
-    async fn pty_request(
-        &mut self,
-        channel: ChannelId,
-        term: &str,
-        cols: u32,
-        rows: u32,
-        _: u32,
-        _: u32,
-        _: &[(Pty, u32)],
-        session: &mut Session,
-    ) -> Result<()> {
-        let state = self.channels.get_mut(&channel).context("unknown channel")?;
-        if state.channel.is_none() || state.pty.is_some() || term.contains('\0') || term.len() > 128
-        {
-            session.channel_failure(channel)?;
-            return Ok(());
-        }
-        let mut master = -1;
-        let mut slave = -1;
-        let size = window_size(cols, rows);
-        unix::check(unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                &size,
-            )
-        })?;
-        let master = unsafe { OwnedFd::from_raw_fd(master) };
-        let slave = unsafe { File::from_raw_fd(slave) };
-        for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
-            unix::check(unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) })?;
-        }
-        unix::check(unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) })?;
-        let user = self.user.as_ref().context("not authenticated")?;
-        unix::check(unsafe { libc::fchown(slave.as_raw_fd(), user.uid, user.gid) })?;
-        // The owned descriptor stays open and unchanged for the registration's lifetime.
-        let master = unsafe { AsyncFd::register(master)? };
-        state.pty = Some(Terminal {
-            master: Arc::new(master),
-            slave: Some(slave),
-            term: term.into(),
-        });
-        session.channel_success(channel)?;
-        Ok(())
-    }
-
-    async fn shell_request(&mut self, channel: ChannelId, session: &mut Session) -> Result<()> {
-        self.start(channel, None, session)
-    }
-
-    async fn exec_request(
-        &mut self,
-        channel: ChannelId,
-        data: &[u8],
-        session: &mut Session,
-    ) -> Result<()> {
-        self.start(channel, Some(std::str::from_utf8(data)?), session)
-    }
-
-    async fn window_change_request(
-        &mut self,
-        channel: ChannelId,
-        cols: u32,
-        rows: u32,
-        _: u32,
-        _: u32,
-        _: &mut Session,
-    ) -> Result<()> {
-        if let Some(pty) = self.channels.get(&channel).and_then(|s| s.pty.as_ref()) {
-            unix::check(unsafe {
-                libc::ioctl(
-                    pty.master.as_raw_fd(),
-                    libc::TIOCSWINSZ,
-                    &window_size(cols, rows),
-                )
-            })?;
-        }
-        Ok(())
-    }
-
-    async fn channel_close(&mut self, channel: ChannelId, _: &mut Session) -> Result<()> {
-        self.channels.remove(&channel);
-        Ok(())
-    }
-
-    async fn subsystem_request(
-        &mut self,
-        channel: ChannelId,
-        _: &str,
-        session: &mut Session,
-    ) -> Result<()> {
-        session.channel_failure(channel)?;
-        Ok(())
-    }
 }
 
-fn window_size(cols: u32, rows: u32) -> libc::winsize {
-    libc::winsize {
-        ws_col: cols.min(u16::MAX as u32) as u16,
-        ws_row: rows.min(u16::MAX as u32) as u16,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    }
+/// An OpenSSH public key line: `ssh-ed25519 BASE64 [COMMENT]`.
+fn public_key(line: &str) -> Result<PublicKey> {
+    let mut fields = line.split_whitespace();
+    ensure!(
+        fields.next().map(str::as_bytes) == Some(ED25519),
+        "only ssh-ed25519 keys are supported"
+    );
+    let blob = BASE64
+        .decode(fields.next().unwrap_or_default().as_bytes())
+        .context("key is not base64")?;
+    let mut blob = Wire(&blob);
+    let key = ed25519(&mut blob)?;
+    ensure!(blob.0.is_empty(), "trailing data after the key");
+    Ok(key)
 }
 
-// Killing the session's original process group also cleans up ordinary shell children.
-struct ProcessGroup(u32);
-impl Drop for ProcessGroup {
-    fn drop(&mut self) {
-        unsafe {
-            libc::kill(-(self.0 as i32), libc::SIGKILL);
-        }
-    }
-}
-
-async fn serve_process(
-    mut child: Child,
-    master: Option<Arc<AsyncFd<OwnedFd>>>,
-    channel: Channel<Msg>,
-    handle: server::Handle,
-    id: ChannelId,
-    mut cancel: watch::Receiver<bool>,
-) -> Result<()> {
-    let group = ProcessGroup(child.id().context("missing shell pid")?);
-    // into_stream() closes on drop, which can race the exit-status message.
-    let (mut incoming_channel, outgoing_channel) = channel.split();
-    let mut outgoing = outgoing_channel.make_writer();
-    let input;
-    let output;
-    let error_output;
-    if let Some(master) = master {
-        let writer = master.clone();
-        input = tokio::spawn(async move {
-            let mut incoming = incoming_channel.make_reader();
-            let mut buffer = [0; 8192];
-            while let Ok(n) = incoming.read(&mut buffer).await {
-                if n == 0 {
-                    let _ = fd_write(&writer, b"\x04").await;
-                    break;
-                }
-                if fd_write(&writer, &buffer[..n]).await.is_err() {
-                    break;
-                }
-            }
-        });
-        output = tokio::spawn(async move {
-            let mut buffer = [0; 8192];
-            loop {
-                let n = fd_read(&master, &mut buffer).await?;
-                if n == 0 {
-                    break;
-                }
-                outgoing.write_all(&buffer[..n]).await?;
-            }
-            Ok::<_, io::Error>(())
-        });
-        error_output = None;
-    } else {
-        let mut stdin = child.stdin.take().context("missing stdin")?;
-        let mut stdout = child.stdout.take().context("missing stdout")?;
-        let mut stderr = child.stderr.take().context("missing stderr")?;
-        input = tokio::spawn(async move {
-            let mut incoming = incoming_channel.make_reader();
-            let _ = tokio::io::copy(&mut incoming, &mut stdin).await;
-        });
-        output = tokio::spawn(async move {
-            tokio::io::copy(&mut stdout, &mut outgoing)
-                .await
-                .map(|_| ())
-        });
-        let handle = handle.clone();
-        error_output = Some(tokio::spawn(async move {
-            forward_stderr(&mut stderr, handle, id).await
-        }));
-    }
-    let status = tokio::select! {
-        status = child.wait() => status?,
-        _ = cancel.changed() => {
-            drop(group);
-            child.wait().await?
-        }
+/// An unencrypted OpenSSH Ed25519 private key file, as `ssh-keygen -t
+/// ed25519 -N ''` writes it.
+fn host_key(text: &str) -> Result<HostKey> {
+    let body: String = text
+        .trim()
+        .strip_prefix("-----BEGIN OPENSSH PRIVATE KEY-----")
+        .and_then(|rest| rest.strip_suffix("-----END OPENSSH PRIVATE KEY-----"))
+        .context("not an OpenSSH private key; create one with ssh-keygen -t ed25519 -N ''")?
+        .split_whitespace()
+        .collect();
+    let data = BASE64
+        .decode(body.as_bytes())
+        .context("key is not base64")?;
+    let mut file = Wire(
+        data.strip_prefix(b"openssh-key-v1\0")
+            .context("not an OpenSSH private key")?,
+    );
+    let (cipher, kdf) = (file.string()?, file.string()?);
+    ensure!(
+        cipher == b"none" && kdf == b"none",
+        "encrypted host keys are not supported"
+    );
+    file.string()?;
+    ensure!(file.u32()? == 1, "expected exactly one key");
+    let public = ed25519(&mut Wire(file.string()?))?;
+    let mut private = Wire(file.string()?);
+    ensure!(private.u32()? == private.u32()?, "corrupt private key");
+    let inner = ed25519(&mut private)?;
+    // The secret key is the 32-byte seed followed by the public key.
+    let secret = private.string()?;
+    let (Some(seed), Some(tail)) = (secret.first_chunk::<32>(), secret.get(32..)) else {
+        bail!("corrupt private key");
     };
-    input.abort();
-    // Background jobs can retain stdout after their shell exits: don't wait forever.
-    let mut output = output;
-    let _ = tokio::time::timeout(Duration::from_secs(2), &mut output).await;
-    output.abort();
-    if let Some(mut errors) = error_output {
-        let _ = tokio::time::timeout(Duration::from_secs(2), &mut errors).await;
-        errors.abort();
-    }
-    use std::os::unix::process::ExitStatusExt;
-    let code = status
-        .code()
-        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)) as u32;
-    let _ = handle.exit_status_request(id, code).await;
-    let _ = handle.eof(id).await;
-    let _ = handle.close(id).await;
-    Ok(())
+    let key = HostKey::from_seed(seed);
+    // The file holds the public key three times; each must be the seed's.
+    ensure!(
+        key.public_key() == public && inner == public && tail == public.as_bytes(),
+        "corrupt private key: its public keys do not match"
+    );
+    Ok(key)
 }
 
-async fn forward_stderr(
-    reader: &mut (impl AsyncRead + Unpin),
-    handle: server::Handle,
-    id: ChannelId,
-) -> Result<()> {
-    let mut buffer = [0; 8192];
-    loop {
-        let n = reader.read(&mut buffer).await?;
-        if n == 0 {
-            return Ok(());
-        }
-        if handle
-            .extended_data(id, 1, buffer[..n].to_vec())
-            .await
-            .is_err()
-        {
-            return Ok(());
-        }
+/// Reads an `ssh-ed25519` public key in SSH wire encoding.
+fn ed25519(wire: &mut Wire) -> Result<PublicKey> {
+    ensure!(
+        wire.string()? == ED25519,
+        "only ssh-ed25519 keys are supported"
+    );
+    let key = wire.string()?;
+    Ok(PublicKey::from_bytes(
+        key.try_into().context("an Ed25519 key has 32 bytes")?,
+    ))
+}
+
+/// The SSH wire encoding of `key`.
+fn blob(key: &PublicKey) -> Vec<u8> {
+    let mut blob = Vec::new();
+    for part in [ED25519, key.as_bytes()] {
+        blob.extend_from_slice(&(part.len() as u32).to_be_bytes());
+        blob.extend_from_slice(part);
+    }
+    blob
+}
+
+/// The fingerprint `ssh-keygen -l` shows.
+fn fingerprint(key: &PublicKey) -> String {
+    format!("SHA256:{}", BASE64_NOPAD.encode(&Sha256::digest(blob(key))))
+}
+
+/// Reads SSH wire-format fields (RFC 4251).
+struct Wire<'a>(&'a [u8]);
+
+impl<'a> Wire<'a> {
+    fn bytes(&mut self, len: usize) -> Result<&'a [u8]> {
+        ensure!(self.0.len() >= len, "truncated key");
+        let (head, tail) = self.0.split_at(len);
+        self.0 = tail;
+        Ok(head)
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_be_bytes(self.bytes(4)?.try_into()?))
+    }
+
+    fn string(&mut self) -> Result<&'a [u8]> {
+        let len = self.u32()? as usize;
+        self.bytes(len)
     }
 }
 
-async fn fd_read(fd: &AsyncFd<OwnedFd>, buffer: &mut [u8]) -> io::Result<usize> {
-    loop {
-        let mut ready = fd.readable().await?;
-        match ready.try_io(|fd| {
-            let n = unsafe { libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
-            if n < 0 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::EIO) {
-                    Ok(0)
-                } else {
-                    Err(error)
-                }
-            } else {
-                Ok(n as usize)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    // From `ssh-keygen -t ed25519 -C test@tinyinit` and `ssh-keygen -l`.
+    const PUBLIC: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINWauYHquFmI4/Nk2jTnrxpRmSHg0CSdccNP7oBsFkQt test@tinyinit";
+    const FINGERPRINT: &str = "SHA256:dezTwKPZjsHOOzqmzXluxK3sflao6WKhRcUS+/iqVaI";
+
+    #[test]
+    fn public_keys_are_plain_openssh_ed25519_lines() {
+        let key = public_key(PUBLIC).unwrap();
+        assert_eq!(fingerprint(&key), FINGERPRINT);
+        assert_eq!(
+            BASE64.encode(&blob(&key)),
+            PUBLIC.split(' ').nth(1).unwrap()
+        );
+        let bare = PUBLIC.rsplit_once(' ').unwrap().0;
+        assert_eq!(public_key(bare).unwrap(), key);
+        for bad in [
+            "not a valid key",
+            "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDS5vVS rsa",
+            // An RSA key labelled as Ed25519.
+            "ssh-ed25519 AAAAB3NzaC1yc2EAAAADAQABAAABAQDS5vVS",
+            &format!("from=\"10.0.0.1\" {PUBLIC}"),
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINWauYHquFmI4/Nk2jTnrxpRmSHg0CSdccNP7oBs",
+            "ssh-ed25519 !!!!",
+            "ssh-ed25519",
+        ] {
+            assert!(public_key(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// Host keys load from the files `ssh-keygen` writes, and match the
+    /// public key and fingerprint it reports. Skipped without `ssh-keygen`.
+    #[test]
+    fn host_keys_load_from_ssh_keygen_files() {
+        let dir = std::env::temp_dir().join(format!("tinyinit-hostkey-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let keygen = |name: &str, passphrase: &str| {
+            Command::new("ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-N", passphrase, "-C", "", "-f"])
+                .arg(dir.join(name))
+                .status()
+        };
+        match keygen("plain", "") {
+            Ok(status) => assert!(status.success()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                eprintln!("skipped: no ssh-keygen");
+                return;
             }
-        }) {
-            Ok(result) => return result,
-            Err(_) => continue,
+            Err(error) => panic!("{error}"),
         }
+        assert!(keygen("encrypted", "secret").unwrap().success());
+        let read = |name: &str| fs::read_to_string(dir.join(name)).unwrap();
+        let (plain, public, encrypted) = (read("plain"), read("plain.pub"), read("encrypted"));
+        let listed = Command::new("ssh-keygen")
+            .arg("-lf")
+            .arg(dir.join("plain.pub"))
+            .output()
+            .unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        let key = host_key(&plain).unwrap();
+        assert_eq!(key.public_key(), public_key(&public).unwrap());
+        let listed = String::from_utf8(listed.stdout).unwrap();
+        assert_eq!(
+            listed.split(' ').nth(1),
+            Some(fingerprint(&key.public_key()).as_str())
+        );
+        assert!(host_key(&encrypted).is_err());
+        assert!(host_key(PUBLIC).is_err());
     }
-}
-
-async fn fd_write(fd: &AsyncFd<OwnedFd>, mut buffer: &[u8]) -> io::Result<()> {
-    while !buffer.is_empty() {
-        let mut ready = fd.writable().await?;
-        match ready.try_io(|fd| {
-            let n = unsafe { libc::write(fd.as_raw_fd(), buffer.as_ptr().cast(), buffer.len()) };
-            if n < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(n as usize)
-            }
-        }) {
-            Ok(result) => buffer = &buffer[result?..],
-            Err(_) => continue,
-        }
-    }
-    Ok(())
 }

@@ -113,11 +113,7 @@ pub fn run() -> Result<()> {
         }
     })?;
     log.step("applet-links", || {
-        for applet in coreutils::APPLETS
-            .iter()
-            .copied()
-            .chain(["sh", "brush", "poweroff"])
-        {
+        for applet in coreutils::names().chain(["sh", "brush", "poweroff"]) {
             let path = format!("/bin/{applet}");
             if fs::symlink_metadata(&path).is_ok() {
                 fs::remove_file(&path)?;
@@ -279,7 +275,7 @@ pub fn run() -> Result<()> {
                 &mut command,
                 &user,
                 Some(cgroup(&app.name, &app.limits)?),
-                false,
+                true,
                 true,
                 spawn,
             );
@@ -310,7 +306,7 @@ pub fn run() -> Result<()> {
             &mut command,
             &root,
             Some(cgroup("sshd", &Limits::default())?),
-            false,
+            true,
             false,
             spawn,
         );

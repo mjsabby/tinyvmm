@@ -28,7 +28,7 @@ fn run() -> Result<()> {
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
-    if coreutils::APPLETS.contains(&name.as_str()) {
+    if coreutils::is_applet(&name) {
         std::process::exit(coreutils::run(&name, args)?);
     }
     if matches!(name.as_str(), "sh" | "brush") {
@@ -72,7 +72,7 @@ fn run() -> Result<()> {
                  tinyinit coreutils APPLET [ARGS...]\n\
                  Boot as /init with tinyinit.config=/etc/init.json or a bootstrap 9p share.\n\
                  Coreutils: {}",
-                coreutils::APPLETS.join(" ")
+                coreutils::names().collect::<Vec<_>>().join(" ")
             );
             Ok(())
         }
