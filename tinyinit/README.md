@@ -1,9 +1,12 @@
 # tinyinit
 
-One **Linux** Rust/std binary: PID 1, a key-only Russh server, a Brush shell,
-and 30 selected [uutils/coreutils](https://github.com/uutils/coreutils) applets.
+One **Linux** Rust/std binary: PID 1, a key-only [tinyssh](https://github.com/mjsabby/tinyssh)
+server, a Brush shell, and all of [uutils/coreutils](https://github.com/uutils/coreutils):
+every utility uutils builds for Linux with musl (its `feat_os_unix_musl` set,
+105 utilities, plus `[`).
 No systemd, OpenSSH, BusyBox, modules, udev, passwords, sudo, or respawning.
-The applet crates (`uu_cat`, etc.) come from the uutils/coreutils project.
+Each `uu_*` crate (`uu_cat`, etc.) in `Cargo.toml`'s dependencies becomes an
+applet: `build.rs` generates the table from that list.
 
 ## Build on Windows
 
@@ -22,6 +25,12 @@ cd D:\tinyvmm\tinyinit
 This cross-compiles on Windows, including native dependencies, to a static
 Linux ELF at `target\x86_64-unknown-linux-musl\release\tinyinit`.
 The nested crate is independent of tinyvmm's Windows workspace.
+
+tinyssh is compiled for x86-64 with AVX2, BMI2, ADX, AES-NI, PCLMULQDQ, VAES,
+VPCLMULQDQ and SHA-NI and checks nothing at run time, so `.cargo\config.toml`
+builds the whole binary for them (build from this directory to pick it up).
+The guest sees the host's CPU, which must therefore be an AMD Zen 3, Intel
+Ice Lake or later: elsewhere PID 1 itself dies of an illegal instruction.
 
 The default build embeds the official ASP.NET **11.0 RC3**, Ubuntu Resolute
 **chiseled-extra**, Linux x86-64 filesystem. `rootfs.lock.json` pins the image's
@@ -141,10 +150,10 @@ The root switch is a real mount move, not just chroot.
 This is an ordinary writable, RAM-backed Linux filesystem, not a direct mount
 of ELF memory segments. The compressed bytes stay in the executable and the
 expanded files occupy tmpfs memory; there is no guest disk dependency.
-The current build is approximately 73 MiB, with about 162 MiB of expanded
+The current build is approximately 76 MiB, with about 162 MiB of expanded
 regular-file contents, before applications and the kernel. The init ELF is
 shared through a read-only, nosuid bind mount, not copied into the new root.
-The `-NoRootfs` binary is approximately 19 MiB.
+The `-NoRootfs` binary is approximately 22 MiB.
 
 Init gives applications and SSH sessions `PATH=/bin:/usr/bin`, `HOME`, `USER`,
 `LOGNAME` and `SHELL`. Everything image-specific comes from `init.json`:
@@ -255,19 +264,28 @@ SSH `logins` maps each user (including root and image accounts) to `public_keys`
 and/or a `public_keys_file`. The file is read once after shares mount. Use
 distinct users/keys when you want distinct access; an explicitly authorized
 root login is full guest administration without sudo. Ordinary logins have
-no escalation mechanism. Plain OpenSSH public keys only, no authorized_keys
-options or certificates.
+no escalation mechanism. Plain OpenSSH `ssh-ed25519` public keys only (the one
+key type tinyssh speaks), no authorized_keys options or certificates.
 
 SSH supports interactive PTYs, resizing, non-interactive commands, stdin,
-stderr, and exit status; not SFTP/SCP subsystems or port/agent forwarding.
-Brush supplies shell syntax and builtins; selected uutils applets supply
-external tools, not an entire distro. `poweroff` signals PID 1, and is also
-what the kernel runs (`kernel.poweroff_cmd`) when tinyvmm asks the guest to
-shut down.
+stderr, and exit status, one session per connection; not SFTP/SCP subsystems
+or port/agent forwarding. tinyssh negotiates `curve25519-sha256`,
+`ssh-ed25519` and `aes128-gcm@openssh.com` only; OpenSSH 10.1+ clients warn
+that the key exchange is not post-quantum (`-o WarnWeakCrypto=no` silences it).
+Sessions start as tinyinit resolves the login, not as the image's `/etc/passwd`
+says: an init.json account keeps its uid even where the image has another,
+with the environment described under "Boot and configuration", no
+supplementary groups, and `no_new_privs` unless it is root. Brush supplies
+shell syntax and builtins; the uutils coreutils supply the standard external
+tools, not an entire distro (no find, grep or editor). `poweroff` signals
+PID 1, and is also what the kernel runs (`kernel.poweroff_cmd`) when tinyvmm
+asks the guest to shut down.
 
 By default the SSH host key is ephemeral, so its fingerprint changes each boot.
-For a stable identity, set `ssh.host_key` to a protected persistent Linux
-private-key file. Never bake one shared host private key into every instance.
+For a stable identity, set `ssh.host_key` to a protected persistent Linux file
+holding an unencrypted OpenSSH Ed25519 private key (`ssh-keygen -t ed25519 -N ''
+-f host_key`); other key types and passphrase-protected keys are refused.
+Never bake one shared host private key into every instance.
 Bootstrap configuration is copied to root-only `/run/tinyinit.json`.
 
 Without share options, tinyvmm presents 9p files as root-owned 0644/0444.
@@ -320,7 +338,8 @@ Mount/share targets, actual mountinfo, service UID/GID/executable/cwd/log paths,
 and boot-stage errors are recorded; argv, environment values and key contents
 are not dumped. `supervisor-ready` means every essential process was spawned,
 not that the apps are accepting requests. `/run/log/sshd.log` separately records
-host-key work, actual listener readiness and configured authentication delays.
+host-key work and the key's SHA256 fingerprint, actual listener readiness and
+the authentication limits.
 Boot logs are ephemeral; capture the VMM console if a failed boot shuts down.
 
 ```powershell
@@ -357,9 +376,11 @@ The bind mount eliminates that copy and tests verify identical device/inode
 numbers for `/proc/1/exe` and `/bin/tinyinit`.
 Mounting the root tmpfs itself takes about 0.02 ms; eager decompression/file
 creation is the dominant init cost. Guest app timestamps have 10 ms resolution.
-Host timings also include VMM/kernel startup and SSH client overhead. The SSH
-server rejects clients' initial `none` probe immediately; rejected keys and
-other failed authentication attempts keep Russh's 1000 ms delay.
+Host timings also include VMM/kernel startup and SSH client overhead. The table
+was measured with the earlier Russh server, which rejected clients' initial
+`none` probe immediately and delayed failed key attempts by 1000 ms. tinyssh
+answers every authentication attempt at once; a connection gets 6 attempts and
+60 s to authenticate, and at most 16 connections are served at a time.
 The host observation of app readiness occurs after SSH and is only an upper
 bound; the report also contains the apps' own guest readiness timestamps.
 
@@ -387,10 +408,10 @@ directories on the root tmpfs, not additional filesystems. `/bin`, `/sbin`,
 Tmpfs is appropriate for this simple diskless, disposable appliance: it supplies
 normal Linux file/permission/exec semantics and a real root mount for namespaces.
 It is not a zero-copy compressed filesystem. The root currently uses about
-165 MiB, plus the single original init executable (about 73 MiB with the embedded
+165 MiB, plus the single original init executable (about 76 MiB with the embedded
 base) retained by the bind mount. Compared with the old copy-based boot, this
 avoids a second copy of that executable in guest memory. The minimal-init variant's executable
-is about 19 MiB and its external archive is unmounted after extraction.
+is about 22 MiB and its external archive is unmounted after extraction.
 Optional initramfs overlay archives are not explicitly reclaimed yet.
 No guest swap is configured.
 Unless `tmpfs` sets a size, each tmpfs has the kernel's default limit (roughly
@@ -425,7 +446,9 @@ python .\smoketest.py --kernel C:\kernels\vmlinux.tinyvmm
 
 The smoke test boots the real VMM and authenticates from Windows.
 It needs Python, Windows OpenSSH (`ssh`, `ssh-keygen`), and the built VMM/binary.
-No external Linux rootfs is required for the basic smoke test.
+No external Linux rootfs is required for the basic smoke test. The unit test
+for SSH host keys loads keys that WSL's `ssh-keygen` writes, and checks their
+fingerprints against it; it is skipped without `ssh-keygen`.
 
 To also test two instances of an actual Windows-published .NET application:
 
