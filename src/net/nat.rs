@@ -147,6 +147,15 @@ const TCP_IDLE_MS: u64 = (2 * 60 + 4) * 60_000; // reset an established flow idl
 const TCP_HALF_CLOSE_MS: u64 = 4 * 60_000; // reset a half-closed flow idle this long
 const EXPIRE_GATE_MS: u64 = 1_000; // how often the idle sweep runs
 
+// The worker's wait. While its flows are busy it dequeues with an IDLE_MS
+// timeout and sweeps their TCP timers at most every TICK_GATE_MS. Once a whole
+// wait brings no work and no flow has a TCP timer within QUIET_MS, it sleeps
+// until the earliest timer instead (`NatState::quiet_wait`).
+const IDLE_MS: u32 = 25;
+const TICK_GATE_MS: u64 = 20;
+const QUIET_MS: u64 = 1_000;
+const WAIT_FOREVER: u32 = u32::MAX; // INFINITE
+
 // tcp-sans-io poll() event flags (mirror crate::tcb::events).
 const EV_READABLE: u32 = 1 << 0;
 const EV_PEER_CLOSED: u32 = 1 << 3;
@@ -501,6 +510,10 @@ pub(super) trait TcbDyn {
     fn send_commit(&mut self, n: usize) -> Result<usize, TcpError>;
     fn state(&self) -> State;
     fn tick(&mut self) -> Result<(), TcpError>;
+    /// When `tick` next has timer work, in the clock `set_now` feeds, or
+    /// `None` with no timer armed. Output owed for other reasons (data just
+    /// queued, egress resumed) is driven by the caller, not reported here.
+    fn next_deadline(&mut self) -> Option<u64>;
     /// Host back-pressure: build no more segments until resumed.
     fn set_egress_paused(&mut self, paused: bool);
     fn abort(&mut self) -> Result<(), TcpError>;
@@ -555,6 +568,9 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> TcbDyn for Tcb<BUF, R
     }
     fn tick(&mut self) -> Result<(), TcpError> {
         self.tick()
+    }
+    fn next_deadline(&mut self) -> Option<u64> {
+        Tcb::next_deadline(self)
     }
     fn set_egress_paused(&mut self, paused: bool) {
         self.set_egress_paused(paused)
@@ -1069,6 +1085,10 @@ impl Reassembler {
     fn expire(&mut self, now: u64) {
         self.pending
             .retain(|r| now.saturating_sub(r.since) <= REASSEMBLY_MS);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
     }
 }
 
@@ -1924,8 +1944,6 @@ impl NatState {
     }
 
     fn run(mut self) {
-        const IDLE_MS: u32 = 25;
-        const TICK_GATE_MS: u64 = 20;
         // Time a due timer sweep spends first on completions already queued:
         // enough to catch up after a hiccup, bounded so a completion flood
         // cannot starve the timers.
@@ -1936,8 +1954,11 @@ impl NatState {
         const IOCP_BATCH: usize = 16;
         let mut batch: [sys::Completion; IOCP_BATCH] =
             [(false, 0, 0, std::ptr::null_mut()); IOCP_BATCH];
+        let mut wait_ms = IDLE_MS;
+        let mut quiet = false;
         'run: loop {
-            let n = sys::get_many(self.iocp, &mut batch, IDLE_MS);
+            let n = sys::get_many(self.iocp, &mut batch, wait_ms);
+            let mut work = n > 0;
             for &(ok, bytes, key, ov) in &batch[..n] {
                 if !self.dispatch(ok, bytes, key, ov) {
                     break 'run;
@@ -1975,6 +1996,7 @@ impl NatState {
                 self.stats
                     .iocp_backlog_max
                     .fetch_max(queued, Ordering::Relaxed);
+                work |= queued > 0;
                 self.last_tick = self.now();
                 self.wake = Wake::Timer;
                 let tlp0 = self.stats.tlp.load(Ordering::Relaxed);
@@ -1998,6 +2020,11 @@ impl NatState {
             }
             // The sweep may have delivered retransmissions and ACKs.
             self.notify_guest();
+            // Wait past the sweep cadence only after a whole wait brought no
+            // work; any completion puts the worker back on the cadence.
+            let next = if work { None } else { self.quiet_wait(quiet) };
+            quiet = next.is_some();
+            wait_ms = next.unwrap_or(IDLE_MS);
         }
         self.notify_guest();
         self.shutdown();
@@ -3358,6 +3385,57 @@ impl NatState {
         keys.clear();
         self.tick_keys = keys;
     }
+
+    /// How long a worker that found no work may wait for completions, or
+    /// `None` to stay on the `IDLE_MS` cadence with its timer sweep (see
+    /// [`quiet_wait_ms`]). A flow paused on the NIC's RX backlog keeps the
+    /// cadence: the sweep re-drives it should the NIC's wake go missing.
+    fn quiet_wait(&mut self, quiet: bool) -> Option<u32> {
+        if !self.rx_blocked.is_empty() {
+            return None;
+        }
+        let earliest = self
+            .tcp
+            .values_mut()
+            .filter(|f| !f.dead)
+            .filter_map(|f| f.tcb.as_mut().and_then(|t| t.next_deadline()))
+            .min();
+        let sweep = (!self.tcp.is_empty() || !self.udp.is_empty() || !self.frags.is_empty())
+            .then(|| self.last_expire.saturating_add(EXPIRE_GATE_MS));
+        quiet_wait_ms(self.now(), earliest, quiet, self.last_tick, sweep)
+    }
+}
+
+/// The worker's wait after a dequeue that brought no work, given the clock,
+/// its flows' earliest TCP timer, whether it is already `quiet`, when its
+/// timer sweep last ran and when its next idle sweep is due (`None` with no
+/// flow or fragment to sweep). `None` keeps the `IDLE_MS` cadence: unless
+/// already quiet, a timer within `QUIET_MS` means a connection is moving data,
+/// and its timers run exactly as before. Otherwise the wait lasts until the
+/// earliest timer the sweep can fire (it runs at most every `TICK_GATE_MS`),
+/// at most until the idle sweep, and indefinitely with neither. A completion
+/// (a guest frame, socket I/O, a resume) ends any wait.
+fn quiet_wait_ms(
+    now: u64,
+    earliest: Option<u64>,
+    quiet: bool,
+    last_tick: u64,
+    sweep: Option<u64>,
+) -> Option<u32> {
+    if !quiet && earliest.is_some_and(|at| at < now.saturating_add(QUIET_MS)) {
+        return None;
+    }
+    let timer = earliest.map(|at| at.max(last_tick.saturating_add(TICK_GATE_MS)));
+    let until = match (timer, sweep) {
+        (Some(a), Some(b)) => a.min(b),
+        (Some(at), None) | (None, Some(at)) => at,
+        (None, None) => return Some(WAIT_FOREVER),
+    };
+    Some(
+        until
+            .saturating_sub(now)
+            .clamp(1, u64::from(WAIT_FOREVER - 1)) as u32,
+    )
 }
 
 /// One worker thread and the IOCP its flows' sockets complete to.
@@ -4362,6 +4440,82 @@ mod tests {
         flow.shed_idle_queue();
         assert_eq!(flow.pending_to_host.capacity(), 0);
         flow.tcb.take();
+    }
+
+    /// A worker that found no work waits for its next timer: forever with no
+    /// flows, until its idle sweep with only quiet ones. While a timer is
+    /// close it keeps the sweep cadence unless already quiet, and it never
+    /// waits on a timer the sweep can't fire yet.
+    #[test]
+    fn an_idle_worker_waits_for_its_next_timer() {
+        let now = 10_000;
+        assert_eq!(
+            quiet_wait_ms(now, None, false, now, None),
+            Some(WAIT_FOREVER)
+        );
+        assert_eq!(
+            quiet_wait_ms(now, None, false, now, Some(now + 600)),
+            Some(600)
+        );
+        // A timer under QUIET_MS away: a connection is moving data.
+        assert_eq!(
+            quiet_wait_ms(now, Some(now + 200), false, now, Some(now + 600)),
+            None
+        );
+        // A distant one (TIME_WAIT, a backed-off retransmission).
+        assert_eq!(
+            quiet_wait_ms(now, Some(now + 5_000), false, now, Some(now + 600)),
+            Some(600)
+        );
+        assert_eq!(
+            quiet_wait_ms(now, Some(now + 1_500), false, now - 900, Some(now + 2_000)),
+            Some(1_500)
+        );
+        // Already quiet: until the near timer, but not before the sweep may run.
+        assert_eq!(
+            quiet_wait_ms(now, Some(now + 200), true, now - 500, Some(now + 600)),
+            Some(200)
+        );
+        assert_eq!(
+            quiet_wait_ms(now, Some(now + 5), true, now - 3, Some(now + 600)),
+            Some(17)
+        );
+        assert_eq!(
+            quiet_wait_ms(now, Some(now - 1), true, now, Some(now + 600)),
+            Some(20)
+        );
+    }
+
+    /// On either engine an established connection with nothing in flight has
+    /// no timer within QUIET_MS, so its worker may go quiet, while one whose
+    /// data the guest has yet to acknowledge reports its retransmission timer
+    /// (no later than the 1 s initial RTO), so a worker that sleeps until its
+    /// next timer still retransmits on time.
+    #[test]
+    fn a_connection_with_data_in_flight_reports_its_retransmit_timer() {
+        for engine in [TcpEngine::SansIo, TcpEngine::Smoltcp] {
+            let (mut nat, mut guest) = established_pair_on(engine);
+            let now = 5_000;
+            step(&mut *nat, &mut *guest, now);
+            let at = nat.next_deadline();
+            assert!(
+                at.is_none_or(|at| at >= now + QUIET_MS),
+                "{engine:?}: idle, next timer {at:?}"
+            );
+            let (a, _) = nat.send_reserve(100).unwrap();
+            a[..100].fill(7);
+            assert_eq!(nat.send_commit(100), Ok(100));
+            nat.tick().unwrap();
+            let mut sent = false;
+            // Lost on the way: the guest never acknowledges it.
+            while nat.extract_packet_with(&mut |_| sent = true) {}
+            assert!(sent, "{engine:?}");
+            let at = nat.next_deadline();
+            assert!(
+                at.is_some_and(|at| at > now && at <= now + 1_000),
+                "{engine:?}: data in flight, next timer {at:?}"
+            );
+        }
     }
 
     /// Advance both ends to `now`, run their timers and exchange what

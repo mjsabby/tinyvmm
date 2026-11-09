@@ -463,6 +463,12 @@ impl TcbDyn for SmolTcb {
         Ok(())
     }
 
+    fn next_deadline(&mut self) -> Option<u64> {
+        // Output already due reads as time 0.
+        let at = self.iface.poll_at(self.now, &self.sockets)?;
+        Some(at.total_millis().max(0) as u64)
+    }
+
     fn set_egress_paused(&mut self, paused: bool) {
         self.q.paused = paused;
     }

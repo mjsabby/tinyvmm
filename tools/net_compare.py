@@ -33,7 +33,27 @@ Usage:
     [--vmlinux <path>] [--initrd <path>] [--no-build]
     [--vcpus 1] [--ram-mb 1024]
     [--size-mib 256] [--runs 3] [--rr 200] [--par 4] [--ping 200]
+    [--loss 0.01 --extra-initrd <cpio.gz with /opt/ipt>] [--idle 20 [--idle-conns 8]]
     [--host-ip a.b.c.d] [--timeout-sec 600] [--json out.json] [--verbose]
+
+--loss makes the guest drop that fraction of the TCP packets it receives
+(iptables `statistic` in the raw table, so before TCP sees them): the NAT's
+TCP must recover lost data, ACKs, SYN-ACKs and FINs. The same loss applies to
+every VMM. The guest kernel needs CONFIG_IP_NF_RAW, CONFIG_IP_NF_IPTABLES_LEGACY
+and CONFIG_NETFILTER_XT_MATCH_STATISTIC (OpenVMM also needs a serial console
+and PCIe: CONFIG_SERIAL_8250_CONSOLE, CONFIG_PCI_MMCONFIG, CONFIG_PCIEPORTBUS),
+and the guest needs iptables-legacy under /opt/ipt, from --extra-initrd:
+xtables-legacy-multi; libxtables.so.12, libip4tc.so.2, libip6tc.so.2,
+libc.so.6, libm.so.6 and ld-linux-x86-64.so.2 in /opt/ipt/lib; and the
+statistic, standard, tcp and udp extensions (libxt_*.so) in /opt/ipt/xtables.
+On Debian or Ubuntu, `apt-get download iptables libxtables12 libip4tc2
+libip6tc2` and `dpkg-deb -x` each for the iptables files, and take libc, libm
+and ld.so from the same system.
+
+--idle adds three idle phases before the others, each that many seconds:
+no connection open, --idle-conns idle open connections to the host, and after
+they have closed. It reports how often the VMM's threads woke (context
+switches/s) and its CPU in each.
 """
 from __future__ import annotations
 
@@ -284,6 +304,56 @@ def thread_cpu_seconds(proc: subprocess.Popen) -> dict[str, float]:
     return out
 
 
+# Context switches per thread (how often each one woke): the thread records of
+# NtQuerySystemInformation(SystemProcessInformation), offsets for x64.
+_ntdll = ctypes.WinDLL("ntdll")
+_ntdll.NtQuerySystemInformation.argtypes = [ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong,
+                                            ctypes.POINTER(ctypes.c_ulong)]
+_ntdll.NtQuerySystemInformation.restype = ctypes.c_long
+
+
+def _thread_name(tid: int) -> str:
+    h = _k32.OpenThread(THREAD_QUERY_LIMITED_INFORMATION, False, tid)
+    if not h:
+        return f"tid{tid}"
+    name = ctypes.c_wchar_p()
+    key = f"tid{tid}"
+    if _k32.GetThreadDescription(h, ctypes.byref(name)) >= 0 and name.value:
+        key = name.value
+    if name:
+        _k32.LocalFree(ctypes.cast(name, ctypes.c_void_p))
+    _k32.CloseHandle(h)
+    return key
+
+
+def thread_switches(proc: subprocess.Popen) -> dict[str, int]:
+    """Context switches so far per thread of the VMM and its descendants, keyed
+    by thread name (or tid when unnamed)."""
+    pids = set(_descendants(proc.pid))
+    size = 1 << 20
+    while True:
+        buf = ctypes.create_string_buffer(size)
+        got = ctypes.c_ulong()
+        st = _ntdll.NtQuerySystemInformation(5, buf, size, ctypes.byref(got))
+        if st == 0:
+            break
+        if st & 0xFFFFFFFF != 0xC0000004:  # STATUS_INFO_LENGTH_MISMATCH
+            return {}
+        size = max(size * 2, got.value + 65536)
+    raw, out, off = buf.raw, {}, 0
+    while True:
+        nxt, nthreads = int.from_bytes(raw[off:off + 4], "little"), int.from_bytes(raw[off + 4:off + 8], "little")
+        if int.from_bytes(raw[off + 0x50:off + 0x58], "little") in pids:
+            for i in range(nthreads):
+                t = off + 0x100 + i * 0x50
+                tid = int.from_bytes(raw[t + 0x30:t + 0x38], "little")
+                key = _thread_name(tid)
+                out[key] = out.get(key, 0) + int.from_bytes(raw[t + 0x40:t + 0x44], "little")
+        if not nxt:
+            return out
+        off += nxt
+
+
 # ---------------------------------------------------------------------------
 # VMM launch
 # ---------------------------------------------------------------------------
@@ -295,7 +365,9 @@ def guest_cmdline(a: argparse.Namespace, host: str, port: int, console: str) -> 
         f"NETCMP_HOST={host}", f"NETCMP_PORT={port}",
         f"NETCMP_SIZE={a.size_mib << 20}", f"NETCMP_RUNS={a.runs}",
         f"NETCMP_RR={a.rr}", f"NETCMP_PAR={a.par}", f"NETCMP_PING={a.ping}",
-    ]).replace("  ", " ")
+        f"NETCMP_LOSS={a.loss}" if a.loss else "",
+        f"NETCMP_IDLE={a.idle} NETCMP_IDLE_CONNS={a.idle_conns}" if a.idle else "",
+    ]).replace("  ", " ").strip()
 
 
 def vmm_argv(name: str, a: argparse.Namespace, host: str, port: int) -> list[str]:
@@ -327,6 +399,10 @@ def vmm_argv(name: str, a: argparse.Namespace, host: str, port: int) -> list[str
 PHASE_RE = re.compile(r"NETCMP PHASE (\w+) (begin|end)")
 # Guest network counter deltas over a phase: "NETCMP <kind> <phase> k=v k=v ...".
 GUEST_RE = re.compile(r"NETCMP (TCPEXT|SNMP|NETDEV|IRQ) (\w+)(.*)$")
+# tinyvmm's NAT teardown line: how its TCP recovered what the guest dropped.
+NAT_KEYS = ("retransmits", "rto", "tlp", "recoveries", "dsacks")
+# --idle phases: no connections, idle open ones, after they closed.
+IDLE_PHASES = ("idle0", "idle1", "idle2")
 
 
 @dataclass
@@ -339,6 +415,10 @@ class RunResult:
     rr: tuple | None = None                     # (n, ok, us)
     guest: dict = field(default_factory=dict)   # phase -> {counter: delta}
     threads: dict = field(default_factory=dict)  # phase -> {thread: % of one CPU}
+    loss: tuple | None = None                   # (TCP packets seen, dropped) by the guest
+    loss_failed: bool = False
+    nat: dict = field(default_factory=dict)     # NAT_KEYS -> count (tinyvmm only)
+    wakes: dict = field(default_factory=dict)   # phase -> {thread: context switches/s}
     log: str = ""
 
 
@@ -351,7 +431,7 @@ def run_one(name: str, a: argparse.Namespace, srv: Server, host: str) -> RunResu
     # stdin EOF (so DEVNULL would kill it immediately).
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, bufsize=0)
-    marks: dict[str, tuple[float, float, dict[str, float], float]] = {}
+    marks: dict[str, tuple] = {}
     lines: list[str] = []
     done = threading.Event()
 
@@ -371,13 +451,16 @@ def run_one(name: str, a: argparse.Namespace, srv: Server, host: str) -> RunResu
             if m:
                 now, cpu = time.perf_counter(), proc_cpu_seconds(proc)
                 thr, own = thread_cpu_seconds(proc), time.process_time()
+                sw = thread_switches(proc)
                 if m.group(2) == "begin":
-                    marks[m.group(1)] = (now, cpu, thr, own)
+                    marks[m.group(1)] = (now, cpu, thr, own, sw)
                 else:
-                    t0, c0, thr0, own0 = marks.get(m.group(1), (now, cpu, thr, own))
+                    t0, c0, thr0, own0, sw0 = marks.get(m.group(1), (now, cpu, thr, own, sw))
                     res.phases[m.group(1)] = {"wall": now - t0, "cpu": cpu - c0}
                     res.xfers[m.group(1)] = srv.take()
                     if now > t0:
+                        res.wakes[m.group(1)] = {
+                            k: (v - sw0.get(k, 0)) / (now - t0) for k, v in sw.items()}
                         res.threads[m.group(1)] = {
                             k: 100.0 * (v - thr0.get(k, 0.0)) / (now - t0)
                             for k, v in thr.items()}
@@ -389,6 +472,16 @@ def run_one(name: str, a: argparse.Namespace, srv: Server, host: str) -> RunResu
             mm = re.search(r"NETCMP RR n=(\d+) ok=(\d+) us=(\d+)", line)
             if mm:
                 res.rr = tuple(int(x) for x in mm.groups())
+            ml = re.search(r"NETCMP LOSS seen=(\d+) dropped=(\d+)", line)
+            if ml:
+                res.loss = (int(ml.group(1)), int(ml.group(2)))
+            if "NETCMP LOSS failed" in line:
+                res.loss_failed = True
+            if "nat: tcp_flows=" in line:
+                for k in NAT_KEYS:
+                    mk = re.search(rf"\b{k}=(\d+)", line)
+                    if mk:
+                        res.nat[k] = int(mk.group(1))
             if "NETCMP DONE" in line:
                 res.ok = True
                 done.set()
@@ -435,32 +528,93 @@ def summarize(rs: list[RunResult]) -> dict:
             losses.append(int(m.group(1)))
         if r.rr and r.rr[2] > 0:
             rr_tps.append(r.rr[1] / (r.rr[2] / 1e6))
+        # A transfer's record lands when its connection ends, which can be after
+        # its phase's end marker (a lost FIN or ACK): match transfers to phases
+        # by tag, not by when they landed.
+        allx = [x for xs in r.xfers.values() for x in xs]
+
+        def of(ph: str, xs: list[Xfer] = allx) -> list[Xfer]:
+            if ph == "par":
+                return [x for x in xs if x.tag.startswith("par") and "_" in x.tag]
+            return [x for x in xs if x.tag.startswith(ph) and x.tag[len(ph):].isdigit()]
         for ph, lst in (("dl", dl), ("ul", ul)):
-            for x in r.xfers.get(ph, []):
-                if x.tag.startswith(ph) and x.tag[len(ph):].isdigit():
-                    lst.append(gbps(x.nbytes, x.t1 - x.t0))
+            for x in of(ph):
+                lst.append(gbps(x.nbytes, x.t1 - x.t0))
         rounds: dict[str, list[Xfer]] = {}
-        for x in r.xfers.get("par", []):
-            if x.tag.startswith("par"):
-                rounds.setdefault(x.tag.split("_")[0], []).append(x)
+        for x in of("par"):
+            rounds.setdefault(x.tag.split("_")[0], []).append(x)
         for xs in rounds.values():
             t0, t1 = min(x.t0 for x in xs), max(x.t1 for x in xs)
             par.append(gbps(sum(x.nbytes for x in xs), t1 - t0))
         for ph in cpu:
             if ph in r.phases:
                 cpu[ph][0] += r.phases[ph]["cpu"]
-                cpu[ph][1] += sum(x.nbytes for x in r.xfers.get(ph, []))
+                cpu[ph][1] += sum(x.nbytes for x in allx if x.tag.startswith(ph))
         for ph in irq:
             g = r.guest.get(ph, {})
             if "rx_irqs" in g:
                 irq[ph][0] += g["rx_irqs"]
                 irq[ph][1] += g.get("tx_irqs", 0)
-                irq[ph][2] += sum(x.nbytes for x in r.xfers.get(ph, []))
+                irq[ph][2] += sum(x.nbytes for x in allx if x.tag.startswith(ph))
     s["ping_avg_ms"] = statistics.mean(t[1] for t in rtts) if rtts else None
     s["ping_min_ms"] = min(t[0] for t in rtts) if rtts else None
     s["ping_max_ms"] = max(t[2] for t in rtts) if rtts else None
     s["ping_loss_pct"] = max(losses) if losses else None
     s["rr_tps"] = statistics.mean(rr_tps) if rr_tps else None
+
+    # Per-request latency from the server's clock: `service` runs from the
+    # request's arrival to the guest's close after reading the response (so it
+    # holds the NAT's recovery of a lost response or FIN); `gap` is arrival to
+    # the next arrival (it also holds a lost SYN-ACK or ACK).
+    service, gap = [], []
+    seen = dropped = rr_n = rr_ok = 0
+    nat = {k: 0 for k in NAT_KEYS}
+    for r in rs:
+        # A request's record lands when its connection ends, which can be after
+        # the phase marker: look in every phase.
+        xs = sorted((x for xs in r.xfers.values() for x in xs if x.tag == "rr"),
+                    key=lambda x: x.t0)
+        service += [(x.t1 - x.t0) * 1e3 for x in xs]
+        gap += [(y.t0 - x.t0) * 1e3 for x, y in zip(xs, xs[1:])]
+        if r.loss:
+            seen, dropped = seen + r.loss[0], dropped + r.loss[1]
+        for k in NAT_KEYS:
+            nat[k] += r.nat.get(k, 0)
+        if r.rr:
+            rr_n, rr_ok = rr_n + r.rr[0], rr_ok + r.rr[1]
+
+    def pcts(v: list[float]):
+        if not v:
+            return None
+        v = sorted(v)
+        return (v[len(v) // 2], v[min(len(v) - 1, int(0.99 * len(v)))], v[-1])
+
+    s["rr_service_ms"] = pcts(service)
+    s["rr_gap_ms"] = pcts(gap)
+    s["rr_fail"] = rr_n - rr_ok if rr_n else None
+    s["loss_pct"] = 100.0 * dropped / seen if seen else None
+    s["loss_failed"] = any(r.loss_failed for r in rs)
+    s["nat_recovery"] = (tuple(nat[k] for k in NAT_KEYS)
+                         if any(r.nat for r in rs) else None)
+    s["_rr_service_ms"], s["_rr_gap_ms"] = service, gap
+
+    # Idle phases: how often the VMM's threads woke, in all and in the NAT's
+    # workers (tinyvmm's `nat-worker*`), and its CPU.
+    for ph in IDLE_PHASES:
+        runs = [r for r in rs if ph in r.wakes and ph in r.phases]
+        if not runs:
+            continue
+        s[f"{ph}_wakes"] = statistics.mean(sum(r.wakes[ph].values()) for r in runs)
+        s[f"{ph}_nat_wakes"] = statistics.mean(
+            sum(v for k, v in r.wakes[ph].items() if k.startswith("nat-worker")) for r in runs)
+        s[f"{ph}_cpu_pct"] = statistics.mean(
+            100.0 * r.phases[ph]["cpu"] / r.phases[ph]["wall"] for r in runs)
+        agg: dict[str, list[float]] = {}
+        for r in runs:
+            for k, v in r.wakes[ph].items():
+                agg.setdefault(k, []).append(v)
+        s[f"_{ph}_threads"] = sorted(((statistics.mean(v), k) for k, v in agg.items()),
+                                     reverse=True)[:6]
 
     def total(phase: str, *keys: str):
         got = [r.guest[phase] for r in rs if phase in r.guest]
@@ -475,6 +629,7 @@ def summarize(rs: list[RunResult]) -> dict:
         s[f"{k}_gbps_min"] = min(v) if v else None
         s[f"{k}_gbps_max"] = max(v) if v else None
         s[f"{k}_n"] = len(v)
+        s[f"_{k}_gbps"] = v
         c, b = cpu[k]
         s[f"{k}_cpu_s_per_gib"] = c / (b / (1 << 30)) if b else None
         rx, tx, b = irq[k]
@@ -494,6 +649,9 @@ def report(results: dict[str, list[RunResult]], a: argparse.Namespace) -> dict:
         ("ping min/max (ms)", None, None),
         ("ping loss (%)", "ping_loss_pct", "d"),
         ("TCP conn+req/resp (txn/s) higher=better", "rr_tps", ".1f"),
+        ("  per request p50/p99/max (ms)", "rr_service_ms", ".1f"),
+        ("  request to next p50/p99/max (ms)", "rr_gap_ms", ".1f"),
+        ("  failed requests", "rr_fail", "d"),
         (f"download 1 stream (Gbps)", "dl_gbps", ".3f"),
         (f"upload 1 stream (Gbps)", "ul_gbps", ".3f"),
         (f"download x{a.par} streams (Gbps)", "par_gbps", ".3f"),
@@ -507,11 +665,21 @@ def report(results: dict[str, list[RunResult]], a: argparse.Namespace) -> dict:
         ("guest dup segments in download (D-SACK)", "dl_dups", "d"),
         ("guest NIC rx drops in download", "dl_rx_drops", "d"),
         ("guest retransmits in upload", "ul_retrans", "d"),
+        ("guest-injected TCP loss (%)", "loss_pct", ".2f"),
+        ("NAT retrans/rto/tlp/recov/dsack", "nat_recovery", "d"),
     ]
+    if a.idle:
+        for ph, what in (("idle0", "no connections"),
+                         ("idle1", f"{a.idle_conns} idle open connections"),
+                         ("idle2", "after they closed")):
+            rows += [(f"idle, {what}: VMM wakeups/s", f"{ph}_wakes", ".0f"),
+                     ("  NAT worker wakeups/s", f"{ph}_nat_wakes", ".1f"),
+                     ("  VMM CPU (% of one core)", f"{ph}_cpu_pct", ".2f")]
     w = 42
     print("\n" + "=" * (w + 18 * len(names)))
     print(f"NAT networking comparison  (vcpus={a.vcpus}, ram={a.ram_mb} MiB, "
-          f"size={a.size_mib} MiB x {a.runs} runs, iterations={a.iterations})")
+          f"size={a.size_mib} MiB x {a.runs} runs, iterations={a.iterations}, "
+          f"guest TCP rx loss={a.loss or 0})")
     print("=" * (w + 18 * len(names)))
     print(" " * w + "".join(f"{n:>18}" for n in names))
     for label, key, spec in rows:
@@ -521,7 +689,7 @@ def report(results: dict[str, list[RunResult]], a: argparse.Namespace) -> dict:
         else:
             cells = []
             for s in sums.values():
-                v = s[key]
+                v = s.get(key)
                 if isinstance(v, tuple):
                     cell = "/".join(format(x, spec) for x in v)
                 else:
@@ -543,6 +711,12 @@ def report(results: dict[str, list[RunResult]], a: argparse.Namespace) -> dict:
             if top:
                 print(f"  {name} {ph}: busiest threads (% of one CPU): "
                       + ", ".join(f"{t} {p:.0f}" for p, t in top))
+    for name, s in sums.items():
+        for ph in IDLE_PHASES:
+            top = s.get(f"_{ph}_threads")
+            if top:
+                print(f"  {name} {ph}: most wakeups/s: "
+                      + ", ".join(f"{t} {w:.1f}" for w, t in top))
     return sums
 
 
@@ -569,6 +743,15 @@ def main() -> int:
     ap.add_argument("--ping", type=int, default=200)
     ap.add_argument("--host-ip")
     ap.add_argument("--timeout-sec", type=int, default=600)
+    ap.add_argument("--loss", help="drop this fraction (e.g. 0.01) of the TCP packets the "
+                    "guest receives, from after the settle; needs --extra-initrd")
+    ap.add_argument("--extra-initrd", type=Path,
+                    help="cpio(.gz) appended to the initrd, e.g. one with iptables-legacy "
+                         "under /opt/ipt for --loss")
+    ap.add_argument("--idle", type=int, default=0,
+                    help="seconds of each idle phase (none by default): the VMM's wakeups "
+                         "and CPU with no connection, idle open ones, and after they close")
+    ap.add_argument("--idle-conns", type=int, default=8)
     ap.add_argument("--json", type=Path)
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args()
@@ -576,6 +759,11 @@ def main() -> int:
     if not a.no_build:
         subprocess.run([sys.executable, str(REPO / "tools" / "make_initramfs.py"),
                         "--busybox", str(a.busybox), "--out", str(a.initrd)], check=True)
+    if a.extra_initrd:
+        # Linux unpacks concatenated archives in order.
+        combined = a.initrd.with_name(a.initrd.name.split(".")[0] + "-extra.cpio.gz")
+        combined.write_bytes(a.initrd.read_bytes() + a.extra_initrd.read_bytes())
+        a.initrd = combined
     host = discover_host_ipv4(a.host_ip)
     srv = Server(host)
     print(f"[net-compare] host server {host}:{srv.port}")
@@ -589,6 +777,9 @@ def main() -> int:
     if srv.errors:
         print(f"[net-compare] server errors: {srv.errors[:5]}")
     sums = report(results, a)
+    lossy = [v for v, s in sums.items() if s.get("loss_failed")]
+    if lossy:
+        print(f"[net-compare] FAIL: the guest could not arm --loss for {lossy}")
     if a.json:
         a.json.write_text(json.dumps({"args": {k: str(v) for k, v in vars(a).items()},
                                       "summary": sums}, indent=2))

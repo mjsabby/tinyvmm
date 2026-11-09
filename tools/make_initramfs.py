@@ -316,12 +316,21 @@ fi
 # driver kills any VMM still running 5 s after the marker.
 # Cmdline vars: NETCMP_HOST, NETCMP_PORT, NETCMP_SIZE (bytes per stream),
 # NETCMP_RUNS, NETCMP_RR (sequential tiny requests), NETCMP_PAR (streams),
-# NETCMP_PING (count).
+# NETCMP_PING (count), NETCMP_LOSS (optional: drop this fraction of the TCP
+# packets eth0 receives, e.g. 0.01, so the NAT's TCP has to recover them;
+# needs iptables-legacy under /opt/ipt, see net_compare.py --extra-initrd),
+# NETCMP_IDLE (optional: seconds of each idle phase) and NETCMP_IDLE_CONNS.
 if grep -q 'tinyvmm.test=netcmp' /proc/cmdline 2>/dev/null; then
     arg() { tr ' ' '\\n' < /proc/cmdline | grep "^$1=" | cut -d= -f2; }
     host=$(arg NETCMP_HOST); port=$(arg NETCMP_PORT); size=$(arg NETCMP_SIZE)
     runs=$(arg NETCMP_RUNS); rr=$(arg NETCMP_RR); par=$(arg NETCMP_PAR)
-    pingn=$(arg NETCMP_PING)
+    pingn=$(arg NETCMP_PING); loss=$(arg NETCMP_LOSS)
+    idle=$(arg NETCMP_IDLE); iconns=$(arg NETCMP_IDLE_CONNS)
+    ipt() {
+        mkdir -p /run
+        XTABLES_LIBDIR=/opt/ipt/xtables /opt/ipt/lib/ld-linux-x86-64.so.2 \\
+            --library-path /opt/ipt/lib /opt/ipt/xtables-legacy-multi iptables "$@"
+    }
     base="http://${host}:${port}"
     us() { awk '{print int($1 * 1000000)}' /proc/uptime; }
     # Guest network counters over a phase, as non-zero deltas. TCPEXT: DSACK /
@@ -354,6 +363,46 @@ if grep -q 'tinyvmm.test=netcmp' /proc/cmdline 2>/dev/null; then
     log "NETCMP ENV mtrr=$(cat /proc/mtrr 2>/dev/null | tr '\\n' ';') pat=$(dmesg | grep -m1 -i 'x86/PAT' | cut -c16-)"
     # Settle: let the NIC finish coming up before timing anything.
     wget -q -O /dev/null -T 10 -t 3 "${base}/bytes/1/warm" 2>/dev/null
+    # Idle: how often the VMM wakes while the guest sends nothing -- with no
+    # connection open, with NETCMP_IDLE_CONNS idle open ones (stdin a FIFO
+    # that one sleep holds open, so nc sends nothing), and after they have
+    # closed. Every job started here is reaped here: the par phase's `wait`
+    # waits for all of the shell's background jobs.
+    if [ -n "${idle}" ]; then
+        # The driver samples the VMM at each marker: start a phase once the
+        # traffic before it has settled, and pause after it before the next.
+        sleep 2
+        log "NETCMP PHASE idle0 begin"; sleep "${idle}"; log "NETCMP PHASE idle0 end"
+        sleep 1
+        rm -f /tmp/idlehold; mkfifo /tmp/idlehold
+        sleep $((idle + 60)) > /tmp/idlehold &
+        pids="$!"
+        for i in $(seq 1 "${iconns:-8}"); do
+            nc "${host}" "${port}" < /tmp/idlehold > /dev/null 2>&1 &
+            pids="$! ${pids}"
+        done
+        sleep 2
+        log "NETCMP PHASE idle1 begin"; sleep "${idle}"; log "NETCMP PHASE idle1 end"
+        sleep 1
+        kill ${pids} 2>/dev/null
+        wait ${pids} 2>/dev/null
+        rm -f /tmp/idlehold
+        sleep 2
+        log "NETCMP PHASE idle2 begin"; sleep "${idle}"; log "NETCMP PHASE idle2 end"
+        sleep 1
+    fi
+    # Loss, armed only now so the settle and the idle phases go unharmed: the
+    # first rule counts every TCP packet eth0 receives, the second drops the
+    # chosen fraction before TCP sees it.
+    if [ -n "${loss}" ]; then
+        if ipt -t raw -A PREROUTING -i eth0 -p tcp \\
+            && ipt -t raw -A PREROUTING -i eth0 -p tcp -m statistic --mode random \\
+                --probability "${loss}" -j DROP; then
+            log "NETCMP LOSS armed p=${loss}"
+        else
+            log "NETCMP LOSS failed p=${loss}"
+        fi
+    fi
 
     log "NETCMP PHASE ping begin"
     ping -c "${pingn}" -i 0.01 -W 1 "${host}" > /tmp/ping.log 2>&1
@@ -405,6 +454,9 @@ if grep -q 'tinyvmm.test=netcmp' /proc/cmdline 2>/dev/null; then
     log "NETCMP PHASE par end"
     netdelta par
 
+    if [ -n "${loss}" ]; then
+        log "NETCMP LOSS $(ipt -t raw -nvxL PREROUTING | awk 'NR>2{p[++n]=$1} END{printf "seen=%d dropped=%d", p[1], p[2]}')"
+    fi
     log "NETCMP DONE"
     # Stop tinyvmm cleanly so it prints its teardown counters (see
     # src/main.rs); other VMMs are killed by the driver on `NETCMP DONE`.
