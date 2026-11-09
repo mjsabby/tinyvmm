@@ -229,7 +229,7 @@ repo root) and need WHP — bare metal or nested Hyper-V:
 | `python tools\smp_test.py` | AP bring-up, scheduling on every vCPU, IPIs, blk under SMP |
 | `python tools\irq_test.py` | interrupt delivery at 1 and 2 vCPUs: COM1 IRQs reach the guest as ExtINT (also waking an idle BSP), MSIs keep flowing afterwards, the LAPIC timer is calibrated to WHP's interrupt clock, and `sleep 2` takes 2 s of host time |
 | `python tools\irq_bench.py --tinyvmm base=<exe> --tinyvmm new=<exe>` | A/B interrupt-path latency: timer wake-up, virtio-blk QD1 round trip, cross-CPU wake-up, idle host CPU, VM exits |
-| `python tools\net_compare.py` | NAT networking vs OpenVMM, and tinyvmm's user-mode backends against each other (`--vmm tinyvmm,tinyvmm-smoltcp,tinyvmm-slirp,tinyvmm-gvisor`) |
+| `python tools\net_compare.py` | NAT networking vs OpenVMM, and tinyvmm's user-mode backends against each other (`--vmm tinyvmm,tinyvmm-smoltcp,tinyvmm-slirp,tinyvmm-gvisor`); `--loss 0.02` makes the guest drop that share of the TCP packets it receives, so each NAT's TCP must recover them (needs a guest kernel with iptables' raw table and `statistic` match, and `--extra-initrd` with iptables-legacy, see the script), and `--idle 20` measures how often the VMM wakes while the guest is idle |
 | `python tools\nat_test.py [--backend nat\|smoltcp\|slirp\|gvisor]` | how a user-mode backend ends connections and relays datagrams (phases A–L, [§3](#virtio-net-backends---net-backend)) |
 | `python tools\save_restore_test.py [--vcpus 2 --trigger-cpu 1]` | `--save`, then three `--restore`s of the snapshot, which they leave unchanged; `--trigger-cpu` fires the trigger from that vCPU (an AP when above 0) |
 
@@ -766,7 +766,18 @@ including the audio track.
   copied once into the guest's RX buffers. Each worker dequeues up to 16
   completions per `GetQueuedCompletionStatusEx` and interrupts the guest once
   for the TCP and UDP frames a batch delivered (sooner if 8 are waiting); ARP
-  and ICMP replies interrupt right away. A UDP flow keeps one overlapped
+  and ICMP replies interrupt right away. While its connections move data, a
+  worker waits at most 25 ms for completions and sweeps its flows' TCP timers
+  (retransmission, tail-loss probe, delayed ACK) at most every 20 ms. Once a
+  whole wait brings no work, no flow is paused on the guest's RX backlog and
+  no TCP timer is due within a second, it waits for its earliest timer instead
+  (tcp-sans-io's `next_deadline`, smoltcp's `poll_at`): about once a second,
+  for the idle sweep, while it holds any flow, and not at all while it holds
+  none. Any completion puts it back on the 20 ms cadence, so connections that
+  move data keep their timers exactly as before. With the guest idle, the
+  four workers used to wake about 135 times a second between them; now they
+  don't wake with no connection open, and about 4 times a second with 8 idle
+  ones (`net_compare.py --idle`). A UDP flow keeps one overlapped
   receive posted on a socket set to skip the IOCP for receives that complete
   at once, so after a completion it takes the datagrams already queued inline,
   up to 32 per pass, instead of one completion and worker wake each (one per
@@ -917,6 +928,41 @@ TCP flows still defaulted to 1 MiB rings.
   better than 1 MiB. Where loopback is cheaper per byte, 1 MiB is the clear
   choice: the reference machine measured 25 Gbps at 1 MiB against 5.7 with
   autotuning.
+
+#### Loss recovery and idle wakeups
+
+Nothing is lost over the virtual link, so the table above can't show how a
+NAT's own TCP recovers. `net_compare.py --loss P` makes the guest drop that
+share of the TCP packets it receives, before its TCP sees them, so the NAT
+must recover lost data, SYN-ACKs and FINs; `--idle 20` counts how often the
+VMM's threads wake while the guest sits idle. Measured as above, against
+OpenVMM's `consomme` (`--vmm openvmm-pcie`, OpenVMM `3536f22c`), with one
+kernel for both VMMs (the harness configuration plus iptables' raw table and
+`statistic` match), 16 MiB transfers, means over six boots for `nat` and
+three for the others (two each for the idle row):
+
+| | `nat` | `smoltcp` | OpenVMM `consomme` |
+|---|---|---|---|
+| download, 1 stream, at 0 / 0.5 / 2% loss (Gbps) | 2.68 / 3.02 / 0.80 | 2.77 / — / 0.010 | 2.82 / 2.02 / 0.056 |
+| download, 2 streams, at 2% loss (Gbps) | 1.90 | 0.010 | 0.039 |
+| connect + request + response at 2% loss: txn/s; per request p99 / max (ms) | 62; 0.9 / 223 | 21; 1025 / 3025 | 25; 1008 / 1015 |
+| at 5% loss | 0.07 Gbps one stream, 19 txn/s | — | didn't finish in 15 min |
+| VMM wakeups/s with the guest idle: no connection / 8 idle ones | 13 / 16 | 13 / 20 | 13 / 11 |
+
+`tcp-sans-io` recovers with SACK, RACK and tail-loss probes, and its minimum
+RTO is 200 ms, so a lost segment usually costs a round trip or a probe rather
+than a timeout. `consomme` negotiates neither SACK nor timestamps, has no RACK
+or tail-loss probe, and its minimum RTO is 1 s (`consomme/src/tcp.rs`);
+smoltcp's minimum RTO is also 1 s, and it has no tail-loss probe either. So a
+lost segment at the end of a response costs them a second, and several losses
+in a window collapse a download. With every stack a lost SYN-ACK costs about
+a second (the guest or the NAT retransmits after 1 s), which is what holds
+the connection rate down at every loss rate. Idle, all of them sleep until
+their next timer: `consomme` arms one timer for its connections' earliest
+deadline (`PolledTimer::poll_until`) and checks UDP expiry when it next
+wakes, while tinyvmm's NAT also wakes each worker that holds flows once a
+second for its idle sweep (UDP expiry, TCP watchdogs, freeing idle buffers).
+What remains of either VMM's wakeups is mostly the guest's own timer.
 
 ### Doorbells — the "notify without a VM exit" path
 
