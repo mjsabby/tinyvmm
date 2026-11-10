@@ -145,15 +145,20 @@ const UDP_IDLE_MS: u64 = 60_000; // reap a UDP NAT entry idle this long
 const TCP_CONNECT_MS: u64 = 10_000; // limit on the host connect, then on the guest handshake
 const TCP_IDLE_MS: u64 = (2 * 60 + 4) * 60_000; // reset an established flow idle this long
 const TCP_HALF_CLOSE_MS: u64 = 4 * 60_000; // reset a half-closed flow idle this long
-const EXPIRE_GATE_MS: u64 = 1_000; // how often the idle sweep runs
+const EXPIRE_GATE_MS: u64 = 1_000; // how often the idle sweep runs while busy
 
 // The worker's wait. While its flows are busy it dequeues with an IDLE_MS
 // timeout and sweeps their TCP timers at most every TICK_GATE_MS. Once a whole
 // wait brings no work and no flow has a TCP timer within QUIET_MS, it sleeps
-// until the earliest timer instead (`NatState::quiet_wait`).
+// until the earliest timer or idle-sweep job instead (`NatState::quiet_wait`).
+// Those jobs, and TCP timers at least GRID_FROM_MS away (keepalive, TIME_WAIT,
+// a long backoff), are put off to the next whole GRID_MS of the clock all
+// workers share, so their wakeups coalesce across flows and workers.
 const IDLE_MS: u32 = 25;
 const TICK_GATE_MS: u64 = 20;
 const QUIET_MS: u64 = 1_000;
+const GRID_MS: u64 = 1_000;
+const GRID_FROM_MS: u64 = 10_000;
 const WAIT_FOREVER: u32 = u32::MAX; // INFINITE
 
 // tcp-sans-io poll() event flags (mirror crate::tcb::events).
@@ -998,11 +1003,14 @@ impl Reassembler {
     /// non-zero offset). Once its datagram is whole, append that, as the
     /// guest would have sent it unfragmented, to `out` and return true.
     /// Malformed fragments are dropped, and so is a datagram whose fragments
-    /// contradict where it ends.
+    /// contradict where it ends. Datagrams past REASSEMBLY_MS go first, so a
+    /// datagram reusing an ID never completes from a stale one's fragments,
+    /// however long since the idle sweep last ran.
     fn add(&mut self, ip: &[u8], now: u64, out: &mut Vec<u8>) -> bool {
         if ip.len() < 20 {
             return false;
         }
+        self.expire(now);
         let ihl = usize::from(ip[0] & 0x0F) * 4;
         let total = usize::from(be16(&ip[2..4])).min(ip.len());
         let fo = be16(&ip[6..8]);
@@ -1086,10 +1094,6 @@ impl Reassembler {
         self.pending
             .retain(|r| now.saturating_sub(r.since) <= REASSEMBLY_MS);
     }
-
-    fn is_empty(&self) -> bool {
-        self.pending.is_empty()
-    }
 }
 
 /// One overlapped UDP receive, owned by its flow. `overlapped` MUST be first
@@ -1141,6 +1145,15 @@ impl Drop for UdpFlow {
         {
             sys::close_sock(op.sock);
         }
+    }
+}
+
+impl UdpFlow {
+    /// Whether the entry has been idle longer than UDP_IDLE_MS, so the idle
+    /// sweep reaps it and nothing more from the host reaches the guest
+    /// through it.
+    fn expired(&self, now: u64) -> bool {
+        now.saturating_sub(self.last_use) > UDP_IDLE_MS
     }
 }
 
@@ -1283,12 +1296,44 @@ impl TcpFlow {
     /// keeps its buffer between chunks while an idle one gives back what an
     /// upload grew it to (`TO_HOST_CAP` and up).
     fn shed_idle_queue(&mut self) {
-        if self.pending_to_host.is_empty()
-            && !self.send_inflight
-            && self.pending_to_host.capacity() > 0
-        {
+        if self.holds_idle_queue() {
             self.pending_to_host = Vec::new();
         }
+    }
+
+    fn holds_idle_queue(&self) -> bool {
+        self.pending_to_host.is_empty()
+            && !self.send_inflight
+            && self.pending_to_host.capacity() > 0
+    }
+
+    /// When the idle sweep should free an emptied queue buffer: a second after
+    /// the flow's last activity (a host send completing, say), if it holds one.
+    fn shed_at(&self) -> Option<u64> {
+        self.holds_idle_queue()
+            .then(|| self.last_activity.saturating_add(EXPIRE_GATE_MS))
+    }
+
+    /// When a watchdog resets this flow, which the idle sweep does once its
+    /// clock reaches this: TCP_CONNECT_MS after the flow began while it is
+    /// still establishing (the host connect hasn't completed, and the guest's
+    /// SYN is then refused; or the TCB isn't synchronized yet, which covers an
+    /// inbound flow whose guest never accepts), TCP_HALF_CLOSE_MS after its
+    /// last activity once half-closed, and TCP_IDLE_MS after it in any state.
+    /// A live flow always has its TCB.
+    fn watchdog_at(&self) -> u64 {
+        let st = self.tcb.as_ref().unwrap().state();
+        let mut at = self.last_activity.saturating_add(TCP_IDLE_MS + 1);
+        if matches!(
+            st,
+            State::FinWait1 | State::FinWait2 | State::Closing | State::CloseWait | State::LastAck
+        ) {
+            at = at.min(self.last_activity.saturating_add(TCP_HALF_CLOSE_MS + 1));
+        }
+        if !self.connected || !st.is_synchronized() {
+            at = at.min(self.created_at.saturating_add(TCP_CONNECT_MS + 1));
+        }
+        at
     }
 }
 
@@ -1837,6 +1882,8 @@ struct NatState {
     icmp_reply_pool: Arc<SyncBoxPool<IcmpReplyMsg>>,
     default_tier: usize,
     port_tier: HashMap<u16, usize>,
+    /// The clock's origin (`now`), one for all workers, so the whole seconds
+    /// their quiet waits end on (`GRID_MS`) are the same instants.
     start: Instant,
     rng: u32,
     /// Per-NAT 128-bit secret from the OS CSPRNG, installed into every Tcb
@@ -1959,6 +2006,9 @@ impl NatState {
         'run: loop {
             let n = sys::get_many(self.iocp, &mut batch, wait_ms);
             let mut work = n > 0;
+            // A quiet wait that ran out was for a TCP timer or the idle
+            // sweep's next job, which may be due before the sweep's gate.
+            let quiet_timeout = quiet && n == 0;
             for &(ok, bytes, key, ov) in &batch[..n] {
                 if !self.dispatch(ok, bytes, key, ov) {
                     break 'run;
@@ -2014,7 +2064,7 @@ impl NatState {
             // Re-read the clock: the catch-up above may have created flows or
             // stamped activity after `now`, and those must not look ancient.
             let now = self.now();
-            if now.wrapping_sub(self.last_expire) >= EXPIRE_GATE_MS {
+            if quiet_timeout || now.wrapping_sub(self.last_expire) >= EXPIRE_GATE_MS {
                 self.last_expire = now;
                 self.expire_idle(now);
             }
@@ -2366,6 +2416,9 @@ impl NatState {
     ) -> Option<SOCKET> {
         let key = (gip, gport, dip, dport);
         let now = self.now();
+        // An entry idle past UDP_IDLE_MS that a quiet worker hasn't swept yet
+        // carries on: the guest's datagram refreshes it, as it would have a
+        // minute earlier (consomme reuses such a connection too).
         if let Some(f) = self.udp.get_mut(&key) {
             f.last_use = now;
             return Some(f.op.as_ref().unwrap().sock);
@@ -2464,9 +2517,14 @@ impl NatState {
         // If the flow was reaped while this recv was in flight, the socket was
         // closed (aborting it); the op has now drained, so free it safely. A
         // failed receive (e.g. ICMP port-unreachable) drops the flow too; a
-        // later guest send recreates it. No other op is pending either way.
-        let dead = self.udp.get(&key).map(|f| f.dead).unwrap_or(true);
-        if dead || !ok || bytes == 0 {
+        // later guest send recreates it. So does a datagram for a flow already
+        // idle past UDP_IDLE_MS, undelivered: a quiet worker leaves reaping
+        // such flows to the sweep its next traffic brings, and this may be
+        // that traffic (as consomme drops timed-out connections before it
+        // reads their sockets). No other op is pending either way.
+        let now = self.now();
+        let gone = self.udp.get(&key).is_none_or(|f| f.dead || f.expired(now));
+        if gone || !ok || bytes == 0 {
             self.reap_udp(key);
             return;
         }
@@ -3303,17 +3361,22 @@ impl NatState {
         }
     }
 
-    /// Periodic idle sweep (runs every EXPIRE_GATE_MS): reap idle UDP NAT
-    /// entries, free the guest->host queue buffers TCP flows no longer use, and
-    /// reset stuck or idle TCP flows (connect-deadline, idle, and half-close
-    /// watchdogs). Mirrors the C++ backend's ExpireIdle + the TSI engine's
-    /// per-conn watchdogs.
+    /// The idle sweep: reap idle UDP NAT entries and fragments, free the
+    /// guest->host queue buffers TCP flows no longer use, and reset stuck or
+    /// idle TCP flows (`TcpFlow::watchdog_at`). It runs every EXPIRE_GATE_MS
+    /// while the worker is busy and, while it is quiet, when a TCP flow's
+    /// watchdog or buffer comes due (`quiet_wait`). UDP entries and fragments
+    /// don't wake a quiet worker, as in OpenVMM's consomme: an expired one
+    /// waits for the next sweep, and meanwhile neither a host datagram
+    /// (`on_udp_recv`) nor a fragment (`Reassembler::add`) gets through it.
+    /// Mirrors the C++ backend's ExpireIdle + the TSI engine's per-conn
+    /// watchdogs.
     fn expire_idle(&mut self, now: u64) {
         // UDP: reap entries idle longer than UDP_IDLE_MS.
         let udp_dead: Vec<FlowKey> = self
             .udp
             .iter()
-            .filter(|(_, f)| !f.dead && now.saturating_sub(f.last_use) > UDP_IDLE_MS)
+            .filter(|(_, f)| !f.dead && f.expired(now))
             .map(|(k, _)| *k)
             .collect();
         for k in udp_dead {
@@ -3330,29 +3393,7 @@ impl NatState {
         let tcp_victims: Vec<FlowKey> = self
             .tcp
             .iter()
-            .filter(|(_, f)| {
-                if f.dead {
-                    return false;
-                }
-                let idle = now.saturating_sub(f.last_activity);
-                let st = f.tcb.as_ref().unwrap().state();
-                let half = matches!(
-                    st,
-                    State::FinWait1
-                        | State::FinWait2
-                        | State::Closing
-                        | State::CloseWait
-                        | State::LastAck
-                );
-                // Establishment watchdog: fire if the host connect hasn't
-                // completed (outbound; the guest's SYN is then refused) or,
-                // since it did, the TCB hasn't reached a synchronized state
-                // (also covers an inbound flow whose guest never accepts).
-                let establishing = !f.connected || !st.is_synchronized();
-                (establishing && now.saturating_sub(f.created_at) > TCP_CONNECT_MS)
-                    || (half && idle > TCP_HALF_CLOSE_MS)
-                    || (idle > TCP_IDLE_MS)
-            })
+            .filter(|(_, f)| !f.dead && now >= f.watchdog_at())
             .map(|(k, _)| *k)
             .collect();
         for k in tcp_victims {
@@ -3389,32 +3430,38 @@ impl NatState {
     /// How long a worker that found no work may wait for completions, or
     /// `None` to stay on the `IDLE_MS` cadence with its timer sweep (see
     /// [`quiet_wait_ms`]). A flow paused on the NIC's RX backlog keeps the
-    /// cadence: the sweep re-drives it should the NIC's wake go missing.
+    /// cadence: the sweep re-drives it should the NIC's wake go missing. Only
+    /// TCP flows schedule the idle sweep: an expired UDP entry or fragment
+    /// waits for the next one (see `expire_idle`).
     fn quiet_wait(&mut self, quiet: bool) -> Option<u32> {
         if !self.rx_blocked.is_empty() {
             return None;
         }
-        let earliest = self
-            .tcp
-            .values_mut()
-            .filter(|f| !f.dead)
-            .filter_map(|f| f.tcb.as_mut().and_then(|t| t.next_deadline()))
-            .min();
-        let sweep = (!self.tcp.is_empty() || !self.udp.is_empty() || !self.frags.is_empty())
-            .then(|| self.last_expire.saturating_add(EXPIRE_GATE_MS));
+        let mut earliest: Option<u64> = None;
+        let mut sweep: Option<u64> = None;
+        for f in self.tcp.values_mut().filter(|f| !f.dead) {
+            let job = f.watchdog_at().min(f.shed_at().unwrap_or(u64::MAX));
+            sweep = Some(sweep.unwrap_or(u64::MAX).min(job));
+            if let Some(at) = f.tcb.as_mut().and_then(|t| t.next_deadline()) {
+                earliest = Some(earliest.unwrap_or(u64::MAX).min(at));
+            }
+        }
         quiet_wait_ms(self.now(), earliest, quiet, self.last_tick, sweep)
     }
 }
 
 /// The worker's wait after a dequeue that brought no work, given the clock,
 /// its flows' earliest TCP timer, whether it is already `quiet`, when its
-/// timer sweep last ran and when its next idle sweep is due (`None` with no
-/// flow or fragment to sweep). `None` keeps the `IDLE_MS` cadence: unless
-/// already quiet, a timer within `QUIET_MS` means a connection is moving data,
-/// and its timers run exactly as before. Otherwise the wait lasts until the
-/// earliest timer the sweep can fire (it runs at most every `TICK_GATE_MS`),
-/// at most until the idle sweep, and indefinitely with neither. A completion
-/// (a guest frame, socket I/O, a resume) ends any wait.
+/// timer sweep last ran and when the idle sweep's next job is due (`None`
+/// with none). `None` keeps the `IDLE_MS` cadence: unless already quiet, a
+/// timer within `QUIET_MS` means a connection is moving data, and its timers
+/// run exactly as before. Otherwise the wait lasts until the earliest timer
+/// the sweep can fire (it runs at most every `TICK_GATE_MS`) or the idle
+/// sweep's job, and indefinitely with neither. The job, and a timer
+/// `GRID_FROM_MS` or more away, wait for a whole `GRID_MS` (a job already due,
+/// for the next one), so a quiet worker's wakeups for them coalesce, and a job
+/// the sweep fails to clear costs at most a wakeup a second. A completion (a
+/// guest frame, socket I/O, a resume) ends any wait.
 fn quiet_wait_ms(
     now: u64,
     earliest: Option<u64>,
@@ -3425,7 +3472,14 @@ fn quiet_wait_ms(
     if !quiet && earliest.is_some_and(|at| at < now.saturating_add(QUIET_MS)) {
         return None;
     }
-    let timer = earliest.map(|at| at.max(last_tick.saturating_add(TICK_GATE_MS)));
+    let timer = earliest.map(|at| {
+        if at >= now.saturating_add(GRID_FROM_MS) {
+            on_grid(at)
+        } else {
+            at.max(last_tick.saturating_add(TICK_GATE_MS))
+        }
+    });
+    let sweep = sweep.map(|at| on_grid(at.max(now.saturating_add(1))));
     let until = match (timer, sweep) {
         (Some(a), Some(b)) => a.min(b),
         (Some(at), None) | (None, Some(at)) => at,
@@ -3436,6 +3490,11 @@ fn quiet_wait_ms(
             .saturating_sub(now)
             .clamp(1, u64::from(WAIT_FOREVER - 1)) as u32,
     )
+}
+
+/// The first whole `GRID_MS` of the workers' shared clock at or after `t`.
+fn on_grid(t: u64) -> u64 {
+    t.div_ceil(GRID_MS).saturating_mul(GRID_MS)
 }
 
 /// One worker thread and the IOCP its flows' sockets complete to.
@@ -3563,6 +3622,7 @@ impl NatBackend {
         let flows = Arc::new(FlowCounts::default());
         let router = Arc::new(FlowRouter::new(n));
         let all_iocps: Arc<[Iocp]> = iocps.clone().into();
+        let start = Instant::now();
         let mut shards = Vec::with_capacity(n);
         for (s, &iocp) in iocps.iter().enumerate() {
             // Worker-only object pools: one Tcb free-list per compile-time
@@ -3606,7 +3666,7 @@ impl NatBackend {
                 icmp_reply_pool: icmp_reply_pool.clone(),
                 default_tier,
                 port_tier: port_tier.clone(),
-                start: Instant::now(),
+                start,
                 // Distinct non-zero xorshift seeds per shard.
                 rng: 0x2545_F491 ^ (s as u32).wrapping_mul(0x9E37_79B9),
                 tcb_secret,
@@ -4059,7 +4119,7 @@ mod tests {
     /// A datagram missing a fragment never comes out, nor one whose
     /// fragments disagree on where it ends (whichever arrives first); and
     /// one whose fragments stopped coming is forgotten, so a late fragment
-    /// can't complete it.
+    /// can't complete it, whether or not an idle sweep ran since.
     #[test]
     fn broken_fragment_trains_are_dropped() {
         let (_, f) = guest_fragments(7, 4000);
@@ -4079,7 +4139,6 @@ mod tests {
         assert!(!r.add(&f[2], 0, &mut out), "missing the middle one");
         r.expire(REASSEMBLY_MS);
         assert_eq!(r.pending.len(), 1, "still waiting");
-        r.expire(REASSEMBLY_MS + 1);
         assert!(!r.add(&f[1], REASSEMBLY_MS + 1, &mut out), "too late");
         assert!(out.is_empty());
     }
@@ -4442,34 +4501,91 @@ mod tests {
         flow.tcb.take();
     }
 
-    /// A worker that found no work waits for its next timer: forever with no
-    /// flows, until its idle sweep with only quiet ones. While a timer is
-    /// close it keeps the sweep cadence unless already quiet, and it never
-    /// waits on a timer the sweep can't fire yet.
+    /// A quiet worker wakes for a flow's idle-sweep jobs when the sweep acts
+    /// on them: its establishment watchdog TCP_CONNECT_MS after it began,
+    /// until it connects; its idle watchdog TCP_IDLE_MS after its last
+    /// activity, or TCP_HALF_CLOSE_MS once it is half-closed; and freeing its
+    /// emptied queue's buffer, once, a second after.
+    #[test]
+    fn a_flows_sweep_jobs_fall_due_with_its_watchdogs() {
+        let (nat, mut guest) = established_pair();
+        let mut flow = connected_flow(nat);
+        (flow.created_at, flow.last_activity) = (1_000, 50_000);
+        assert_eq!(flow.watchdog_at(), 50_001 + TCP_IDLE_MS);
+        flow.connected = false;
+        assert_eq!(flow.watchdog_at(), 1_001 + TCP_CONNECT_MS);
+        flow.connected = true;
+        on_host_eof(&mut flow);
+        step(&mut **flow.tcb.as_mut().unwrap(), &mut *guest, 0);
+        assert_eq!(flow.tcb.as_ref().unwrap().state(), State::FinWait2);
+        assert_eq!(flow.watchdog_at(), 50_001 + TCP_HALF_CLOSE_MS);
+        assert_eq!(flow.shed_at(), None);
+        flow.pending_to_host.reserve(1);
+        assert_eq!(flow.shed_at(), Some(51_000));
+        flow.shed_idle_queue();
+        assert_eq!(flow.shed_at(), None);
+        flow.tcb.take();
+    }
+
+    /// A worker that found no work waits for its next timer or idle-sweep
+    /// job, forever with neither. While a timer is close it keeps the sweep
+    /// cadence unless already quiet, and it never waits on a timer the sweep
+    /// can't fire yet. A job, or a timer GRID_FROM_MS or more away, waits for
+    /// a whole second of the clock the workers share (a job already due, for
+    /// the next one).
     #[test]
     fn an_idle_worker_waits_for_its_next_timer() {
-        let now = 10_000;
+        let now = 10_250;
         assert_eq!(
             quiet_wait_ms(now, None, false, now, None),
             Some(WAIT_FOREVER)
         );
         assert_eq!(
             quiet_wait_ms(now, None, false, now, Some(now + 600)),
-            Some(600)
+            Some(750)
+        );
+        assert_eq!(
+            quiet_wait_ms(now, None, false, now, Some(11_000)),
+            Some(750)
+        );
+        assert_eq!(
+            quiet_wait_ms(now, None, false, now, Some(11_001)),
+            Some(1_750)
+        );
+        assert_eq!(
+            quiet_wait_ms(now, None, false, now, Some(now - 5_000)),
+            Some(750)
+        );
+        assert_eq!(
+            quiet_wait_ms(11_000, None, false, 11_000, Some(11_000)),
+            Some(1_000)
         );
         // A timer under QUIET_MS away: a connection is moving data.
         assert_eq!(
             quiet_wait_ms(now, Some(now + 200), false, now, Some(now + 600)),
             None
         );
-        // A distant one (TIME_WAIT, a backed-off retransmission).
+        // A backed-off retransmission, before the job or after it.
         assert_eq!(
-            quiet_wait_ms(now, Some(now + 5_000), false, now, Some(now + 600)),
-            Some(600)
+            quiet_wait_ms(now, Some(now + 1_500), false, now - 900, Some(now + 60_000)),
+            Some(1_500)
         );
         assert_eq!(
-            quiet_wait_ms(now, Some(now + 1_500), false, now - 900, Some(now + 2_000)),
-            Some(1_500)
+            quiet_wait_ms(now, Some(now + 5_000), false, now, Some(now + 600)),
+            Some(750)
+        );
+        // Keepalive, TIME_WAIT: on the whole seconds too.
+        assert_eq!(
+            quiet_wait_ms(now, Some(now + 9_999), false, now, None),
+            Some(9_999)
+        );
+        assert_eq!(
+            quiet_wait_ms(now, Some(now + 10_000), false, now, None),
+            Some(10_750)
+        );
+        assert_eq!(
+            quiet_wait_ms(now, Some(70_000), false, now, Some(75_500)),
+            Some(59_750)
         );
         // Already quiet: until the near timer, but not before the sweep may run.
         assert_eq!(
