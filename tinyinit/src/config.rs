@@ -47,6 +47,11 @@ pub struct Share {
     /// How the guest caches a read-only share; writable shares are uncached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<ShareCache>,
+    /// Only root may use the mount. Not a configuration key: tinyinit sets it
+    /// for the bootstrap share, which holds the whole configuration (every
+    /// app's environment included) and whatever else the host put beside it.
+    #[serde(skip)]
+    pub root_only: bool,
 }
 
 /// The guest's 9p cache mode for a read-only share.
@@ -716,6 +721,7 @@ mod tests {
             target: target.into(),
             readonly: true,
             cache: None,
+            root_only: false,
         };
         for target in ["/srv/data", "/mnt/apps", "/data", "/usr/share/dotnet"] {
             c.mounts = vec![share(target)];

@@ -21,7 +21,10 @@ if ($LASTEXITCODE -ne 0) { throw 'initramfs packaging failed' }
 $vmm = Join-Path $PSScriptRoot '..\target\release\tinyvmm.exe'
 if (-not (Test-Path $vmm)) { throw 'Build tinyvmm first: cargo build --release' }
 $vmArgs = @(
-    '--pvh-run', '--vcpus', "$Vcpus", '--ram-mb', "$RamMb", '--rng',
+    # --shutdown-sentinel: tinyinit prints the sentinel as it shuts down, which
+    # stops the VM even with a -Kernel built without ACPI (one that can't
+    # power off). A kernel from kernel\tinyvmm.config doesn't need it.
+    '--pvh-run', '--shutdown-sentinel', '--vcpus', "$Vcpus", '--ram-mb', "$RamMb", '--rng',
     '--net', '--portfwd', "${SshPort}:22",
     '--virtio-9p-share', "bootstrap=$((Resolve-Path $Bootstrap).Path),ro"
 )

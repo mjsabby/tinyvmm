@@ -51,7 +51,8 @@ class VM:
         self.events = {}
         self.boot_ready = threading.Event()
         argv = [
-            str(args.vmm), "--pvh-run", "--vcpus", str(args.vcpus), "--ram-mb", "1536", "--rng",
+            str(args.vmm), "--pvh-run", "--shutdown-sentinel",
+            "--vcpus", str(args.vcpus), "--ram-mb", "1536", "--rng",
             "--net", "--portfwd", f"{self.port}:22",
             "--virtio-9p-share", f"bootstrap={bootstrap},ro",
             "--virtio-9p-share", f"apps={args.apps},ro",
@@ -321,6 +322,12 @@ def main():
         check(result.returncode == 0 and result.stdout == b"0\n", "authorized root administration")
         result = vm.ssh("id -u; touch /home/app/login.txt; touch /root/forbidden", user="app")
         check(result.stdout.startswith(b"1000\n") and result.returncode != 0, "ordinary login cannot access root home")
+        # The bootstrap share holds the whole configuration: root alone reads it.
+        result = vm.ssh("cat /mnt/bootstrap/init.json; ls /mnt/bootstrap", user="app")
+        check(result.returncode != 0 and b"TINYINIT_TEST_VALUE" not in result.stdout and b"caller.pub" not in result.stdout,
+              "bootstrap share is closed to ordinary users", result.stdout[:200] + result.stderr[:200])
+        result = vm.ssh("cat /mnt/bootstrap/init.json")
+        check(result.returncode == 0 and b"TINYINIT_TEST_VALUE" in result.stdout, "root reads the bootstrap share")
         result = vm.ssh("cat /mnt/apps/share-marker.txt")
         check(result.stdout.strip() == b"WINDOWS_SHARE_OK", "read Windows 9p deployment share")
         result = vm.ssh("touch /mnt/apps/forbidden", user="app")
