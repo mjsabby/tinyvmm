@@ -55,6 +55,12 @@ const CTRL_REQ_MAX: usize = 64 + (MAX_BACKING_ENTRIES as usize) * 16;
 /// panic=abort). 512 MiB comfortably holds several max-size scanouts.
 const MAX_RESOURCES: usize = 1024;
 const MAX_TOTAL_RESOURCE_BYTES: usize = 512 << 20;
+/// Cap on the backing (scatter-gather) entries held across all resources, at
+/// 16 bytes each. A resource's own limit is `MAX_BACKING_ENTRIES`; without a
+/// total, every resource attaching a full list pins a gigabyte the byte cap
+/// above never sees. A guest's framebuffers take one entry per run of pages:
+/// thousands at most.
+const MAX_TOTAL_BACKING_ENTRIES: usize = 1 << 20;
 const BPP: u32 = 4;
 
 // virtio_gpu_ctrl_type — 2D control commands.
@@ -470,22 +476,24 @@ impl GpuDevice {
             return RESP_OK_NODATA;
         }
         let stride = (res.width * BPP) as u64;
+        // One cursor for the whole transfer: rows are read at increasing
+        // offsets, so the backing list is walked once, not once per row.
+        let mut backing = BackingCursor::new(&self.mem, &res.backing);
         let ok = if rx == 0 && ry == 0 && rw == res.width && rh == res.height {
             // Whole-resource fast path: one contiguous backing read.
             let len = (stride * rh as u64) as usize;
-            read_backing(&self.mem, &res.backing, offset, &mut res.host[..len])
+            backing.read(offset, &mut res.host[..len])
         } else {
             let row_bytes = (rw * BPP) as usize;
             let mut ok = true;
             for row in 0..rh as u64 {
-                let src = offset + stride * row;
                 let dst = ((ry as u64 + row) * stride + (rx * BPP) as u64) as usize;
-                if !read_backing(
-                    &self.mem,
-                    &res.backing,
-                    src,
-                    &mut res.host[dst..dst + row_bytes],
-                ) {
+                // `offset` is the guest's: past the end of the address space
+                // there is no backing to read.
+                let read = offset
+                    .checked_add(stride * row)
+                    .is_some_and(|src| backing.read(src, &mut res.host[dst..dst + row_bytes]));
+                if !read {
                     ok = false;
                     break;
                 }
@@ -518,19 +526,29 @@ impl GpuDevice {
         if st.req.len() < need {
             return RESP_ERR_UNSPEC;
         }
-        // Read entries before taking the &mut resource borrow so `st.req` and
-        // `st.resources` aren't borrowed at once.
+        // What the other resources hold counts against the total; this
+        // resource's own list is replaced.
+        let others: usize = st
+            .resources
+            .iter()
+            .filter(|&(&other, _)| other != id)
+            .map(|(_, r)| r.backing.len())
+            .sum();
         let Some(res) = st.resources.get_mut(&id) else {
             return RESP_ERR_INVALID_RESOURCE_ID;
         };
-        res.backing.clear();
-        res.backing.reserve(nr as usize);
+        if others + nr as usize > MAX_TOTAL_BACKING_ENTRIES {
+            return RESP_ERR_OUT_OF_MEMORY;
+        }
+        // A fresh, exactly sized list: the old one's memory goes back now.
+        let mut backing = Vec::with_capacity(nr as usize);
         for i in 0..nr as usize {
             let base = 32 + i * 16;
             let addr = rd_u64(&st.req, base);
             let len = rd_u32(&st.req, base + 8) as u64;
-            res.backing.push((addr, len));
+            backing.push((addr, len));
         }
+        res.backing = backing;
         RESP_OK_NODATA
     }
 
@@ -539,7 +557,7 @@ impl GpuDevice {
         let Some(res) = st.resources.get_mut(&id) else {
             return RESP_ERR_INVALID_RESOURCE_ID;
         };
-        res.backing.clear();
+        res.backing = Vec::new();
         RESP_OK_NODATA
     }
 
@@ -936,29 +954,66 @@ fn write_response(chain: &PoppedChain, resp: &[u8]) -> u32 {
     off as u32
 }
 
-/// Read `dst.len()` bytes from a scatter-gather backing starting at linear
-/// `offset`. Returns false if the backing doesn't fully cover the range.
-fn read_backing(mem: &GuestMemory, backing: &[(u64, u64)], offset: u64, dst: &mut [u8]) -> bool {
-    let mut di = 0usize;
-    let mut skip = offset;
-    for &(gpa, len) in backing {
-        if di >= dst.len() {
-            break;
+/// Reads a resource's scatter-gather backing, the guest pages laid end to end
+/// as one linear buffer. It remembers which entry the last read ended in, so
+/// reads at increasing offsets (a transfer's rows) walk the list once in all:
+/// starting over for each row made a guest's 65536-entry list of empty
+/// segments cost half a billion steps per transfer, on the vCPU thread.
+struct BackingCursor<'a> {
+    mem: &'a GuestMemory,
+    backing: &'a [(u64, u64)],
+    /// The entry that holds linear offset `base`, and every offset from there
+    /// to the entry's end.
+    idx: usize,
+    /// The linear offset `backing[idx]` starts at. Entries are at most
+    /// 4 GiB each and `MAX_BACKING_ENTRIES` in number, so this can't overflow.
+    base: u64,
+}
+
+impl<'a> BackingCursor<'a> {
+    fn new(mem: &'a GuestMemory, backing: &'a [(u64, u64)]) -> Self {
+        BackingCursor {
+            mem,
+            backing,
+            idx: 0,
+            base: 0,
         }
-        if skip >= len {
-            skip -= len;
-            continue;
-        }
-        let seg_off = skip;
-        let avail = (len - seg_off) as usize;
-        let want = (dst.len() - di).min(avail);
-        if !mem.read_into(gpa + seg_off, &mut dst[di..di + want]) {
-            return false;
-        }
-        di += want;
-        skip = 0;
     }
-    di == dst.len()
+
+    /// Read `dst.len()` bytes starting at linear `offset`. Returns false if
+    /// the backing doesn't fully cover the range, or names memory that isn't
+    /// guest RAM.
+    fn read(&mut self, offset: u64, dst: &mut [u8]) -> bool {
+        if offset < self.base {
+            // An earlier offset than the last read's: start over.
+            self.idx = 0;
+            self.base = 0;
+        }
+        let mut at = offset;
+        let mut di = 0usize;
+        while di < dst.len() {
+            let Some(&(gpa, len)) = self.backing.get(self.idx) else {
+                return false;
+            };
+            let end = self.base + len;
+            if at >= end {
+                self.base = end;
+                self.idx += 1;
+                continue;
+            }
+            let seg_off = at - self.base;
+            let want = (dst.len() - di).min((len - seg_off) as usize);
+            let Some(from) = gpa.checked_add(seg_off) else {
+                return false;
+            };
+            if !self.mem.read_into(from, &mut dst[di..di + want]) {
+                return false;
+            }
+            di += want;
+            at += want as u64;
+        }
+        true
+    }
 }
 
 /// Indices into a source 4-byte pixel that yield (blue, green, red) for the GDI
@@ -1524,5 +1579,105 @@ mod tests {
             );
         }
         assert_eq!(gpu.state.lock().unwrap().scanout_resource, 0);
+    }
+
+    /// The cursor reads the backing as one linear buffer: across segments,
+    /// past empty ones, forwards and backwards, and refuses what the list
+    /// doesn't cover or what isn't guest RAM.
+    #[test]
+    fn backing_cursor_reads_the_linear_backing() {
+        let mem = GuestMemory::new_host_only(64 * 1024).unwrap();
+        let image: Vec<u8> = (0..mem.size()).map(|i| (i % 251) as u8).collect();
+        assert!(mem.write_bytes(0, &image));
+        let backing = [
+            (0x3000u64, 0x100u64),
+            (0x9000, 0),
+            (0x1000, 0x80),
+            (0x5000, 0),
+            (0x7000, 0x200),
+        ];
+        let linear: Vec<u8> = backing
+            .iter()
+            .flat_map(|&(gpa, len)| image[gpa as usize..(gpa + len) as usize].to_vec())
+            .collect();
+
+        let mut cursor = BackingCursor::new(&mem, &backing);
+        // Increasing offsets, as a transfer's rows are read.
+        for off in (0..linear.len()).step_by(37) {
+            let mut dst = vec![0u8; (linear.len() - off).min(100)];
+            assert!(cursor.read(off as u64, &mut dst), "offset {off}");
+            assert_eq!(dst, linear[off..off + dst.len()], "offset {off}");
+        }
+        // An earlier offset still reads right.
+        let mut dst = [0u8; 16];
+        assert!(cursor.read(8, &mut dst));
+        assert_eq!(dst, linear[8..24]);
+        // The whole of it in one read, and not a byte more.
+        let mut all = vec![0u8; linear.len()];
+        assert!(cursor.read(0, &mut all));
+        assert_eq!(all, linear);
+        assert!(!cursor.read(1, &mut all), "one byte past the end");
+        assert!(!cursor.read(u64::MAX, &mut dst));
+        assert!(cursor.read(u64::MAX, &mut []), "nothing to read");
+
+        // A segment outside guest RAM, and one whose address wraps.
+        let outside = [(mem.size() as u64, 16u64)];
+        assert!(!BackingCursor::new(&mem, &outside).read(0, &mut dst[..4]));
+        let wraps = [(u64::MAX - 1, 16u64)];
+        assert!(!BackingCursor::new(&mem, &wraps).read(8, &mut dst[..4]));
+    }
+
+    /// A transfer's rows share one walk of the backing list. Each row used to
+    /// start over from the first entry, so 65535 empty entries ahead of the
+    /// data cost 8192 x 65536 steps per transfer, and a guest could queue
+    /// 65535 of those on one notification.
+    #[test]
+    fn a_transfer_walks_the_backing_list_once() {
+        let mem = GuestMemory::new_host_only(64 * 1024).unwrap();
+        let mut backing = vec![(0u64, 0u64); 65535];
+        backing.push((0x1000, 0x8000));
+        let mut cursor = BackingCursor::new(&mem, &backing);
+        let mut row = [0u8; 4];
+        for r in 0..8192u64 {
+            assert!(cursor.read(r * 4, &mut row));
+            assert_eq!(
+                cursor.idx, 65535,
+                "row {r} found the cursor past the empties"
+            );
+        }
+    }
+
+    /// Backing lists count against a total across resources: 1024 resources
+    /// with a full list each would otherwise pin a gigabyte the resource-byte
+    /// cap doesn't see. Detaching gives a list's memory back.
+    #[test]
+    fn backing_entries_are_capped_across_resources() {
+        let (gpu, _, _) = gpu_with_capture();
+        let full = MAX_BACKING_ENTRIES as usize;
+        let attach = |id: u32| {
+            let mut body = vec![id, full as u32];
+            body.resize(2 + 4 * full, 0);
+            run(&gpu, CMD_RESOURCE_ATTACH_BACKING, &body)
+        };
+        let fit = (MAX_TOTAL_BACKING_ENTRIES / full) as u32;
+        for id in 1..=fit + 1 {
+            assert_eq!(
+                run(&gpu, CMD_RESOURCE_CREATE_2D, &[id, 2, 1, 1]),
+                RESP_OK_NODATA
+            );
+        }
+        for id in 1..=fit {
+            assert_eq!(attach(id), RESP_OK_NODATA, "resource {id}");
+        }
+        assert_eq!(attach(fit + 1), RESP_ERR_OUT_OF_MEMORY);
+        // Replacing a resource's own list is not growth.
+        assert_eq!(attach(1), RESP_OK_NODATA);
+        // A detached list is freed, and its room can be used again.
+        assert_eq!(run(&gpu, CMD_RESOURCE_DETACH_BACKING, &[1]), RESP_OK_NODATA);
+        assert_eq!(
+            gpu.state.lock().unwrap().resources[&1].backing.capacity(),
+            0
+        );
+        assert_eq!(attach(fit + 1), RESP_OK_NODATA);
     }
 }

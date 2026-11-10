@@ -26,7 +26,7 @@
 
 use crate::diag::etw;
 use crate::virtio::device::{
-    DEVICE_ID_INPUT, FEATURE_RING_EVENT_IDX, FEATURE_VERSION_1, VirtioDevice,
+    DEVICE_ID_INPUT, FEATURE_RING_EVENT_IDX, FEATURE_VERSION_1, VirtioDevice, vm_stopping,
 };
 use crate::virtio::queue::{ChainScratch, PoppedChain, QueueState, Virtqueue};
 use crate::whp::GuestMemory;
@@ -36,6 +36,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub const EVENT_QUEUE: u32 = 0;
 pub const STATUS_QUEUE: u32 = 1;
 pub const INPUT_QUEUE_MAX: u32 = 64;
+/// The most status events read from one statusq chain (see `drain_status`).
+const STATUS_EVENTS_PER_CHAIN: usize = 64;
 
 // ---- evdev event types (linux/input-event-codes.h) ----
 pub const EV_SYN: u16 = 0x00;
@@ -454,8 +456,11 @@ impl InputDevice {
         let interrupt;
         {
             let mut q = self.eventq.lock().unwrap();
-            if !q.ready() {
-                // No ring yet: the whole frame (+ SYN) is lost.
+            // No ring yet, or the VM is stopping (no vCPU will run to read the
+            // ring, and a snapshot may be capturing it; checked under the
+            // queue's lock, which the capture takes before it reads guest
+            // RAM): the whole frame (+ SYN) is lost.
+            if !q.ready() || vm_stopping() {
                 self.events_dropped
                     .fetch_add(events.len() as u64 + 1, Ordering::Relaxed);
                 return;
@@ -507,6 +512,11 @@ impl InputDevice {
             }
             let mut scratch = self.status_scratch.lock().unwrap();
             while q.pop_into(&mut scratch) {
+                // A driver sends one status event per chain (Linux's
+                // `virtinput_send_status`). A descriptor can name all of
+                // guest RAM, though, and this runs on the vCPU thread: read
+                // a bounded number of events and ignore the rest.
+                let mut left = STATUS_EVENTS_PER_CHAIN;
                 for buf in scratch.bufs.iter() {
                     // statusq buffers are device-readable (driver-written).
                     if buf.write || buf.len == 0 {
@@ -514,10 +524,11 @@ impl InputDevice {
                     }
                     let mut ev = [0u8; 8];
                     let mut off = 0;
-                    while off + 8 <= buf.len {
+                    while left > 0 && off + 8 <= buf.len {
                         buf.read_at(off, &mut ev);
                         self.handle_status_event(InputEvent::decode(&ev));
                         off += 8;
+                        left -= 1;
                     }
                 }
                 q.push(scratch.head_index, 0);
@@ -917,5 +928,47 @@ mod tests {
             }
         }
         assert_eq!((x, y), (4096, 8192));
+    }
+
+    /// A statusq chain is read for a bounded number of events. Its descriptors
+    /// can each name all of guest RAM, and the drain runs on the vCPU thread:
+    /// reading every 8 bytes, one notification kept a vCPU busy for days.
+    #[test]
+    fn a_status_chain_is_read_for_a_bounded_number_of_events() {
+        const DESC: u64 = 0x1000;
+        const AVAIL: u64 = 0x2000;
+        const USED: u64 = 0x3000;
+        const BUF: u64 = 0x10_0000;
+        const BUF_LEN: u32 = 16 << 20;
+        let mem = Arc::new(GuestMemory::new_host_only(32 << 20).unwrap());
+        let dev = InputDevice::new_keyboard(mem.clone());
+        // The first events switch Num Lock on; one just past the limit would
+        // switch Caps Lock on.
+        let on = |led: u16| InputEvent::new(EV_LED, led, 1).encode();
+        for i in 0..STATUS_EVENTS_PER_CHAIN as u64 {
+            mem.write_at(BUF + 8 * i, &on(LED_NUML)).unwrap();
+        }
+        mem.write_at(BUF + 8 * STATUS_EVENTS_PER_CHAIN as u64, &on(LED_CAPSL))
+            .unwrap();
+        // One chain of 64 descriptors, each all 16 MiB of the same buffer.
+        for i in 0..64u16 {
+            let mut d = [0u8; 16];
+            d[0..8].copy_from_slice(&BUF.to_le_bytes());
+            d[8..12].copy_from_slice(&BUF_LEN.to_le_bytes());
+            let next = if i == 63 { 0u16 } else { 1 };
+            d[12..14].copy_from_slice(&next.to_le_bytes());
+            d[14..16].copy_from_slice(&(i + 1).to_le_bytes());
+            mem.write_at(DESC + 16 * u64::from(i), &d).unwrap();
+        }
+        mem.write_at(AVAIL + 2, &1u16.to_le_bytes()).unwrap();
+        dev.enable_queue(STATUS_QUEUE, DESC, AVAIL, USED, 64, false);
+
+        dev.notify_queue(STATUS_QUEUE);
+        assert_eq!(mem.read_u16(USED + 2), Some(1), "the chain was retired");
+        assert_eq!(
+            dev.led_state.load(Ordering::Relaxed),
+            1 << LED_NUML,
+            "events past the limit are ignored"
+        );
     }
 }

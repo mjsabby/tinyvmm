@@ -579,33 +579,66 @@ fn stored_chunks(len: usize, read: &(impl Fn(usize, &mut [u8]) + Sync)) -> Vec<b
 // ============================================================
 // Writer
 // ============================================================
+/// Writes a snapshot beside its destination and puts it there only once it
+/// is whole ([`Self::finalize`]). A save that fails part-way, or a process
+/// that dies in one, then leaves the snapshot that was there before as it
+/// was, where writing in place would have truncated it first; and nothing
+/// that opens `path` ever finds half a snapshot.
 pub struct SnapshotWriter {
+    /// Where the snapshot goes when it is whole.
     path: String,
+    /// Where it is written: in `path`'s directory, so that the rename which
+    /// publishes it stays on one volume.
+    partial: String,
     out: BufWriter<File>,
     crc: u32,
     bytes: u64,
     header_written: bool,
     finalized: bool,
+    /// The partial file is marked to go when its handle closes: a process
+    /// killed while saving then leaves no file the size of its guest's RAM
+    /// behind, as it has no chance to remove one. `finalize` takes the mark
+    /// back.
+    doomed: bool,
 }
 
 impl SnapshotWriter {
     pub fn create(path: &str) -> Result<SnapshotWriter> {
-        let f =
-            File::create(path).map_err(|e| Error::msg(format!("snapshot: create {path}: {e}")))?;
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        // Others may rename or delete the file while it is open (that is how
+        // `finalize` publishes it), but not read or write it.
+        const FILE_SHARE_DELETE: u32 = 4;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const DELETE: u32 = 0x0001_0000;
+        let partial = format!("{path}.{}.partial", std::process::id());
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .access_mode(GENERIC_WRITE | DELETE)
+            .share_mode(FILE_SHARE_DELETE)
+            .open(&partial)
+            .map_err(|e| Error::msg(format!("snapshot: create {partial}: {e}")))?;
+        // Where the file system can't, `Drop` still removes the file on the
+        // way out of a save that fails.
+        let doomed = winsys::fs::set_delete_on_close(f.as_raw_handle(), true).is_ok();
         Ok(SnapshotWriter {
             path: path.to_string(),
+            partial,
             out: BufWriter::new(f),
             crc: 0xFFFF_FFFF,
             bytes: 0,
             header_written: false,
             finalized: false,
+            doomed,
         })
     }
 
     fn write_raw(&mut self, data: &[u8]) -> Result<()> {
         self.out
             .write_all(data)
-            .map_err(|e| Error::msg(format!("snapshot: write {}: {e}", self.path)))?;
+            .map_err(|e| Error::msg(format!("snapshot: write {}: {e}", self.partial)))?;
         self.crc = crc32_update(self.crc, data);
         self.bytes += data.len() as u64;
         Ok(())
@@ -696,6 +729,25 @@ impl SnapshotWriter {
             .get_ref()
             .sync_all()
             .map_err(|e| Error::msg(format!("snapshot: sync: {e}")))?;
+        // Whole and on disk: it stays, and takes the destination's place.
+        if self.doomed {
+            use std::os::windows::io::AsRawHandle;
+            winsys::fs::set_delete_on_close(self.out.get_ref().as_raw_handle(), false).map_err(
+                |e| {
+                    Error::msg(format!(
+                        "snapshot: could not keep {}: error {e}",
+                        self.partial
+                    ))
+                },
+            )?;
+            self.doomed = false;
+        }
+        std::fs::rename(&self.partial, &self.path).map_err(|e| {
+            Error::msg(format!(
+                "snapshot: could not put {} in place of {}: {e}",
+                self.partial, self.path
+            ))
+        })?;
         self.finalized = true;
         Ok(self.bytes)
     }
@@ -704,9 +756,12 @@ impl SnapshotWriter {
 impl Drop for SnapshotWriter {
     fn drop(&mut self) {
         if !self.finalized {
-            // Partial file: best-effort remove so a crashed save leaves nothing.
-            let _ = std::fs::remove_file(&self.path);
-            eprintln!("[snapshot] WARN: writer dropped without finalize; removed partial file");
+            // Not whole: remove it (best effort), unless it goes by itself
+            // when `out` closes. Whatever was at `path` is untouched.
+            if !self.doomed {
+                let _ = std::fs::remove_file(&self.partial);
+            }
+            eprintln!("[snapshot] WARN: the save did not finish; removed the partial file");
         }
     }
 }
@@ -1119,6 +1174,99 @@ mod tests {
                 "cut {cut}"
             );
         }
+    }
+
+    /// A process killed while it is saving runs no cleanup: all that happens
+    /// is that its handles close. The partial file goes with its handle, so
+    /// no file the size of the guest's RAM is left beside the snapshot.
+    #[test]
+    fn a_save_that_is_killed_leaves_no_partial_file() {
+        let dir = std::env::temp_dir().join(format!("tv_snap_killed_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vm.tvm");
+        let count = || std::fs::read_dir(&dir).unwrap().count();
+
+        let mut w = SnapshotWriter::create(path.to_str().unwrap()).unwrap();
+        w.write_header("{}").unwrap();
+        w.write_section(SectionType::VcpuRegs, &[7; 1 << 16])
+            .unwrap();
+        assert_eq!(count(), 1, "the partial file");
+        // As a kill leaves it: the file's handle closed, and nothing else
+        // of the writer run (not its `Drop`).
+        let w = std::mem::ManuallyDrop::new(w);
+        drop(unsafe { std::ptr::read(&w.out) });
+        assert_eq!(count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A save replaces the snapshot at its path only when it is whole: one
+    /// that is abandoned leaves the earlier snapshot as it was, and no
+    /// partial file behind either way.
+    #[test]
+    fn an_unfinished_save_leaves_the_previous_snapshot() {
+        let dir = std::env::temp_dir().join(format!("tv_snap_atomic_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vm.tvm");
+        let p = path.to_str().unwrap();
+        let files = || -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+        let save = |marker: u8, finish: bool| {
+            let mut w = SnapshotWriter::create(p).unwrap();
+            w.write_header("{}").unwrap();
+            w.write_section(SectionType::VcpuRegs, &[marker; 64])
+                .unwrap();
+            if finish {
+                w.finalize().unwrap();
+            }
+        };
+        let marker = || -> u8 {
+            let mut r = SnapshotReader::open(p).unwrap();
+            r.read_header().unwrap();
+            r.next_section().unwrap().unwrap().payload[0]
+        };
+
+        // Nothing at the path until the first save is whole.
+        save(1, false);
+        assert_eq!(files(), Vec::<String>::new());
+        save(2, true);
+        assert_eq!(files(), ["vm.tvm"]);
+        assert_eq!(marker(), 2);
+
+        // An abandoned save: the snapshot from before is still there, whole.
+        save(3, false);
+        assert_eq!(files(), ["vm.tvm"]);
+        assert_eq!(marker(), 2);
+
+        // While a save is under way the path still holds the earlier one.
+        let mut w = SnapshotWriter::create(p).unwrap();
+        w.write_header("{}").unwrap();
+        w.write_section(SectionType::VcpuRegs, &[4; 64]).unwrap();
+        assert_eq!(marker(), 2);
+        assert_eq!(files().len(), 2, "the partial file is beside it");
+        w.finalize().unwrap();
+        assert_eq!(files(), ["vm.tvm"]);
+        assert_eq!(marker(), 4);
+
+        // A snapshot in use (being restored from) is not replaced, and the
+        // failed save cleans up after itself.
+        let reader = SnapshotReader::open(p).unwrap();
+        let mut w = SnapshotWriter::create(p).unwrap();
+        w.write_header("{}").unwrap();
+        w.write_section(SectionType::VcpuRegs, &[5; 64]).unwrap();
+        assert!(w.finalize().is_err());
+        drop(reader);
+        assert_eq!(files(), ["vm.tvm"]);
+        assert_eq!(marker(), 4);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

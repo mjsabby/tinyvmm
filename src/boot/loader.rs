@@ -39,6 +39,8 @@ const PT_LOAD: u32 = 1;
 const PT_NOTE: u32 = 4;
 const SHT_NOTE: u32 = 7;
 const EM_X86_64: u16 = 0x3e;
+/// More program headers than a kernel has (a handful).
+const MAX_PROGRAM_HEADERS: usize = 1024;
 
 // 32-bit flat-PM GDT (null / code / data).
 const GDT_CODE32: u64 = 0x00CF_9A00_0000_FFFF;
@@ -152,6 +154,16 @@ fn find_pvh_note(blob: &[u8]) -> Option<u32> {
     None
 }
 
+/// Scan a note blob with `find_pvh_note`, counting its length against what
+/// is `left` of the file to scan: headers that name the same bytes over and
+/// over can then cost no more than the file is long.
+fn scan_notes(blob: &[u8], left: &mut usize) -> Result<Option<u32>> {
+    *left = left
+        .checked_sub(blob.len())
+        .ok_or_else(|| Error::msg("ELF notes overlap in the file"))?;
+    Ok(find_pvh_note(blob))
+}
+
 struct PvhInfo {
     phys32_entry: Option<u32>,
     segments: Vec<LoadSegment>,
@@ -181,12 +193,21 @@ fn inspect(bytes: &[u8]) -> Result<PvhInfo> {
     if e_phoff == 0 || e_phnum == 0 || e_phentsize != 56 {
         return Err(Error::msg("ELF has no program headers"));
     }
+    if e_phnum > MAX_PROGRAM_HEADERS {
+        return Err(Error::msg("ELF has too many program headers"));
+    }
 
     let mut info = PvhInfo {
         phys32_entry: None,
         segments: Vec::new(),
         kernel_phys_max: 0,
     };
+    // What the PT_LOADs take from the file, and what is scanned for notes,
+    // come to no more than the file holds unless headers share bytes: a
+    // crafted image's way of having a small file copied and scanned once per
+    // header.
+    let mut load_left = bytes.len();
+    let mut notes_left = bytes.len();
 
     for i in 0..e_phnum {
         let ph = e_phoff + i * 56;
@@ -199,11 +220,10 @@ fn inspect(bytes: &[u8]) -> Result<PvhInfo> {
         if p_type == PT_NOTE {
             let start = p_offset as usize;
             let end = start.saturating_add(p_filesz as usize);
-            if end <= bytes.len()
-                && let Some(e) = find_pvh_note(&bytes[start..end])
-                && info.phys32_entry.is_none()
-            {
-                info.phys32_entry = Some(e);
+            // The first entry found is the one used: nothing after it is
+            // scanned.
+            if info.phys32_entry.is_none() && end <= bytes.len() {
+                info.phys32_entry = scan_notes(&bytes[start..end], &mut notes_left)?;
             }
         } else if p_type == PT_LOAD {
             if p_filesz == 0 && p_memsz == 0 {
@@ -216,6 +236,9 @@ fn inspect(bytes: &[u8]) -> Result<PvhInfo> {
             if p_memsz < p_filesz {
                 return Err(Error::msg("PT_LOAD p_memsz < p_filesz"));
             }
+            load_left = load_left
+                .checked_sub(p_filesz as usize)
+                .ok_or_else(|| Error::msg("PT_LOAD segments overlap in the file"))?;
             info.segments.push(LoadSegment {
                 paddr: p_paddr,
                 filesz: p_filesz,
@@ -232,6 +255,8 @@ fn inspect(bytes: &[u8]) -> Result<PvhInfo> {
         let e_shentsize = rd_u16(bytes, 58)? as usize;
         let e_shnum = rd_u16(bytes, 60)? as usize;
         if e_shoff != 0 && e_shnum != 0 && e_shentsize == 64 {
+            // Sections name the bytes the segments did, a second time.
+            let mut notes_left = bytes.len();
             for i in 0..e_shnum {
                 let sh = e_shoff + i * 64;
                 if rd_u32(bytes, sh + 4)? != SHT_NOTE {
@@ -241,7 +266,7 @@ fn inspect(bytes: &[u8]) -> Result<PvhInfo> {
                 let sh_size = rd_u64(bytes, sh + 32)? as usize;
                 let end = sh_offset.saturating_add(sh_size);
                 if end <= bytes.len()
-                    && let Some(e) = find_pvh_note(&bytes[sh_offset..end])
+                    && let Some(e) = scan_notes(&bytes[sh_offset..end], &mut notes_left)?
                 {
                     info.phys32_entry = Some(e);
                     break;
@@ -464,4 +489,128 @@ pub fn setup_pvh_entry(vp: &Vcpu, res: &PvhLoadResult) -> Result<()> {
         reg64(0),
     ];
     vp.set_registers(&names, &values)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ops::Range;
+
+    const ENTRY: u32 = 0x0100_0000;
+    const PADDR: u64 = 0x10_0000;
+
+    /// The Xen PHYS32_ENTRY note naming `ENTRY`.
+    fn pvh_note() -> Vec<u8> {
+        let words = [4, 4, ELF_NOTE_PHYS32_ENTRY].map(u32::to_le_bytes);
+        [&words.concat()[..], b"Xen\0", &ENTRY.to_le_bytes()].concat()
+    }
+
+    /// An ELF file: its header, a program header for each of `segments` (its
+    /// type and the bytes of `body` it names, loaded at `PADDR`), `body`,
+    /// then a section header for each of `sections` likewise.
+    fn elf(
+        segments: &[(u32, Range<usize>)],
+        sections: &[(u32, Range<usize>)],
+        body: &[u8],
+    ) -> Vec<u8> {
+        fn put(file: &mut [u8], at: usize, bytes: &[u8]) {
+            file[at..at + bytes.len()].copy_from_slice(bytes);
+        }
+        let body_at = 64 + 56 * segments.len();
+        let mut file = vec![0u8; body_at];
+        put(&mut file, 0, &[0x7f, b'E', b'L', b'F', 2, 1]);
+        put(&mut file, 18, &EM_X86_64.to_le_bytes());
+        put(&mut file, 32, &64u64.to_le_bytes());
+        put(&mut file, 54, &56u16.to_le_bytes());
+        put(&mut file, 56, &(segments.len() as u16).to_le_bytes());
+        for (i, (kind, bytes)) in segments.iter().enumerate() {
+            let ph = 64 + 56 * i;
+            put(&mut file, ph, &kind.to_le_bytes());
+            put(
+                &mut file,
+                ph + 8,
+                &((body_at + bytes.start) as u64).to_le_bytes(),
+            );
+            put(&mut file, ph + 24, &PADDR.to_le_bytes());
+            put(&mut file, ph + 32, &(bytes.len() as u64).to_le_bytes());
+            put(&mut file, ph + 40, &(bytes.len() as u64).to_le_bytes());
+        }
+        file.extend_from_slice(body);
+        if !sections.is_empty() {
+            let e_shoff = file.len() as u64;
+            put(&mut file, 40, &e_shoff.to_le_bytes());
+            put(&mut file, 58, &64u16.to_le_bytes());
+            put(&mut file, 60, &(sections.len() as u16).to_le_bytes());
+        }
+        for (kind, bytes) in sections {
+            let mut sh = [0u8; 64];
+            put(&mut sh, 4, &kind.to_le_bytes());
+            put(&mut sh, 24, &((body_at + bytes.start) as u64).to_le_bytes());
+            put(&mut sh, 32, &(bytes.len() as u64).to_le_bytes());
+            file.extend_from_slice(&sh);
+        }
+        file
+    }
+
+    #[test]
+    fn finds_the_entry_in_a_note_segment_or_section() {
+        let body = [&[0xAA; 32][..], &pvh_note()].concat();
+        let note = 32..body.len();
+        let segments = [(PT_LOAD, 0..32), (PT_NOTE, note.clone())];
+        let info = inspect(&elf(&segments, &[], &body)).unwrap();
+        assert_eq!(info.phys32_entry, Some(ENTRY));
+        assert_eq!(info.segments.len(), 1);
+        assert_eq!(info.kernel_phys_max, PADDR + 32);
+        // A kernel that keeps the note only as a section.
+        let info = inspect(&elf(&segments[..1], &[(SHT_NOTE, note)], &body)).unwrap();
+        assert_eq!(info.phys32_entry, Some(ENTRY));
+        let info = inspect(&elf(&segments[..1], &[], &body)).unwrap();
+        assert_eq!(info.phys32_entry, None);
+    }
+
+    #[test]
+    fn headers_naming_the_same_bytes_over_and_over_are_refused() {
+        let error = |file: &[u8]| inspect(file).err().unwrap().to_string();
+        let body = [&[0u8; 4096][..], &pvh_note()].concat();
+        let (all, note) = (0..body.len(), 4096..body.len());
+        // Segments that share no bytes load. One naming the file's bytes
+        // again had them copied again: 65535 times, with as many headers.
+        let apart = [
+            (PT_LOAD, 0..2048),
+            (PT_LOAD, 2048..4096),
+            (PT_NOTE, note.clone()),
+        ];
+        let info = inspect(&elf(&apart, &[], &body)).unwrap();
+        assert_eq!((info.segments.len(), info.phys32_entry), (2, Some(ENTRY)));
+        let again = vec![(PT_LOAD, all.clone()); 3];
+        assert_eq!(
+            error(&elf(&again, &[], &body)),
+            "PT_LOAD segments overlap in the file"
+        );
+        // Once the entry is found, no other note is scanned: these hundred
+        // each name the whole file.
+        let mut found = vec![(PT_NOTE, note)];
+        found.extend(vec![(PT_NOTE, all.clone()); 100]);
+        let info = inspect(&elf(&found, &[], &body)).unwrap();
+        assert_eq!(info.phys32_entry, Some(ENTRY));
+        // Until it is found, no byte is scanned twice, in segments or in
+        // sections.
+        let lost = vec![(PT_NOTE, all.clone()); 100];
+        assert_eq!(
+            error(&elf(&lost, &[], &body)),
+            "ELF notes overlap in the file"
+        );
+        let lost = vec![(SHT_NOTE, all); 100];
+        assert_eq!(
+            error(&elf(&apart[..2], &lost, &body)),
+            "ELF notes overlap in the file"
+        );
+        // And a kernel has no thousand program headers.
+        let headers = |count: usize| elf(&vec![(0, 0..0); count], &[], &body);
+        assert!(inspect(&headers(MAX_PROGRAM_HEADERS)).is_ok());
+        assert_eq!(
+            error(&headers(MAX_PROGRAM_HEADERS + 1)),
+            "ELF has too many program headers"
+        );
+    }
 }

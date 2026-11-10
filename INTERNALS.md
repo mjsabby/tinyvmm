@@ -618,16 +618,16 @@ before the reset without touching the guest (`blk.rs` `epoch`).
 (16-byte entries: `addr,len,flags,next`), an **avail ring** (driver → device), and
 a **used ring** (device → driver). The device side:
 
-- `pop_into(&mut chain)` (`queue.rs:272`): read the avail index (Acquire), walk
+- `pop_into(&mut chain)` (`queue.rs:350`): read the avail index (Acquire), walk
   the descriptor chain following `NEXT`, resolve each `addr/len` through
   `host_range` into a `ChainBuf { ptr, len, write }`, and collect read-only vs
   device-writable buffers. **It reuses the chain's `Vec`, so the hot path
   allocates nothing.**
-- `push(head, used_len)` (`queue.rs:409`) is `add_used` + `publish_used`: write
+- `push(head, used_len)` (`queue.rs:524`) is `add_used` + `publish_used`: write
   the used-ring element, then publish `used.idx` after a `Release` fence.
   Multi-buffer RX (`MRG_RXBUF`) calls `add_used` once per buffer and publishes
   once, because the driver drops a packet whose later buffers aren't already in
-  the used ring (`queue.rs:419`, `:429`).
+  the used ring (`queue.rs:534`, `:544`).
 - **EVENT_IDX suppression**: when negotiated, the device writes `avail_event` to
   ask for the next kick and reads `used_event` to decide whether to actually
   raise an interrupt — this is what lets a busy queue run with almost no
@@ -635,11 +635,11 @@ a **used ring** (device → driver). The device side:
   side, and Release/Acquire do **not** order a store before a later load, so
   each needs a **full fence** that pairs with the barrier in the Linux driver:
   when the ring looks empty, store `avail_event`, `fence(SeqCst)`, re-read
-  `avail.idx` (`queue.rs:384` `arm_kick_and_recheck`, vhost's `enable_notify`
+  `avail.idx` (`queue.rs:499` `arm_kick_and_recheck`, vhost's `enable_notify`
   pattern); after publishing `used.idx`, `fence(SeqCst)` before reading
-  `used_event` (`queue.rs:442` `should_interrupt_driver`). Without them a kick
+  `used_event` (`queue.rs:557` `should_interrupt_driver`). Without them a kick
   or an interrupt is occasionally lost and the queue stalls for good.
-  Store-buffer litmus tests run both sides on real CPUs (`queue.rs:542`).
+  Store-buffer litmus tests run both sides on real CPUs (`queue.rs:760`).
 
 This is also your **primary attack surface**. The guest controls every byte of
 those rings. The popper therefore: rejects an avail head `≥ size`; validates the
@@ -647,9 +647,21 @@ descriptor table is mapped before walking; **bounds the walk by `size`** and
 re-checks every `next` against the table it indexes (the ring size for direct
 descriptors, the indirect table's length for indirect ones), so a cyclic or
 oversized chain can neither loop nor quadratically inflate your buffers
-(`queue.rs:306`). There's a fuzz test that scribbles random bytes over the rings
-and asserts `pop()` never panics, never loops, never returns a buffer outside RAM
-(`queue.rs:494`). **Write this test early.**
+(`queue.rs:404`). It also bounds how far the avail index may run ahead: a driver
+can't have more than `size` buffers outstanding, so an `avail.idx` further ahead
+than that isn't work to do, it is a ring the driver broke (and, unchecked, 65535
+pops of the same descriptors for one kick, on a thread a stop request can't
+interrupt). Such a queue is marked broken and yields nothing until it is reset
+(`queue.rs:372`, `mark_broken`). There's a fuzz test that scribbles random bytes
+over the rings and asserts `pop()` never panics, never loops, never returns a
+buffer outside RAM, and never yields more than a ring's worth (`queue.rs:609`).
+**Write this test early.**
+
+Bound what one chain can make you do as well, not only how many chains there
+are: a descriptor's length is the guest's to choose, up to all of guest RAM.
+A device that copies, prints or zeroes "the whole buffer" does gigabytes of
+work under its queue lock for one kick. Cap it per chain (the console's
+`TX_CHAIN_MAX`, snd's `SILENT_PERIOD_MAX`, input's `STATUS_EVENTS_PER_CHAIN`).
 
 **5. Reads/writes are zero-copy.** `host_range` returns a validated pointer the
 OS operates on *in place*: virtio-blk hands `req.buf = seg_ptr` straight to
@@ -722,7 +734,12 @@ done. Build them in this order:
   symlink or junction on the way can take it outside the share; links that stay
   inside are followed on a checked slow path (`README.md` §9). Fids hold paths,
   not handles: Windows refuses to rename a directory while any handle to
-  something below it is open. Deletes and renames go through
+  something below it is open. Those paths, and the directory listings fids
+  hold, are counted against budgets (a fid is cheap for the guest to make and
+  either can be large). Requests finish on the workers in any order, so a
+  `Tflush` is parked on the request it names until that one's reply is on the
+  used ring (`Flights`), and a reset ends an epoch rather than waiting
+  (`P9Device::epoch`), as virtio-blk's does. Deletes and renames go through
   `FileDispositionInformationEx` / `FileRenameInformationEx` with POSIX
   semantics, so, as on Linux, a name goes away at once and a rename can replace
   a file that is still open. NTFS has no POSIX owner or mode, so `Rgetattr`
@@ -942,22 +959,27 @@ useful template because the ordering constraints are real:
 12. power-off/reboot -> stop_all; gpu window close, Ctrl+A S, Ctrl+C/Break or
     closing the console -> GracefulStop: shutdown IC, else SysRq s,u on hvc0
     and a wait for the disks to go idle, then stop_all; spawn watchdog
-    (optional), wire interactive console + shutdown sentinel
+    (optional), wire interactive console (+ the shutdown sentinel, if
+    --shutdown-sentinel)
 13. arm snapshot trigger (if --save)
 14. BSP runs on the main thread; each AP runs on its own thread (pinned per --cpu-affinity;
        the whole process was confined to the mode's core class before step 3, so every
        thread it starts inherits that)
-15. teardown: stop_all → disarm GracefulStop (nothing stops a partition being
-       deleted) → cancel + join APs → join watchdog → close the gpu window
-       quiesce each blk device (take what's left in its ring, stop taking
-         requests, wait for every one it took), then stop its IOCP worker
+15. teardown: stop_all (from here the disks leave what the guest has queued:
+       at once, or 15 s on if the guest asked for its snapshot) → disarm
+       GracefulStop (nothing stops a partition being deleted) → cancel + join
+       APs → join watchdog → close the gpu window
+       join the doorbell pumps; each blk device stops taking requests (for a
+         snapshot it first takes what's left in its ring) and waits for every
+         one it took, 30 s at most for both; then stop its IOCP worker
        stop VMBus's devices (their IC threads write guest RAM)
-       if snapshot armed+requested: quiesce net backends + 9p pool, write the file
+       if snapshot armed+requested: quiesce net backends + 9p pool, write the
+         file (not if a disk left work behind, or 9p is still at work)
        else: print device stats + exit counters
 ```
 
-The teardown ordering is not optional: **each blk device is quiesced and its
-IOCP worker stopped before the device drops**, or a completion lands on freed
+The teardown ordering is not optional: **each blk device is brought to rest and
+its IOCP worker stopped before the device drops**, or a completion lands on freed
 memory, and before a snapshot is captured, or it records a request taken off
 the avail ring that the restored device never completes. The NAT and
 9p workers aren't stopped on a normal exit — each NAT worker owns its flow state
@@ -1048,7 +1070,9 @@ real debugging time in this project.
     `poweroff` falls back to `STI;HLT` and produces no terminal exit, and a
     reboot ends in a triple fault. PM1 registers and `\_S5` give it soft-off,
     and the FADT's reset register a reboot: port writes the VMM can stop on.
-    The harnesses' hvc0 shutdown sentinel predates them and still works. (§M1)
+    The harnesses' hvc0 shutdown sentinel predates them; it is opt-in
+    (`--shutdown-sentinel`), since a line on the console is not a privileged
+    channel inside the guest. (§M1)
 14. **Release/Acquire isn't enough for EVENT_IDX.** The device's "store my index,
     then load yours" handshakes need a full fence that pairs with the driver's
     barrier; without it a kick or interrupt is occasionally lost and the queue

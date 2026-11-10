@@ -44,7 +44,7 @@ use crate::host::audio::{
     self, CaptureClient, ComInit, Event, INFINITE, RenderClient, WaitOutcome, wait_any,
 };
 use crate::virtio::device::{
-    DEVICE_ID_SOUND, FEATURE_RING_EVENT_IDX, FEATURE_VERSION_1, VirtioDevice,
+    DEVICE_ID_SOUND, FEATURE_RING_EVENT_IDX, FEATURE_VERSION_1, VirtioDevice, vm_stopping,
 };
 use crate::virtio::queue::{ChainScratch, PoppedChain, QueueState, Virtqueue};
 use crate::whp::GuestMemory;
@@ -61,6 +61,9 @@ pub const SND_QUEUE_COUNT: u32 = 4;
 
 const CTRL_QUEUE_MAX: u32 = 64;
 const PCM_QUEUE_MAX: u32 = 256;
+/// The most of one capture chain the silent fallback zeroes: over five
+/// seconds of 48 kHz stereo S16 (see `fill_capture_silence`).
+const SILENT_PERIOD_MAX: usize = 1 << 20;
 
 // ---- control request codes (uapi/linux/virtio_snd.h) ----
 const R_JACK_INFO: u32 = 1;
@@ -287,7 +290,8 @@ impl SndDevice {
         let (written, irq) = {
             let mut g = self.play.lock().unwrap();
             let io = &mut *g;
-            if !io.q.ready() {
+            // `ring_at_rest`: checked under the stream's lock, as it must be.
+            if !io.q.ready() || ring_at_rest() {
                 for b in dst.iter_mut() {
                     *b = 0;
                 }
@@ -346,7 +350,7 @@ impl SndDevice {
         let irq = {
             let mut g = self.cap.lock().unwrap();
             let io = &mut *g;
-            if !io.q.ready() {
+            if !io.q.ready() || ring_at_rest() {
                 return false;
             }
             let mut produced = 0usize;
@@ -411,7 +415,7 @@ impl SndDevice {
         let irq = {
             let mut g = self.cap.lock().unwrap();
             let io = &mut *g;
-            if !io.q.ready() {
+            if !io.q.ready() || ring_at_rest() {
                 return false;
             }
             if !io.cur_valid {
@@ -421,7 +425,13 @@ impl SndDevice {
                 io.cur_off = 0;
                 io.cur_payload = writable_len(&io.cur).saturating_sub(STATUS_BYTES);
             }
-            zero_writable(&mut io.cur, io.cur_off, io.cur_payload);
+            // A period is a fraction of a second of PCM. A chain's buffers can
+            // name all of guest RAM, though: zero a bounded part and complete
+            // it, rather than fill gigabytes under the stream lock.
+            let end = io
+                .cur_payload
+                .min(io.cur_off.saturating_add(SILENT_PERIOD_MAX));
+            zero_writable(&mut io.cur, io.cur_off, end);
             write_status(&mut io.cur, S_OK, 0);
             let head = io.cur.head_index;
             let used = writable_len(&io.cur) as u32;
@@ -628,6 +638,15 @@ impl SndDevice {
         q.set_event_idx_enabled(event_idx);
         q.set_ready(true);
     }
+}
+
+/// Whether the audio workers must leave the PCM rings as they are: the VM is
+/// stopping, so no vCPU will run to use them, and a snapshot may be capturing
+/// them. A worker checks this under its stream's lock, which the capture
+/// takes before it reads guest RAM: a period being filled finishes first, and
+/// none is started after.
+fn ring_at_rest() -> bool {
+    vm_stopping()
 }
 
 fn period_bytes_to_ms(period_bytes: u32) -> u32 {

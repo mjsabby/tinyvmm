@@ -39,10 +39,12 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_BEGIN, FILE_ID_BOTH_DIR_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo,
     FileStandardInfo, FindClose, FindFirstFileW, FindNextFileW, FlushFileBuffers,
-    GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW, ReadFile,
-    SYNCHRONIZE, SetEndOfFile, SetFilePointerEx, SetFileTime, WIN32_FIND_DATAW, WriteFile,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
+    QueryDosDeviceW, ReadFile, SYNCHRONIZE, SetEndOfFile, SetFilePointerEx, SetFileTime,
+    WIN32_FIND_DATAW, WriteFile,
 };
-use windows_sys::Win32::System::IO::{IO_STATUS_BLOCK, OVERLAPPED};
+use windows_sys::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK, OVERLAPPED};
+use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
 use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
 
 pub use windows_sys::Win32::Foundation::HANDLE;
@@ -306,6 +308,21 @@ pub fn delete_by_handle(h: HANDLE) -> Result<(), u32> {
     ))
 }
 
+/// Mark the file `h` refers to, opened with `DELETE` access, to be deleted
+/// when its last handle closes, or take that mark back
+/// (`FileDispositionInformation`). A marked file goes with the process that
+/// holds it, however the process ends, and nobody else can open it meanwhile.
+pub fn set_delete_on_close(h: HANDLE, delete: bool) -> Result<(), u32> {
+    // FILE_DISPOSITION_INFORMATION: one BOOLEAN DeleteFile.
+    let delete = delete as u8;
+    nt_result(set_information(
+        h,
+        (&raw const delete).cast(),
+        1,
+        FileDispositionInformation,
+    ))
+}
+
 /// Rename the file or directory `h` refers to, opened with `DELETE` access, to
 /// `name` (one component, no NUL) in the open directory `dir`, replacing a file
 /// of that name. With POSIX semantics where the file system has them, a target
@@ -415,6 +432,112 @@ pub fn final_nt_path_by_handle(h: HANDLE) -> Option<Vec<u16>> {
         }
         buf.resize(n as usize, 0);
     }
+}
+
+/// Where a symlink or junction points, as its reparse data says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkTarget {
+    /// A symlink's relative target: a `\`-separated path from the directory
+    /// the link is in, which may hold `.` and `..`.
+    Relative(Vec<u16>),
+    /// An absolute target, as the NT path the kernel parses:
+    /// `\??\C:\dir\file`, `\??\Volume{...}\dir`, `\??\UNC\server\share\dir`.
+    Absolute(Vec<u16>),
+}
+
+const ERROR_INVALID_REPARSE_DATA: u32 = 4392;
+
+/// Read where the link `h` points (`FSCTL_GET_REPARSE_POINT`). `h` is the
+/// link itself, opened with [`Open::as_entry`]; it needs no particular access
+/// right. Fails with `ERROR_NOT_A_REPARSE_POINT` for a file that is none, and
+/// with `ERROR_INVALID_REPARSE_DATA` for a reparse point that is neither a
+/// symlink nor a junction (a cloud file, a WSL link) or whose data is
+/// malformed.
+pub fn link_target(h: HANDLE) -> Result<LinkTarget, u32> {
+    // MAXIMUM_REPARSE_DATA_BUFFER_SIZE: no reparse point holds more.
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            h,
+            FSCTL_GET_REPARSE_POINT,
+            null(),
+            0,
+            buf.as_mut_ptr().cast(),
+            buf.len() as u32,
+            &mut returned,
+            null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(unsafe { GetLastError() });
+    }
+    let data = buf.get(..returned as usize).unwrap_or(&buf);
+    parse_link_target(data).ok_or(ERROR_INVALID_REPARSE_DATA)
+}
+
+/// The target in a `REPARSE_DATA_BUFFER` for a symlink or a junction (a mount
+/// point): its substitute name. `None` for any other tag, and for data whose
+/// name doesn't lie within it.
+fn parse_link_target(data: &[u8]) -> Option<LinkTarget> {
+    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+    const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+    const SYMLINK_FLAG_RELATIVE: u32 = 1;
+    // ReparseTag u32, ReparseDataLength u16, Reserved u16; then
+    // SubstituteNameOffset, SubstituteNameLength, PrintNameOffset,
+    // PrintNameLength (u16 each, in bytes, from PathBuffer); a symlink's
+    // Flags u32; PathBuffer.
+    let u16_at = |at: usize| Some(u16::from_le_bytes(data.get(at..at + 2)?.try_into().ok()?));
+    let tag = u32::from_le_bytes(data.get(0..4)?.try_into().ok()?);
+    let (path_buffer, relative) = match tag {
+        IO_REPARSE_TAG_SYMLINK => {
+            let flags = u32::from_le_bytes(data.get(16..20)?.try_into().ok()?);
+            (20, flags & SYMLINK_FLAG_RELATIVE != 0)
+        }
+        IO_REPARSE_TAG_MOUNT_POINT => (16, false),
+        _ => return None,
+    };
+    let start = path_buffer + u16_at(8)? as usize;
+    let len = u16_at(10)? as usize;
+    if !len.is_multiple_of(2) {
+        return None;
+    }
+    let name: Vec<u16> = data
+        .get(start..start.checked_add(len)?)?
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
+        .collect();
+    if name.is_empty() || name.contains(&0) {
+        return None;
+    }
+    Some(if relative {
+        LinkTarget::Relative(name)
+    } else {
+        LinkTarget::Absolute(name)
+    })
+}
+
+/// What the DOS device `name` (`C:`, `Volume{...}`, `UNC`) stands for: the NT
+/// path the object manager puts in place of `\??\<name>`, such as
+/// `\Device\HarddiskVolume3` for a drive (`QueryDosDeviceW`). That is the
+/// form [`final_nt_path_by_handle`] gives a volume too. `None` if there is no
+/// such device.
+pub fn dos_device_target(name: &[u16]) -> Option<Vec<u16>> {
+    if name.is_empty() || name.contains(&0) || name.contains(&(b'\\' as u16)) {
+        return None;
+    }
+    let name: Vec<u16> = name.iter().copied().chain([0]).collect();
+    let mut buf = vec![0u16; 1024];
+    let n = unsafe { QueryDosDeviceW(name.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+    if n == 0 {
+        return None;
+    }
+    // A list of strings: the first is the mapping in force.
+    let end = buf.iter().position(|&c| c == 0)?;
+    buf.truncate(end);
+    (!buf.is_empty()).then_some(buf)
 }
 
 /// `GetFileInformationByHandle` decoded into a [`FileInfo`].
@@ -763,12 +886,30 @@ pub struct ReadDirIds {
 }
 
 pub fn read_dir_ids(h: HANDLE) -> ReadDirIds {
+    read_dir_ids_from(h, true)
+}
+
+/// [`read_dir_ids`], from the directory's first entry (`restart`) or from
+/// where the last enumeration of this handle stopped. The position belongs to
+/// the handle, not to the iterator, and moves a batch at a time: an iterator
+/// dropped [at the end of a batch](ReadDirIds::at_batch_end) has returned
+/// every entry the handle has moved past, so one that doesn't restart carries
+/// on exactly after them.
+pub fn read_dir_ids_from(h: HANDLE, restart: bool) -> ReadDirIds {
     ReadDirIds {
         handle: h,
         buf: vec![0u8; 64 * 1024].into_boxed_slice(),
         pos: usize::MAX,
         done: false,
-        restart: true,
+        restart,
+    }
+}
+
+impl ReadDirIds {
+    /// Whether every entry the file system has handed over so far has been
+    /// returned: the next `next()` asks it for another batch.
+    pub fn at_batch_end(&self) -> bool {
+        self.pos == usize::MAX
     }
 }
 
@@ -899,8 +1040,9 @@ impl Drop for ReadDir {
 mod tests {
     use super::*;
     use windows_sys::Win32::Storage::FileSystem::{
-        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, FILE_READ_ATTRIBUTES, FILE_READ_EA,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_EA, OPEN_EXISTING,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY,
+        FILE_READ_ATTRIBUTES, FILE_READ_EA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_WRITE_EA, OPEN_EXISTING,
     };
 
     const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
@@ -908,6 +1050,56 @@ mod tests {
     fn wide(p: &std::path::Path) -> Vec<u16> {
         use std::os::windows::ffi::OsStrExt;
         p.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+
+    /// A directory handle keeps its place between listings: one that is
+    /// dropped at the end of a batch and one that carries on from there
+    /// return, between them, every entry once.
+    #[test]
+    fn a_listing_carries_on_where_the_last_one_stopped() {
+        let dir = std::env::temp_dir().join(format!("winsys_dir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // More entries than one batch holds.
+        let mut want: Vec<String> = vec![".".into(), "..".into()];
+        for i in 0..1500 {
+            let name = format!("f{i:04}");
+            std::fs::write(dir.join(&name), b"").unwrap();
+            want.push(name);
+        }
+        let h = create_file(
+            &wide(&dir),
+            FILE_LIST_DIRECTORY,
+            SHARE_ALL,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+        )
+        .unwrap();
+
+        let mut names = Vec::new();
+        let mut batches = 0;
+        loop {
+            let mut listing = read_dir_ids_from(h, batches == 0);
+            assert!(listing.at_batch_end());
+            let Some(first) = listing.next() else {
+                break;
+            };
+            names.push(first.name);
+            while !listing.at_batch_end() {
+                names.push(listing.next().unwrap().name);
+            }
+            batches += 1;
+        }
+        let first = names[0].clone();
+        let again = read_dir_ids(h).next().unwrap().name;
+        close(h);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(batches > 1, "{batches} batch");
+        assert_eq!(again, first, "a restarted listing starts over");
+        names.sort();
+        want.sort();
+        assert_eq!(names, want);
     }
 
     /// What we write must be what WSL writes: NTFS's own `FileStatLxInformation`
@@ -950,5 +1142,141 @@ mod tests {
                 ..all
             })
         );
+    }
+
+    const TAG_MOUNT_POINT: u32 = 0xA000_0003;
+    const TAG_SYMLINK: u32 = 0xA000_000C;
+
+    /// A `REPARSE_DATA_BUFFER` as NTFS returns it: the substitute name, then
+    /// the print name. `flags` is a symlink's; a junction has none.
+    fn reparse_data(tag: u32, flags: Option<u32>, substitute: &str, print: &str) -> Vec<u8> {
+        let bytes = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+        let (sub, prn) = (bytes(substitute), bytes(print));
+        let mut body = Vec::new();
+        for v in [0, sub.len(), sub.len() + 2, prn.len()] {
+            body.extend_from_slice(&(v as u16).to_le_bytes());
+        }
+        if let Some(flags) = flags {
+            body.extend_from_slice(&flags.to_le_bytes());
+        }
+        body.extend_from_slice(&sub);
+        body.extend_from_slice(&[0, 0]);
+        body.extend_from_slice(&prn);
+        body.extend_from_slice(&[0, 0]);
+        let mut data = tag.to_le_bytes().to_vec();
+        data.extend_from_slice(&(body.len() as u16).to_le_bytes());
+        data.extend_from_slice(&[0, 0]);
+        data.extend_from_slice(&body);
+        data
+    }
+
+    fn utf16(s: &str) -> Vec<u16> {
+        s.encode_utf16().collect()
+    }
+
+    #[test]
+    fn a_link_target_is_read_from_reparse_data() {
+        let relative = reparse_data(TAG_SYMLINK, Some(1), r"..\lib\x.so", r"..\lib\x.so");
+        assert_eq!(
+            parse_link_target(&relative),
+            Some(LinkTarget::Relative(utf16(r"..\lib\x.so")))
+        );
+        let absolute = reparse_data(TAG_SYMLINK, Some(0), r"\??\C:\lib\x.so", r"C:\lib\x.so");
+        assert_eq!(
+            parse_link_target(&absolute),
+            Some(LinkTarget::Absolute(utf16(r"\??\C:\lib\x.so")))
+        );
+        let junction = reparse_data(TAG_MOUNT_POINT, None, r"\??\C:\lib", r"C:\lib");
+        assert_eq!(
+            parse_link_target(&junction),
+            Some(LinkTarget::Absolute(utf16(r"\??\C:\lib")))
+        );
+
+        // Not a link: a cloud file's tag, with the same layout after it.
+        let mut other = junction.clone();
+        other[0..4].copy_from_slice(&0x9000_001Au32.to_le_bytes());
+        assert_eq!(parse_link_target(&other), None);
+        // Data cut short anywhere before the name's end, down to nothing, is
+        // refused, not read past. (A symlink's name starts 20 bytes in.)
+        let name_end = 20 + utf16(r"..\lib\x.so").len() * 2;
+        for len in 0..name_end {
+            assert_eq!(parse_link_target(&relative[..len]), None, "{len} bytes");
+        }
+        assert!(parse_link_target(&relative[..name_end]).is_some());
+        // A name that claims to start, or to end, beyond the data.
+        let mut far = relative.clone();
+        far[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert_eq!(parse_link_target(&far), None);
+        let mut long = relative.clone();
+        long[10..12].copy_from_slice(&0xFFFEu16.to_le_bytes());
+        assert_eq!(parse_link_target(&long), None);
+        // Half a character, and no name at all.
+        let mut odd = relative.clone();
+        odd[10..12].copy_from_slice(&5u16.to_le_bytes());
+        assert_eq!(parse_link_target(&odd), None);
+        let mut empty = relative;
+        empty[10..12].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(parse_link_target(&empty), None);
+    }
+
+    /// A junction read back from the file system names its target as an NT
+    /// path whose device, mapped, gives the path the target's own handle
+    /// reports: what lets a link's target be compared with a share's root.
+    #[test]
+    fn a_junction_tells_where_it_points() {
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        let base = std::env::temp_dir().join(format!("winsys_link_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // By its real path: a junction keeps its target as it was written, and
+        // the temporary directory may be named by a short name (`USERNA~1`).
+        let base = std::fs::canonicalize(&base).unwrap();
+        let base = std::path::PathBuf::from(base.to_str().unwrap().trim_start_matches(r"\\?\"));
+        let (target, link) = (base.join("target"), base.join("link"));
+        std::fs::create_dir_all(&target).unwrap();
+        // `mklink /J` needs no elevation.
+        let made = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !made {
+            eprintln!("[winsys-test] skipping: could not create a directory junction");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        let open = |p: &std::path::Path, flags: u32| {
+            create_file(
+                &wide(p),
+                FILE_READ_ATTRIBUTES,
+                SHARE_ALL,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | flags,
+            )
+            .unwrap()
+        };
+        let (l, t) = (open(&link, FILE_FLAG_OPEN_REPARSE_POINT), open(&target, 0));
+        let pointed = link_target(l);
+        let plain = link_target(t);
+        let real = final_nt_path_by_handle(t).unwrap();
+        close(l);
+        close(t);
+        let _ = std::fs::remove_dir(&link);
+        let _ = std::fs::remove_dir_all(&base);
+
+        const ERROR_NOT_A_REPARSE_POINT: u32 = 4390;
+        assert_eq!(plain, Err(ERROR_NOT_A_REPARSE_POINT));
+        let Ok(LinkTarget::Absolute(nt)) = pointed else {
+            panic!("a junction's target is absolute: {pointed:?}");
+        };
+        let rest = nt.strip_prefix(utf16(r"\??\").as_slice()).unwrap();
+        let cut = rest.iter().position(|&c| c == b'\\' as u16).unwrap();
+        let mut mapped = dos_device_target(&rest[..cut]).unwrap();
+        mapped.extend_from_slice(&rest[cut..]);
+        let lower = |w: &[u16]| String::from_utf16_lossy(w).to_lowercase();
+        assert_eq!(lower(&mapped), lower(&real));
+        assert_eq!(dos_device_target(&utf16("NoSuchDevice{tinyvmm}")), None);
+        assert_eq!(dos_device_target(&utf16(r"C:\Windows")), None);
     }
 }

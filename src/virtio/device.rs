@@ -3,6 +3,62 @@
 //! owned by the device).
 
 use crate::virtio::queue::QueueState;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+/// The VM is stopping: its vCPUs have been told to stop and teardown (or a
+/// snapshot) follows. One VM per process, so one flag.
+static VM_STOPPING: AtomicBool = AtomicBool::new(false);
+
+/// When the disk work a guest left queued stops being run (see
+/// [`guest_work_cut_off`]). Set once, by the first stop.
+static GUEST_WORK_UNTIL: OnceLock<Instant> = OnceLock::new();
+
+/// Tell every device the VM is stopping (see [`vm_stopping`]). `patience` is
+/// how much longer the disks run what the guest has queued on them (see
+/// [`guest_work_cut_off`]): none for a stop that keeps nothing of the guest,
+/// some for one a snapshot follows. The first call decides.
+pub fn set_vm_stopping(patience: Duration) {
+    // Before the flag, so that whoever sees the flag finds the time.
+    GUEST_WORK_UNTIL.get_or_init(|| Instant::now() + patience);
+    VM_STOPPING.store(true, Ordering::Release);
+}
+
+/// Whether the VM is stopping. Two things go by it:
+///
+/// * what the host itself would put on a ring (console input, input events,
+///   the audio workers' periods): from here on they leave the rings alone,
+///   checked under the queue's lock, so that a snapshot captures rings at
+///   rest and teardown isn't racing them;
+/// * the console's output drain, which writes less of each chain: the stop
+///   flag of a vCPU is only looked at between VM exits, and a doorbell pump
+///   is only joined between drains, so what the guest queued stands between
+///   the user and the stop they asked for.
+///
+/// No drain leaves chains behind on its account: one that did would give a
+/// snapshot requests the guest has kicked for and the restored guest would
+/// never kick for again. A drain is bounded instead, by the ring's size and
+/// by what each device does per chain. The disk is the exception, as one
+/// chain of its can name the whole disk many times over: see
+/// [`guest_work_cut_off`].
+pub fn vm_stopping() -> bool {
+    VM_STOPPING.load(Ordering::Acquire)
+}
+
+/// Whether the disks have stopped running what the guest queued on them: the
+/// VM is stopping, and the time [`set_vm_stopping`] gave that work is up. A
+/// disk's drain looks at this between requests and between the segments of
+/// one, on whichever thread it runs (a vCPU's, when the kick was a VM exit),
+/// so a guest can't choose how long a stop takes by what it queues. A disk
+/// that left work behind on this account says so
+/// (`BlockDevice::left_work_behind`), and no snapshot is written of it.
+pub fn guest_work_cut_off() -> bool {
+    vm_stopping()
+        && GUEST_WORK_UNTIL
+            .get()
+            .is_some_and(|until| Instant::now() >= *until)
+}
 
 pub const DEVICE_ID_NET: u32 = 1;
 pub const DEVICE_ID_BLOCK: u32 = 2;

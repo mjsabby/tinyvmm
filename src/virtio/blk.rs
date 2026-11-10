@@ -18,13 +18,23 @@
 //! runs under the transport lock their completions take), so it completes
 //! asynchronously: it starts a new epoch, requests from an earlier epoch settle
 //! without touching the guest, and `reset_pending` keeps the device status
-//! non-zero until they have. `quiesce` stops the device for teardown and
-//! snapshots once every request it took has completed.
+//! non-zero until they have.
+//!
+//! One chain can name the whole disk many times over (each segment up to
+//! `size_max`, and the same guest buffer will do for all of them), and a ring
+//! holds hundreds of chains, so what a guest has queued can take hours. A VM
+//! that is stopping therefore doesn't run it to the end: a drain gives up
+//! between requests, and between the segments of one, once the device is
+//! abandoned or the time the stop gave the guest's queued work is up
+//! (`giving_up`). `quiesce` stops the device for a snapshot once every
+//! request the guest queued has completed, and says whether that happened in
+//! time; `abandon` and `stop_taking_requests` stop it for a teardown that
+//! keeps nothing.
 
 use crate::diag::etw;
 use crate::host::block_file::{BlockFile, Op, Request};
 use crate::virtio::device::{
-    DEVICE_ID_BLOCK, FEATURE_RING_EVENT_IDX, FEATURE_VERSION_1, VirtioDevice,
+    DEVICE_ID_BLOCK, FEATURE_RING_EVENT_IDX, FEATURE_VERSION_1, VirtioDevice, guest_work_cut_off,
 };
 use crate::virtio::queue::{ChainBuf, ChainScratch, Virtqueue};
 use crate::whp::GuestMemory;
@@ -328,6 +338,15 @@ pub struct BlockDevice {
     epoch: AtomicU32,
     /// Set by `quiesce`: the device takes no more requests.
     stopped: AtomicBool,
+    /// Set by `abandon`: a drain takes no further request, and one it is
+    /// submitting a segment at a time is cut short (see `giving_up`).
+    abandoning: AtomicBool,
+    /// Giving up had an effect: a request stayed in the ring, or was cut
+    /// short and failed. The device is then no state to snapshot.
+    gave_up: AtomicBool,
+    /// Called before each segment of a request submitted a segment at a time.
+    #[cfg(test)]
+    before_segment: Mutex<Option<Box<dyn Fn() + Send>>>,
     /// Most requests the guest had outstanding at once (in flight here plus
     /// still waiting in the avail ring), sampled at each pop.
     max_depth: AtomicU64,
@@ -404,6 +423,10 @@ impl BlockDevice {
             active: AtomicU64::new(0),
             epoch: AtomicU32::new(0),
             stopped: AtomicBool::new(false),
+            abandoning: AtomicBool::new(false),
+            gave_up: AtomicBool::new(false),
+            #[cfg(test)]
+            before_segment: Mutex::new(None),
             max_depth: AtomicU64::new(0),
         });
 
@@ -459,7 +482,13 @@ impl BlockDevice {
     /// snapshot never captures a request taken off the avail ring but not yet
     /// completed, and the backend can stop with nothing in flight. Doorbells
     /// that arrive afterwards are ignored.
-    pub fn quiesce(&self) {
+    ///
+    /// Returns whether every request taken settled by `deadline`; while it
+    /// returns false, guest RAM and the backend must stay as they are, as for
+    /// [`Self::stop_taking_requests`]. A device at rest is still no state to
+    /// snapshot if it gave up on what the guest had queued: the caller asks
+    /// [`Self::left_work_behind`] as well.
+    pub fn quiesce(&self, deadline: Instant) -> bool {
         {
             let mut scratch = self.drain_chain.lock().unwrap();
             if !self.stopped.load(Ordering::Relaxed) {
@@ -470,6 +499,9 @@ impl BlockDevice {
         let start = Instant::now();
         let mut warned = false;
         while self.active.load(Ordering::Acquire) != 0 {
+            if Instant::now() >= deadline {
+                return false;
+            }
             if !warned && start.elapsed() >= Duration::from_secs(5) {
                 warned = true;
                 eprintln!(
@@ -479,6 +511,60 @@ impl BlockDevice {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+        true
+    }
+
+    /// A teardown that keeps nothing of the guest has begun: take no further
+    /// request off the ring, and cut short one that is being submitted a
+    /// segment at a time. It takes no lock, so it reaches a drain that is
+    /// under way, which is then back within one segment's I/O (the host
+    /// serves a read from its cache, or of a sparse file's hole, before
+    /// `ReadFile` returns). Otherwise a request whose segments name the
+    /// whole disk would keep the draining thread, and the stop that is
+    /// waiting for it, for as long as the guest chose. Followed by
+    /// [`Self::stop_taking_requests`].
+    pub fn abandon(&self) {
+        self.abandoning.store(true, Ordering::Release);
+    }
+
+    /// Whether a drain leaves the rest of what the guest queued: the device
+    /// was abandoned, or the VM is stopping and the time its queued disk work
+    /// was given is up. The second reaches a drain on a vCPU's thread (the
+    /// kick was a VM exit: no doorbells), which `abandon` can't: teardown
+    /// calls that once the vCPUs are joined, and this one isn't until its
+    /// drain returns.
+    fn giving_up(&self) -> bool {
+        self.abandoning.load(Ordering::Relaxed) || guest_work_cut_off()
+    }
+
+    /// Whether giving up left a request of the guest's unserved: in the ring
+    /// still, or failed part-way. A snapshot of the device would then hold a
+    /// request the restored guest waits on for good, or an I/O error the
+    /// guest's disk never had.
+    pub fn left_work_behind(&self) -> bool {
+        self.gave_up.load(Ordering::Acquire)
+    }
+
+    /// Stop for a teardown that keeps nothing of the guest: take no more
+    /// requests, leaving what the guest queued in its ring, and wait until
+    /// `deadline` for those already taken to settle. Returns whether they
+    /// all did. Unlike [`Self::quiesce`] it runs none of the work a guest
+    /// left behind, and it can't wait forever on a disk that doesn't answer;
+    /// while it returns false, guest RAM and the backend must stay as they
+    /// are, since the host may still be reading or writing through them.
+    pub fn stop_taking_requests(&self, deadline: Instant) -> bool {
+        {
+            // Serialises with a drain still running on another thread.
+            let _scratch = self.drain_chain.lock().unwrap();
+            self.stopped.store(true, Ordering::Relaxed);
+        }
+        while self.active.load(Ordering::Acquire) != 0 {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        true
     }
 
     fn raise(&self, qidx: u32) {
@@ -649,6 +735,19 @@ impl BlockDevice {
             };
             let mut file_off = base_offset;
             for seg in data {
+                #[cfg(test)]
+                if let Some(hook) = &*self.before_segment.lock().unwrap() {
+                    hook();
+                }
+                // The host may serve each segment before the call returns
+                // (`sync` always does), so on this thread the request lasts
+                // as long as its segments together: no further once the
+                // guest's queued work is being left.
+                if self.giving_up() {
+                    self.gave_up.store(true, Ordering::Release);
+                    unsafe { (*parent).failed.store(true, Ordering::Relaxed) };
+                    break;
+                }
                 // Bounds-check each segment against the backing file (subtraction
                 // form so a 32-bit length + 64-bit offset can't wrap the check).
                 if file_off > backend_size || seg.len as u64 > backend_size - file_off {
@@ -739,6 +838,12 @@ impl BlockDevice {
         // ones stay async so a host cache miss never stalls the others.
         let inline_ok = crate::virtio::transport::on_doorbell_pump();
         loop {
+            if self.giving_up() {
+                if self.queue.lock().unwrap().has_avail() {
+                    self.gave_up.store(true, Ordering::Release);
+                }
+                break;
+            }
             let (taken, waiting, epoch) = {
                 let mut q = self.queue.lock().unwrap();
                 if !q.pop_into(scratch) {
@@ -1311,6 +1416,11 @@ mod tests {
         mem.read_array::<1>(gpa).unwrap()[0]
     }
 
+    /// A deadline no test should come near.
+    fn soon() -> Instant {
+        Instant::now() + Duration::from_secs(10)
+    }
+
     fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !done() {
@@ -1381,7 +1491,7 @@ mod tests {
         dev.notify_queue(0);
         wait_until("a FLUSH on the new queue", || fresh.used_idx(&mem) == 1);
         assert_eq!(byte(&mem, status), BLK_S_OK);
-        dev.quiesce();
+        assert!(dev.quiesce(soon()));
         backend.stop();
     }
 
@@ -1412,7 +1522,8 @@ mod tests {
 
         // Published after the last drain: the doorbell pump never got to it.
         let status = ring.request(&mem, 2, 4, BLK_T_IN, &DATA);
-        dev.quiesce();
+        assert!(dev.quiesce(soon()), "everything queued was served");
+        assert!(!dev.left_work_behind());
         let q = dev.capture_queue(0).unwrap();
         assert_eq!((q.last_avail, q.last_used_idx), (3, 2));
         assert_eq!(ring.used_idx(&mem), 2);
@@ -1426,6 +1537,101 @@ mod tests {
         assert_eq!(dev.queue_has_work(0), Some(false));
         dev.notify_queue(0);
         assert_eq!(dev.capture_queue(0).unwrap().last_avail, 3);
+        backend.stop();
+        assert_eq!(backend.inflight(), 0);
+    }
+
+    /// A teardown that keeps nothing of the guest runs none of what the
+    /// guest left in its ring: once abandoned, a drain takes nothing, and
+    /// stopping finds nothing in flight to wait for.
+    #[test]
+    fn an_abandoned_device_leaves_the_ring_as_it_is() {
+        let image = Image::new();
+        let (mem, backend, dev) = device(&image);
+        let ring = Ring(0x1_0000);
+        ring.enable(&dev);
+        let first = ring.request(&mem, 0, 0, BLK_T_IN, &DATA);
+        dev.notify_queue(0);
+        wait_until("the first read", || byte(&mem, first) == BLK_S_OK);
+
+        let left = ring.request(&mem, 1, 4, BLK_T_IN, &DATA);
+        dev.abandon();
+        assert!(!dev.left_work_behind(), "nothing has been passed over yet");
+        dev.notify_queue(0);
+        assert_eq!(dev.capture_queue(0).unwrap().last_avail, 1, "not taken");
+        assert_eq!(byte(&mem, left), 0xaa, "its status byte is untouched");
+        assert!(dev.left_work_behind());
+        assert!(dev.stop_taking_requests(soon()));
+        dev.notify_queue(0);
+        assert_eq!(dev.capture_queue(0).unwrap().last_avail, 1);
+        backend.stop();
+        assert_eq!(backend.inflight(), 0);
+    }
+
+    /// Abandoning costs a snapshot only what it passed over: with nothing in
+    /// the ring the device comes to rest whole, with something it says that
+    /// it didn't.
+    #[test]
+    fn an_abandoned_device_tells_whether_it_left_work_behind() {
+        let image = Image::new();
+        for queued in [false, true] {
+            let (mem, backend, dev) = device(&image);
+            let ring = Ring(0x1_0000);
+            ring.enable(&dev);
+            let status = queued.then(|| ring.request(&mem, 0, 0, BLK_T_IN, &DATA));
+            dev.abandon();
+            assert!(dev.quiesce(soon()), "at rest either way");
+            assert_eq!(dev.left_work_behind(), queued);
+            if let Some(status) = status {
+                assert_eq!(byte(&mem, status), 0xaa, "left in the ring, untouched");
+                assert_eq!(ring.used_idx(&mem), 0);
+            }
+            backend.stop();
+            assert_eq!(backend.inflight(), 0);
+        }
+    }
+
+    /// A request too large to coalesce is submitted a segment at a time, and
+    /// the host may serve each before the call returns, so the draining
+    /// thread is held for as long as the segments take together. Abandoning
+    /// reaches it between two of them: the request fails there, with the
+    /// rest of its segments never read, rather than run to its end.
+    #[test]
+    fn abandoning_cuts_a_request_short_between_segments() {
+        const SEG: u32 = 2 << 20;
+        let image = Image::new();
+        let (mem, backend, dev) = device(&image);
+        let ring = Ring(0x1_0000);
+        ring.enable(&dev);
+        // Three segments, more together than a bounce buffer holds, all
+        // naming one guest buffer.
+        let buf = 0x40_0000;
+        mem.write_at(buf, &vec![0x11; SEG as usize]).unwrap();
+        let status = ring.request(&mem, 0, 0, BLK_T_IN, &[(buf, SEG, true); 3]);
+
+        let segments = Arc::new(AtomicU32::new(0));
+        let hook = {
+            let (segments, dev) = (segments.clone(), Arc::downgrade(&dev));
+            move || {
+                if segments.fetch_add(1, Ordering::SeqCst) == 1 {
+                    dev.upgrade().unwrap().abandon();
+                }
+            }
+        };
+        *dev.before_segment.lock().unwrap() = Some(Box::new(hook));
+        dev.notify_queue(0);
+
+        wait_until("the request to fail", || ring.used_idx(&mem) == 1);
+        assert_eq!(byte(&mem, status), BLK_S_IOERR);
+        assert_eq!(
+            segments.load(Ordering::SeqCst),
+            2,
+            "the third was never reached"
+        );
+        assert!(dev.left_work_behind());
+        // The first segment had been read before the request was given up.
+        assert_eq!(byte(&mem, buf), 0x5a);
+        assert!(dev.stop_taking_requests(soon()));
         backend.stop();
         assert_eq!(backend.inflight(), 0);
     }

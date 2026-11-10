@@ -233,6 +233,15 @@ repo root) and need WHP — bare metal or nested Hyper-V:
 | `python tools\nat_test.py [--backend nat\|smoltcp\|slirp\|gvisor]` | how a user-mode backend ends connections and relays datagrams (phases A–L, [§3](#virtio-net-backends---net-backend)) |
 | `python tools\save_restore_test.py [--vcpus 2 --trigger-cpu 1]` | `--save`, then three `--restore`s of the snapshot, which they leave unchanged; `--trigger-cpu` fires the trigger from that vCPU (an AP when above 0) |
 
+`python poc\run.py` attacks a build rather than exercising it: a hostile
+virtio driver in guest user space (rings that lie about their length, chains
+that name all of guest RAM, resets mid-request, a read of the whole disk as
+the VM is stopped), and host-side cases (a boot image's `grub.cfg`, a DLL
+planted in the current directory, an interrupted `--save`). It prints
+`VULNERABLE` or `NOT VULNERABLE` per case with what it measured, for an old
+build and a new one, and needs zig to build its guest; see
+[`poc/README.md`](poc/README.md).
+
 ### Large pages
 
 Plain builds allocate guest RAM with `MEM_LARGE_PAGES` (2 MiB pages) when the
@@ -312,7 +321,7 @@ may come before or after the kernel path; a bare `--` ends them.
 | `--net-backend loopback\|nat\|smoltcp\|slirp\|gvisor\|wintun` | `nat` | Backend for the current NIC (see [§3](#virtio-net-backends---net-backend)). `smoltcp` is the NAT with smoltcp as its TCP engine; `slirp` and `gvisor` need their DLLs. |
 | `--portfwd HOSTPORT:GUESTPORT` | — | Forward `127.0.0.1:HOSTPORT` and `[::1]:HOSTPORT` (host) → `172.29.255.2:GUESTPORT` (guest). Clients resolve `localhost` to `::1` first, and Windows takes ~2 s to refuse a connect to a closed loopback port, so without the IPv6 listener every new `localhost` connection would wait that long before falling back to IPv4 (`nat`/`smoltcp`; skipped where the host has no IPv6, with a warning if another process holds the port on `::1`). User-mode backends (`nat`, `smoltcp`, `slirp`, `gvisor`) only. Repeatable per NIC. |
 | `--nat-workers <N>` | a quarter of the host's logical CPUs, 1–4 | NAT worker threads for the current NIC (`nat`, `smoltcp`), **1–16**. Each owns the TCP flows assigned to it; one flow never spans workers, so this scales many-flow traffic, not a single stream (see [§3](#3-devices-in-detail)). Kept across `--save`/`--restore`. |
-| `--nat-host-local` | off | Let the current NIC's guest (`nat`, `smoltcp`) reach host-local destinations: the host's loopback on every port of the gateway `172.29.255.1`, and `127.0.0.0/8`, link-local `169.254.0.0/16` (cloud metadata such as Azure IMDS) and Azure's `168.63.129.16` directly. Off, the NAT refuses them, except DNS: port 53 of the gateway (a resolver on the host's `127.0.0.1`) and of `168.63.129.16` (Azure DNS). See [§3](#virtio-net-backends---net-backend). Kept across `--save`/`--restore`. |
+| `--nat-host-local` | off | Let the current NIC's guest (`nat`, `smoltcp`, `slirp`, `gvisor`) reach host-local destinations: the host's loopback on every port of the gateway `172.29.255.1`, and `127.0.0.0/8`, the host's own addresses, link-local `169.254.0.0/16` (cloud metadata such as Azure IMDS), the metadata addresses `100.100.100.200` and `192.0.0.192`, and Azure's `168.63.129.16` directly. Off, they are refused, except DNS: port 53 of the gateway (a resolver on the host's `127.0.0.1`), of the host's own addresses and of `168.63.129.16` (Azure DNS). A guest that must reach a service on the host itself needs this flag. See [§3](#virtio-net-backends---net-backend). Kept across `--save`/`--restore`. |
 | `--wintun-name <adapter>` / `--wintun-host <ipv4>` | — | WinTun adapter name / host-side gateway IPv4 (wintun backend). |
 | `--drive <path>[,readonly\|ro]` | — | Add a VHDX-backed virtio-blk disk using the native Windows driver. Raw disk images are not supported, including read-only ones; `--iso` separately attaches read-only installation media. **Repeatable up to 8** (`/dev/vda`, `/dev/vdb`, …). With no kernel path and no `--iso` (plain builds), tinyvmm boots the Linux installed on the first drive that has one, before the VM starts: it reads the partition table (GPT or MBR), finds an ext2/3/4 filesystem with `boot/grub/grub.cfg` or `boot/grub2/grub.cfg` (or `grub/`/`grub2/` on a separate `/boot`), and boots that configuration's first `menuentry` with a `linux` line, as `--iso` does. So drop `--iso` once an installation finishes, and a kernel the guest installs boots next time. A filesystem that wasn't cleanly unmounted (a VM killed rather than shut down) is read as Linux sees it after recovery: the journal's committed transactions are replayed in memory. Code in `src/convenience/`. |
 | `--virtio-9p-share <tag>=<host_dir>[,ro][,uid=<n>][,gid=<n>][,metadata][,nocase]` | — | Share a host directory over virtio-9p (9P2000.L). **Repeatable up to 8.** Tag 1–256 bytes; host path canonicalized and must be a directory; duplicate tags rejected. NTFS has no POSIX owners, so by default every entry reports owner `uid`:`gid` (default `0:0`, root) with a synthesized mode (dirs `0755`, files `0644`, `0444` if read-only on the host). The guest enforces those bits, so set `uid`/`gid` to the guest user that must write; `chmod`/`chown` succeed but aren't stored. With `metadata` (like WSL's drvfs option of the same name), owners and modes live in WSL's `$LXUID`/`$LXGID`/`$LXMOD` NTFS extended attributes: `chmod`/`chown` persist, new files record their creator, group and mode, WSL sees the same values, and `uid`/`gid` apply only to entries without metadata. Names match case exactly, as on Linux: `cat A.cs` doesn't open `a.cs`. Each lookup compares the name the file system stores (NTFS, ReFS), read in the same call as the attributes, so it costs nothing. With `nocase`, names match ignoring case, as on Windows. Only lookups are exact: Windows can't hold two names that differ only in case, and creating, renaming or deleting by name still ignores case. While the VM runs, the root is held open, so Windows won't rename the folders that contain it (§9). Kept across `--save`/`--restore`. |
@@ -325,6 +334,7 @@ may come before or after the kernel path; a bare `--` ends them.
 | `--save <path>` | — | Arm snapshot-on-trigger: when the guest issues `CPUID(0x4000DE57)`, quiesce the machine, write `<path>`, and exit. |
 | `--unsafe-save-mutable-drive` | off | Allow `--save` with a *writable* `--drive` attached (otherwise refused — the disk is not part of the snapshot, so a mutated disk would diverge from restored RAM). |
 | `--watchdog-secs <N>` | `0` | `0` = run until stopped; else stop after N seconds, printing `io/cpuid/msr` exit counters each second. |
+| `--shutdown-sentinel` | off | Stop the VM at once when the guest prints `=== tinyvmm shutdown requested ===` on hvc0. For test guests whose kernel has no ACPI and so can't power off (the `tools\` harnesses pass it). Off by default: anything in the guest that gets that line onto the console (a service whose log is echoed there, say) could otherwise cut the VM's power, unsynced data and all. A guest with ACPI just powers off (the appliance's tinyinit prints the sentinel and then does). If a guest prints the sentinel without this flag and is still running 5 s later, tinyvmm says that it ignored it. |
 | `--debug-boot` | off | Prepend `earlyprintk=ttyS0,115200` so early boot streams to the 8250 UART before hvc0 is up. |
 | `--no-default-cmdline` | off | Leave out the default kernel command line (below). |
 | `--no-vmbus` | off | Leave out VMBus and its services: time sync, which keeps the guest's clock on the host's as in WSL, and shutdown, which lets tinyvmm ask the guest to shut down (see [VMBus: time sync & shutdown](#vmbus-time-sync--shutdown-srcvmbus)). Off on its own where the host's WHP can't run it. |
@@ -356,7 +366,7 @@ and accepts a small set of overrides:
 |------|-----------|
 | `--drive <path>[,ro\|rw]` | Re-attach disks (blk content is not in the snapshot, so the operator supplies the backing files in the same order). |
 | `--unsafe-restore-mutable-drive` | Permit re-attaching a writable disk whose size differs from save time. |
-| `--cpu-affinity …` / `--watchdog-secs N` / `--poll-us N` | Same as `--pvh-run`. |
+| `--cpu-affinity …` / `--watchdog-secs N` / `--poll-us N` / `--shutdown-sentinel` | Same as `--pvh-run`. |
 | `--record <file.mp4>[,fps=N][,kbps=N]` | Record the restored VM, as with `--pvh-run` (the snapshot must include a GPU). Recording starts with the restored frame. |
 
 ### Examples
@@ -402,9 +412,9 @@ Close the VM before mounting its VHDX in WSL for offline
 editing; flush, unmount, and detach it from WSL before booting the VM again.
 
 The text console forwards raw stdin to the virtio-console RX queue; **Ctrl+A then
-S** asks the guest to shut down and **Ctrl+A then X** quits at once. The guest can
-also request a clean shutdown by printing a sentinel on hvc0, which a watcher
-thread detects to stop the VM.
+S** asks the guest to shut down and **Ctrl+A then X** quits at once. With
+`--shutdown-sentinel`, a guest that can't power off (a test kernel without ACPI)
+can ask to be stopped by printing a sentinel line on hvc0.
 
 The guest powering off (ACPI S5) or rebooting (the ACPI reset register, or the
 keyboard controller's reset) stops the VM with exit code 0; tinyvmm never
@@ -806,13 +816,19 @@ including the audio track.
     retransmissions (`SIO_TCP_INITIAL_RTO`), which otherwise take ~2 s to
     report a refusal.
   * Host-local destinations are refused at once, the way a router keeps its
-    clients off its own loopback: the gateway's ports other than DNS (53), and
-    `127.0.0.0/8`, link-local `169.254.0.0/16` (where clouds serve instance
-    metadata and identity tokens, e.g. Azure IMDS at `169.254.169.254`) and
-    Azure's platform address `168.63.129.16` except its DNS port. A guest would
+    clients off its own loopback: the gateway's ports other than DNS (53),
+    `127.0.0.0/8`, the host's own addresses on every interface except their
+    DNS port (Windows delivers what the host sends to itself locally, so its
+    inbound firewall rules don't apply; the addresses are re-read every
+    second), link-local `169.254.0.0/16` (where clouds serve instance
+    metadata and identity tokens, e.g. Azure IMDS at `169.254.169.254`), the
+    metadata addresses `100.100.100.200` and `192.0.0.192`, and Azure's
+    platform address `168.63.129.16` except its DNS port. A guest would
     otherwise reach them as the host, past the firewall and with the host's
     cloud identity. `--nat-host-local` lets them through: the gateway then
-    stands for the host's loopback on every port.
+    stands for the host's loopback on every port. A guest that should reach a
+    service on the host (a dev server on the LAN address, say) needs that
+    flag, or a `--portfwd` in the other direction.
   * A host-side reset reaches the guest as a reset, not a clean EOF that would
     make a cut-off stream look complete; and the guest's reset reaches the host
     as one (an abortive close, `SO_LINGER` 0). Only the FIN handshake ends the
@@ -853,16 +869,34 @@ including the audio track.
   thread owns it and polls its host sockets with `WSAPoll`. libslirp takes and
   builds MTU-sized frames, so guest TSO super-segments are segmented in
   software first. Same addresses as `nat`, plus libslirp's own DNS forwarder at
-  `172.29.255.3`, which its DHCP offers. `python tools\fetch_libslirp.py`
+  `172.29.255.3`, which its DHCP offers. The NAT's destination policy applies
+  here and to `gvisor` too, by a filter on the guest's frames
+  (`src/net/filter.rs`): left to themselves both stacks connect, as the host,
+  to anything the guest names (libslirp takes every address on the guest's
+  link for the host's loopback, gVisor's shim dials `127.0.0.1` or a metadata
+  address as given), so the gateway and the DNS forwarder serve port 53 only,
+  host-local destinations are refused (a connection attempt with a reset),
+  multicast and broadcast stay on the guest's link, and `--nat-host-local`
+  opts back in. `python tools\fetch_libslirp.py`
   fetches MSYS2's UCRT64 build (`libslirp-0.dll` and the GLib, libintl,
   libiconv and PCRE2 DLLs it imports, with their licenses) into
-  `target\release`; tinyvmm loads it from `TINYVMM_LIBSLIRP` (a path), next to
-  `tinyvmm.exe`, or the DLL search path.
+  `target\release`. The packages are pinned: `tools\libslirp.lock.json` names
+  each package file and its SHA-256, and nothing else is accepted
+  (`--update-lock` takes what the repository offers now, for review). tinyvmm
+  loads `libslirp-0.dll` from the path in
+  `TINYVMM_LIBSLIRP` if that is set, else from the directory `tinyvmm.exe` is
+  in, and from nowhere else; the DLLs it imports load from its own directory,
+  `tinyvmm.exe`'s or System32. Neither the current directory nor `PATH` is
+  searched, for this
+  DLL or for the gVisor and WinTun ones below: a DLL found there (in a folder
+  shared with a guest, say) would run inside the VMM. A DLL that is missing,
+  or doesn't load, is an error naming the path tried.
 * **`gvisor`** — [gVisor](https://gvisor.dev)'s netstack, the user-space TCP/IP
   stack of gVisor's sandbox and of gvisor-tap-vsock (`src/net/gvisor.rs`, FFI in
   `crates/winsys/src/gvisor.rs`). `gvisor\build.ps1` builds `gvisor/` (Go, cgo
   with a MinGW-w64 `gcc` or `zig cc`) into `target\release\tinyvmm_gvisor.dll`,
-  loaded from `TINYVMM_GVISOR`, next to `tinyvmm.exe`, or the search path
+  loaded from the path in `TINYVMM_GVISOR` if that is set, else from the
+  directory `tinyvmm.exe` is in, and from nowhere else
   (`TINYVMM_GVISOR_DEBUG=1` prints the stack's nonzero counters and any
   connection the forwarder never finished when the VM stops; `2` also logs
   each connection). The stack owns the gateway
@@ -874,9 +908,17 @@ including the audio track.
   TIME_WAIT only to a listening endpoint, which a forwarder isn't, so a guest
   reusing a port the stack had closed first stalled for up to 60 s. DHCP is
   answered in tinyvmm (the NAT's lease); pings to hosts other than the gateway
-  are dropped.
-* **`wintun`** — bridges onto a real WinTun L3 adapter (`wintun.dll` loaded at
-  runtime via `GetProcAddress`; requires elevation to create the adapter).
+  are dropped. Like the NAT, the shim bounds what it relays: 4096 TCP flows
+  (a connection past that is refused) and 256 UDP flows (the least recently
+  used gives way to a new one), and past 256 open TCP flows a new one relays
+  through 32 KiB buffers instead of 256 KiB. Without the bound a guest opening
+  flows as fast as it could send packets pinned gigabytes of host memory and
+  a host socket per flow.
+* **`wintun`** — bridges onto a real WinTun L3 adapter (requires elevation to
+  create the adapter). `wintun.dll` is loaded at run time from the path in
+  `TINYVMM_WINTUN` if that is set, else from the directory `tinyvmm.exe` is
+  in, and from nowhere else: tinyvmm runs elevated here, so it must not pick
+  one up from the current directory or `PATH`.
 
 #### Comparing the user-mode backends
 
@@ -1008,6 +1050,16 @@ the vCPUs are joined, teardown stops every doorbell pump and device thread,
 closes the NAT's sockets and frees guest RAM before it unregisters a doorbell or
 deletes the partition (`ReleaseBeforeTeardown` in `main.rs`). A stuck process
 then holds a few MB and no ports, and warns after 10 s.
+
+For the same reason a doorbell is **never unregistered while the VM runs**. The
+guest decides when a BAR is unmapped (it clears the command register's memory
+bit, or moves the BAR), and it also decides how many signals the doorbell has
+seen: unregistering there would let it park the vCPU thread in that wait from
+inside the VM. A transport registers its doorbells once, at the first address
+its BAR is mapped at, and keeps them until teardown. While the BAR is unmapped
+or mapped elsewhere, a write that still matches the old address is handed to
+the MMIO bus like any other write to that address (where nothing answers), so
+the guest sees what an unmapped BAR would give it.
 
 Use `--no-doorbells` with `--pvh-run` or `--restore` to avoid this doorbell
 teardown path altogether. It disables WHP MMIO doorbell registration for
@@ -1422,10 +1474,17 @@ static mut / Box::leak
   (WHP handle delete + event close), `BlockFile`/`Inner` (`CloseHandle` of the
   file + IOCP), `MappedFile` (`UnmapViewOfFile`), `PciTransport` (tear down the
   doorbell pump + join), the `Display` window thread, and `SnapshotWriter` (delete
-  a half-written file). Teardown order is explicit in `main.rs` — blk devices are
-  quiesced and their IOCP workers stopped *before* their owners drop, so no
-  completion lands on freed memory; then the doorbell pumps, NIC backends and 9p
-  workers stop and guest RAM is freed before any doorbell or the partition is
+  a half-written file). Teardown order is explicit in `main.rs` (`settle_devices`,
+  then `ReleaseBeforeTeardown`) — the disks stop running what the guest has
+  queued as soon as the stop is announced (see *Work per kick* below), the
+  doorbell pumps are joined, blk devices stop
+  taking requests and wait for those in flight (30 s at most for both; a disk
+  that doesn't answer keeps its buffers and guest RAM until the process exits,
+  and a pump still serving a request by then ends the process on the spot), and
+  their IOCP workers are stopped *before* their owners drop, so no
+  completion lands on freed memory; then every queue is disabled, the NIC
+  backends and 9p workers stop and guest RAM is freed before any doorbell or the
+  partition is
   torn down (see [Doorbells](#doorbells--the-notify-without-a-vm-exit-path)).
 * **`#[repr(C)]` (8) + `transmute` (12)** — ABI control at the FFI line. `repr(C)`
   guarantees field order for the `OVERLAPPED`-first request structs and the NAT
@@ -1481,6 +1540,7 @@ free-list, the `OnceLock` callbacks, the `UnsafeCell` slot bodies).
 | `Mutex<RxPool>` + `Mutex<TxScratch>` (net) | RX slot pool + reused TX scratch | the backend worker injecting vs the vCPU/pump draining | hand-off boundary between the network thread and the device |
 | transport mutexes (`Common`, `PciConfigSpace`, `Option<DoorbellState>`) | virtio common-cfg, PCI config space, the live doorbell set | vCPU MMIO writes vs BAR (un)map vs pump lifecycle | a config write mutates several fields consistently |
 | 9p `Mutex<Fids>` + `SlotPool` free-list `Mutex<Vec<u16>>` | the open fid→handle map; free slot indices | the 9p workers running concurrent reads/writes | a shared mutable map + index pool across the pool |
+| 9p `Mutex<Flights>` + `OwnedHandle::listing` | which request each slot carries and the `Tflush` slots parked on it; a directory handle's listing in the making (each handle has its own lock) | a worker retiring a request vs one parking a `Tflush` on it; two readdirs of one directory handle | a reply and the unlisting of its request must be one step for a `Tflush` to order after it (taken alone or before the queue lock, never inside it); a handle's place in its directory must not move between choosing to carry on from it and noting where it then stands (taken before `Fids`) |
 | gpu `Mutex<GpuState>` + queue/scratch mutexes | resources map, scanout binding | the vCPU draining controlq vs the present path | resource table + scanout mutate together |
 | scanout `Mutex<State>` (`src/scanout.rs`) | the latest picture (`Arc<Frame>`), spare buffers, recent damage, the window's dirty area | the vCPU publishing a flush vs the window and the recorder taking the latest picture | readers only clone an `Arc` under it and read outside it; the vCPU draws on a spare no reader holds |
 | input `Mutex<Virtqueue>` + `Mutex<ChainScratch>` (event/status) | eventq/statusq + reused scratch | the window thread injecting vs the vCPU | host-event injection vs guest kicks |
@@ -1512,7 +1572,33 @@ the locking story above.
   `>= size`; the descriptor table is validated mapped before traversal; the chain
   walk is **bounded by `size`** and every `next` index — direct *and* indirect — is
   checked `< size` / `< inner_count`, so a cyclic or oversized chain can neither
-  loop nor run off the ring.
+  loop nor run off the ring. The avail index is bounded too: a driver can have at
+  most `size` buffers outstanding, so an `avail.idx` more than `size` ahead of
+  what the device has taken is a driver that broke the ring, not 65535 requests
+  to serve (each re-reading the same descriptors). The queue is then marked
+  **broken** and yields nothing more until the driver resets it, as is one whose
+  head or descriptor table is out of range. One kick is therefore at most `size`
+  chains of work.
+* **Work per kick:** what a chain makes the host do is bounded as well, since a
+  chain's descriptors can each name all of guest RAM and a drain runs to the end
+  on a vCPU or pump thread that a stop request can't interrupt. Console output
+  is written at most 1 MiB per chain (64 KiB once the VM is stopping; the rest
+  is dropped and counted), host input waiting for a guest that doesn't read is
+  capped at 16 MiB, virtio-input reads at most 64 status events per chain,
+  virtio-snd's silent capture zeroes at most 1 MiB per period, and a virtio-gpu
+  transfer walks its backing list once rather than once per row. Once the VM
+  is stopping, host-side sources (console input, input events, the audio
+  workers) leave the rings alone. A disk request has no such cap: a chain may
+  name the whole disk many times over (254 segments of up to `size_max`, the
+  same guest buffer for each), the host serves a cached or sparse read before
+  `ReadFile` returns, and a ring holds 256 chains, hours of work on the
+  draining thread. That is the guest's own time while it runs; a stop is
+  bounded in time instead. Once the VM is stopping, a disk's drain gives up
+  between requests and between the segments of one (`BlockDevice::giving_up`,
+  `virtio::device::guest_work_cut_off`), on whichever thread it runs: at once
+  for a stop that keeps nothing of the guest (what it left queued is its own
+  to lose, as at a power cut), and 15 s after the trigger for a snapshot,
+  which is then not written.
 * **virtio-blk (`src/virtio/blk.rs`):** requires ≥ header+status descriptors, a
   device-readable header ≥ 16 B and a device-writable status ≥ 1 B; rejects an
   out-of-range sector **before** the `sector * 512` multiply (and bounds each
@@ -1521,10 +1607,26 @@ the locking story above.
   never a panic.
 * **virtio-gpu (`src/virtio/gpu.rs`):** resource IDs are checked before lookup;
   geometry is capped at `MAX_DIM`; scanout id and rectangle are bounds-checked;
-  `RESOURCE_ATTACH_BACKING` caps the SG-entry count and validates the request
-  length before parsing; `read_backing()` fails if the SG list does not fully cover
-  the transfer. Malformed commands are answered with an error response, not a
-  panic.
+  `RESOURCE_ATTACH_BACKING` caps the SG-entry count per resource and across
+  all resources (2^20 entries, 16 MiB of host memory) and validates the request
+  length before parsing; a transfer reads through a `BackingCursor`, which
+  fails if the SG list does not fully cover it. Malformed commands are answered
+  with an error response, not a panic.
+* **Boot from a `--drive` or `--iso` (`src/convenience/`, `src/boot/loader.rs`):**
+  a guest wrote the disk that the next start reads before any VM exists, so
+  what an image can make the host allocate or read is capped, and going over a
+  cap is an error that names it, never a silent truncation. A `grub.cfg` is at
+  most 1 MiB, a line after variable substitution 64 KiB (`set a=$a$a` can't
+  double its way to terabytes) and all lines together 4 MiB, with at most 1024
+  variables. An entry loads at most 8 initrds, 2 GiB together, and a 1 GiB
+  kernel; a file over its limit is refused before it is read. An ext4 extent
+  tree must be in file order with no extent overlapping the one before, as
+  Linux requires, so no block of a file is mapped (and read) twice. A journal
+  that needs replay must be a regular file of at most 4 GiB and 2^20 blocks,
+  with at most 2^22 revoke records; a path is at most 4096 bytes and 256 name
+  lookups, symlink targets included. Disk boot reads at most 16 GiB of a drive
+  in all. The PVH loader takes at most 1024 program headers and refuses
+  `PT_LOAD` or note headers that name the same file bytes over and over.
 * **Recorder (`src/record.rs`, `--record`):** guest output only ever reaches it
   through bounded buffers: the scanout's pictures (at most three kept, sized by
   the GPU's own resource caps) and a PCM queue capped at 2 s, beyond which new
@@ -1546,7 +1648,9 @@ the locking story above.
   Each path component is checked by `is_safe_name_component` — rejecting
   empty / `.` / `..`, length > 255, control chars `< 0x20`, the separators and
   Win32 metacharacters `/ \ : * ? " < > |`, a trailing dot or space, and the
-  reserved DOS names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`).
+  reserved DOS names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`,
+  also with a superscript digit, or with spaces before the first dot, which
+  Win32 takes for the same devices).
   `.`/`..` in a `Twalk` are resolved with **clamp-to-root**. Every host operation
   parses the fid's path in one `NtCreateFile` relative to the root handle with
   `OBJ_DONT_REPARSE`, so the kernel refuses a symlink, junction or mount point
@@ -1556,17 +1660,44 @@ the locking story above.
   rename or truncate outside the share. Paths through links still work when the
   link leads inside the share: the slow path follows the link with attribute
   access only, checks the real path (`GetFinalPathNameByHandleW`) against the
-  root's, and only then reopens with the requested access. Deletes and renames
+  root's, and only then reopens with the requested access. Until a path is
+  known to lie inside the share, every failure on that slow path is `EACCES`:
+  whether what a link leads to outside is a directory, a file or missing would
+  otherwise tell the guest what exists on the host. A stale link whose target
+  would lie inside the share is told apart, so that it is `ENOENT` as on Linux
+  rather than "permission denied": the link's own target is read
+  (`FSCTL_GET_REPARSE_POINT`), placed below the root by its text (`..` taking
+  the component before it; an absolute target by its device's NT path), and
+  looked up a component at a time, following nothing, in directories that lie
+  inside the share (`link_missing_inside`). A target that leaves the share is
+  not looked up at all, and an absolute one written another way than the
+  root's real path (a short `PROGRA~1` name, a `subst` drive) stays `EACCES`.
+  Deletes and renames
   act on a link itself, never on its target. Read-only shares reject writes with
   `EROFS`. Because the root is held open, Windows won't rename the folders that
   contain a share root while the VM runs, as for any open folder; the root
   itself can still be renamed or moved, and the share follows it. If the root is
   deleted (a build step that deletes and recreates its output folder), the share
   reattaches to the directory then at the share path, provided it lies where the
-  root was rather than behind a link left in its place. Every open directory
-  fid's readdir listing counts against one 64 MiB budget: a guest opening
-  thousands of fids on a big directory drops other fids' listings (rebuilt if
-  their readdir carries on) instead of growing host memory without bound.
+  root was rather than behind a link left in its place.
+* **virtio-9p memory and ordering (`src/virtio/p9.rs`):** a directory is listed
+  a stretch at a time (about 1 MiB of entries) as its readdir moves along, so
+  a huge directory is never held whole. Different directories are listed side
+  by side (at most one stretch in the making per worker); only readdirs of
+  one directory handle take turns, as its place in the directory is the
+  handle's;
+  the stretches all fids hold count against one 64 MiB budget, and a guest
+  opening thousands of fids on a big directory drops other fids' stretches
+  (read again if their readdir carries on) instead of growing host memory
+  without bound. The paths all fids hold count against another 64 MiB (a fid
+  costs one small `Twalk` and its path can be 96 KiB); past it a request that
+  would give a fid a new path gets `ENOMEM`. A `Tflush` is answered only after
+  the request it flushes: Linux frees that request's buffers on `Rflush`, and
+  a reply landing later would be written into memory the guest has reused. A
+  device reset doesn't wait for requests in flight: it ends their epoch, and
+  a request from an ended epoch writes no reply, pushes no used element and
+  raises no interrupt (the queue itself starts over, as the driver's ring
+  does); the device status reads non-zero until they have all settled.
 * **virtio device config:** devices serve at most a dword at a time; the
   transport splits a guest's 8-byte config access into two (an 8-byte read of
   virtio-net's config used to abort the VMM).
@@ -1594,12 +1725,20 @@ the locking story above.
   broadcast or reserved addresses aren't relayed to the host's network.
 * **NAT destinations (`src/net/nat.rs`, `host_dest`):** the guest reaches what
   a router's clients reach, not what only the host should: TCP, UDP and pings
-  to `127.0.0.0/8`, link-local `169.254.0.0/16` (cloud instance metadata and
-  managed-identity tokens, e.g. Azure IMDS) and Azure's `168.63.129.16`
-  (WireServer) are refused, and the gateway stands for the host's loopback on
-  the DNS port only. Otherwise any guest process (or an SSRF bug in a guest
-  web app) could borrow the host's identity and loopback-only services.
-  `--nat-host-local` opts back in.
+  to `127.0.0.0/8`, the host's own interface addresses, link-local
+  `169.254.0.0/16` (cloud instance metadata and managed-identity tokens, e.g.
+  Azure IMDS), the metadata addresses `100.100.100.200` and `192.0.0.192`,
+  and Azure's `168.63.129.16` (WireServer) are refused, and the gateway stands
+  for the host's loopback on the DNS port only. Otherwise any guest process
+  (or an SSRF bug in a guest web app) could borrow the host's identity and
+  loopback-only services. The host's own addresses count because Windows
+  delivers what the host sends to itself locally: an inbound firewall rule
+  that keeps the network off a service (SMB, RDP, WinRM) doesn't apply to a
+  connection the NAT makes to the host's LAN address. They are read from the
+  system at most once a second, so an address the host has just acquired is
+  refused within that second. `--nat-host-local` opts back in. The `slirp`
+  and `gvisor` backends, whose stacks are not tinyvmm's, get the same policy
+  from a filter on the guest's frames (`src/net/filter.rs`).
 
 ---
 
@@ -1855,10 +1994,17 @@ returns nothing for it). The run loop always returns the signature (so the guest
 can detect support), and when *armed* it records the requesting vp and surfaces
 `StopReason::SnapshotRequested`, advancing RIP first so restore resumes *past* the
 CPUID (`src/whp/snapshot.rs`, `src/whp/run_loop.rs`). Any vCPU may fire it: an AP
-that does also stops the BSP and the other APs. The VMM then quiesces (stops
-+ joins APs, quiesces each blk device so every request it took off its ring has
-completed, stops the blk IOCP workers, stops net backends, quiesces 9p) and
-writes a self-describing file (`src/whp/snapshot_file.rs`):
+that does also stops the BSP and the other APs. CPUID is not a privileged
+instruction, so any process in the guest can fire it too: arm `--save` for a
+guest whose every process may choose the moment (and end the run). The VMM
+then quiesces (stops + joins APs, joins the doorbell pumps, sweeps every queue
+once so nothing the guest kicked for is left unserved, quiesces each blk device
+so every request it took off its ring has completed, stops the blk IOCP
+workers, stops net backends, quiesces 9p, and gives up without writing a
+snapshot if the disks could not serve what the guest had queued within 15 s
+of the trigger or 9p requests are still running on the host) and writes a
+self-describing file (`src/whp/snapshot_file.rs`), beside its destination
+first and renamed into place once whole:
 
 ```
 [24-byte header]  "TVMMSAVE" | version u32 (=3) | reserved u32 | header_json_size u64
@@ -1941,5 +2087,21 @@ What is and isn't snapshottable:
   clock carries on from the save. A restore asks WHP for the same
   enlightenments (`hv_features`) the guest booted with, and fails if the host
   lacks any.
-* `SnapshotWriter`'s `Drop` deletes a half-written file if `finalize()` (which
-  writes the CRC trailer) did not run — no truncated snapshot is ever left behind.
+* A snapshot is written to `<path>.<pid>.partial` beside its destination and
+  renamed over `<path>` only once `finalize()` has written the CRC trailer and
+  synced it. A save that fails part-way (`SnapshotWriter`'s `Drop` deletes the
+  partial file) therefore leaves the snapshot that was at `<path>` before as it
+  was, and nothing that opens `<path>` ever finds half a snapshot. While it is
+  written the partial file is marked to be deleted when its handle closes, so
+  a tinyvmm that is killed mid-save leaves no file the size of its guest's RAM
+  behind either; `finalize()` takes the mark back just before the rename. A
+  `<path>` that a restore has open is not replaced: the save fails.
+* The save quiesces before it captures: the doorbell pumps are joined, every
+  queue is swept once so nothing the guest kicked for is left unserved, the
+  disks drain, the NICs' backends stop, and 9p's workers finish. If 9p requests
+  are still running on the host after that wait, **no snapshot is written**:
+  it would have held them half done. Nor is one written if a disk has not
+  served everything the guest queued on it 15 s after the trigger
+  (`SNAPSHOT_DISK_PATIENCE`; one chain can name the whole disk many times
+  over, so a guest could otherwise keep tinyvmm for hours): the capture would
+  hold requests the restored guest waits on for good.

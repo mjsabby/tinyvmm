@@ -1,7 +1,7 @@
-//! Safe wrapper over `wintun.dll` (loaded at runtime via LoadLibrary) plus the
-//! IP Helper call that assigns the host adapter address. All of the
-//! LoadLibrary/GetProcAddress/`transmute` and fn-pointer-invocation `unsafe` is
-//! concentrated here; callers use the safe methods below.
+//! Safe wrapper over `wintun.dll` (loaded at run time from one fixed place, see
+//! [`WintunApi::load`]) plus the IP Helper call that assigns the host adapter
+//! address. All of the GetProcAddress/`transmute` and fn-pointer-invocation
+//! `unsafe` is concentrated here; callers use the safe methods below.
 //!
 //! The raw `*mut u8` buffers returned by [`WintunApi::receive_packet`] and
 //! [`WintunApi::allocate_send_packet`] are intentionally left raw — they point
@@ -14,8 +14,10 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
     CreateUnicastIpAddressEntry, InitializeUnicastIpAddressEntry, MIB_UNICASTIPADDRESS_ROW,
 };
 use windows_sys::Win32::Networking::WinSock::{AF_INET, IN_ADDR, IN_ADDR_0, SOCKADDR_IN};
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
 use windows_sys::core::GUID;
+
+const DLL: &str = "wintun.dll";
 
 /// Opaque WinTun adapter handle (WINTUN_ADAPTER_HANDLE).
 pub type AdapterHandle = *mut c_void;
@@ -50,18 +52,17 @@ pub struct WintunApi {
 }
 
 impl WintunApi {
-    /// Load wintun.dll and resolve the exports. Returns a descriptive error if
-    /// the DLL can't be found or is missing an export.
+    /// Load wintun.dll and resolve the exports: from the path in
+    /// `TINYVMM_WINTUN` if that is set, else from the running executable's
+    /// directory, and from nowhere else (the `dll` module says why: tinyvmm
+    /// runs elevated with this backend). Returns a descriptive error if the
+    /// DLL isn't there, doesn't load or is missing an export.
     pub fn load() -> Result<WintunApi, String> {
-        let wide: Vec<u16> = "wintun.dll".encode_utf16().chain([0]).collect();
-        let module: HMODULE = unsafe { LoadLibraryW(wide.as_ptr()) };
-        if module.is_null() {
-            return Err(format!(
-                "LoadLibraryW(wintun.dll) failed (err={}); place wintun.dll next to tinyvmm.exe \
-                 or on PATH",
-                unsafe { GetLastError() }
-            ));
-        }
+        let module = crate::dll::load(
+            DLL,
+            "TINYVMM_WINTUN",
+            "put wintun.dll next to tinyvmm.exe, or set TINYVMM_WINTUN to its path",
+        )?;
         unsafe fn sym(m: HMODULE, name: &str) -> Result<*const (), String> {
             unsafe {
                 let c: Vec<u8> = name.bytes().chain([0]).collect();

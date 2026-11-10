@@ -12,6 +12,7 @@
 
 mod csum;
 pub mod dhcp;
+pub mod filter;
 pub mod gvisor;
 pub mod nat;
 pub mod slirp;

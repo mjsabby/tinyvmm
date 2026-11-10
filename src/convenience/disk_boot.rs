@@ -4,6 +4,8 @@
 //! before the VM starts. A kernel the guest installs (whose package rewrites
 //! `grub.cfg`) is thus what boots next time, as with GRUB itself.
 
+use std::cell::Cell;
+
 use crate::convenience::ext4::{Ext4, Kind};
 use crate::convenience::{LoadedEntry, ReadAt, Region, grub_cfg, partition};
 use crate::error::{Error, Result};
@@ -19,6 +21,11 @@ const GRUB_CONFIGS: &[&str] = &[
 ];
 /// Smaller partitions (such as a BIOS boot partition) hold no filesystem.
 const MIN_FILESYSTEM: u64 = 64 << 10;
+/// The most read of a drive while looking for a system to boot. A journal,
+/// a directory and a file each have a cap of their own, but a crafted disk
+/// can hold thousands of partitions that each cost up to theirs. This is
+/// more than twice the largest journal, kernel and initrds together.
+const MAX_READ_BYTES: u64 = 16 << 30;
 
 pub struct DiskBoot {
     pub drive: String,
@@ -65,6 +72,10 @@ pub fn resolve(drives: &[&str]) -> Result<DiskBoot> {
 type Found = (u32, &'static str, usize, LoadedEntry);
 
 fn resolve_from<R: ReadAt>(disk: &R, size: u64) -> Result<Option<Found>> {
+    let disk = &Metered {
+        src: disk,
+        left: Cell::new(MAX_READ_BYTES),
+    };
     for part in partition::partitions(disk, size)? {
         if part.len < MIN_FILESYSTEM {
             continue;
@@ -78,17 +89,38 @@ fn resolve_from<R: ReadAt>(disk: &R, size: u64) -> Result<Option<Found>> {
             if fs.lookup(config)? != Some(Kind::File) {
                 continue;
             }
-            let text = fs.read_file(config)?;
-            let Some(entry) = grub_cfg::first_linux_entry(&String::from_utf8_lossy(&text)) else {
+            let in_config =
+                |e: Error| Error::msg(format!("partition {} ({config}): {e}", part.number));
+            // No more of a configuration is read than the parser takes.
+            let text = fs
+                .read_file_capped(config, grub_cfg::MAX_CONFIG_BYTES as u64)
+                .map_err(in_config)?;
+            let Some(entry) = grub_cfg::first_linux_entry(&text).map_err(in_config)? else {
                 continue;
             };
             // The entry's paths are on the filesystem holding the configuration.
-            let entry = LoadedEntry::load(entry, |path| fs.read_file(path))
-                .map_err(|e| Error::msg(format!("partition {} ({config}): {e}", part.number)))?;
+            let entry = LoadedEntry::load(entry, |path, max| fs.read_file_capped(path, max))
+                .map_err(in_config)?;
             return Ok(Some((part.number, config, fs.journal_blocks(), entry)));
         }
     }
     Ok(None)
+}
+
+/// Reads of a drive counted against a budget: one past it fails.
+struct Metered<'a, R> {
+    src: &'a R,
+    left: Cell<u64>,
+}
+
+impl<R: ReadAt> ReadAt for Metered<'_, R> {
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        let left = self.left.get().checked_sub(buf.len() as u64);
+        self.left.set(left.ok_or_else(|| {
+            std::io::Error::other("read too much of the drive without finding a system to boot")
+        })?);
+        self.src.read_exact_at(offset, buf)
+    }
 }
 
 /// A VHDX read through VHDMP, in whole sectors as it requires.
@@ -207,5 +239,80 @@ mod tests {
         );
         let disk = self::disk(&[&chain.bytes]);
         assert!(resolve_from(&disk, disk.len() as u64).unwrap().is_none());
+    }
+
+    /// What booting a disk whose GRUB configuration is `config` comes to:
+    /// the length of the initrds it loads (`/z`, 6 bytes), or the error.
+    fn booting(config: Node) -> std::result::Result<usize, String> {
+        let root = Image::new(
+            SMALL,
+            vec![
+                Node::Dir("boot", vec![Node::Dir("grub", vec![config])]),
+                Node::File("k", b"kernel"),
+                Node::File("z", b"initrd"),
+            ],
+        );
+        let disk = disk(&[&root.bytes]);
+        match resolve_from(&disk, disk.len() as u64) {
+            Ok(found) => Ok(found.unwrap().3.initrd.map_or(0, |initrd| initrd.len())),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    #[test]
+    fn a_configuration_over_the_caps_is_an_error_naming_it() {
+        let entry = |initrds: usize| {
+            format!(
+                "menuentry x {{\n linux /k\n initrd{}\n}}\n",
+                " /z".repeat(initrds)
+            )
+        };
+        let cfg = |text: &str| booting(Node::File("grub.cfg", text.as_bytes()));
+        // Eight initrds load, each padded to 8 bytes; a ninth is one too many
+        // for an entry, however small.
+        assert_eq!(cfg(&entry(8)), Ok(64));
+        assert_eq!(
+            cfg(&entry(9)).unwrap_err(),
+            "partition 2 (boot/grub/grub.cfg): grub.cfg: an entry with 9 initrds is too large \
+             (at most 8)"
+        );
+        // A variable that multiplies itself: this one asked for 16 TiB.
+        let grow = format!("set a={}\n", "$a".repeat(16)).repeat(10);
+        let error = cfg(&format!("set a={}\n{grow}{}", "A".repeat(16), entry(1))).unwrap_err();
+        let line = "partition 2 (boot/grub/grub.cfg): grub.cfg: line 4 with its variables";
+        assert!(error.starts_with(line), "{error}");
+        // A configuration over a megabyte isn't read: this one is a hole of
+        // that size before its entry, as any size costs a crafted disk nothing.
+        let error = booting(Node::Sparse("grub.cfg", 1100, entry(1).as_bytes())).unwrap_err();
+        assert_eq!(
+            error,
+            "partition 2 (boot/grub/grub.cfg): ext4: boot/grub/grub.cfg is too large (1126437 \
+             bytes; at most 1048576 here)"
+        );
+    }
+
+    #[test]
+    fn reads_of_a_drive_are_counted_against_a_budget() {
+        let image = Image::new(SMALL, vec![Node::File("f", b"data")]);
+        let metered = |budget| Metered {
+            src: &image.bytes,
+            left: Cell::new(budget),
+        };
+        let mut sector = [0u8; 512];
+        let disk = metered(1024);
+        disk.read_exact_at(1024, &mut sector).unwrap();
+        disk.read_exact_at(1024, &mut sector).unwrap();
+        assert_eq!(sector, image.bytes[1024..1536]);
+        let error = disk.read_exact_at(1024, &mut sector).unwrap_err();
+        assert!(error.to_string().contains("read too much of the drive"));
+        // A filesystem on it reports the same, whatever it was reading: here
+        // the budget is its superblock's 1024 bytes.
+        let disk = metered(1024);
+        let fs = Ext4::probe(Region::new(&disk, 0, image.bytes.len() as u64));
+        let error = fs.unwrap().unwrap().lookup("f").unwrap_err().to_string();
+        assert!(error.contains("read too much of the drive"), "{error}");
+        let disk = metered(1 << 20);
+        let fs = Ext4::probe(Region::new(&disk, 0, image.bytes.len() as u64));
+        assert_eq!(fs.unwrap().unwrap().lookup("f").unwrap(), Some(Kind::File));
     }
 }

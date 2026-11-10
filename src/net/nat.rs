@@ -183,9 +183,10 @@ pub struct NatOptions {
     pub dns_servers: Vec<[u8; 4]>,
     pub port_forwards: Vec<PortForward>,
     /// Let the guest reach host-local destinations (`--nat-host-local`):
-    /// every port of the host's loopback at the gateway, 127/8, link-local
-    /// 169.254/16 and Azure's platform address. Off, only the gateway's DNS
-    /// port reaches the host's loopback; see [`host_dest`].
+    /// every port of the host's loopback at the gateway, 127/8, the host's
+    /// own addresses, link-local 169.254/16 and the other cloud metadata
+    /// addresses. Off, only the gateway's DNS port reaches the host's
+    /// loopback; see [`host_dest`].
     pub host_local: bool,
     /// Per-tier count of Tcbs to preallocate at startup (warm pool). Pools
     /// still grow on demand up to the flow cap and keep up to 256 idle Tcbs
@@ -923,7 +924,7 @@ type FlowKey = ([u8; 4], u16, [u8; 4], u16);
 /// only host beside the guest is the gateway). A router forwards no
 /// multicast, broadcast, "this network" (0/8) or reserved (240/4) traffic;
 /// relayed, a guest's mDNS, LLMNR or SSDP would reach the host's LAN.
-fn relayable(ip: [u8; 4], gw: [u8; 4]) -> bool {
+pub(crate) fn relayable(ip: [u8; 4], gw: [u8; 4]) -> bool {
     let mask = crate::net::NETMASK;
     let on_link = (0..4).all(|i| ip[i] & mask[i] == gw[i] & mask[i]);
     ip[0] != 0 && ip[0] < 224 && !on_link
@@ -932,27 +933,105 @@ fn relayable(ip: [u8; 4], gw: [u8; 4]) -> bool {
 /// Azure's platform address: its DNS resolver on port 53, the WireServer
 /// (goal state, certificates) and health probes on the others.
 const AZURE_PLATFORM_IP: [u8; 4] = [168, 63, 129, 16];
-const DNS_PORT: u16 = 53;
+/// Instance metadata services that aren't link-local: Alibaba Cloud's, and
+/// Oracle Cloud Classic's (an address in 192.0.0.0/24, which is reserved and
+/// routed nowhere else).
+const METADATA_IPS: [[u8; 4]; 2] = [[100, 100, 100, 200], [192, 0, 0, 192]];
+pub(crate) const DNS_PORT: u16 = 53;
 
 /// Where the host connects for guest traffic to `ip:port`, or None if the
 /// guest may not reach it. Beyond [`relayable`], host-local destinations are
 /// refused unless `host_local` (`--nat-host-local`): a guest must not borrow
-/// the host's identity to reach what only the host should, such as services
-/// bound to its loopback (127/8), cloud instance metadata and the identity
-/// tokens it issues (169.254.169.254, link-local) or the Azure WireServer.
+/// the host's identity to reach what only the host should. Those are:
+///
+/// * services bound to the host's loopback (127/8);
+/// * the host's own addresses (`host_owned`: `ip` is assigned to one of its
+///   interfaces). Windows delivers what the host sends to itself locally, as
+///   it does loopback traffic, so the inbound firewall rules that keep the
+///   network off a service don't apply to it;
+/// * cloud instance metadata and the identity tokens it issues
+///   (169.254.169.254 and the rest of link-local, [`METADATA_IPS`]) and the
+///   Azure WireServer.
+///
 /// The gateway stands for the host's loopback, on the DNS port only, so a
 /// resolver on the host's 127.0.0.1 keeps working (`dhcp::usable_dns` offers
-/// it as the gateway). `port` is 0 for ICMP.
-fn host_dest(ip: [u8; 4], port: u16, gw: [u8; 4], host_local: bool) -> Option<[u8; 4]> {
+/// it as the gateway). A resolver on one of the host's own addresses, or
+/// Azure's, is likewise reachable on the DNS port alone. `port` is 0 for
+/// ICMP.
+///
+/// The backends with a stack of their own (libslirp, gVisor) get the same
+/// answer for the guest's frames from `net::filter`.
+pub(crate) fn host_dest(
+    ip: [u8; 4],
+    port: u16,
+    gw: [u8; 4],
+    host_local: bool,
+    host_owned: bool,
+) -> Option<[u8; 4]> {
     if ip == gw {
         return (host_local || port == DNS_PORT).then_some([127, 0, 0, 1]);
     }
     if !relayable(ip, gw) {
         return None;
     }
-    let host_only =
-        ip[0] == 127 || ip[..2] == [169, 254] || (ip == AZURE_PLATFORM_IP && port != DNS_PORT);
+    let host_only = ip[0] == 127
+        || ip[..2] == [169, 254]
+        || METADATA_IPS.contains(&ip)
+        || ((host_owned || ip == AZURE_PLATFORM_IP) && port != DNS_PORT);
     (host_local || !host_only).then_some(ip)
+}
+
+/// How long a reading of the host's addresses is trusted. They change when
+/// an interface comes up or renews its lease; until the next reading, a new
+/// one isn't yet refused and a dropped one still is.
+const HOST_ADDRS_TTL_MS: u128 = 1000;
+
+/// The host's own IPv4 addresses ([`host_dest`]'s `host_owned`), read from
+/// the system at most once per [`HOST_ADDRS_TTL_MS`].
+#[derive(Default)]
+pub(crate) struct HostAddrs {
+    addrs: Vec<[u8; 4]>,
+    read_at: Option<Instant>,
+    /// Tests: `addrs` is all there is, and the system isn't read.
+    #[cfg(test)]
+    fixed: bool,
+}
+
+impl HostAddrs {
+    /// A host with exactly `addrs`, whatever the machine running the test has.
+    #[cfg(test)]
+    pub(crate) fn fixed(addrs: Vec<[u8; 4]>) -> Self {
+        HostAddrs {
+            addrs,
+            read_at: None,
+            fixed: true,
+        }
+    }
+
+    pub(crate) fn contains(&mut self, ip: [u8; 4]) -> bool {
+        #[cfg(test)]
+        if self.fixed {
+            return self.addrs.contains(&ip);
+        }
+        self.contains_at(ip, Instant::now(), sys::host_ipv4_addrs)
+    }
+
+    /// [`Self::contains`] at time `now`, reading the addresses with `read`.
+    fn contains_at(
+        &mut self,
+        ip: [u8; 4],
+        now: Instant,
+        read: impl FnOnce() -> Vec<[u8; 4]>,
+    ) -> bool {
+        let fresh = self
+            .read_at
+            .is_some_and(|at| now.saturating_duration_since(at).as_millis() < HOST_ADDRS_TTL_MS);
+        if !fresh {
+            self.addrs = read();
+            self.read_at = Some(now);
+        }
+        self.addrs.contains(&ip)
+    }
 }
 
 /// Most guest datagrams reassembled at once, and how long one may wait for
@@ -1815,6 +1894,8 @@ struct NatState {
     guest_mac: [u8; 6],
     /// `NatOptions::host_local`.
     host_local: bool,
+    /// The host's own addresses, which are host-local destinations.
+    host_addrs: HostAddrs,
     /// What DHCP answers (identical on every shard).
     dhcp: Arc<dhcp::Lease>,
     udp: HashMap<FlowKey, UdpFlow>,
@@ -2266,6 +2347,19 @@ impl NatState {
         }
     }
 
+    /// [`host_dest`] for this NAT: where the host connects for guest traffic
+    /// to `ip:port`, or None if the guest may not reach it.
+    fn host_dest(&mut self, ip: [u8; 4], port: u16) -> Option<[u8; 4]> {
+        // The host's addresses matter only where they decide: with the
+        // opt-in everything relayable passes, and the gateway and what isn't
+        // relayable are settled without them.
+        let host_owned = !self.host_local
+            && ip != self.gw_ip
+            && relayable(ip, self.gw_ip)
+            && self.host_addrs.contains(ip);
+        host_dest(ip, port, self.gw_ip, self.host_local, host_owned)
+    }
+
     fn handle_icmp(&mut self, ip: &Ipv4View) {
         // Pings to the gateway are answered locally; pings to any other host
         // are proxied to the real network via the ICMP worker pool.
@@ -2279,7 +2373,7 @@ impl NatState {
         // link; ignore other ICMP.
         if ip.payload.first().copied() != Some(ICMP_ECHO_REQUEST)
             || ip.payload.len() < 8
-            || host_dest(ip.dst, 0, self.gw_ip, self.host_local).is_none()
+            || self.host_dest(ip.dst, 0).is_none()
         {
             return;
         }
@@ -2309,7 +2403,7 @@ impl NatState {
             self.handle_dhcp(udp.payload);
             return;
         }
-        let Some(host_dip) = host_dest(ip.dst, udp.dst_port, self.gw_ip, self.host_local) else {
+        let Some(host_dip) = self.host_dest(ip.dst, udp.dst_port) else {
             return;
         };
         if let Some(sock) =
@@ -2624,7 +2718,7 @@ impl NatState {
         // A destination the guest may not reach, at capacity, or socket setup
         // failed: refuse with a RST so the guest's connect() fails fast instead
         // of retrying for ~minutes.
-        let refused = match host_dest(key.2, key.3, self.gw_ip, self.host_local) {
+        let refused = match self.host_dest(key.2, key.3) {
             Some(_) if self.flows.tcp.load(Ordering::Relaxed) >= MAX_TCP_FLOWS => {
                 self.stats.tcp_full.fetch_add(1, Ordering::Relaxed);
                 true
@@ -3276,6 +3370,13 @@ impl NatState {
         if reap && let Some(mut f) = self.tcp.remove(&key) {
             self.flows.tcp.fetch_sub(1, Ordering::Relaxed);
             self.release_flow(&key);
+            // Off the pause list with it: the list is emptied only when the
+            // guest drains its RX backlog, so a guest that never does, and
+            // keeps opening and resetting connections, would otherwise grow
+            // it without bound.
+            if f.rx_blocked {
+                self.rx_blocked.retain(|k| *k != key);
+            }
             // The socket was already closed by begin_teardown and all ops
             // have drained, so recycle the pooled Tcb (into its size-tier)
             // and the overlapped op buffers via take(); TcpFlow::drop then
@@ -3452,6 +3553,9 @@ pub struct NatBackend {
     icmp_workers: Mutex<Vec<JoinHandle<()>>>,
     listeners: Mutex<Vec<SOCKET>>,
     listener_threads: Mutex<Vec<JoinHandle<()>>>,
+    /// Set before the listeners are closed, so their threads can tell a
+    /// shutdown from an `accept` that failed.
+    listeners_closing: Arc<AtomicBool>,
     pool: Arc<FramePool<FRAME_CAP>>,
     big_pool: Arc<FramePool<TX_FRAME_CAP>>,
     stats: Arc<NatStats>,
@@ -3474,6 +3578,7 @@ impl NatBackend {
                 icmp_workers: Mutex::new(Vec::new()),
                 listeners: Mutex::new(Vec::new()),
                 listener_threads: Mutex::new(Vec::new()),
+                listeners_closing: Arc::new(AtomicBool::new(false)),
                 pool,
                 big_pool,
                 stats,
@@ -3508,6 +3613,7 @@ impl NatBackend {
         // 127.0.0.1, so every new `localhost` connection would wait that long.
         let mut listeners = Vec::new();
         let mut listener_threads = Vec::new();
+        let listeners_closing = Arc::new(AtomicBool::new(false));
         for pf in &opts.port_forwards {
             let Some(lsock) = sys::new_tcp_listener(pf.host_addr, pf.host_port) else {
                 eprintln!(
@@ -3536,9 +3642,10 @@ impl NatBackend {
                 let ai = accept_inflight.clone();
                 let targets = iocps.clone();
                 let st = stats.clone();
+                let closing = listeners_closing.clone();
                 if let Ok(h) = std::thread::Builder::new()
                     .name(format!("nat-listen{family}-{}", pf.host_port))
-                    .spawn(move || listener_loop(lsock, &targets, pf, ap, ai, &st))
+                    .spawn(move || listener_loop(lsock, &targets, pf, ap, ai, &st, &closing))
                 {
                     listener_threads.push(h);
                 }
@@ -3588,6 +3695,7 @@ impl NatBackend {
                 flows: flows.clone(),
                 gw_ip: opts.gateway_ip,
                 host_local: opts.host_local,
+                host_addrs: HostAddrs::default(),
                 gw_mac: opts.gateway_mac,
                 guest_mac: net.mac(),
                 dhcp: lease.clone(),
@@ -3665,12 +3773,19 @@ impl NatBackend {
             icmp_workers: Mutex::new(icmp_workers),
             listeners: Mutex::new(listeners),
             listener_threads: Mutex::new(listener_threads),
+            listeners_closing,
             pool,
             big_pool,
             stats,
         })
     }
 }
+
+/// How long a port-forward listener waits after a failed `accept` before it
+/// tries again: this long at first, doubling up to the second value while
+/// the failures go on.
+const ACCEPT_RETRY_MS: u64 = 10;
+const ACCEPT_RETRY_MAX_MS: u64 = 1000;
 
 /// Accept loop for one port-forward listener; runs on its own thread. Hands
 /// accepted clients to the workers in turn (`iocps`, one per shard).
@@ -3681,13 +3796,34 @@ fn listener_loop(
     accept_pool: Arc<SyncBoxPool<AcceptMsg>>,
     accept_inflight: Arc<AtomicUsize>,
     stats: &NatStats,
+    closing: &AtomicBool,
 ) {
     let mut next = 0usize;
-    loop {
+    let mut retry_ms = ACCEPT_RETRY_MS;
+    while !closing.load(Ordering::Acquire) {
         let c = sys::accept_one(lsock);
         if c == INVALID_SOCKET {
-            break; // listener closed for shutdown
+            if closing.load(Ordering::Acquire) {
+                break; // listener closed for shutdown
+            }
+            // `accept` fails for reasons that pass: a client that reset its
+            // connection while it waited in the backlog, or the host out of
+            // buffers or handles for a moment. Ending the loop on a failure,
+            // or on any number of them, would let a client turn the port
+            // forward off for good, with its socket still taking connections
+            // nobody accepts. So it only ends with the listener: it waits,
+            // longer while the failures go on, and tries again.
+            if retry_ms == ACCEPT_RETRY_MAX_MS / 2 {
+                eprintln!(
+                    "[nat] WARN: port-forward on port {}: accept keeps failing; still trying",
+                    pf.host_port
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(retry_ms));
+            retry_ms = (retry_ms * 2).min(ACCEPT_RETRY_MAX_MS);
+            continue;
         }
+        retry_ms = ACCEPT_RETRY_MS;
         // Bound accepted-but-undrained connections: a remote accept-flood is
         // dropped here (the client can retry) rather than piling up host sockets
         // and AcceptMsg boxes faster than the workers drain them.
@@ -3796,6 +3932,7 @@ impl NetBackend for NatBackend {
 
     fn stop(&self) {
         // Close listener sockets to unblock their accept() threads, then join.
+        self.listeners_closing.store(true, Ordering::Release);
         for s in self.listeners.lock().unwrap().drain(..) {
             sys::close_sock(s);
         }
@@ -3930,20 +4067,28 @@ mod tests {
         let loopback = Some([127, 0, 0, 1]);
         for host_local in [false, true] {
             assert_eq!(
-                host_dest(gw, 53, gw, host_local),
+                host_dest(gw, 53, gw, host_local, false),
                 loopback,
                 "the host's resolver"
             );
             for ip in [[1, 1, 1, 1], [10, 0, 9, 121], [168, 63, 129, 15]] {
-                assert_eq!(host_dest(ip, 443, gw, host_local), Some(ip), "{ip:?}");
+                assert_eq!(
+                    host_dest(ip, 443, gw, host_local, false),
+                    Some(ip),
+                    "{ip:?}"
+                );
+            }
+            // Its neighbours are no metadata service.
+            for ip in [[100, 100, 100, 100], [100, 100, 100, 201], [192, 0, 0, 191]] {
+                assert_eq!(host_dest(ip, 80, gw, host_local, false), Some(ip), "{ip:?}");
             }
             assert_eq!(
-                host_dest(AZURE_PLATFORM_IP, 53, gw, host_local),
+                host_dest(AZURE_PLATFORM_IP, 53, gw, host_local, false),
                 Some(AZURE_PLATFORM_IP),
                 "Azure DNS"
             );
             for ip in [[224, 0, 0, 251], [255; 4], [0, 0, 0, 0], [172, 29, 255, 3]] {
-                assert_eq!(host_dest(ip, 80, gw, host_local), None, "{ip:?}");
+                assert_eq!(host_dest(ip, 80, gw, host_local, false), None, "{ip:?}");
             }
         }
         for (ip, port) in [
@@ -3953,14 +4098,75 @@ mod tests {
             ([127, 1, 2, 3], 53),
             ([169, 254, 169, 254], 80),
             ([169, 254, 1, 1], 53),
+            ([100, 100, 100, 200], 80),
+            ([100, 100, 100, 200], 53),
+            ([192, 0, 0, 192], 80),
             (AZURE_PLATFORM_IP, 80),
             (AZURE_PLATFORM_IP, 32526),
             (AZURE_PLATFORM_IP, 0),
         ] {
-            assert_eq!(host_dest(ip, port, gw, false), None, "{ip:?}:{port}");
+            assert_eq!(host_dest(ip, port, gw, false, false), None, "{ip:?}:{port}");
             let want = if ip == gw { loopback } else { Some(ip) };
-            assert_eq!(host_dest(ip, port, gw, true), want, "{ip:?}:{port}");
+            assert_eq!(host_dest(ip, port, gw, true, false), want, "{ip:?}:{port}");
         }
+    }
+
+    /// One of the host's own addresses is host-local too: the guest reaches
+    /// only a resolver there, unless `--nat-host-local` lets it through.
+    #[test]
+    fn the_hosts_own_addresses_need_the_opt_in() {
+        let gw = crate::net::GATEWAY_IP;
+        let own = [192, 168, 1, 10];
+        for port in [445, 3389, 5985, 8080, 0] {
+            assert_eq!(host_dest(own, port, gw, false, true), None, "port {port}");
+            assert_eq!(
+                host_dest(own, port, gw, true, true),
+                Some(own),
+                "port {port}"
+            );
+            // The same address on another machine's network is just a host.
+            assert_eq!(
+                host_dest(own, port, gw, false, false),
+                Some(own),
+                "port {port}"
+            );
+        }
+        assert_eq!(
+            host_dest(own, 53, gw, false, true),
+            Some(own),
+            "its resolver"
+        );
+    }
+
+    /// The host's addresses are read once per `HOST_ADDRS_TTL_MS`, not for
+    /// every packet, and an address the host gains or loses is seen at the
+    /// next reading.
+    #[test]
+    fn host_addresses_are_reread_when_stale() {
+        let (a, b) = ([192, 168, 1, 10], [10, 9, 8, 7]);
+        let t0 = Instant::now();
+        let ms = std::time::Duration::from_millis;
+        let mut host = HostAddrs::default();
+        let unread = || -> Vec<[u8; 4]> { panic!("read again while fresh") };
+
+        assert!(host.contains_at(a, t0, || vec![a]));
+        assert!(!host.contains_at(b, t0 + ms(1), unread));
+        assert!(host.contains_at(a, t0 + ms(999), unread));
+        // Stale: the host has moved from `a` to `b`.
+        assert!(host.contains_at(b, t0 + ms(1000), || vec![b]));
+        assert!(!host.contains_at(a, t0 + ms(1500), unread));
+        // A clock reading from before the last one doesn't count as stale.
+        assert!(host.contains_at(b, t0, unread));
+        // A table that can't be read is empty: nothing is known to be the host's.
+        assert!(!host.contains_at(b, t0 + ms(2000), Vec::new));
+    }
+
+    /// The real table, through the cache: the host's loopback is its own.
+    #[test]
+    fn the_hosts_address_table_is_consulted() {
+        let mut host = HostAddrs::default();
+        assert!(host.contains([127, 0, 0, 1]));
+        assert!(!host.contains([192, 0, 2, 1]), "a documentation address");
     }
 
     /// A crowd of connections can't each take the default tier's rings: past

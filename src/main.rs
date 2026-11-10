@@ -209,6 +209,9 @@ fn print_usage() {
          \x20              display + --sound playback to a fragmented H.264/AAC MP4; default 30 fps)\n\
          \x20              [--save <path> [--unsafe-save-mutable-drive]]\n\
          \x20              [--watchdog-secs N] [--debug-boot] [--no-default-cmdline] [--no-vmbus]\n\
+         \x20              [--shutdown-sentinel]  (stop the VM when the guest prints\n\
+         \x20              \"=== tinyvmm shutdown requested ===\" on hvc0; for test guests\n\
+         \x20              that can't power off)\n\
          \x20              [vmlinux] [-- <kernel args>]\n\
          \x20              Kernel args are added to the defaults (console=hvc0 pci=conf1,...);\n\
          \x20              --no-default-cmdline makes them the whole command line instead.\n\
@@ -225,7 +228,7 @@ fn print_usage() {
          \x20              the first drive with one (ext2/3/4 /boot, read before the VM starts).\n\
          \x20 tinyvmm --restore <path> [--drive <path>[,ro|rw]]... [--cpu-affinity p|p-physical|e|all]\n\
          \x20              [--watchdog-secs N] [--unsafe-restore-mutable-drive] [--poll-us N] [--no-doorbells]\n\
-         \x20              [--record <file.mp4>[,fps=N][,kbps=N]]\n\
+         \x20              [--shutdown-sentinel] [--record <file.mp4>[,fps=N][,kbps=N]]\n\
          \x20 tinyvmm --dda-probe <PnpInstanceId>   probe a host PCI device for Discrete Device\n\
          \x20              Assignment (no VM boot): dump IDs/BARs/MSI-X, test direct MMIO mapping.\n\
          \x20              Get the id from Device Manager (Details -> Device instance path) or\n\
@@ -1072,6 +1075,8 @@ struct PvhArgs {
     /// VMBus with the time-sync and shutdown ICs (`vmbus`): on unless
     /// `--no-vmbus`, or the host's WHP can't run it.
     vmbus: bool,
+    /// `--shutdown-sentinel`: see [`watch_shutdown_sentinel`].
+    shutdown_sentinel: bool,
 }
 
 /// Parse a `--portfwd HOSTPORT:GUESTPORT` rule. The host side binds 127.0.0.1
@@ -1127,6 +1132,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
     let mut debug_boot = false;
     let mut default_cmdline = true;
     let mut vmbus = true;
+    let mut shutdown_sentinel = false;
     let mut nics: Vec<NicSpec> = Vec::new();
     let mut with_rng = false;
     let mut with_gpu = false;
@@ -1214,6 +1220,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
             "--debug-boot" => debug_boot = true,
             "--no-default-cmdline" => default_cmdline = false,
             "--no-vmbus" => vmbus = false,
+            "--shutdown-sentinel" => shutdown_sentinel = true,
             "--net" => nics.push(NicSpec::new()),
             "--net-backend" => {
                 i += 1;
@@ -1566,6 +1573,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
         doorbells,
         record,
         vmbus,
+        shutdown_sentinel,
     })
 }
 
@@ -1741,6 +1749,9 @@ struct ReleaseBeforeTeardown<'a> {
     p9_devices: &'a [Arc<P9Device>],
     vmbus: Option<&'a vmbus::Host>,
     ram: &'a GuestMemory,
+    /// Every disk request has settled ([`settle_devices`]). If not, the host
+    /// may still be reading or writing guest RAM for one, and it stays.
+    blk_settled: bool,
 }
 
 impl Drop for ReleaseBeforeTeardown<'_> {
@@ -1754,7 +1765,7 @@ impl Drop for ReleaseBeforeTeardown<'_> {
         for nd in self.net_devices {
             nd.quiesce_backend();
         }
-        let freed = self.p9_devices.iter().all(|p| p.quiesce());
+        let freed = self.p9_devices.iter().all(|p| p.quiesce()) && self.blk_settled;
         if freed {
             // SAFETY: the vCPUs are joined, every doorbell pump is stopped and
             // every queue disabled, and blk, the NICs' backends and 9p have
@@ -1774,6 +1785,214 @@ impl Drop for ReleaseBeforeTeardown<'_> {
                 );
             });
     }
+}
+
+/// What a guest prints on hvc0 to have tinyvmm stop it, with
+/// `--shutdown-sentinel`.
+const SHUTDOWN_SENTINEL: &[u8] = b"=== tinyvmm shutdown requested ===";
+
+/// Finds [`SHUTDOWN_SENTINEL`] in the console's output, however the bytes
+/// are split across writes.
+#[derive(Default)]
+struct SentinelScan {
+    /// The output's last bytes: one fewer than the sentinel is long, so a
+    /// sentinel that straddles two writes is still found.
+    tail: Vec<u8>,
+    found: bool,
+}
+
+impl SentinelScan {
+    /// Take more console output; true the first time the sentinel is
+    /// complete, and never again.
+    fn feed(&mut self, bytes: &[u8]) -> bool {
+        if self.found {
+            return false;
+        }
+        self.tail.extend_from_slice(bytes);
+        let n = SHUTDOWN_SENTINEL.len();
+        self.found = self.tail.windows(n).any(|w| w == SHUTDOWN_SENTINEL);
+        let keep = self.tail.len().min(n - 1);
+        self.tail.drain(..self.tail.len() - keep);
+        self.found
+    }
+}
+
+/// `--shutdown-sentinel`: stop every vCPU, at once, when the guest prints
+/// [`SHUTDOWN_SENTINEL`] on hvc0. The harnesses' guests ask to be stopped
+/// this way: it predates ACPI power-off, and it still stops a kernel built
+/// without ACPI, whose `poweroff` falls back to STI;HLT and never produces a
+/// halt VM-exit.
+///
+/// It is off unless asked for (`enabled`). The console is no place for a
+/// command by default: anything in the guest that gets a line onto hvc0 (a
+/// service whose log is echoed there, a kernel message quoting a name it was
+/// given) would then be able to cut the VM's power, with whatever the guest
+/// had not yet written to its disks. A guest that can power off (ACPI) needs
+/// none.
+///
+/// A sentinel that is not acted on is still noticed, and said so once if the
+/// guest is still running `SENTINEL_HINT_AFTER` later: a guest that prints it
+/// and then cannot power off sits there halted, and the user should learn why
+/// from tinyvmm rather than from a VM that never ends.
+fn watch_shutdown_sentinel(
+    console: &ConsoleDevice,
+    tag: &'static str,
+    enabled: bool,
+    stop_all: impl Fn() + Send + 'static,
+) {
+    let mut scan = SentinelScan::default();
+    console.set_byte_observer(Box::new(move |bytes: &[u8]| {
+        if !scan.feed(bytes) {
+            return;
+        }
+        if enabled {
+            stop_all();
+            return;
+        }
+        // Only if the guest is still running a while later: one that powers
+        // off right after printing it (tinyinit does) needs no telling.
+        let _ = std::thread::Builder::new()
+            .name("sentinel-hint".into())
+            .spawn(move || {
+                std::thread::sleep(SENTINEL_HINT_AFTER);
+                if !virtio::device::vm_stopping() {
+                    eprintln!(
+                        "\r\n[{tag}] the guest printed the shutdown sentinel on hvc0 {} s ago and \
+                         is still running. tinyvmm acts on the sentinel only with \
+                         --shutdown-sentinel, which a guest that can't power off by ACPI needs.",
+                        SENTINEL_HINT_AFTER.as_secs()
+                    );
+                }
+            });
+    }));
+}
+
+/// How long after an ignored shutdown sentinel tinyvmm says that it ignored
+/// it, if the guest is still running then.
+const SENTINEL_HINT_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a teardown waits, once the VM has stopped, for the doorbell
+/// pumps to finish what they are serving and for the disk requests in flight.
+/// What takes longer isn't waited for: a host disk or share that has stopped
+/// answering must not keep tinyvmm from ending.
+const TEARDOWN_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Tell the devices that the VM is stopping, before its vCPUs are told, so
+/// that a device drain already under way sees it (see
+/// `virtio::device::vm_stopping`).
+///
+/// The disks stop running what the guest has queued on them: at once, unless
+/// the guest has asked for the snapshot it was started to take, which wants
+/// that work done and gives it `SNAPSHOT_DISK_PATIENCE`. A drain may be
+/// running on a vCPU's thread, which stops only when the drain returns, and
+/// one chain can name the whole disk many times over: left to finish, the
+/// guest would choose how long the stop takes.
+fn announce_stop() {
+    let patience = if whp::snapshot::was_requested() {
+        SNAPSHOT_DISK_PATIENCE
+    } else {
+        std::time::Duration::ZERO
+    };
+    virtio::device::set_vm_stopping(patience);
+}
+
+/// How long the disks go on running what the guest has queued once it has
+/// asked for a snapshot. Half of `TEARDOWN_PATIENCE`, so a drain that gives
+/// up is back well before the wait for its pump runs out, and the snapshot
+/// is refused for what it would be missing rather than the process ended.
+const SNAPSHOT_DISK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Bring the virtio devices to rest once the vCPUs have stopped and been
+/// joined. Returns whether every disk request settled, so that the disks'
+/// workers are stopped and nothing of theirs can touch guest RAM any more.
+///
+/// The doorbell pumps go first: until they are joined, a kick that arrived
+/// just before the stop can still be taking requests off a queue. A pump may
+/// be in the middle of a request it serves itself (a lone disk read, a 9p
+/// request). If it is still at it when `TEARDOWN_PATIENCE` is up, the
+/// process ends here: the pump can't be joined, and nothing it uses (the
+/// device, guest RAM, the doorbells) can be taken from under it, which is
+/// all the rest of teardown would do.
+///
+/// For a snapshot, what the guest had queued is then taken and run to the
+/// end, so the capture holds no request that was kicked for but never
+/// served: the restored guest would wait on it for good. A disk gives that
+/// work `SNAPSHOT_DISK_PATIENCE` from the stop (`announce_stop`); the
+/// caller writes no snapshot of a disk that left some behind
+/// (`BlockDevice::left_work_behind`), or when this returns false.
+///
+/// Otherwise nothing more is taken: what a guest leaves queued when it is
+/// stopped is its own to lose, as at a power cut, and running it would let
+/// the guest choose how long tinyvmm takes to stop. The disks have known
+/// since the stop was announced; they are told again here, before the pumps
+/// are joined (`BlockDevice::abandon`), which also cuts a request short
+/// that a pump is submitting a segment at a time. Requests already in
+/// flight get what is left of `TEARDOWN_PATIENCE`.
+fn settle_devices(
+    tag: &str,
+    for_snapshot: bool,
+    transports: &[Arc<PciTransport>],
+    blk_devices: &[Arc<BlockDevice>],
+    blk_backends: &[Arc<BlockFile>],
+) -> bool {
+    let deadline = std::time::Instant::now() + TEARDOWN_PATIENCE;
+    if !for_snapshot {
+        for d in blk_devices {
+            d.abandon();
+        }
+    }
+    let mut pumps_joined = true;
+    for t in transports {
+        pumps_joined &= t.stop_pump_by(deadline);
+    }
+    if !pumps_joined {
+        eprintln!(
+            "[{tag}] WARN: a device was still serving a request {} s after the VM stopped (a \
+             host disk or share that doesn't answer?); ending without waiting for it{}",
+            TEARDOWN_PATIENCE.as_secs(),
+            if for_snapshot {
+                ", no snapshot written"
+            } else {
+                ""
+            }
+        );
+        std::process::exit(1);
+    }
+    if for_snapshot {
+        for t in transports {
+            t.sweep_queues();
+        }
+    }
+    let mut settled = true;
+    for d in blk_devices {
+        // Every disk is told to stop, also once one has run out of time.
+        settled &= if for_snapshot {
+            d.quiesce(deadline)
+        } else {
+            d.stop_taking_requests(deadline)
+        };
+    }
+    if settled {
+        for b in blk_backends {
+            b.stop();
+        }
+    } else {
+        eprintln!(
+            "[{tag}] WARN: disk requests were still in flight {} s after the VM stopped; \
+             leaving them and guest RAM to the process exit",
+            TEARDOWN_PATIENCE.as_secs()
+        );
+        // A backend waits for its requests when it is stopped or dropped, and
+        // their completions land in the device's pools: keep both alive
+        // rather than wait on a disk that isn't answering.
+        for d in blk_devices {
+            std::mem::forget(d.clone());
+        }
+        for b in blk_backends {
+            std::mem::forget(b.clone());
+        }
+    }
+    settled
 }
 
 fn run_pvh_run(args: &[String]) -> Result<i32> {
@@ -2415,6 +2634,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     let stop_all = {
         let stoppers = stoppers.clone();
         move || {
+            announce_stop();
             for (flag, vp) in stoppers.iter() {
                 flag.store(true, Ordering::Release);
                 let _ = vp.cancel();
@@ -2489,32 +2709,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     let console_restore =
         setup_interactive_console(console.clone(), console_input, graceful.clone());
 
-    // Shutdown sentinel watcher: the guest prints this marker on hvc0 to
-    // request a clean stop. Harnesses use it: it predates ACPI power-off, and
-    // it still stops a kernel built without ACPI, whose `poweroff` falls back
-    // to STI;HLT and never produces a halt VM-exit. We scan the console TX
-    // byte stream (guest -> host) for the sentinel and stop every vCPU.
-    {
-        const SENTINEL: &[u8] = b"=== tinyvmm shutdown requested ===";
-        let stop_all = stop_all.clone();
-        let mut acc: Vec<u8> = Vec::new();
-        let mut fired = false;
-        console.set_byte_observer(Box::new(move |bytes: &[u8]| {
-            if fired {
-                return;
-            }
-            acc.extend_from_slice(bytes);
-            if acc.windows(SENTINEL.len()).any(|w| w == SENTINEL) {
-                fired = true;
-                stop_all();
-            }
-            // Bound memory; keep only enough tail for a straddling match.
-            if acc.len() > SENTINEL.len() {
-                let drop = acc.len() - SENTINEL.len();
-                acc.drain(0..drop);
-            }
-        }));
-    }
+    watch_shutdown_sentinel(&console, "pvh-run", cfg.shutdown_sentinel, stop_all.clone());
 
     println!("[pvh-run] running ({} vCPU(s))", cfg.vcpus);
     btimer.mark("entering guest");
@@ -2606,21 +2801,26 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
     // Finalize the recording now that the guest has stopped producing output.
     finish_recording(recorder.as_ref(), "pvh-run");
 
-    // Quiesce every virtio-blk device, then stop its IOCP worker. With the
-    // vCPUs joined, each device takes what the guest left in its ring, stops
-    // taking requests (a doorbell pump that wakes later finds it stopped), and
-    // waits until every request it took has completed. A snapshot then holds no
-    // request taken off the avail ring but never completed, and stop() finds
-    // nothing in flight, so no completion lands on freed memory. Then print the
-    // per-disk shutdown summary (max_depth > 1 proves the concurrent-writer
+    // Snapshot save: if armed and the guest issued the trigger (from any
+    // vCPU), the machine is quiesced, captured and written below. If the guest
+    // stopped for any other reason, no snapshot is written.
+    let snapshot_requested = cfg.save_path.is_some()
+        && (reason == StopReason::SnapshotRequested
+            || ap_reasons.contains(&StopReason::SnapshotRequested));
+
+    // Bring the devices to rest (see `settle_devices`): the pumps are joined,
+    // each disk stops taking requests and those it took complete, then its
+    // IOCP worker stops, so no completion lands on freed memory. The per-disk
+    // shutdown summary follows (max_depth > 1 proves the concurrent-writer
     // phase reached real queue depth; max_inflight counts only the ops the host
     // completed asynchronously, i.e. page-cache misses and flushes).
-    for d in &blk_devices {
-        d.quiesce();
-    }
-    for b in &blk_backends {
-        b.stop();
-    }
+    let blk_settled = settle_devices(
+        "pvh-run",
+        snapshot_requested,
+        &transports,
+        &blk_devices,
+        &blk_backends,
+    );
     // VMBus's devices stop writing guest RAM before a snapshot captures it.
     if let Some(host) = &vmbus_host {
         host.stop();
@@ -2632,24 +2832,29 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         p9_devices: &p9_devices,
         vmbus: vmbus_host.as_deref(),
         ram: &ram,
+        blk_settled,
     };
 
-    // Snapshot save: if armed and the guest issued the trigger (from any vCPU),
-    // capture the now quiesced machine (APs stopped + joined, blk devices
-    // quiesced) and write the file, then exit. If the guest stopped for any
-    // other reason, the snapshot is not written.
     if let Some(ref save_path) = cfg.save_path {
-        let requested = reason == StopReason::SnapshotRequested
-            || ap_reasons.contains(&StopReason::SnapshotRequested);
-        if requested {
+        if snapshot_requested {
             // Quiesce every net data plane and 9p worker pool before capturing,
             // so no inbound frame or 9p reply mutates an RX/used ring or guest
             // RAM after the device + RAM sections are taken.
             for nd in &net_devices {
                 nd.quiesce_backend();
             }
-            for p9 in &p9_devices {
-                p9.quiesce();
+            if !blk_settled || blk_devices.iter().any(|d| d.left_work_behind()) {
+                return Err(Error::msg(
+                    "the disk requests the guest had queued were not all served when the \
+                     snapshot was due; no snapshot written (the restored guest would wait on \
+                     them for good)",
+                ));
+            }
+            if !p9_devices.iter().all(|p9| p9.quiesce()) {
+                return Err(Error::msg(
+                    "9p requests were still running on the host when the snapshot was \
+                     due; no snapshot written (it would have captured them half done)",
+                ));
             }
             write_snapshot(
                 save_path,
@@ -2896,6 +3101,7 @@ fn wire_net_backend(net: &Arc<NetDevice>, nic: &NicSpec) -> Result<String> {
         NetBackendKind::Slirp => {
             let opts = crate::net::slirp::SlirpOptions {
                 port_forwards: nic.port_forwards.clone(),
+                host_local: nic.nat_host_local,
             };
             let (backend, version) = crate::net::slirp::SlirpBackend::new(net, opts)
                 .map_err(|e| Error::msg(format!("slirp NIC: {e}")))?;
@@ -2913,6 +3119,7 @@ fn wire_net_backend(net: &Arc<NetDevice>, nic: &NicSpec) -> Result<String> {
             let opts = crate::net::gvisor::GvisorOptions {
                 port_forwards: nic.port_forwards.clone(),
                 dns_servers: crate::net::sys::dns_servers(),
+                host_local: nic.nat_host_local,
             };
             let (backend, version) = crate::net::gvisor::GvisorBackend::new(net, opts)
                 .map_err(|e| Error::msg(format!("gvisor NIC: {e}")))?;
@@ -3210,7 +3417,7 @@ fn write_snapshot(
 /// Restore a machine from a snapshot file and resume it. The device tree + RAM
 /// size come entirely from the snapshot header; `--restore` also accepts optional
 /// `--drive` (positional path/RO overrides), `--cpu-affinity`, `--watchdog-secs`,
-/// and `--unsafe-restore-mutable-drive`.
+/// `--shutdown-sentinel` and `--unsafe-restore-mutable-drive`.
 /// Parse a restore-time `--drive` override: `<path>[,readonly|ro|rw]`. Returns
 /// the path and an OPTIONAL readonly flag — `None` means "inherit the saved
 /// drive's readonly state". (The boot-time `--drive` parse instead defaults RO
@@ -3251,6 +3458,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
     let mut watchdog_secs = 0u32;
     let mut unsafe_restore_mutable_drive = false;
     let mut doorbells = true;
+    let mut shutdown_sentinel = false;
     let mut record: Option<RecordSpec> = None;
     {
         let mut i = 3;
@@ -3283,6 +3491,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
                 }
                 "--unsafe-restore-mutable-drive" => unsafe_restore_mutable_drive = true,
                 "--no-doorbells" => doorbells = false,
+                "--shutdown-sentinel" => shutdown_sentinel = true,
                 "--poll-us" => {
                     i += 1;
                     virtio::transport::set_poll_max_us(parse_poll_us(args.get(i))?);
@@ -3298,7 +3507,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
                     return Err(Error::msg(format!(
                         "--restore: unknown flag '{other}' (want --drive, --cpu-affinity, \
                          --watchdog-secs, --unsafe-restore-mutable-drive, --poll-us, \
-                         --no-doorbells, --record)"
+                         --no-doorbells, --shutdown-sentinel, --record)"
                     )));
                 }
             }
@@ -4047,6 +4256,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
     let stop_all = {
         let stoppers = stoppers.clone();
         move || {
+            announce_stop();
             for (flag, vp) in stoppers.iter() {
                 flag.store(true, Ordering::Release);
                 let _ = vp.cancel();
@@ -4088,26 +4298,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
     };
     let console_restore =
         setup_interactive_console(console.clone(), console_input, graceful.clone());
-    {
-        const SENTINEL: &[u8] = b"=== tinyvmm shutdown requested ===";
-        let stop_all = stop_all.clone();
-        let mut acc: Vec<u8> = Vec::new();
-        let mut fired = false;
-        console.set_byte_observer(Box::new(move |bytes: &[u8]| {
-            if fired {
-                return;
-            }
-            acc.extend_from_slice(bytes);
-            if acc.windows(SENTINEL.len()).any(|w| w == SENTINEL) {
-                fired = true;
-                stop_all();
-            }
-            if acc.len() > SENTINEL.len() {
-                let drop = acc.len() - SENTINEL.len();
-                acc.drain(0..drop);
-            }
-        }));
-    }
+    watch_shutdown_sentinel(&console, "restore", shutdown_sentinel, stop_all.clone());
 
     // Put back every vCPU's TSC/TscAux, then restart the partition's clocks:
     // the TSCs and the reference time resume together from the saved instant.
@@ -4194,13 +4385,9 @@ fn run_restore(args: &[String]) -> Result<i32> {
         let _ = w.join();
     }
     console_restore.restore();
-    // As in run_pvh_run: quiesce each blk device before stopping its worker.
-    for d in &blk_devices {
-        d.quiesce();
-    }
-    for b in &blk_backends {
-        b.stop();
-    }
+    // As in run_pvh_run: bring the devices to rest before stopping the
+    // disks' workers.
+    let blk_settled = settle_devices("restore", false, &transports, &blk_devices, &blk_backends);
     let _release = ReleaseBeforeTeardown {
         tag: "restore",
         transports: &transports,
@@ -4208,6 +4395,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
         p9_devices: &p9_devices,
         vmbus: vmbus_host.as_deref(),
         ram: &ram,
+        blk_settled,
     };
     if let Some(d) = &display {
         d.shutdown();
@@ -5394,5 +5582,40 @@ fn main() {
             eprintln!("tinyvmm error: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sentinel is found once, however the console's writes split it,
+    /// and not in output that only resembles it.
+    #[test]
+    fn the_shutdown_sentinel_is_found_across_writes() {
+        let text = b"[init] done\n=== tinyvmm shutdown requested ===\nlate output";
+        // Whole, and split at every byte.
+        for cut in 0..=text.len() {
+            let mut scan = SentinelScan::default();
+            let first = scan.feed(&text[..cut]);
+            let second = scan.feed(&text[cut..]);
+            assert!(first ^ second, "cut at {cut}: {first} {second}");
+            assert!(!scan.feed(text), "found only once");
+        }
+        // A byte at a time.
+        let mut scan = SentinelScan::default();
+        let hits = text.iter().filter(|b| scan.feed(&[**b])).count();
+        assert_eq!(hits, 1);
+
+        // Near misses, and a sentinel broken by other output.
+        let mut scan = SentinelScan::default();
+        assert!(!scan.feed(b"=== tinyvmm shutdown requested =="));
+        assert!(!scan.feed(b" ==="));
+        assert!(!scan.feed(b"=== tinyvmm shutdown "));
+        assert!(!scan.feed(b"[kernel] oops\n"));
+        assert!(!scan.feed(b"requested ==="));
+        assert!(scan.tail.len() < SHUTDOWN_SENTINEL.len(), "bounded memory");
+        // ... and then a real one.
+        assert!(scan.feed(b"=== tinyvmm shutdown requested ==="));
     }
 }

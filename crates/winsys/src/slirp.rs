@@ -7,18 +7,13 @@
 //! it makes into its [`SlirpHost`]) happens on the thread that drives it.
 
 use core::ffi::{c_char, c_int, c_void};
-use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 use std::time::Instant;
-use windows_sys::Win32::Foundation::{GetLastError, HMODULE};
 use windows_sys::Win32::Networking::WinSock::{
     POLLERR, POLLHUP, POLLNVAL, POLLRDBAND, POLLRDNORM, POLLWRNORM, SOCKET, WSAPOLLFD, WSAPoll,
 };
-use windows_sys::Win32::System::LibraryLoader::{
-    GetProcAddress, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
-    LoadLibraryExW, LoadLibraryW,
-};
+use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
 
 const DLL: &str = "libslirp-0.dll";
 
@@ -138,53 +133,22 @@ struct Api {
     version: VersionFn,
 }
 
-/// Load libslirp once: from `TINYVMM_LIBSLIRP` (a path to the DLL), else
-/// next to the running executable, else from the DLL search path. Its own
-/// dependencies (GLib, ...) load from the directory it is in.
+/// Load libslirp once: from the path in `TINYVMM_LIBSLIRP` if that is set,
+/// else from the running executable's directory, and from nowhere else (see
+/// `crate::dll`). Its own dependencies (GLib, ...) load from the directory it
+/// is in.
 fn api() -> Result<&'static Api, String> {
     static API: OnceLock<Result<Api, String>> = OnceLock::new();
     API.get_or_init(load).as_ref().map_err(Clone::clone)
 }
 
 fn load() -> Result<Api, String> {
-    let wide = |s: &std::ffi::OsStr| -> Vec<u16> {
-        use std::os::windows::ffi::OsStrExt;
-        s.encode_wide().chain([0]).collect()
-    };
-    let mut paths: Vec<PathBuf> = Vec::new();
-    if let Some(p) = std::env::var_os("TINYVMM_LIBSLIRP") {
-        paths.push(p.into());
-    }
-    if let Some(dir) = std::env::current_exe()
-        .ok()
-        .and_then(|e| e.parent().map(PathBuf::from))
-    {
-        paths.push(dir.join(DLL));
-    }
-    let mut module: HMODULE = std::ptr::null_mut();
-    for p in paths.iter().filter(|p| p.is_file()) {
-        let w = wide(p.as_os_str());
-        module = unsafe {
-            LoadLibraryExW(
-                w.as_ptr(),
-                std::ptr::null_mut(),
-                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
-            )
-        };
-        if !module.is_null() {
-            break;
-        }
-    }
-    if module.is_null() {
-        module = unsafe { LoadLibraryW(wide(DLL.as_ref()).as_ptr()) };
-    }
-    if module.is_null() {
-        return Err(format!(
-            "could not load {DLL} (err={}); run tools\\fetch_libslirp.py, which puts it and the \
-             DLLs it needs next to tinyvmm.exe, or set TINYVMM_LIBSLIRP to its path",
-            unsafe { GetLastError() }
-        ));
-    }
+    let module = crate::dll::load(
+        DLL,
+        "TINYVMM_LIBSLIRP",
+        "run tools\\fetch_libslirp.py, which puts it and the DLLs it needs next to tinyvmm.exe, \
+         or set TINYVMM_LIBSLIRP to its path",
+    )?;
     let sym = |name: &str| -> Result<*const (), String> {
         let c: Vec<u8> = name.bytes().chain([0]).collect();
         match unsafe { GetProcAddress(module, c.as_ptr()) } {
