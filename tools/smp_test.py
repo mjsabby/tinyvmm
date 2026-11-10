@@ -36,6 +36,7 @@ import threading
 import time
 from pathlib import Path
 from vhdx import make_vhdx
+from vmm_harness import sentinel_args
 
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_TINYVMM = REPO / "target" / "release" / "tinyvmm.exe"
@@ -174,7 +175,7 @@ def main() -> int:
     for n in counts:
         print(f"\n========== SMP self-test: --vcpus {n} ==========")
         argv = [
-            str(args.tinyvmm), "--pvh-run",
+            str(args.tinyvmm), "--pvh-run", *sentinel_args(args.tinyvmm),
             "--vcpus", str(n),
             "--ram-mb", "256",
             "--initrd", str(args.initrd),
@@ -200,7 +201,7 @@ def main() -> int:
         make_vhdx(vdc, BLK_VDC_BYTES, args.tinyvmm, fill=0x42)
         try:
             argv = [
-                str(args.tinyvmm), "--pvh-run",
+                str(args.tinyvmm), "--pvh-run", *sentinel_args(args.tinyvmm),
                 "--vcpus", "2",
                 "--ram-mb", "256",
                 "--drive", str(vdb),

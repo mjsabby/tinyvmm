@@ -65,6 +65,8 @@ import time
 from ctypes import wintypes
 from pathlib import Path
 
+from vmm_harness import sentinel_args
+
 
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_TINYVMM = REPO / "target" / "release" / "tinyvmm.exe"
@@ -453,7 +455,7 @@ def main() -> int:
 
     argv = [
         str(args.tinyvmm),
-        "--pvh-run",
+        "--pvh-run", *sentinel_args(args.tinyvmm),
         "--ram-mb", "256",
         "--virtio-9p-share", f"host={share},{SHARE_OPTS}",
         "--initrd", str(args.initrd),

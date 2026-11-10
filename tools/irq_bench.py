@@ -48,7 +48,7 @@ METRICS = [
 
 def one_run(exe: str, args: argparse.Namespace, scratch: Path) -> dict[str, float]:
     make_vhdx(scratch, SCRATCH_BYTES, exe)
-    argv = [exe, "--pvh-run", "--vcpus", str(args.vcpus), "--ram-mb", "256",
+    argv = [exe, "--pvh-run", *vh.sentinel_args(exe), "--vcpus", str(args.vcpus), "--ram-mb", "256",
             "--drive", str(scratch), "--initrd", str(args.initrd), str(args.vmlinux),
             "--", "tinyvmm.test=bench-irq", *vh.GUEST_CMDLINE]
     run = vh.run_vmm(argv, args.timeout_sec, echo=args.verbose, cpu_markers=IDLE)

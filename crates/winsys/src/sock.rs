@@ -3,8 +3,9 @@
 
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    FIXED_INFO_W2KSP1, GetNetworkParams, ICMP_ECHO_REPLY, IP_ADDR_STRING, IcmpCloseHandle,
-    IcmpCreateFile, IcmpSendEcho,
+    FIXED_INFO_W2KSP1, FreeMibTable, GetNetworkParams, GetUnicastIpAddressTable, ICMP_ECHO_REPLY,
+    IP_ADDR_STRING, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho, MIB_UNICASTIPADDRESS_ROW,
+    MIB_UNICASTIPADDRESS_TABLE,
 };
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, FIONBIO, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0, INVALID_SOCKET,
@@ -677,12 +678,61 @@ pub fn dns_servers() -> Vec<[u8; 4]> {
     out
 }
 
+/// The host's own unicast IPv4 addresses, on every interface (its loopback
+/// included); empty if the address table can't be read.
+pub fn host_ipv4_addrs() -> Vec<[u8; 4]> {
+    let mut table: *mut MIB_UNICASTIPADDRESS_TABLE = std::ptr::null_mut();
+    // SAFETY: on success the call stores a table it allocated in `table`,
+    // which is freed below.
+    if unsafe { GetUnicastIpAddressTable(AF_INET, &mut table) } != ERROR_SUCCESS || table.is_null()
+    {
+        return Vec::new();
+    }
+    // SAFETY: the table is its header followed by `NumEntries` rows. The rows
+    // are addressed without a reference to the one-row array the header
+    // declares, so the pointer stays valid for all of them. Each row's
+    // address is a SOCKADDR_INET whose family says which member is live, and
+    // every bit pattern is a valid `S_addr` (octets in network order).
+    let out = unsafe {
+        let rows = (&raw const (*table).Table).cast::<MIB_UNICASTIPADDRESS_ROW>();
+        let rows = std::slice::from_raw_parts(rows, (*table).NumEntries as usize);
+        rows.iter()
+            .filter(|r| r.Address.si_family == AF_INET)
+            .map(|r| r.Address.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes())
+            .collect()
+    };
+    // SAFETY: `table` came from GetUnicastIpAddressTable and isn't used again.
+    unsafe { FreeMibTable(table as *const c_void) };
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::UdpSocket;
     use std::os::windows::io::AsRawSocket;
     use std::time::Duration;
+
+    /// The address table lists the host's loopback and the address the host
+    /// would send from to reach the outside (when it has a route there).
+    #[test]
+    fn host_addresses_include_loopback_and_the_outbound_address() {
+        let addrs = host_ipv4_addrs();
+        assert!(addrs.contains(&[127, 0, 0, 1]), "{addrs:?}");
+        assert!(!addrs.contains(&[0, 0, 0, 0]), "{addrs:?}");
+        // Connecting a datagram socket sends nothing; it only picks the
+        // source address. 192.0.2.1 is a documentation address (RFC 5737).
+        let s = UdpSocket::bind("0.0.0.0:0").unwrap();
+        if s.connect("192.0.2.1:9").is_ok()
+            && let Ok(std::net::SocketAddr::V4(local)) = s.local_addr()
+            && !local.ip().is_unspecified()
+        {
+            assert!(
+                addrs.contains(&local.ip().octets()),
+                "{local} not in {addrs:?}"
+            );
+        }
+    }
 
     /// In skip mode a receive that finds a datagram queued completes inline
     /// and queues no completion (one would be handled twice), while one that

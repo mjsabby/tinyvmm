@@ -286,7 +286,12 @@ For a stable identity, set `ssh.host_key` to a protected persistent Linux file
 holding an unencrypted OpenSSH Ed25519 private key (`ssh-keygen -t ed25519 -N ''
 -f host_key`); other key types and passphrase-protected keys are refused.
 Never bake one shared host private key into every instance.
-Bootstrap configuration is copied to root-only `/run/tinyinit.json`.
+Bootstrap configuration is copied to root-only `/run/tinyinit.json`, and the
+bootstrap share itself is mounted for root alone (9p `access=0`): 9p shows the
+host's files as world-readable, so any account could otherwise read
+`init.json` (every app's `env` included) and whatever else sits beside it.
+Other users get `EPERM` for anything under `/mnt/bootstrap`; give applications
+their files through a share listed in `mounts` instead.
 
 Without share options, tinyvmm presents 9p files as root-owned 0644/0444.
 Use `,uid=1000,gid=1000` to grant the configured app account ownership on a

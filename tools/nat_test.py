@@ -254,7 +254,7 @@ def main() -> int:
     print(f"[nat-test] host server 127.0.0.1:{port}, UDP echo {udp_port}, closed port {closed}, "
           f"forward {fwd} -> guest 8080, multicast {MCAST_GROUP}:{mcast_port}")
 
-    argv = [str(args.tinyvmm), "--pvh-run", "--ram-mb", "1024",
+    argv = [str(args.tinyvmm), "--pvh-run", *h.sentinel_args(args.tinyvmm), "--ram-mb", "1024",
             "--net", "--net-backend", args.backend, "--portfwd", f"{fwd}:8080",
             # The host servers are on the host's loopback, at the gateway.
             "--nat-host-local",

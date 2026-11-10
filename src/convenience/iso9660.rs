@@ -118,13 +118,24 @@ impl<R: ReadAt> Iso9660<R> {
     }
 
     /// Read a whole file.
+    #[cfg(test)]
     pub fn read_file(&self, path: &str) -> Result<Vec<u8>> {
+        self.read_file_capped(path, u64::from(MAX_FILE_BYTES))
+    }
+
+    /// Read a whole file of at most `max` bytes. A larger one is an error
+    /// before any of it is read (or allocated).
+    pub fn read_file_capped(&self, path: &str, max: u64) -> Result<Vec<u8>> {
         let entry = self
             .lookup(path)?
             .filter(|e| !e.dir)
             .ok_or_else(|| Error::msg(format!("ISO 9660: no file {path}")))?;
-        if entry.size > MAX_FILE_BYTES {
-            return Err(Error::msg(format!("ISO 9660: {path} is too large")));
+        let max = max.min(u64::from(MAX_FILE_BYTES));
+        if u64::from(entry.size) > max {
+            return Err(Error::msg(format!(
+                "ISO 9660: {path} is too large ({} bytes; at most {max} here)",
+                entry.size
+            )));
         }
         let mut buf = vec![0u8; entry.size as usize];
         read(&self.src, u64::from(entry.lba) * SECTOR, &mut buf)?;

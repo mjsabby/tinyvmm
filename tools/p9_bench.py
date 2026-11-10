@@ -36,6 +36,8 @@ import threading
 import time
 from pathlib import Path
 
+from vmm_harness import sentinel_args
+
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_TINYVMM = REPO / "target" / "debug" / "tinyvmm.exe"
 DEFAULT_VMLINUX = REPO / "vmlinux"
@@ -122,7 +124,7 @@ def main() -> int:
     print(f"[p9-bench] staged {total_bytes:,} bytes")
 
     argv = [
-        str(args.tinyvmm), "--pvh-run",
+        str(args.tinyvmm), "--pvh-run", *sentinel_args(args.tinyvmm),
         "--ram-mb", str(args.ram_mb),
         "--virtio-9p-share", f"host={share}",
         "--initrd", str(args.initrd),

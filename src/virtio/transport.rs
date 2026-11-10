@@ -11,7 +11,7 @@ use crate::pci::{CAP_ID_VENDOR, PciFunction};
 use crate::virtio::device::{
     FEATURE_RING_EVENT_IDX, STATUS_DRIVER_OK, STATUS_FEATURES_OK, STATUS_NEEDS_RESET, VirtioDevice,
 };
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use whpsys::doorbell::Doorbell;
@@ -101,7 +101,6 @@ struct Common {
     /// The status a reset (status write of 0) started from. Reads report it
     /// instead of 0 while the device is still settling that reset.
     reset_from: u8,
-    config_generation: u8,
     queue_select: u16,
     queues: Vec<QueueState>,
 }
@@ -116,6 +115,15 @@ pub struct PciTransport {
     cfg: Mutex<PciConfigSpace>,
     common: Mutex<Common>,
     isr_status: AtomicU32,
+    /// The MSI-X vector of each queue and of config changes, as `common` has
+    /// them (`sync_vectors`), and the config generation. Kept outside
+    /// `common` so that raising an interrupt takes no lock: devices raise from
+    /// their own threads, sometimes under a device lock, while `common` is
+    /// held across the device callbacks (reset, enable, disable) that take
+    /// those same locks.
+    queue_vectors: Vec<AtomicU16>,
+    config_vector: AtomicU16,
+    config_generation: AtomicU8,
     bar_gpa: AtomicU64,
     bar_mapped: AtomicBool,
     notify_count: AtomicU64,
@@ -124,11 +132,44 @@ pub struct PciTransport {
     doorbell_state: Mutex<Option<DoorbellState>>,
 }
 
-/// Active doorbell set + the pump thread servicing them. Dropped on BAR unmap.
+/// The doorbells of a transport and the pump thread serving them. Registered
+/// the first time the BAR is mapped and kept until the transport drops:
+/// unregistering one can block forever in vid.sys (see `whpsys::doorbell`),
+/// and the guest decides when a BAR is unmapped, so nothing it does may reach
+/// an unregistration.
 struct DoorbellState {
     stop_event: HANDLE,
     doorbells: Vec<Doorbell>,
     pump: Option<JoinHandle<()>>,
+    route: Arc<DoorbellRoute>,
+}
+
+/// What a doorbell pump needs to know about its transport's BAR.
+struct DoorbellRoute {
+    /// The BAR base the doorbells were registered at.
+    gpa: u64,
+    /// The BAR is mapped at `gpa` now, so a doorbell is a kick of this
+    /// device's queue. Otherwise the guest has unmapped or moved the BAR and
+    /// the write belongs to whatever sits at that address (see
+    /// [`doorbell_pump`]).
+    live: AtomicBool,
+    mmio_bus: Arc<MmioBus>,
+}
+
+impl DoorbellRoute {
+    /// Hand the write that fired queue `q`'s doorbell to the MMIO bus: the
+    /// 2-byte store of `q` to that queue's notify address, which is all a
+    /// doorbell matches.
+    fn forward(&self, q: u32) {
+        let mut write = MmioAccess {
+            gpa: self.gpa + OFF_NOTIFY + u64::from(q) * u64::from(NOTIFY_MULT),
+            access_size: 2,
+            is_write: true,
+            data: [0; 8],
+        };
+        write.data[..2].copy_from_slice(&(q as u16).to_le_bytes());
+        self.mmio_bus.dispatch(&mut write);
+    }
 }
 
 // SAFETY: the raw fields are OS event HANDLEs (stop_event + the per-doorbell
@@ -252,7 +293,20 @@ impl PollWindow {
 /// it only needs `notify_queue`, the device merely *weak*-refs the transport
 /// back (via the irq closure) so there's no strong cycle, and teardown drives
 /// the exit via `stop_event` + join — so no per-fire `upgrade()` is needed.
-fn doorbell_pump(device: Arc<dyn VirtioDevice>, handles: SendHandles, qcount: u32) {
+///
+/// `handles[i + 1]` is the doorbell of queue `queues[i]`. The doorbells stay
+/// registered at `route.gpa` for the transport's whole life, wherever the
+/// guest moves the BAR. While the BAR isn't there, a doorbell is still the
+/// 2-byte write of the queue index that matched it, at an address this device
+/// no longer answers: the pump hands that write to the MMIO bus, as the VM
+/// exit it replaced would have, so it reaches whichever device the guest put
+/// there (or nothing).
+fn doorbell_pump(
+    device: Arc<dyn VirtioDevice>,
+    route: Arc<DoorbellRoute>,
+    handles: SendHandles,
+    queues: Vec<u32>,
+) {
     ON_DOORBELL_PUMP.with(|c| c.set(true));
     // INFINITE: wake only on a doorbell/stop. Set to a finite value to also run
     // a periodic all-queue safety sweep (not needed; see above).
@@ -266,12 +320,19 @@ fn doorbell_pump(device: Arc<dyn VirtioDevice>, handles: SendHandles, qcount: u3
             break; // stop_event
         }
         if r == WAIT_TIMEOUT {
-            for q in 0..qcount {
-                device.notify_queue(q);
+            if route.live.load(Ordering::Acquire) {
+                for &q in &queues {
+                    device.notify_queue(q);
+                }
             }
         } else {
             let i = r.wrapping_sub(WAIT_OBJECT_0) as usize;
             if i >= 1 && i < handles.len() {
+                let q = queues[i - 1];
+                if !route.live.load(Ordering::Acquire) {
+                    route.forward(q);
+                    continue;
+                }
                 // Doorbell events are auto-reset (see whpsys::doorbell): WFMO
                 // already consumed the signal, no ResetEvent needed.
                 if crate::diag::etw::enabled(
@@ -283,10 +344,9 @@ fn doorbell_pump(device: Arc<dyn VirtioDevice>, handles: SendHandles, qcount: u3
                         crate::diag::etw::VERBOSE,
                         crate::diag::etw::kw::DOORBELL,
                     )
-                    .u32("queue", (i - 1) as u32)
+                    .u32("queue", q)
                     .write();
                 }
-                let q = (i - 1) as u32;
                 window.on_doorbell();
                 device.notify_queue(q);
                 // Requests the poll catches are drained like a doorbell's. If
@@ -408,11 +468,13 @@ impl PciTransport {
                 msix_config: 0xFFFF,
                 status: 0,
                 reset_from: 0,
-                config_generation: 0,
                 queue_select: 0,
                 queues,
             }),
             isr_status: AtomicU32::new(0),
+            queue_vectors: (0..qcount).map(|_| AtomicU16::new(0xFFFF)).collect(),
+            config_vector: AtomicU16::new(0xFFFF),
+            config_generation: AtomicU8::new(0),
             bar_gpa: AtomicU64::new(0),
             bar_mapped: AtomicBool::new(false),
             notify_count: AtomicU64::new(0),
@@ -429,15 +491,15 @@ impl PciTransport {
         self.msix.injected_count()
     }
 
+    /// Raise queue `qidx`'s interrupt. Takes no transport lock (see
+    /// `queue_vectors`), so a device may call it from any thread, whatever
+    /// device lock it holds.
     pub fn raise_queue_interrupt(&self, qidx: u32) {
         self.isr_status.fetch_or(ISR_QUEUE_BIT, Ordering::Relaxed);
-        let v = {
-            let c = self.common.lock().unwrap();
-            c.queues
-                .get(qidx as usize)
-                .map(|q| q.msix_vector)
-                .unwrap_or(0xFFFF)
-        };
+        let v = self
+            .queue_vectors
+            .get(qidx as usize)
+            .map_or(0xFFFF, |v| v.load(Ordering::Acquire));
         if v != 0xFFFF {
             self.msix.trigger(v as u32);
         }
@@ -445,13 +507,20 @@ impl PciTransport {
 
     pub fn raise_config_change_interrupt(&self) {
         self.isr_status.fetch_or(ISR_CONFIG_BIT, Ordering::Relaxed);
-        let v = {
-            let mut c = self.common.lock().unwrap();
-            c.config_generation = c.config_generation.wrapping_add(1);
-            c.msix_config
-        };
+        self.config_generation.fetch_add(1, Ordering::AcqRel);
+        let v = self.config_vector.load(Ordering::Acquire);
         if v != 0xFFFF {
             self.msix.trigger(v as u32);
+        }
+    }
+
+    /// Publish the MSI-X vectors `c` holds to the lock-free copies the raise
+    /// paths read. Call with `common` held, after anything that changes them.
+    fn sync_vectors(&self, c: &Common) {
+        self.config_vector.store(c.msix_config, Ordering::Release);
+        for (i, v) in self.queue_vectors.iter().enumerate() {
+            let vector = c.queues.get(i).map_or(0xFFFF, |q| q.msix_vector);
+            v.store(vector, Ordering::Release);
         }
     }
 
@@ -481,7 +550,12 @@ impl PciTransport {
         if !self.bar_mapped.swap(false, Ordering::Relaxed) {
             return;
         }
-        self.teardown_doorbells();
+        // The doorbells stay registered (see `DoorbellState`); from now on
+        // their pump treats a write there as one to an address this device
+        // doesn't answer.
+        if let Some(state) = self.doorbell_state.lock().unwrap().as_ref() {
+            state.route.live.store(false, Ordering::Release);
+        }
         let gpa = self.bar_gpa.load(Ordering::Relaxed);
         self.mmio_bus.unregister(gpa + OFF_COMMON);
         self.mmio_bus.unregister(gpa + OFF_ISR);
@@ -492,9 +566,18 @@ impl PciTransport {
 
     /// Register a WHP doorbell on each queue's notify register and start the
     /// pump thread. Matching guest kicks then signal an event with no VM exit.
+    ///
+    /// Done once, where the BAR is first mapped. If the guest later maps it
+    /// somewhere else, the registration stays where it is and kicks at the new
+    /// address take the MMIO exit: following the BAR would mean unregistering
+    /// (see `DoorbellState`), or registering without bound.
     fn install_doorbells(&self, gpa: u64) {
         let mut guard = self.doorbell_state.lock().unwrap();
-        if guard.is_some() {
+        if let Some(state) = guard.as_ref() {
+            state
+                .route
+                .live
+                .store(state.route.gpa == gpa, Ordering::Release);
             return;
         }
         let qcount = self.device.queue_count();
@@ -503,39 +586,49 @@ impl PciTransport {
             return;
         }
         let mut doorbells = Vec::with_capacity(qcount as usize);
+        let mut queues = Vec::with_capacity(qcount as usize);
         let mut handles: Vec<HANDLE> = Vec::with_capacity(qcount as usize + 1);
         handles.push(stop_event);
         for q in 0..qcount {
             let notify_gpa = gpa + OFF_NOTIFY + (q as u64) * (NOTIFY_MULT as u64);
             // The driver writes the 16-bit queue index to the notify register.
-            match Doorbell::new(self.part, notify_gpa, q as u64, 2) {
-                Some(db) => {
-                    handles.push(db.event());
-                    doorbells.push(db);
-                }
-                None => {
-                    // Partial failure: tear down what we registered and bail
-                    // (the MMIO fallback still services notifies).
-                    unsafe {
-                        CloseHandle(stop_event);
-                    }
-                    return;
-                }
+            // A queue whose doorbell can't be registered keeps the MMIO exit;
+            // the ones registered so far are kept, never unregistered.
+            if let Some(db) = Doorbell::new(self.part, notify_gpa, q as u64, 2) {
+                handles.push(db.event());
+                queues.push(q);
+                doorbells.push(db);
             }
         }
+        if doorbells.is_empty() {
+            unsafe {
+                CloseHandle(stop_event);
+            }
+            return;
+        }
+        let route = Arc::new(DoorbellRoute {
+            gpa,
+            live: AtomicBool::new(true),
+            mmio_bus: self.mmio_bus.clone(),
+        });
         let device = self.device.clone();
         let send = SendHandles(handles);
+        let pump_route = route.clone();
         let pump = std::thread::Builder::new()
             .name(format!("{}-doorbell", self.name))
-            .spawn(move || doorbell_pump(device, send, qcount))
+            .spawn(move || doorbell_pump(device, pump_route, send, queues))
             .ok();
         *guard = Some(DoorbellState {
             stop_event,
             doorbells,
             pump,
+            route,
         });
     }
 
+    /// Unregister the doorbells. Only as the transport drops: this can block
+    /// forever (see `DoorbellState`), so VM teardown has freed guest RAM by
+    /// then, and nothing the guest does while it runs gets here.
     fn teardown_doorbells(&self) {
         let state = self.doorbell_state.lock().unwrap().take();
         if let Some(mut state) = state {
@@ -561,6 +654,18 @@ impl PciTransport {
     /// teardown frees guest RAM first. Devices with work in flight on their own
     /// threads (blk, net, 9p) need their own quiesce as well.
     pub fn stop(&self) {
+        self.stop_pump();
+        for q in 0..self.device.queue_count() {
+            self.device.disable_queue(q);
+        }
+    }
+
+    /// Join the doorbell pump and leave the queues as they are. Call once the
+    /// vCPUs have stopped: from then on nothing takes requests off this
+    /// device's queues behind the caller's back, so a snapshot can capture
+    /// them, and teardown isn't racing a drain. A kick the pump hadn't got to
+    /// stays in the ring (see [`Self::sweep_queues`]).
+    pub fn stop_pump(&self) {
         let pump = self.doorbell_state.lock().unwrap().as_mut().map(|s| {
             unsafe {
                 SetEvent(s.stop_event);
@@ -570,8 +675,44 @@ impl PciTransport {
         if let Some(Some(h)) = pump {
             let _ = h.join();
         }
+    }
+
+    /// [`Self::stop_pump`], but no later than `deadline`: false if the pump
+    /// is still serving a request then. A device may run a request on its
+    /// pump (a lone disk read, a 9p request), which then takes as long as the
+    /// host's disk or share does, and one that has stopped answering takes
+    /// for ever. The pump is left as it is in that case, and so must
+    /// everything it uses be: the caller can't go on tearing the VM down.
+    pub fn stop_pump_by(&self, deadline: std::time::Instant) -> bool {
+        let pump = self.doorbell_state.lock().unwrap().as_mut().map(|s| {
+            unsafe {
+                SetEvent(s.stop_event);
+            }
+            s.pump.take()
+        });
+        let Some(Some(h)) = pump else {
+            return true;
+        };
+        while !h.is_finished() {
+            if std::time::Instant::now() >= deadline {
+                if let Some(s) = self.doorbell_state.lock().unwrap().as_mut() {
+                    s.pump = Some(h);
+                }
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let _ = h.join();
+        true
+    }
+
+    /// Take whatever the driver left in each queue, on the calling thread, as
+    /// a kick would. For a snapshot, after [`Self::stop_pump`]: a request the
+    /// guest had already kicked for is then served before the capture rather
+    /// than left in a ring whose doorbell the restored guest won't ring again.
+    pub fn sweep_queues(&self) {
         for q in 0..self.device.queue_count() {
-            self.device.disable_queue(q);
+            self.device.notify_queue(q);
         }
     }
 
@@ -634,27 +775,29 @@ impl PciTransport {
                 let v = u64::from_le_bytes(access.data);
                 self.write_cc32(&mut c, off, v as u32);
                 self.write_cc32(&mut c, off + 4, (v >> 32) as u32);
-                return;
-            }
-            let n = sz.min(4) as usize;
-            let mut buf = [0u8; 4];
-            buf[..n].copy_from_slice(&access.data[..n]);
-            let v = u32::from_le_bytes(buf);
-            let aligned = off & !0x3;
-            let shift = (off & 0x3) * 8;
-            if sz < 4 {
-                let mask = match sz {
-                    1 => 0xFFu32,
-                    2 => 0xFFFF,
-                    _ => 0xFFFF_FFFF,
-                };
-                let mut cur = self.read_cc32(&c, aligned);
-                cur &= !(mask << shift);
-                cur |= (v & mask) << shift;
-                self.write_cc32(&mut c, aligned, cur);
             } else {
-                self.write_cc32(&mut c, aligned, v);
+                let n = sz.min(4) as usize;
+                let mut buf = [0u8; 4];
+                buf[..n].copy_from_slice(&access.data[..n]);
+                let v = u32::from_le_bytes(buf);
+                let aligned = off & !0x3;
+                let shift = (off & 0x3) * 8;
+                if sz < 4 {
+                    let mask = match sz {
+                        1 => 0xFFu32,
+                        2 => 0xFFFF,
+                        _ => 0xFFFF_FFFF,
+                    };
+                    let mut cur = self.read_cc32(&c, aligned);
+                    cur &= !(mask << shift);
+                    cur |= (v & mask) << shift;
+                    self.write_cc32(&mut c, aligned, cur);
+                } else {
+                    self.write_cc32(&mut c, aligned, v);
+                }
             }
+            // A write may have set a vector, or reset them all.
+            self.sync_vectors(&c);
             return;
         }
 
@@ -705,7 +848,7 @@ impl PciTransport {
             CC_MSIX_CONFIG => c.msix_config as u32 | ((self.device.queue_count()) << 16),
             CC_DEVICE_STATUS => {
                 c.status as u32
-                    | ((c.config_generation as u32) << 8)
+                    | ((self.config_generation.load(Ordering::Acquire) as u32) << 8)
                     | ((c.queue_select as u32) << 16)
             }
             CC_QUEUE_SIZE => {
@@ -801,26 +944,36 @@ impl PciTransport {
                 let en = (value & 0xFFFF) as u16;
                 let sel = c.queue_select as usize;
                 if sel < c.queues.len() {
-                    c.queues[sel].enable = en;
                     let q = c.queues[sel];
+                    // A driver that never wrote queue_size keeps the size it
+                    // read there: the device's maximum (spec §4.1.4.3).
+                    let size = match q.size {
+                        0 => self.device.queue_max(c.queue_select as u32) as u16,
+                        n => n,
+                    };
                     // Spec §2.7: desc 16-byte, avail 2-byte, used 4-byte aligned.
                     // The queue's atomic ring-index accesses (`AtomicU16::from_ptr`)
                     // require natural alignment; an odd guest GPA would be Rust UB
                     // (and a fault on non-x86). Refuse the enable instead.
                     let aligned = q.desc & 0xF == 0 && q.driver & 1 == 0 && q.device & 3 == 0;
-                    if en != 0 && q.size != 0 && aligned {
+                    if en != 0 && size != 0 && aligned {
                         let event_idx = c.driver_features & FEATURE_RING_EVENT_IDX != 0;
                         self.device.enable_queue(
                             c.queue_select as u32,
                             q.desc,
                             q.driver,
                             q.device,
-                            q.size,
+                            size,
                             event_idx,
                         );
+                        c.queues[sel].size = size;
+                        c.queues[sel].enable = en;
                     } else if en == 0 {
                         self.device.disable_queue(c.queue_select as u32);
+                        c.queues[sel].enable = 0;
                     }
+                    // A refused enable changes nothing, so queue_enable keeps
+                    // reading what is true of the queue.
                 }
             }
             o if o == CC_QUEUE_DESC || o == CC_QUEUE_DRIVER || o == CC_QUEUE_DEVICE => {
@@ -1251,7 +1404,7 @@ impl PciTransport {
                 c.driver_features,
                 c.msix_config,
                 c.status,
-                c.config_generation,
+                self.config_generation.load(Ordering::Acquire),
                 c.queue_select,
                 c.queues.clone(),
             )
@@ -1310,13 +1463,15 @@ impl PciTransport {
             c.driver_features = snap.driver_features;
             c.msix_config = snap.msix_config;
             c.status = snap.status;
-            c.config_generation = snap.config_generation;
+            self.config_generation
+                .store(snap.config_generation, Ordering::Release);
             c.queue_select = snap.queue_select;
             if snap.common_queues.len() == c.queues.len() {
                 c.queues.copy_from_slice(&snap.common_queues);
             } else {
                 c.queues = snap.common_queues.clone();
             }
+            self.sync_vectors(&c);
         }
         self.isr_status.store(snap.isr, Ordering::Relaxed);
         self.msix
@@ -1482,5 +1637,227 @@ mod tests {
             *dev.writes.lock().unwrap(),
             [(2, 4, 0x4433_2211), (6, 4, 0x8877_6655)]
         );
+    }
+
+    fn opts(num_msix_vectors: u16) -> Options {
+        Options {
+            vendor_id: 0x1AF4,
+            sub_vendor_id: 0x1AF4,
+            sub_id: 0,
+            num_msix_vectors,
+            pci_class: 0x02,
+            pci_subclass: 0,
+            doorbells: false,
+        }
+    }
+
+    /// Program queue `q` (size 8) through the common config, as a driver does.
+    fn program_queue(t: &PciTransport, q: u32, vector: u16, desc: u64, avail: u64, used: u64) {
+        common(t, CC_DEVICE_STATUS + 2, 2, Some(q)); // queue_select
+        common(t, CC_QUEUE_SIZE, 4, Some(8 | (vector as u32) << 16));
+        common(t, CC_QUEUE_DESC, 4, Some(desc as u32));
+        common(t, CC_QUEUE_DRIVER, 4, Some(avail as u32));
+        common(t, CC_QUEUE_DEVICE, 4, Some(used as u32));
+        common(t, CC_QUEUE_ENABLE, 2, Some(1));
+    }
+
+    /// Raising an interrupt takes no transport lock. It used to take
+    /// `common`, which is held across `reset`, `enable_queue` and
+    /// `disable_queue`: a device raising from under a lock those take
+    /// deadlocked against a guest's status write.
+    #[test]
+    fn raising_an_interrupt_takes_no_transport_lock() {
+        let dev = Arc::new(SlowReset::default());
+        let t = PciTransport::new("test", dev, opts(2), Arc::new(MmioBus::new()), 0);
+        let _held = t.common.lock().unwrap();
+        t.raise_queue_interrupt(0);
+        t.raise_config_change_interrupt();
+    }
+
+    /// The vectors the raise paths read follow what the driver programs, and
+    /// a reset clears them.
+    #[test]
+    fn interrupt_vectors_follow_the_common_config() {
+        let dev = Arc::new(SlowReset::default());
+        let t = PciTransport::new("test", dev, opts(2), Arc::new(MmioBus::new()), 0);
+        let vectors = |t: &PciTransport| {
+            (
+                t.config_vector.load(Ordering::Acquire),
+                t.queue_vectors[0].load(Ordering::Acquire),
+            )
+        };
+        assert_eq!(vectors(&t), (0xFFFF, 0xFFFF));
+        common(&t, CC_DEVICE_STATUS, 1, Some(0x03));
+        common(&t, CC_MSIX_CONFIG, 2, Some(1));
+        program_queue(&t, 0, 0, 0x1000, 0x2000, 0x3000);
+        assert_eq!(vectors(&t), (1, 0));
+        common(&t, CC_DEVICE_STATUS, 1, Some(0));
+        assert_eq!(vectors(&t), (0xFFFF, 0xFFFF));
+    }
+
+    /// virtio-net's TX drain holds its TX queue lock while a backend that
+    /// answers inline (loopback, WinTun's ARP responder, gVisor's DHCP)
+    /// delivers a frame and raises the RX interrupt; a device reset holds
+    /// `common` and then takes the TX queue lock. With the raise taking
+    /// `common` too, the two threads waited on each other for good. Wired as
+    /// `main.rs` wires a NIC, with the two sides made to meet.
+    #[test]
+    fn a_tx_drain_and_a_device_reset_do_not_deadlock() {
+        use crate::virtio::net::{LoopbackBackend, NET_RX_QUEUE, NET_TX_QUEUE, NetDevice};
+        use crate::virtio::queue::VRING_DESC_F_WRITE;
+        use crate::whp::GuestMemory;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let mem = Arc::new(GuestMemory::new_host_only(1 << 20).unwrap());
+        let dev = NetDevice::new(mem.clone(), [2, 0, 0, 0, 0, 1]);
+        dev.set_backend(LoopbackBackend::new(&dev));
+        let net_dev: Arc<dyn VirtioDevice> = dev.clone();
+        let t = PciTransport::new("net", net_dev, opts(3), Arc::new(MmioBus::new()), 0);
+        // When the drain raises the RX interrupt (TX queue lock held), let
+        // the reset get as far as it can first.
+        let (at_raise, reset_go) = mpsc::channel::<()>();
+        let wt = Arc::downgrade(&t);
+        dev.set_irq_callback(Box::new(move |q| {
+            if q == NET_RX_QUEUE {
+                let _ = at_raise.send(());
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            if let Some(t) = wt.upgrade() {
+                t.raise_queue_interrupt(q);
+            }
+        }));
+
+        // RX: eight writable 2 KiB buffers. TX: one 76-byte chain, a zeroed
+        // virtio_net_hdr and a 64-byte frame.
+        const RX: (u64, u64, u64) = (0x1000, 0x2000, 0x3000);
+        const TX: (u64, u64, u64) = (0x4000, 0x5000, 0x6000);
+        for i in 0..8u16 {
+            let mut d = [0u8; 16];
+            d[0..8].copy_from_slice(&(0x10000 + u64::from(i) * 2048).to_le_bytes());
+            d[8..12].copy_from_slice(&2048u32.to_le_bytes());
+            d[12..14].copy_from_slice(&VRING_DESC_F_WRITE.to_le_bytes());
+            mem.write_at(RX.0 + 16 * u64::from(i), &d).unwrap();
+            mem.write_at(RX.1 + 4 + 2 * u64::from(i), &i.to_le_bytes())
+                .unwrap();
+        }
+        mem.write_at(RX.1 + 2, &8u16.to_le_bytes()).unwrap();
+        let mut d = [0u8; 16];
+        d[0..8].copy_from_slice(&0x20000u64.to_le_bytes());
+        d[8..12].copy_from_slice(&76u32.to_le_bytes());
+        mem.write_at(TX.0, &d).unwrap();
+        mem.write_at(0x20000 + 12, &[0xAB; 64]).unwrap();
+        mem.write_at(TX.1 + 2, &1u16.to_le_bytes()).unwrap();
+
+        common(&t, CC_DEVICE_STATUS, 1, Some(0x03));
+        program_queue(&t, NET_RX_QUEUE, 0xFFFF, RX.0, RX.1, RX.2);
+        program_queue(&t, NET_TX_QUEUE, 0xFFFF, TX.0, TX.1, TX.2);
+
+        let (done, finished) = mpsc::channel::<&'static str>();
+        let pump = {
+            let (dev, done) = (dev.clone(), done.clone());
+            std::thread::spawn(move || {
+                dev.notify_queue(NET_TX_QUEUE);
+                let _ = done.send("the TX drain");
+            })
+        };
+        let vcpu = {
+            let t = t.clone();
+            std::thread::spawn(move || {
+                reset_go.recv().unwrap();
+                common(&t, CC_DEVICE_STATUS, 1, Some(0));
+                let _ = done.send("the reset");
+            })
+        };
+        for _ in 0..2 {
+            finished
+                .recv_timeout(Duration::from_secs(20))
+                .expect("the TX drain and the device reset are waiting on each other");
+        }
+        pump.join().unwrap();
+        vcpu.join().unwrap();
+        assert_eq!(mem.read_u16(RX.2 + 2), Some(1), "the frame came back");
+    }
+
+    /// A doorbell that fires while the BAR isn't where it was registered is
+    /// the guest's write to that address, and goes to whatever is there now.
+    #[test]
+    fn a_stale_doorbell_is_a_write_on_the_bus() {
+        let bus = Arc::new(MmioBus::new());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        assert!(bus.register(
+            0xE000_1000,
+            0x1000,
+            "other-device-notify",
+            Box::new(move |a| {
+                let value = u16::from_le_bytes([a.data[0], a.data[1]]);
+                log.lock()
+                    .unwrap()
+                    .push((a.gpa, a.access_size, a.is_write, value));
+            }),
+        ));
+        let route = DoorbellRoute {
+            gpa: 0xE000_0000,
+            live: AtomicBool::new(false),
+            mmio_bus: bus,
+        };
+        route.forward(0);
+        route.forward(3);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [(0xE000_1000, 2, true, 0), (0xE000_100C, 2, true, 3)]
+        );
+    }
+
+    /// Records the queues the transport enables.
+    #[derive(Default)]
+    struct Enables(Mutex<Vec<(u32, u64, u16)>>);
+
+    impl VirtioDevice for Enables {
+        fn device_id(&self) -> u32 {
+            4
+        }
+        fn device_features(&self) -> u64 {
+            0
+        }
+        fn set_driver_features(&self, _: u64) -> bool {
+            true
+        }
+        fn queue_count(&self) -> u32 {
+            1
+        }
+        fn queue_max(&self, _: u32) -> u32 {
+            8
+        }
+        fn enable_queue(&self, idx: u32, desc: u64, _: u64, _: u64, size: u16, _: bool) {
+            self.0.lock().unwrap().push((idx, desc, size));
+        }
+        fn disable_queue(&self, _: u32) {}
+        fn notify_queue(&self, _: u32) {}
+        fn driver_ok(&self) {}
+        fn reset(&self) {}
+    }
+
+    /// A driver that never writes queue_size gets the size it read there, the
+    /// device's maximum; and an enable the transport refuses (a misaligned
+    /// ring) doesn't read back as enabled.
+    #[test]
+    fn queue_enable_defaults_the_size_and_reports_refusals() {
+        let dev = Arc::new(Enables::default());
+        let t = PciTransport::new("test", dev.clone(), opts(2), Arc::new(MmioBus::new()), 0);
+        let enabled = |t: &PciTransport| common(t, CC_QUEUE_ENABLE, 2, None) & 0xFFFF;
+        assert_eq!(common(&t, CC_QUEUE_SIZE, 2, None), 8, "the maximum");
+
+        // Misaligned descriptor table: refused.
+        common(&t, CC_QUEUE_DESC, 4, Some(0x1001));
+        common(&t, CC_QUEUE_ENABLE, 2, Some(1));
+        assert_eq!(enabled(&t), 0);
+        assert!(dev.0.lock().unwrap().is_empty());
+
+        common(&t, CC_QUEUE_DESC, 4, Some(0x1000));
+        common(&t, CC_QUEUE_ENABLE, 2, Some(1));
+        assert_eq!(enabled(&t), 1);
+        assert_eq!(*dev.0.lock().unwrap(), [(0, 0x1000, 8)]);
     }
 }

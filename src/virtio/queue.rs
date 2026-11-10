@@ -3,7 +3,7 @@
 
 use crate::whp::GuestMemory;
 use std::sync::Arc;
-use std::sync::atomic::{Ordering, fence};
+use std::sync::atomic::{AtomicU32, Ordering, fence};
 
 pub const VRING_DESC_F_NEXT: u16 = 1;
 pub const VRING_DESC_F_WRITE: u16 = 2;
@@ -180,7 +180,15 @@ pub struct Virtqueue {
     last_avail: u16,
     last_used_idx: u16,
     last_used_signaled: u16,
+    /// The driver broke the ring's rules (see [`Self::pop_into`]): nothing
+    /// more is taken from it until the device is reset.
+    broken: bool,
 }
+
+/// How many broken queues have been reported; the rest stay quiet, so a guest
+/// that resets and breaks a queue in a loop can't flood the host's log.
+static BROKEN_REPORTS: AtomicU32 = AtomicU32::new(0);
+const MAX_BROKEN_REPORTS: u32 = 8;
 
 impl Virtqueue {
     pub fn new(mem: Arc<GuestMemory>, max_size: u32) -> Self {
@@ -196,6 +204,7 @@ impl Virtqueue {
             last_avail: 0,
             last_used_idx: 0,
             last_used_signaled: 0,
+            broken: false,
         }
     }
 
@@ -236,6 +245,27 @@ impl Virtqueue {
         self.last_avail = 0;
         self.last_used_idx = 0;
         self.last_used_signaled = 0;
+        self.broken = false;
+    }
+
+    /// Whether the driver broke the ring's rules, so the queue takes nothing
+    /// more until a reset.
+    pub fn broken(&self) -> bool {
+        self.broken
+    }
+
+    /// Stop taking chains from this queue until the device is reset: the
+    /// driver published something no driver can (`what`). Going on would let
+    /// a guest turn one notification into work without bound, or leave the
+    /// queue stalled with nothing to say why.
+    fn mark_broken(&mut self, what: std::fmt::Arguments<'_>) {
+        self.broken = true;
+        if BROKEN_REPORTS.fetch_add(1, Ordering::Relaxed) < MAX_BROKEN_REPORTS {
+            eprintln!(
+                "[virtio] a {}-entry virtqueue stopped until its device is reset: {what}",
+                self.size
+            );
+        }
     }
 
     /// Capture the durable queue programming + ring position for snapshot.
@@ -267,6 +297,7 @@ impl Virtqueue {
         self.last_avail = s.last_avail;
         self.last_used_idx = s.last_used_idx;
         self.last_used_signaled = s.last_used_signaled;
+        self.broken = false;
     }
 
     fn host(&self, gpa: u64, bytes: u64) -> Option<*mut u8> {
@@ -318,20 +349,38 @@ impl Virtqueue {
     /// returning false if the ring is empty. Alloc-free on the hot path.
     pub fn pop_into(&mut self, out: &mut PoppedChain) -> bool {
         out.bufs.clear();
-        if !self.ready || self.size == 0 {
+        if !self.ready || self.size == 0 || self.broken {
             return false;
         }
         // Without EVENT_IDX the driver kicks for every publish (we never set
         // VRING_USED_F_NO_NOTIFY), so an empty ring needs no re-check.
-        if self.avail_idx() == self.last_avail
-            && (!self.event_idx || self.arm_kick_and_recheck() == self.last_avail)
-        {
+        let mut avail = self.avail_idx();
+        if avail == self.last_avail {
+            if !self.event_idx {
+                return false;
+            }
+            avail = self.arm_kick_and_recheck();
+            if avail == self.last_avail {
+                return false;
+            }
+        }
+        // A driver has `size` descriptors, so it can have at most `size`
+        // chains outstanding. `avail.idx` is the guest's to write, though: set
+        // 65535 ahead, it would make one notification replay the ring that
+        // many times (vhost and QEMU refuse it the same way).
+        let ahead = avail.wrapping_sub(self.last_avail);
+        if u32::from(ahead) > self.size {
+            self.mark_broken(format_args!(
+                "the driver moved avail.idx to {avail}, {ahead} past the last entry taken"
+            ));
             return false;
         }
         let slot = self.last_avail % self.size as u16;
         let head = self.avail_ring(slot);
         if head >= self.size as u16 {
-            self.last_avail = self.last_avail.wrapping_add(1);
+            self.mark_broken(format_args!(
+                "the avail ring names descriptor {head}, which the queue doesn't have"
+            ));
             return false;
         }
 
@@ -339,7 +388,9 @@ impl Virtqueue {
         // Validate the descriptor table is mapped; individual descriptors are
         // then read with bounds-checked `read_array` (no raw pointer math).
         if self.host(desc_base, 16 * self.size as u64).is_none() {
-            self.last_avail = self.last_avail.wrapping_add(1);
+            self.mark_broken(format_args!(
+                "its descriptor table (at 0x{desc_base:x}) isn't in guest RAM"
+            ));
             return false;
         }
 
@@ -426,7 +477,7 @@ impl Virtqueue {
     /// Entries the driver has published but the device hasn't popped yet
     /// (capped at the ring size, since `avail.idx` is guest-controlled).
     pub fn avail_pending(&self) -> u16 {
-        if !self.ready || self.size == 0 {
+        if !self.ready || self.size == 0 || self.broken {
             return 0;
         }
         self.avail_idx()
@@ -580,6 +631,21 @@ mod tests {
                 }
             }
 
+            // A wholly random avail ring is refused at its index or its first
+            // head, which would leave the descriptor walk untested. Three
+            // rounds in four publish a full ring of valid heads instead, so
+            // every chain walked is one of random descriptors.
+            let walk = iter % 4 != 0;
+            if walk {
+                mem.write_at(avail_gpa + 2, &(size as u16).to_le_bytes())
+                    .unwrap();
+                for slot in 0..size as u64 {
+                    let head = (rng.next() % size as u64) as u16;
+                    mem.write_at(avail_gpa + 4 + 2 * slot, &head.to_le_bytes())
+                        .unwrap();
+                }
+            }
+
             let mut q = Virtqueue::new(mem.clone(), 256);
             q.set_size(size);
             q.set_desc_gpa(desc_gpa);
@@ -590,9 +656,15 @@ mod tests {
 
             // Drain a bounded number of chains; must always terminate. Any chain
             // we get back must point inside the slab.
+            let mut popped = 0;
             for _ in 0..(size + 4) {
                 match q.pop() {
                     Some(chain) => {
+                        popped += 1;
+                        assert!(
+                            chain.bufs.len() as u32 <= size,
+                            "chain longer than the ring"
+                        );
                         for buf in &chain.bufs {
                             assert!(buf.len as u64 <= slab, "chain buf len escapes slab");
                         }
@@ -600,7 +672,89 @@ mod tests {
                     None => break,
                 }
             }
+            assert!(popped <= size, "more chains than the ring holds");
+            if walk {
+                assert_eq!(popped, size, "a full ring of valid heads is all taken");
+            }
         }
+    }
+
+    /// A queue of `size` entries whose every avail slot names descriptor 0, a
+    /// 16-byte readable buffer.
+    fn ring_of(size: u32) -> (Arc<GuestMemory>, Virtqueue) {
+        let mem = Arc::new(GuestMemory::new_host_only(64 * 1024).unwrap());
+        let mut d = [0u8; 16];
+        d[..8].copy_from_slice(&0x8000u64.to_le_bytes());
+        d[8..12].copy_from_slice(&16u32.to_le_bytes());
+        mem.write_at(DESC, &d).unwrap();
+        let mut q = Virtqueue::new(mem.clone(), SIZE);
+        q.set_size(size);
+        q.set_desc_gpa(DESC);
+        q.set_avail_gpa(AVAIL);
+        q.set_used_gpa(USED);
+        q.set_ready(true);
+        (mem, q)
+    }
+
+    fn drain(q: &mut Virtqueue) -> u32 {
+        let mut chain = PoppedChain::default();
+        let mut pops = 0;
+        while q.pop_into(&mut chain) {
+            pops += 1;
+        }
+        pops
+    }
+
+    /// `avail.idx` is the guest's to write. A driver can have at most `size`
+    /// chains outstanding, so an index further ahead than that is refused:
+    /// taken at its word, one store made a 2-entry ring yield 65535 chains,
+    /// each a request the device then served.
+    #[test]
+    fn an_avail_index_past_the_ring_stops_the_queue() {
+        let (mem, mut q) = ring_of(2);
+        assert!(mem.store_release_u16(AVAIL + 2, 0xFFFF));
+        assert_eq!(drain(&mut q), 0);
+        assert!(q.broken());
+        assert!(!q.has_avail(), "a stopped queue reports no work");
+
+        // It stays stopped whatever the driver publishes next...
+        assert!(mem.store_release_u16(AVAIL + 2, 1));
+        assert_eq!(drain(&mut q), 0);
+
+        // ...until the device is reset and the queue programmed again.
+        q.reset();
+        assert!(!q.broken());
+        q.set_size(2);
+        q.set_desc_gpa(DESC);
+        q.set_avail_gpa(AVAIL);
+        q.set_used_gpa(USED);
+        q.set_ready(true);
+        assert_eq!(drain(&mut q), 1);
+    }
+
+    /// The bound is the ring size itself: a driver that fills the ring, again
+    /// and again across the index's wrap, is served in full.
+    #[test]
+    fn a_full_ring_is_taken_whole() {
+        let (mem, mut q) = ring_of(8);
+        let mut idx = 0u16;
+        for _ in 0..9000 {
+            idx = idx.wrapping_add(8);
+            assert!(mem.store_release_u16(AVAIL + 2, idx));
+            assert_eq!(drain(&mut q), 8);
+            assert!(!q.broken());
+        }
+    }
+
+    /// A head no descriptor table of this size has stops the queue too,
+    /// rather than leave it half alive with a kick that never comes.
+    #[test]
+    fn a_head_outside_the_table_stops_the_queue() {
+        let (mem, mut q) = ring_of(4);
+        mem.write_at(AVAIL + 4, &4u16.to_le_bytes()).unwrap();
+        assert!(mem.store_release_u16(AVAIL + 2, 2));
+        assert_eq!(drain(&mut q), 0);
+        assert!(q.broken());
     }
 
     // EVENT_IDX notification races, run as store-buffer litmus tests on real

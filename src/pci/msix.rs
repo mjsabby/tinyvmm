@@ -156,8 +156,42 @@ impl MsiX {
     }
 
     /// Sync the MSI-X Message Control register from config space after a write.
+    ///
+    /// An interrupt raised while the function is disabled or masked is only
+    /// latched in the pending bits (`trigger`). When the function comes out
+    /// of that state, those of them whose own vector isn't masked are
+    /// delivered, as the per-vector unmask does for its vector: a driver
+    /// that masks the whole function for a moment (Linux does while it sets
+    /// its vectors up, and around suspend) would otherwise lose whatever the
+    /// device raised meanwhile, and wait on it for good.
     pub fn set_control(&self, mc: u16) {
-        self.control.store(mc, Ordering::Relaxed);
+        const ENABLE: u16 = 0x8000;
+        const FUNCTION_MASK: u16 = 0x4000;
+        let delivers = |c: u16| c & ENABLE != 0 && c & FUNCTION_MASK == 0;
+        let due: Vec<u32> = {
+            // The new value and the scan of the pending bits are one step
+            // under the lock `trigger` decides and latches under: a raise
+            // racing this either latched before the scan, and is delivered
+            // here, or sees the new value and delivers itself.
+            let mut t = self.tables.lock().unwrap();
+            let old = self.control.swap(mc, Ordering::Relaxed);
+            if !delivers(mc) || delivers(old) {
+                return;
+            }
+            let due: Vec<u32> = (0..self.num_vectors)
+                .filter(|&v| {
+                    let pending = (t.pba[v as usize / 64] >> (v % 64)) & 0x1 != 0;
+                    pending && t.table[v as usize].ctrl & 0x1 == 0
+                })
+                .collect();
+            for &v in &due {
+                t.pba[v as usize / 64] &= !(1u64 << (v % 64));
+            }
+            due
+        };
+        for v in due {
+            self.do_inject(v);
+        }
     }
 
     fn enabled(&self) -> bool {
@@ -274,14 +308,15 @@ impl MsiX {
         if vector >= self.num_vectors {
             return false;
         }
-        if !self.enabled() || self.function_masked() {
-            let mut t = self.tables.lock().unwrap();
-            t.pba[vector as usize / 64] |= 1u64 << (vector % 64);
-            return false;
-        }
         {
+            // Whether to deliver or latch is decided, and the latch made,
+            // under the lock the unmask paths replay under (`set_control`,
+            // `handle_table`): were the masks read before it, an unmask
+            // could scan the pending bits in between and leave this one
+            // latched with nothing to deliver it.
             let mut t = self.tables.lock().unwrap();
-            if t.table[vector as usize].ctrl & 0x1 != 0 {
+            let live = self.enabled() && !self.function_masked();
+            if !live || t.table[vector as usize].ctrl & 0x1 != 0 {
                 t.pba[vector as usize / 64] |= 1u64 << (vector % 64);
                 return false;
             }
@@ -304,5 +339,139 @@ impl MsiX {
                 .write();
         }
         inject_msi(self.part, addr, data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TABLE: u32 = 0;
+    const PBA: u32 = 0x800;
+    const ENABLE: u16 = 0x8000;
+    const FUNCTION_MASK: u16 = 0x4000;
+
+    /// An MSI-X function with `n` vectors and no partition behind it. Its
+    /// messages name a delivery mode `inject_msi` refuses before it reaches
+    /// the hypervisor, so "delivered" here is `injected_count`.
+    fn msix(n: u32) -> Arc<MsiX> {
+        let m = MsiX::new(n, 0, 1, TABLE, PBA);
+        for v in 0..n {
+            write_entry(&m, v, 8, 0x0200);
+        }
+        m
+    }
+
+    fn write_entry(m: &MsiX, vector: u32, field: u64, value: u32) {
+        let mut data = [0u8; 8];
+        data[..4].copy_from_slice(&value.to_le_bytes());
+        m.handle_table(&mut MmioAccess {
+            gpa: TABLE as u64 + vector as u64 * 16 + field,
+            access_size: 4,
+            is_write: true,
+            data,
+        });
+    }
+
+    fn unmask(m: &MsiX, vector: u32) {
+        write_entry(m, vector, 12, 0);
+    }
+
+    fn pending(m: &MsiX) -> u64 {
+        let mut a = MmioAccess {
+            gpa: PBA as u64,
+            access_size: 8,
+            is_write: false,
+            data: [0; 8],
+        };
+        m.handle_pba(&mut a);
+        u64::from_le_bytes(a.data)
+    }
+
+    /// What the device raises while the function is masked is delivered when
+    /// the mask lifts, for the vectors that aren't masked themselves.
+    #[test]
+    fn lifting_the_function_mask_delivers_what_was_latched() {
+        let m = msix(4);
+        m.set_control(ENABLE | FUNCTION_MASK);
+        for v in [0, 1, 3] {
+            unmask(&m, v);
+        }
+        // Vectors 0, 2 and 3 are raised; 2 is still masked itself.
+        for v in [0, 2, 3] {
+            assert!(!m.trigger(v));
+        }
+        assert_eq!(pending(&m), 0b1101);
+        assert_eq!(m.injected_count(), 0);
+
+        m.set_control(ENABLE);
+        assert_eq!(m.injected_count(), 2, "vectors 0 and 3");
+        assert_eq!(pending(&m), 0b0100, "vector 2 waits for its own unmask");
+        unmask(&m, 2);
+        assert_eq!(m.injected_count(), 3);
+        assert_eq!(pending(&m), 0);
+
+        // Nothing is delivered twice: the same control value again, or a
+        // mask and unmask with nothing raised in between.
+        m.set_control(ENABLE);
+        m.set_control(ENABLE | FUNCTION_MASK);
+        m.set_control(ENABLE);
+        assert_eq!(m.injected_count(), 3);
+    }
+
+    /// An interrupt raised while the function mask is being lifted is
+    /// delivered by whichever side sees the other, never left latched with
+    /// the function and the vector both unmasked.
+    #[test]
+    fn a_raise_racing_the_unmask_is_not_left_latched() {
+        use std::sync::mpsc;
+        let m = msix(1);
+        unmask(&m, 0);
+        let (go, raise) = mpsc::channel::<()>();
+        let (raised, done) = mpsc::channel::<()>();
+        let raiser = {
+            let m = m.clone();
+            std::thread::spawn(move || {
+                while raise.recv().is_ok() {
+                    m.trigger(0);
+                    raised.send(()).unwrap();
+                }
+            })
+        };
+        for round in 0..3000u32 {
+            m.set_control(ENABLE | FUNCTION_MASK);
+            go.send(()).unwrap();
+            // Lift the mask before, during or after the raise.
+            for _ in 0..(round % 200) * 16 {
+                std::hint::spin_loop();
+            }
+            m.set_control(ENABLE);
+            done.recv().unwrap();
+            assert_eq!(pending(&m), 0, "round {round}: latched with nothing masked");
+        }
+        drop(go);
+        raiser.join().unwrap();
+        assert_eq!(m.injected_count(), 3000);
+    }
+
+    /// The same when the function is enabled with interrupts already
+    /// latched, and nothing is delivered into a function that is still
+    /// masked or disabled.
+    #[test]
+    fn enabling_the_function_delivers_what_was_latched() {
+        let m = msix(2);
+        unmask(&m, 0);
+        unmask(&m, 1);
+        assert!(!m.trigger(1), "disabled: latched");
+        m.set_control(FUNCTION_MASK);
+        m.set_control(ENABLE | FUNCTION_MASK);
+        m.set_control(0);
+        assert_eq!((m.injected_count(), pending(&m)), (0, 0b10));
+
+        m.set_control(ENABLE);
+        assert_eq!((m.injected_count(), pending(&m)), (1, 0));
+        // Live now: a raise is delivered at once and latches nothing.
+        m.trigger(0);
+        assert_eq!((m.injected_count(), pending(&m)), (2, 0));
     }
 }

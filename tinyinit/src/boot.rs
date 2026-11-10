@@ -138,6 +138,7 @@ pub fn run() -> Result<()> {
             target: "/mnt/bootstrap".into(),
             readonly: true,
             cache: None,
+            root_only: true,
         };
         log.record(&format!(
             "share tag={} target={} readonly=true",
@@ -439,6 +440,7 @@ fn switch_root(log: &mut BootLog, cmdline: &str) -> Result<()> {
                 target: "/rootfs-source".into(),
                 readonly: true,
                 cache: None,
+                root_only: false,
             })
         })?;
         let source = ["rootfs.tar.zst", "rootfs.tar.gz"]
@@ -550,10 +552,16 @@ fn mount_share(share: &Share) -> Result<()> {
     // and attributes too, for trees the host leaves alone while the VM runs.
     // Writable shares stay uncached, so the guest always reads what the host
     // last wrote.
-    let options = format!(
+    let mut options = format!(
         "trans=virtio,version=9p2000.L,msize=512000,cache={}",
         share.cache_mode()
     );
+    if share.root_only {
+        // 9p shows the host's files as world-readable, and nothing in the
+        // guest can chmod them. `access=<uid>` lets that one user use the
+        // mount: everyone else gets EPERM for anything below it.
+        options.push_str(",access=0");
+    }
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match unix::mount(&share.tag, &share.target, "9p", flags, &options) {

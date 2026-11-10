@@ -71,6 +71,8 @@ from ctypes import wintypes
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from vmm_harness import sentinel_args
+
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_TINYVMM = REPO / "target" / "release" / "tinyvmm.exe"
 DEFAULT_OPENVMM = Path(r"C:\openvmm\target\release\openvmm.exe")
@@ -372,11 +374,13 @@ def guest_cmdline(a: argparse.Namespace, host: str, port: int, console: str) -> 
 
 def vmm_argv(name: str, a: argparse.Namespace, host: str, port: int) -> list[str]:
     if name == "tinyvmm" or name.startswith("tinyvmm-"):
-        # `tinyvmm-<backend>` picks the --net-backend (nat by default).
+        # `tinyvmm-<backend>` picks the --net-backend (nat by default). The
+        # servers are on one of the host's own addresses, which a guest
+        # reaches only with --nat-host-local.
         backend = name.partition("-")[2] or "nat"
-        return [str(a.tinyvmm), "--pvh-run", "--ram-mb", str(a.ram_mb),
+        return [str(a.tinyvmm), "--pvh-run", *sentinel_args(a.tinyvmm), "--ram-mb", str(a.ram_mb),
                 "--vcpus", str(a.vcpus), "--net", "--net-backend", backend,
-                *a.tinyvmm_arg,
+                "--nat-host-local", *a.tinyvmm_arg,
                 "--initrd", str(a.initrd), "--watchdog-secs", str(a.timeout_sec),
                 str(a.vmlinux), "--", guest_cmdline(a, host, port, "hvc0")]
     if name.startswith("openvmm"):

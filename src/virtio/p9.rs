@@ -132,6 +132,7 @@ const E_PERM: u32 = 1;
 const E_NOENT: u32 = 2;
 const E_IO: u32 = 5;
 const E_BADF: u32 = 9;
+const E_NOMEM: u32 = 12;
 const E_ACCES: u32 = 13;
 const E_EXIST: u32 = 17;
 const E_NOTDIR: u32 = 20;
@@ -401,8 +402,16 @@ fn filetime_to_unix(ticks: u64) -> (u64, u64) {
     (since / 10_000_000, (since % 10_000_000) * 100)
 }
 
+/// The FILETIME of a Unix time. The guest picks both numbers (Tsetattr), so
+/// a time past the end of FILETIME's range is its last tick rather than an
+/// overflow. That tick is `i64::MAX`: the kernel reads a FILETIME as signed,
+/// and takes -1 and -2 not for times but for orders to stop and resume
+/// updating the handle's timestamps.
 fn unix_to_filetime(sec: u64, nsec: u64) -> u64 {
-    sec * 10_000_000 + nsec / 100 + FILETIME_BIAS_TO_1970
+    sec.saturating_mul(10_000_000)
+        .saturating_add(nsec / 100)
+        .saturating_add(FILETIME_BIAS_TO_1970)
+        .min(i64::MAX as u64)
 }
 
 /// Prepend `\\?\` so Win32 lifts the MAX_PATH limit. Returns a NUL-terminated
@@ -471,6 +480,39 @@ fn contained_in(p: &[u16], root: &[u16]) -> bool {
     p.starts_with(root) && (p.len() == root.len() || p[root.len()] == b'\\' as u16)
 }
 
+const SEP: u16 = b'\\' as u16;
+/// `\??\`: the object manager's directory of DOS device names, where the
+/// target of an absolute link begins.
+const NT_DOS_DEVICES: &[u16] = &[SEP, b'?' as u16, b'?' as u16, SEP];
+
+/// The path that `parts` make up, one after another, as its components below
+/// `root` (a path from `fs::final_nt_path_by_handle`): `.` is dropped and `..`
+/// takes the component before it, as Windows resolves a link's target. `None`
+/// if a `..` has nothing left to take, or the path that results is not `root`
+/// (which gives no components) or below it. Names compare as
+/// [`normalize_for_containment`] has them.
+fn steps_below(root: &[u16], parts: &[&[u16]]) -> Option<Vec<Vec<u16>>> {
+    const DOT: u16 = b'.' as u16;
+    let mut path: Vec<&[u16]> = Vec::new();
+    for name in parts.iter().flat_map(|p| p.split(|&c| c == SEP)) {
+        match name {
+            [] | [DOT] => {}
+            [DOT, DOT] => {
+                path.pop()?;
+            }
+            name => path.push(name),
+        }
+    }
+    let lower = |name: &[u16]| normalize_for_containment(name);
+    let mut below = path.iter();
+    for name in root.split(|&c| c == SEP).filter(|name| !name.is_empty()) {
+        if lower(below.next()?) != lower(name) {
+            return None;
+        }
+    }
+    Some(below.map(|name| name.to_vec()).collect())
+}
+
 fn is_safe_name_component(comp: &str) -> bool {
     if comp.is_empty() || comp == "." || comp == ".." {
         return false;
@@ -490,10 +532,16 @@ fn is_safe_name_component(comp: &str) -> bool {
     if last == '.' || last == ' ' {
         return false;
     }
-    let stem = comp.split('.').next().unwrap_or(comp).to_ascii_uppercase();
+    // Win32 takes a name for a DOS device by what precedes its first dot, less
+    // trailing spaces (`NUL .txt` is `NUL`), and counts the superscript digits
+    // as digits (`COM¹`). The share itself never parses names that way, but a
+    // host program opening such a file by its Win32 path would get the device.
+    let stem = comp.split('.').next().unwrap_or(comp);
+    let stem = stem.trim_end_matches(' ').to_ascii_uppercase();
     const RESERVED: &[&str] = &[
         "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "COM9", "COM¹", "COM²", "COM³", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7",
+        "LPT8", "LPT9", "LPT¹", "LPT²", "LPT³",
     ];
     !RESERVED.contains(&stem.as_str())
 }
@@ -559,33 +607,113 @@ struct DirEntryCached {
 /// fids are dropped, and rebuilt if their readdir carries on.
 const DIR_CACHE_BUDGET: usize = 64 << 20;
 
-/// What a listing costs against [`DIR_CACHE_BUDGET`].
-fn dir_cache_bytes(cache: &[DirEntryCached]) -> usize {
-    cache
-        .iter()
-        .map(|e| std::mem::size_of::<DirEntryCached>() + e.name.len())
-        .sum()
+/// About how much of a directory a fid's listing holds at a time. A directory
+/// that takes more is listed a stretch at a time as its readdir moves along
+/// (see [`P9Device::list_dir`]), so no directory, however big, takes more
+/// than this of the budget per fid, or while it is being read.
+const DIR_WINDOW_BYTES: usize = 1 << 20;
+
+/// What a listing costs against [`DIR_CACHE_BUDGET`]: the memory it holds,
+/// spare capacity included.
+#[allow(clippy::ptr_arg)]
+fn dir_cache_bytes(cache: &Vec<DirEntryCached>) -> usize {
+    cache.capacity() * std::mem::size_of::<DirEntryCached>()
+        + cache.iter().map(|e| e.name.capacity()).sum::<usize>()
 }
 
-/// A fid's cached directory listing. Its bytes count toward the share's
-/// running total (`Fids::dir_cache_total`) for exactly as long as it lives,
-/// however it goes: clunk, remove, reopen, a walk replacing the fid, eviction
-/// or a reset. Checking the budget is then O(1) rather than a sum over every
-/// fid, which a guest holding many fids paid on each listing.
+/// A stretch of a directory's listing, as [`P9Device::list_dir`] read it.
+struct DirWindow {
+    entries: Vec<DirEntryCached>,
+    /// The place of `entries[0]` in the listing.
+    base: usize,
+    /// The listing ends with `entries`.
+    ended: bool,
+    /// How many of the listing's entries the directory handle has moved past.
+    cursor: usize,
+}
+
+impl DirWindow {
+    /// Take the listing's next entry, kept if the stretch has reached its
+    /// start.
+    fn push(&mut self, entry: DirEntryCached) {
+        if self.cursor >= self.base {
+            self.entries.push(entry);
+        }
+        self.cursor += 1;
+    }
+}
+
+/// Build an Rreaddir of as many of `entries` as fit in `count` bytes. `first`
+/// is the place of `entries[0]` in its directory's listing; each entry
+/// carries the place of the one after it, the offset a readdir carries on
+/// from.
+fn build_rreaddir(
+    reply: &mut Vec<u8>,
+    tag: u16,
+    entries: &[DirEntryCached],
+    first: usize,
+    count: u32,
+) {
+    reply.clear();
+    enc4(reply, 0);
+    enc1(reply, R_READDIR);
+    enc2(reply, tag);
+    let count_off = reply.len();
+    enc4(reply, 0);
+    let start_payload = reply.len();
+    for (i, de) in entries.iter().enumerate() {
+        let need = 13 + 8 + 1 + 2 + de.name.len();
+        if (reply.len() - start_payload) + need > count as usize {
+            break;
+        }
+        enc_qid(reply, de.qid_type, de.qid_version, de.qid_path);
+        enc8(reply, (first + i + 1) as u64);
+        enc1(reply, de.d_type);
+        enc_str(reply, &de.name);
+    }
+    let payload_len = (reply.len() - start_payload) as u32;
+    reply[count_off..count_off + 4].copy_from_slice(&payload_len.to_le_bytes());
+    finalize(reply);
+}
+
+/// The stretch of its directory's listing a fid holds. Its bytes count toward
+/// the share's running total (`Fids::dir_cache_total`) for exactly as long as
+/// it lives, however it goes: clunk, remove, reopen, a walk replacing the fid,
+/// eviction or a reset. Checking the budget is then O(1) rather than a sum
+/// over every fid, which a guest holding many fids paid on each listing.
 struct DirCache {
     entries: Vec<DirEntryCached>,
+    /// The place of `entries[0]` in the listing.
+    base: usize,
+    /// The listing ends with `entries`.
+    ended: bool,
     bytes: usize,
     total: Arc<AtomicUsize>,
 }
 
 impl DirCache {
-    fn new(entries: Vec<DirEntryCached>, total: &Arc<AtomicUsize>) -> DirCache {
+    /// `entries` as a whole listing.
+    fn new(mut entries: Vec<DirEntryCached>, total: &Arc<AtomicUsize>) -> DirCache {
+        entries.shrink_to_fit();
         let bytes = dir_cache_bytes(&entries);
         total.fetch_add(bytes, Ordering::Relaxed);
         DirCache {
             entries,
+            base: 0,
+            ended: true,
             bytes,
             total: total.clone(),
+        }
+    }
+
+    /// The entries from `offset` of the listing on, if this stretch has them
+    /// or knows there are none.
+    fn entries_from(&self, offset: usize) -> Option<&[DirEntryCached]> {
+        let at = offset.checked_sub(self.base)?;
+        if at < self.entries.len() || (at == self.entries.len() && self.ended) {
+            Some(&self.entries[at..])
+        } else {
+            None
         }
     }
 }
@@ -602,22 +730,96 @@ impl Drop for DirCache {
 /// / `Tremove` / `Trename` drops the map's `Arc`, but the real `CloseHandle` is
 /// deferred until the last in-flight user drops its clone. That closes the
 /// use-after-close race without serialising the concurrent worker pool.
-struct OwnedHandle(HANDLE);
+struct OwnedHandle {
+    handle: HANDLE,
+    /// Held while this handle, a directory's, is listed (`P9Device::list_dir`)
+    /// until the fid has what was read. A handle's place in its directory is
+    /// the handle's own, so it must not move between the choice to carry on
+    /// from it and the note of where it then stands: two readdirs of one
+    /// handle take turns. Each handle has its own lock, so different
+    /// directories are listed side by side, as many at once as there are
+    /// workers. Taken before `fids`.
+    listing: Mutex<()>,
+}
 
-// The only access is `get()` (a copy of the value, used while at least one `Arc`
-// ref is held) and the one-shot close in `Drop`.
+// The only access to `handle` is `get()` (a copy of the value, used while at
+// least one `Arc` ref is held) and the one-shot close in `Drop`.
 unsafe impl Send for OwnedHandle {}
 unsafe impl Sync for OwnedHandle {}
 
 impl OwnedHandle {
+    fn new(handle: HANDLE) -> OwnedHandle {
+        OwnedHandle {
+            handle,
+            listing: Mutex::new(()),
+        }
+    }
+
     fn get(&self) -> HANDLE {
-        self.0
+        self.handle
     }
 }
 
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
-        fs::close(self.0);
+        fs::close(self.handle);
+    }
+}
+
+/// Most bytes every fid's path may hold at once (`FidEntry::rel`). A fid costs
+/// the guest one small Twalk, and its path can be as long as NTFS lets a path
+/// be (32767 UTF-16 units, some 96 KiB as stored here), so `MAX_FIDS` alone
+/// lets a guest pin gigabytes. Past this, a request that would make a fid a
+/// new path fails with ENOMEM. Real workloads hold a few thousand fids with
+/// paths of a few hundred bytes.
+const FID_PATH_BUDGET: usize = 64 << 20;
+
+/// A fid's path below the share root. Its bytes count toward the share's
+/// running total (`P9Device::fid_path_bytes`) for exactly as long as it lives,
+/// however it goes: clunk, remove, a walk, create or rename replacing it,
+/// Tversion or a reset. Making one reserves its bytes, so the total never
+/// passes the budget.
+struct FidPath {
+    path: PathBuf,
+    bytes: usize,
+    total: Arc<AtomicUsize>,
+}
+
+impl FidPath {
+    /// `path` as a fid's path; `None` if the fid paths counted in `total`
+    /// would then hold more than `budget` bytes.
+    fn within(mut path: PathBuf, total: &Arc<AtomicUsize>, budget: usize) -> Option<FidPath> {
+        path.shrink_to_fit();
+        let bytes = path.capacity();
+        total
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                held.checked_add(bytes).filter(|&sum| sum <= budget)
+            })
+            .ok()?;
+        Some(FidPath {
+            path,
+            bytes,
+            total: total.clone(),
+        })
+    }
+}
+
+impl std::ops::Deref for FidPath {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for FidPath {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for FidPath {
+    fn drop(&mut self) {
+        self.total.fetch_sub(self.bytes, Ordering::Relaxed);
     }
 }
 
@@ -626,7 +828,7 @@ struct FidEntry {
     /// validated components only, never `.` or `..`. Fids keep a path, not a
     /// handle, because Windows refuses to rename a directory while any handle
     /// to something under it is open.
-    rel: PathBuf,
+    rel: FidPath,
     is_dir: bool,
     qid_path: u64,
     /// The attaching user's uid (Tattach `n_uname`), recorded as the owner of
@@ -637,13 +839,17 @@ struct FidEntry {
     handle: Option<Arc<OwnedHandle>>,
     opened: bool,
     open_flags: u32,
-    /// The listing a readdir from offset 0 built; `None` until then, and
-    /// after the budget drops it.
+    /// The stretch of the directory's listing the last readdir read; `None`
+    /// until then, and after the budget drops it.
     dir_cache: Option<DirCache>,
+    /// How many of its listing's entries the directory `handle` has moved
+    /// past, which is where a listing that carries on, rather than starting
+    /// over, picks up. `None` until the handle has been listed.
+    dir_cursor: Option<usize>,
 }
 
 impl FidEntry {
-    fn new(rel: PathBuf, is_dir: bool, qid_path: u64, uid: u32) -> FidEntry {
+    fn new(rel: FidPath, is_dir: bool, qid_path: u64, uid: u32) -> FidEntry {
         FidEntry {
             rel,
             is_dir,
@@ -653,11 +859,22 @@ impl FidEntry {
             opened: false,
             open_flags: 0,
             dir_cache: None,
+            dir_cursor: None,
         }
     }
 
     fn drop_dir_cache(&mut self) {
         self.dir_cache = None;
+    }
+
+    /// Make `h`, opened with the Tlopen/Tlcreate `flags`, the fid's handle.
+    fn open(&mut self, h: OwnedHandle, flags: u32) {
+        self.handle = Some(Arc::new(h));
+        self.opened = true;
+        self.open_flags = flags;
+        // What was listed, and how far, was the previous handle's.
+        self.drop_dir_cache();
+        self.dir_cursor = None;
     }
 
     fn close_handle(&mut self) {
@@ -668,6 +885,7 @@ impl FidEntry {
         self.handle = None;
         self.opened = false;
         self.drop_dir_cache();
+        self.dir_cursor = None;
     }
 }
 
@@ -679,14 +897,28 @@ struct Fids {
 }
 
 impl Fids {
-    /// Give fid `fid` the listing `cache`, first dropping other fids'
-    /// listings as needed to keep them all within [`DIR_CACHE_BUDGET`]. A
-    /// single listing bigger than the budget is still kept: its readdir needs
-    /// it.
-    fn set_dir_cache(&mut self, fid: u32, cache: Vec<DirEntryCached>) {
-        self.set_dir_cache_within(fid, cache, DIR_CACHE_BUDGET);
+    /// Give fid `fid` the stretch `window` of its directory's listing, read
+    /// through `handle`, and note where that left the handle. Nothing happens
+    /// if the fid has since been clunked or opened anew: the handle listed is
+    /// then not the one it holds.
+    fn set_dir_window(&mut self, fid: u32, handle: &Arc<OwnedHandle>, window: DirWindow) {
+        let Some(e) = self.map.get_mut(&fid) else {
+            return;
+        };
+        if !e.handle.as_ref().is_some_and(|h| Arc::ptr_eq(h, handle)) {
+            return;
+        }
+        e.dir_cursor = Some(window.cursor);
+        self.set_dir_cache_within(fid, window.entries, DIR_CACHE_BUDGET);
+        if let Some(cache) = self.map.get_mut(&fid).and_then(|e| e.dir_cache.as_mut()) {
+            cache.base = window.base;
+            cache.ended = window.ended;
+        }
     }
 
+    /// Give fid `fid` the listing `cache`, first dropping other fids'
+    /// listings as needed to keep them all within `budget`. A single listing
+    /// bigger than the budget is still kept: its readdir needs it.
     fn set_dir_cache_within(&mut self, fid: u32, cache: Vec<DirEntryCached>, budget: usize) {
         let Some(e) = self.map.get_mut(&fid) else {
             return;
@@ -743,8 +975,11 @@ const P9_STOP_KEY: usize = usize::MAX;
 ///   free-list -> drain (fills t_msg/wbufs/head/cap) -> IOCP -> worker (fills
 ///   reply, writes guest RAM, pushes the used ring) -> free-list,
 /// so no two threads ever touch the same slot at once; the IOCP post/get pair is
-/// the synchronizing barrier. `t_msg`/`reply`/`bounce` are reused, so
-/// steady-state request handling allocates nothing.
+/// the synchronizing barrier. A Tflush that waits for the request it flushes
+/// takes a detour: its worker parks the slot in [`Flights`], whose lock then
+/// stands for the slot until the worker retiring that request takes it out.
+/// `t_msg`/`reply`/`bounce` are reused, so steady-state request handling
+/// allocates nothing.
 struct P9Slot {
     t_msg: Vec<u8>,
     reply: Vec<u8>,
@@ -760,6 +995,8 @@ struct P9Slot {
     runs: Vec<(*mut u8, usize)>,
     head_index: u16,
     cap: u32,
+    /// The device epoch the request was taken in (see `P9Device::epoch`).
+    epoch: u32,
 }
 
 impl P9Slot {
@@ -774,7 +1011,113 @@ impl P9Slot {
             runs: Vec::new(),
             head_index: 0,
             cap: 0,
+            epoch: 0,
         }
+    }
+
+    /// The request's tag, if the message is long enough to have one.
+    fn tag(&self) -> Option<u16> {
+        let tag = self.t_msg.get(5..REPLY_HEADER_SIZE)?;
+        Some(u16::from_le_bytes([tag[0], tag[1]]))
+    }
+
+    /// The tag a Tflush in this slot flushes.
+    fn flushed_tag(&self) -> Option<u16> {
+        let oldtag = self.t_msg.get(REPLY_HEADER_SIZE..REPLY_HEADER_SIZE + 2)?;
+        Some(u16::from_le_bytes([oldtag[0], oldtag[1]]))
+    }
+}
+
+/// "No slot" in the lists of [`Flights`].
+const NO_SLOT: u16 = u16::MAX;
+
+/// The requests in flight, by the slot that carries each, kept so that a
+/// Tflush is answered only once the request it flushes has been: 9P forbids a
+/// reply to a flushed request after its Rflush, and a client frees the
+/// request's buffers on that Rflush (Linux does, see `p9_virtio_cancelled`),
+/// while the workers answer requests in whatever order they finish.
+///
+/// A request is listed here from the moment it is taken off the ring until
+/// its reply is on the used ring, both changing under this lock. So a Tflush
+/// that finds its target listed parks its own slot on it, to be answered
+/// right after the target by the worker that retires it; one that doesn't is
+/// answered at once, the target's reply (if it ever was in flight) being out
+/// already.
+struct Flights {
+    /// The tag and device epoch of the request each slot carries.
+    request: Vec<Option<(u16, u32)>>,
+    /// The slot each parked Tflush slot waits for.
+    parked_on: Vec<u16>,
+    /// The first and last Tflush slot parked on each slot, in arrival order.
+    first: Vec<u16>,
+    last: Vec<u16>,
+    /// The Tflush slot parked after each one, on the same slot.
+    next: Vec<u16>,
+}
+
+impl Flights {
+    fn new(n: usize) -> Self {
+        Flights {
+            request: vec![None; n],
+            parked_on: vec![NO_SLOT; n],
+            first: vec![NO_SLOT; n],
+            last: vec![NO_SLOT; n],
+            next: vec![NO_SLOT; n],
+        }
+    }
+
+    /// List the request in `slot`.
+    fn begin(&mut self, slot: u16, tag: u16, epoch: u32) {
+        self.request[slot as usize] = Some((tag, epoch));
+    }
+
+    /// A slot other than `not` whose request, taken in `epoch`, has `tag`.
+    fn find(&self, tag: u16, epoch: u32, not: u16) -> Option<u16> {
+        let found = self
+            .request
+            .iter()
+            .enumerate()
+            .position(|(i, r)| *r == Some((tag, epoch)) && i != not as usize)?;
+        Some(found as u16)
+    }
+
+    /// Park `flush` on `target`. False, with nothing changed, if `target`
+    /// waits for `flush` itself (two Tflushes naming each other, say), as
+    /// neither would ever be answered.
+    fn park(&mut self, flush: u16, target: u16) -> bool {
+        let mut at = target;
+        while at != NO_SLOT {
+            if at == flush {
+                return false;
+            }
+            at = self.parked_on[at as usize];
+        }
+        self.parked_on[flush as usize] = target;
+        match self.last[target as usize] {
+            NO_SLOT => self.first[target as usize] = flush,
+            last => self.next[last as usize] = flush,
+        }
+        self.last[target as usize] = flush;
+        true
+    }
+
+    /// Unlist the request in `slot`, whose reply is out. Returns the first
+    /// and last of the Tflush slots that were parked on it, chained by
+    /// `next`, and now the caller's to answer.
+    fn end(&mut self, slot: u16) -> (u16, u16) {
+        let s = slot as usize;
+        self.request[s] = None;
+        self.parked_on[s] = NO_SLOT;
+        let parked = (self.first[s], self.last[s]);
+        self.first[s] = NO_SLOT;
+        self.last[s] = NO_SLOT;
+        parked
+    }
+
+    /// How many Tflush slots are parked.
+    #[cfg(test)]
+    fn parked(&self) -> usize {
+        self.parked_on.iter().filter(|&&on| on != NO_SLOT).count()
     }
 }
 
@@ -830,6 +1173,15 @@ impl SlotPool {
 struct P9Engine {
     iocp: Iocp,
     pool: SlotPool,
+    /// Taken on its own or before the queue lock, never inside it.
+    flights: Mutex<Flights>,
+}
+
+/// How many workers a share's pool has.
+fn p9_worker_count() -> usize {
+    thread::available_parallelism()
+        .map(|n| n.get().clamp(2, P9_MAX_WORKERS))
+        .unwrap_or(4)
 }
 
 /// One worker: block on the IOCP and run each posted request to completion.
@@ -870,11 +1222,33 @@ pub struct P9Device {
     writes: AtomicU64,
     write_bytes: AtomicU64,
     fids: Mutex<Fids>,
+    /// Bytes of every fid's path, kept by [`FidPath`].
+    fid_path_bytes: Arc<AtomicUsize>,
+    /// [`DIR_WINDOW_BYTES`]; a test lists a small directory in several
+    /// stretches by lowering it.
+    dir_window_bytes: AtomicUsize,
     irq: OnceLock<IrqFn>,
     engine: P9Engine,
     // Reused across drain calls so submit allocates nothing (see `drain`).
     drain_chain: Mutex<ChainScratch>,
+    /// Requests taken off the avail ring that have not yet settled: been
+    /// retired on the used ring, or dropped. Incremented under the queue
+    /// lock, so a reset either precedes a pop or sees its request here.
+    active: AtomicU32,
+    /// Bumped by each reset, under the queue lock. A request remembers the
+    /// epoch it was taken in; one from an earlier epoch is stale: if it has
+    /// not started it is dropped, else it runs to its end, and either way it
+    /// writes no reply, pushes no used element and raises no interrupt, as
+    /// its buffers and ring belong to the driver again (and the queue may
+    /// since have been re-enabled). As for virtio-blk.
+    epoch: AtomicU32,
+    /// Called with each request's T-message by the thread about to handle it.
+    #[cfg(test)]
+    before_request: OnceLock<RequestHook>,
 }
+
+#[cfg(test)]
+type RequestHook = Box<dyn Fn(&[u8]) + Send + Sync>;
 
 impl P9Device {
     pub fn new(
@@ -910,20 +1284,24 @@ impl P9Device {
             writes: AtomicU64::new(0),
             write_bytes: AtomicU64::new(0),
             fids: Mutex::new(Fids::default()),
+            fid_path_bytes: Arc::default(),
+            dir_window_bytes: AtomicUsize::new(DIR_WINDOW_BYTES),
             irq: OnceLock::new(),
             engine: P9Engine {
                 iocp,
                 pool: SlotPool::new(P9_QUEUE_MAX as usize),
+                flights: Mutex::new(Flights::new(P9_QUEUE_MAX as usize)),
             },
             drain_chain: Mutex::new(ChainScratch::default()),
+            active: AtomicU32::new(0),
+            epoch: AtomicU32::new(0),
+            #[cfg(test)]
+            before_request: OnceLock::new(),
         });
         // Precreate the worker pool. Each worker holds a strong Arc<P9Device>
         // (the device never strong-refs the workers back, so there's no cycle);
         // they run for the process lifetime — no join, the OS reclaims at exit.
-        let nworkers = thread::available_parallelism()
-            .map(|n| n.get().clamp(2, P9_MAX_WORKERS))
-            .unwrap_or(4);
-        for w in 0..nworkers {
+        for w in 0..p9_worker_count() {
             let d = dev.clone();
             let _ = thread::Builder::new()
                 .name(format!("p9-worker-{w}"))
@@ -968,16 +1346,19 @@ impl P9Device {
         )
     }
 
-    /// Wait for all in-flight 9p requests to drain (the slot pool becomes fully
-    /// free) so a snapshot captures a consistent device, or teardown can free
-    /// guest RAM — no reply landing in guest RAM / the used ring afterwards.
+    /// Wait for all in-flight 9p requests to drain (every request taken has
+    /// settled and the slot pool is fully free) so a snapshot captures a
+    /// consistent device, or teardown can free guest RAM — no reply landing in
+    /// guest RAM / the used ring afterwards.
     /// Bounded spin: the guest is already stopped, so no new requests arrive and
     /// the worker pool completes the in-flight ones promptly. Returns false if
     /// requests are still in flight when it gives up.
     pub fn quiesce(&self) -> bool {
         let total = self.engine.pool.slots.len();
         for _ in 0..5_000 {
-            if self.engine.pool.free.lock().unwrap().len() >= total {
+            if self.active.load(Ordering::Acquire) == 0
+                && self.engine.pool.free.lock().unwrap().len() >= total
+            {
                 return true;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -994,6 +1375,12 @@ impl P9Device {
 
     fn alloc_qid_path(&self) -> u64 {
         self.next_qid_path.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// `path` as a fid's path; `None` if the share's fids already hold as
+    /// many path bytes as they may (see [`FID_PATH_BUDGET`]).
+    fn fid_path(&self, path: PathBuf) -> Option<FidPath> {
+        FidPath::within(path, &self.fid_path_bytes, FID_PATH_BUDGET)
     }
 
     /// The share root's handle. It opens on first use (normally when the device
@@ -1021,7 +1408,7 @@ impl P9Device {
         {
             return Ok(cur.clone());
         }
-        let handle = OwnedHandle(fs::create_file(
+        let handle = OwnedHandle::new(fs::create_file(
             &to_win32_long_path(&self.host_root),
             FILE_READ_ATTRIBUTES,
             FILE_SHARE_RWD,
@@ -1099,7 +1486,7 @@ impl P9Device {
     fn open_below(&self, root: HANDLE, rel: &Path, how: fs::Open) -> Result<Opened, u32> {
         match fs::open_relative(root, &rel_wide(rel), how) {
             Ok((h, created)) => Ok(Opened {
-                handle: OwnedHandle(h),
+                handle: OwnedHandle::new(h),
                 created,
                 followed: false,
             }),
@@ -1116,17 +1503,21 @@ impl P9Device {
     /// itself a link and `how` doesn't ask for the link itself, what it points
     /// at opens with attribute access only and is checked the same way before
     /// it gets `how.access`. So nothing outside the share is created, deleted,
-    /// truncated or opened for data.
+    /// truncated or opened for data, and no error tells what a link that
+    /// leads outside leads to.
     fn open_linked(&self, root: HANDLE, rel: &Path, how: fs::Open) -> Result<Opened, u32> {
         // The root itself is not reached through a link.
         let (Some(parent), Some(name)) = (rel.parent(), rel.file_name()) else {
             return Err(ERROR_ACCESS_DENIED);
         };
-        let dir = self.open_followed(root, &rel_wide(parent), fs::Kind::Directory)?;
+        let dir = match self.open_followed(root, &rel_wide(parent), fs::Kind::Directory) {
+            Ok(dir) => dir,
+            Err(_) => self.open_dir_by_steps(root, parent)?,
+        };
         let name: Vec<u16> = name.encode_wide().collect();
         match fs::open_relative(dir.get(), &name, how) {
             Ok((h, created)) => Ok(Opened {
-                handle: OwnedHandle(h),
+                handle: OwnedHandle::new(h),
                 created,
                 followed: false,
             }),
@@ -1135,9 +1526,9 @@ impl P9Device {
                 Err(ERROR_ALREADY_EXISTS)
             }
             Err(ERROR_REPARSE_POINT_ENCOUNTERED) => {
-                let target = self.open_followed(dir.get(), &name, how.kind)?;
+                let target = self.open_link(root, dir.get(), &name, how.kind)?;
                 Ok(Opened {
-                    handle: OwnedHandle(fs::reopen(target.get(), how.access)?),
+                    handle: OwnedHandle::new(fs::reopen(target.get(), how.access)?),
                     created: false,
                     followed: true,
                 })
@@ -1147,15 +1538,153 @@ impl P9Device {
     }
 
     /// Open `name` below `dir` following links, with attribute access only, and
-    /// keep it only if it lies inside the share.
+    /// keep it only if it lies inside the share. Unless it is known to lie
+    /// inside, the error is ERROR_ACCESS_DENIED whatever went wrong: a link
+    /// may lead anywhere, and whether what it names is missing, a file, a
+    /// directory or just out of bounds would tell the guest what exists
+    /// outside the share.
     fn open_followed(&self, dir: HANDLE, name: &[u16], kind: fs::Kind) -> Result<OwnedHandle, u32> {
-        let how = fs::Open::existing(0).with_kind(kind).following();
-        let h = OwnedHandle(fs::open_relative(dir, name, how)?.0);
-        if self.handle_contained(h.get()) {
-            Ok(h)
-        } else {
-            Err(ERROR_ACCESS_DENIED)
+        let any = fs::Open::existing(0).following();
+        let inside = |how: fs::Open| {
+            let h = OwnedHandle::new(fs::open_relative(dir, name, how).ok()?.0);
+            self.handle_contained(h.get()).then_some(h)
+        };
+        if let Some(h) = inside(any.with_kind(kind)) {
+            return Ok(h);
         }
+        // It may be there, inside the share, and just not a `kind`.
+        match kind {
+            fs::Kind::Directory if inside(any).is_some() => Err(ERROR_DIRECTORY),
+            fs::Kind::File if inside(any).is_some() => Err(ERROR_DIRECTORY_NOT_SUPPORTED),
+            _ => Err(ERROR_ACCESS_DENIED),
+        }
+    }
+
+    /// [`Self::open_followed`] of the link `name` in `dir`, a directory inside
+    /// the share (below `root`), saying more than ERROR_ACCESS_DENIED when
+    /// more is known: see [`Self::link_missing_inside`].
+    fn open_link(
+        &self,
+        root: HANDLE,
+        dir: HANDLE,
+        name: &[u16],
+        kind: fs::Kind,
+    ) -> Result<OwnedHandle, u32> {
+        self.open_followed(dir, name, kind).map_err(|e| match e {
+            ERROR_ACCESS_DENIED => self
+                .link_missing_inside(root, dir, name, 0)
+                .unwrap_or(ERROR_ACCESS_DENIED),
+            e => e,
+        })
+    }
+
+    /// Why the link `name` in `dir`, a directory inside the share, can't be
+    /// followed, if that is because what it points at is missing inside the
+    /// share: ERROR_FILE_NOT_FOUND or ERROR_PATH_NOT_FOUND, or ERROR_DIRECTORY
+    /// where its path runs through a file. `None` otherwise.
+    ///
+    /// [`Self::open_followed`] can't tell a link whose target is gone from one
+    /// that leads out of the share: the open just fails. Both would be
+    /// "permission denied" to the guest, yet a stale link inside a tree is
+    /// common, and what looks for a file through one expects "no such file".
+    /// So the target is read from the link and looked up one component at a
+    /// time from the root, each lookup following nothing in a directory that
+    /// lies inside the share (a component that is a link itself goes through
+    /// `open_followed`, and then this). What such a lookup finds is the
+    /// share's own contents, which the guest may see anyway. A target that
+    /// leaves the share, by `..` or by its absolute path, is not looked up at
+    /// all, and one that is there after all (something else went wrong)
+    /// reports nothing.
+    ///
+    /// `..` is taken off the path as written, with the component before it,
+    /// as Windows resolves a relative link. Should that ever differ from what
+    /// the kernel did, the cost is an error code: nothing here opens a name
+    /// outside the share.
+    fn link_missing_inside(
+        &self,
+        root: HANDLE,
+        dir: HANDLE,
+        name: &[u16],
+        depth: u32,
+    ) -> Option<u32> {
+        /// Links whose targets are failing links, followed this far.
+        const DEPTH_MAX: u32 = 8;
+        if depth >= DEPTH_MAX {
+            return None;
+        }
+        let link = fs::open_relative(dir, name, fs::Open::existing(0).as_entry()).ok()?;
+        let link = OwnedHandle::new(link.0);
+        let target = fs::link_target(link.get()).ok()?;
+        let root_path = fs::final_nt_path_by_handle(root)?;
+        let steps = match &target {
+            fs::LinkTarget::Relative(t) => {
+                let dir_path = fs::final_nt_path_by_handle(dir)?;
+                steps_below(&root_path, &[&dir_path, t])?
+            }
+            fs::LinkTarget::Absolute(t) => {
+                // `\??\<device>\path`: the device as the object manager maps it.
+                let rest = t.strip_prefix(NT_DOS_DEVICES)?;
+                let cut = rest.iter().position(|&c| c == SEP).unwrap_or(rest.len());
+                let device = fs::dos_device_target(&rest[..cut])?;
+                steps_below(&root_path, &[&device, &rest[cut..]])?
+            }
+        };
+        let mut at: Option<OwnedHandle> = None;
+        for (i, step) in steps.iter().enumerate() {
+            let here = at.as_ref().map_or(root, OwnedHandle::get);
+            // Every step but the last has to be a directory.
+            let kind = if i + 1 == steps.len() {
+                fs::Kind::Any
+            } else {
+                fs::Kind::Directory
+            };
+            let found = match fs::open_relative(here, step, fs::Open::existing(0).with_kind(kind)) {
+                Err(ERROR_REPARSE_POINT_ENCOUNTERED) => {
+                    self.open_followed(here, step, kind).map_err(|e| match e {
+                        ERROR_ACCESS_DENIED => {
+                            self.link_missing_inside(root, here, step, depth + 1)
+                        }
+                        e => Some(e),
+                    })
+                }
+                found => found.map(|(h, _)| OwnedHandle::new(h)).map_err(Some),
+            };
+            match found {
+                Ok(h) => at = Some(h),
+                Err(Some(e @ (ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND | ERROR_DIRECTORY))) => {
+                    return Some(e);
+                }
+                Err(_) => return None,
+            }
+        }
+        // Every step is there (or the target is the root itself).
+        None
+    }
+
+    /// Open the directory `rel` below the share root as
+    /// [`Self::open_followed`] does, when that failed, a component at a time:
+    /// each is looked up, following nothing, in a directory known to lie
+    /// inside the share, where a failure says nothing about the outside and
+    /// so is reported as it is (a missing directory is still missing); a
+    /// component that is a link goes through `open_followed`.
+    fn open_dir_by_steps(&self, root: HANDLE, rel: &Path) -> Result<OwnedHandle, u32> {
+        let mut dir: Option<OwnedHandle> = None;
+        for name in rel.components() {
+            let std::path::Component::Normal(name) = name else {
+                return Err(ERROR_ACCESS_DENIED);
+            };
+            let name: Vec<u16> = name.encode_wide().collect();
+            let at = dir.as_ref().map_or(root, OwnedHandle::get);
+            let how = fs::Open::existing(0).with_kind(fs::Kind::Directory);
+            dir = Some(match fs::open_relative(at, &name, how) {
+                Ok((h, _)) => OwnedHandle::new(h),
+                Err(ERROR_REPARSE_POINT_ENCOUNTERED) => {
+                    self.open_link(root, at, &name, fs::Kind::Directory)?
+                }
+                Err(e) => return Err(e),
+            });
+        }
+        dir.ok_or(ERROR_ACCESS_DENIED)
     }
 
     /// Open the file a fid names with `access`: through the fid's open handle
@@ -1168,7 +1697,7 @@ impl P9Device {
         access: u32,
     ) -> Result<OwnedHandle, u32> {
         match open {
-            Some(h) => fs::reopen(h.get(), access).map(OwnedHandle),
+            Some(h) => fs::reopen(h.get(), access).map(OwnedHandle::new),
             None => self
                 .open_rel(rel, fs::Open::existing(access))
                 .map(|(h, _)| h),
@@ -1213,7 +1742,7 @@ impl P9Device {
         if access & GENERIC_WRITE != 0 {
             return fs::set_end_of_file(h, 0);
         }
-        let w = OwnedHandle(fs::reopen(h, GENERIC_WRITE)?);
+        let w = OwnedHandle::new(fs::reopen(h, GENERIC_WRITE)?);
         fs::set_end_of_file(w.get(), 0)
     }
 
@@ -1227,7 +1756,7 @@ impl P9Device {
         match fs::lx_metadata(h) {
             Ok(md) => md,
             Err(ERROR_ACCESS_DENIED) => fs::reopen(h, FILE_READ_EA)
-                .map(OwnedHandle)
+                .map(OwnedHandle::new)
                 .and_then(|h2| fs::lx_metadata(h2.get()))
                 .unwrap_or_default(),
             Err(_) => fs::LxMetadata::default(),
@@ -1237,7 +1766,7 @@ impl P9Device {
     /// Store the `Some` fields of `md` as the WSL metadata of the file `h`
     /// refers to.
     fn set_lx_metadata(h: HANDLE, md: fs::LxMetadata) -> Result<(), u32> {
-        let h = OwnedHandle(fs::reopen(h, FILE_WRITE_EA)?);
+        let h = OwnedHandle::new(fs::reopen(h, FILE_WRITE_EA)?);
         fs::set_lx_metadata(h.get(), md)
     }
 
@@ -1376,7 +1905,7 @@ impl P9Device {
         // extending the contended queue-lock hold time.
         let mut chain = self.drain_chain.lock().unwrap();
         loop {
-            let more = {
+            let (more, epoch) = {
                 let mut q = self.queue.lock().unwrap();
                 if !q.ready() {
                     return None;
@@ -1384,19 +1913,17 @@ impl P9Device {
                 if !q.pop_into(&mut chain) {
                     return None;
                 }
-                q.has_avail()
+                self.active.fetch_add(1, Ordering::Relaxed);
+                (q.has_avail(), self.epoch.load(Ordering::Relaxed))
             };
             let Some(idx) = self.engine.pool.acquire() else {
-                // Pool exhausted (impossible when sized to ring depth): retire the
+                // Pool exhausted (a driver that keeps to its ring can't have
+                // more requests in flight than there are slots): retire the
                 // descriptor empty so the guest isn't wedged, then stop draining.
-                let int = {
-                    let mut q = self.queue.lock().unwrap();
-                    q.push(chain.head_index, 0);
-                    q.should_interrupt_driver()
-                };
-                if int {
+                if self.push_used(epoch, chain.head_index, 0) {
                     self.raise(P9_REQUEST_QUEUE);
                 }
+                self.settle(1);
                 return None;
             };
             // SAFETY: we just acquired `idx` and own it until we post it. The
@@ -1421,6 +1948,11 @@ impl P9Device {
             slot.wbufs.clear();
             slot.wbufs
                 .extend(chain.bufs.iter().filter(|b| b.write).copied());
+            slot.epoch = epoch;
+            // In flight from here on, for a Tflush to find (see `Flights`).
+            if let Some(tag) = slot.tag() {
+                self.engine.flights.lock().unwrap().begin(idx, tag, epoch);
+            }
             if inline_ok && !more && self.engine.pool.in_use.load(Ordering::Relaxed) == 1 {
                 return Some(idx);
             }
@@ -1431,32 +1963,138 @@ impl P9Device {
         }
     }
 
+    /// Whether `epoch`, the one a request was taken in, is still the
+    /// device's: no reset has ended it.
+    fn current(&self, epoch: u32) -> bool {
+        self.epoch.load(Ordering::Relaxed) == epoch
+    }
+
+    /// Retire `head` on the used ring, unless the epoch it was taken in has
+    /// ended. Returns whether the driver wants an interrupt for it.
+    fn push_used(&self, epoch: u32, head: u16, used_len: u32) -> bool {
+        let mut q = self.queue.lock().unwrap();
+        if !self.current(epoch) {
+            return false;
+        }
+        q.push(head, used_len);
+        q.should_interrupt_driver()
+    }
+
+    /// Copy `reply` into the writable buffers `wbufs` of a request taken in
+    /// `epoch`, unless that has ended: the buffers are the driver's again.
+    /// Returns the bytes written.
+    fn write_reply(&self, epoch: u32, wbufs: &mut [ChainBuf], reply: &[u8]) -> u32 {
+        if !self.current(epoch) {
+            return 0;
+        }
+        write_chain(wbufs, reply)
+    }
+
+    /// `n` requests taken off the ring have settled: the device will not
+    /// touch their guest buffers or the used ring for them again. Must come
+    /// last.
+    fn settle(&self, n: u32) {
+        self.active.fetch_sub(n, Ordering::Release);
+    }
+
     /// Run one request to completion (on a worker, or inline on the pump):
-    /// handle it straight into the guest's buffers, push the used ring, raise
-    /// the IRQ, then recycle the slot.
+    /// handle it straight into the guest's buffers, then retire it. A Tflush
+    /// of a request still in flight is parked instead, for whoever retires
+    /// that request to answer.
     fn complete_slot(&self, idx: u16) {
         // SAFETY: this slot was handed to us via the IOCP (or kept by the
-        // drain for inline execution); we own it until release.
+        // drain for inline execution); we own it until it is retired or
+        // parked.
         let slot = unsafe { self.engine.pool.slot(idx) };
         slot.reply.clear();
+        // Taken before a reset and not yet started: dropped. The session it
+        // belonged to is over.
+        if !self.current(slot.epoch) {
+            return self.retire(idx, 0);
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.before_request.get() {
+            hook(&slot.t_msg);
+        }
         let written = match slot.t_msg.get(4).copied() {
+            // Parked: the slot is not this thread's any more.
+            Some(T_FLUSH) if self.park_flush(idx, slot.flushed_tag(), slot.epoch) => return,
             Some(T_READ) if slot.t_msg.len() >= REPLY_HEADER_SIZE => self.read_into_chain(slot),
             Some(T_WRITE) if !slot.rbufs.is_empty() => self.write_from_chain(slot),
             _ => {
                 self.dispatch(&slot.t_msg, &mut slot.reply, slot.cap);
-                write_chain(&mut slot.wbufs, &slot.reply)
+                self.write_reply(slot.epoch, &mut slot.wbufs, &slot.reply)
             }
         };
-        let head = slot.head_index;
-        let interrupt = {
-            let mut q = self.queue.lock().unwrap();
-            q.push(head, written);
-            q.should_interrupt_driver()
+        self.retire(idx, written);
+    }
+
+    /// Park the Tflush of `oldtag` in slot `idx`, taken in `epoch`, on the
+    /// request it flushes if that one is in flight: the worker that retires
+    /// it then answers the Tflush, whose slot is its own from the moment this
+    /// returns true. False if the Tflush is to be answered now: the
+    /// request's reply is out already, or there is no such request.
+    fn park_flush(&self, idx: u16, oldtag: Option<u16>, epoch: u32) -> bool {
+        let Some(oldtag) = oldtag else {
+            return false;
         };
-        self.engine.pool.release(idx);
+        let mut flights = self.engine.flights.lock().unwrap();
+        let parked = flights
+            .find(oldtag, epoch, idx)
+            .is_some_and(|target| flights.park(idx, target));
+        if parked {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+        }
+        parked
+    }
+
+    /// Retire the request in slot `idx`, whose reply of `written` bytes is in
+    /// its buffers: put it on the used ring and take it out of [`Flights`],
+    /// in one hold of that lock, then do the same for each Tflush that was
+    /// parked on it, and for those parked on them in turn. A stale request
+    /// (see `epoch`) is only taken out. Raises one interrupt for them all,
+    /// recycles their slots and settles them.
+    fn retire(&self, idx: u16, written: u32) {
+        let pool = &self.engine.pool;
+        let mut interrupt = false;
+        let mut settled = 0;
+        {
+            let mut flights = self.engine.flights.lock().unwrap();
+            // The slots to retire, chained by `flights.next` from `cur` to
+            // `last`, and the reply length of `cur`.
+            let (mut cur, mut last, mut len) = (idx, idx, written);
+            loop {
+                // SAFETY: `idx` is the caller's to retire; every other slot
+                // here was parked, which left it to whoever takes it out of
+                // `flights` under its lock.
+                let slot = unsafe { pool.slot(cur) };
+                interrupt |= self.push_used(slot.epoch, slot.head_index, len);
+                let (first_parked, last_parked) = flights.end(cur);
+                if first_parked != NO_SLOT {
+                    flights.next[last as usize] = first_parked;
+                    last = last_parked;
+                }
+                let next = std::mem::replace(&mut flights.next[cur as usize], NO_SLOT);
+                if cur != idx {
+                    pool.release(cur);
+                }
+                settled += 1;
+                if next == NO_SLOT {
+                    break;
+                }
+                cur = next;
+                // SAFETY: as above.
+                let slot = unsafe { pool.slot(cur) };
+                let tag = slot.tag().unwrap_or(0);
+                build_header_only(&mut slot.reply, R_FLUSH, tag);
+                len = self.write_reply(slot.epoch, &mut slot.wbufs, &slot.reply);
+            }
+        }
+        pool.release(idx);
         if interrupt {
             self.raise(P9_REQUEST_QUEUE);
         }
+        self.settle(settled);
     }
 
     fn dispatch(&self, t_msg: &[u8], reply: &mut Vec<u8>, writable_cap: u32) {
@@ -1485,6 +2123,8 @@ impl P9Device {
             T_CLUNK => self.h_clunk(tag, body, reply),
             T_REMOVE => self.h_remove(tag, body, reply),
             T_FSYNC => self.h_fsync(tag, body, reply),
+            // Of a request that isn't in flight: one that is has the Tflush
+            // wait for it (see `park_flush`).
             T_FLUSH => build_header_only(reply, R_FLUSH, tag),
             T_MKDIR => self.h_mkdir(tag, body, reply),
             T_RENAME => self.h_rename(tag, body, reply),
@@ -1562,6 +2202,10 @@ impl P9Device {
             build_rlerror(reply, tag, E_NOTDIR);
             return;
         }
+        let Some(rel) = self.fid_path(PathBuf::new()) else {
+            build_rlerror(reply, tag, E_NOMEM);
+            return;
+        };
         {
             let mut f = self.fids.lock().unwrap();
             if !f.map.contains_key(&fid) && f.map.len() >= MAX_FIDS {
@@ -1574,8 +2218,7 @@ impl P9Device {
             } else {
                 n_uname
             };
-            f.map
-                .insert(fid, FidEntry::new(PathBuf::new(), true, qp, uid));
+            f.map.insert(fid, FidEntry::new(rel, true, qp, uid));
         }
         reply.clear();
         enc4(reply, 0);
@@ -1617,7 +2260,7 @@ impl P9Device {
                 build_rlerror(reply, tag, E_INVAL);
                 return;
             }
-            src_rel = src.rel.clone();
+            src_rel = src.rel.to_path_buf();
             src_is_dir = src.is_dir;
             src_qid_path = src.qid_path;
             src_uid = src.uid;
@@ -1634,9 +2277,15 @@ impl P9Device {
         }
 
         if nwname == 0 {
+            // The clone's path counts like any other: a fid is cheap to
+            // make, its path may be long.
+            let Some(rel) = self.fid_path(src_rel) else {
+                build_rlerror(reply, tag, E_NOMEM);
+                return;
+            };
             self.fids.lock().unwrap().map.insert(
                 newfid,
-                FidEntry::new(src_rel, src_is_dir, src_qid_path, src_uid),
+                FidEntry::new(rel, src_is_dir, src_qid_path, src_uid),
             );
             reply.clear();
             enc4(reply, 0);
@@ -1691,6 +2340,10 @@ impl P9Device {
 
         if qids.len() == nwname as usize {
             let (qt, _, qp) = *qids.last().unwrap();
+            let Some(rel) = self.fid_path(rel) else {
+                build_rlerror(reply, tag, E_NOMEM);
+                return;
+            };
             self.fids
                 .lock()
                 .unwrap()
@@ -1722,7 +2375,7 @@ impl P9Device {
                 build_rlerror(reply, tag, E_BADF);
                 return;
             };
-            rel = e.rel.clone();
+            rel = e.rel.to_path_buf();
             is_dir = e.is_dir;
             qid_path = e.qid_path;
             already_open = e.opened;
@@ -1778,9 +2431,7 @@ impl P9Device {
                 build_rlerror(reply, tag, E_INVAL);
                 return;
             }
-            e.handle = Some(Arc::new(h));
-            e.opened = true;
-            e.open_flags = flags;
+            e.open(h, flags);
         }
         let qt = if is_dir { QT_DIR } else { QT_FILE };
         reply.clear();
@@ -1823,10 +2474,14 @@ impl P9Device {
                 build_rlerror(reply, tag, E_INVAL);
                 return;
             }
-            parent_rel = e.rel.clone();
+            parent_rel = e.rel.to_path_buf();
             creator = e.uid;
         }
-        let rel = parent_rel.join(&name);
+        // The path the fid will have, reserved before anything is created.
+        let Some(rel) = self.fid_path(parent_rel.join(&name)) else {
+            build_rlerror(reply, tag, E_NOMEM);
+            return;
+        };
         let acc = flags & O_ACCMODE;
         let want_append = flags & O_APPEND != 0;
         let mut access = GENERIC_WRITE | FILE_READ_ATTRIBUTES;
@@ -1886,9 +2541,7 @@ impl P9Device {
             e.rel = rel;
             e.is_dir = false;
             e.qid_path = qp;
-            e.handle = Some(Arc::new(h));
-            e.opened = true;
-            e.open_flags = flags;
+            e.open(h, flags);
         }
         reply.clear();
         enc4(reply, 0);
@@ -1929,7 +2582,7 @@ impl P9Device {
     fn fail_slot(&self, slot: &mut P9Slot, tag: u16, ecode: u32) -> u32 {
         self.rlerrors.fetch_add(1, Ordering::Relaxed);
         build_rlerror(&mut slot.reply, tag, ecode);
-        write_chain(&mut slot.wbufs, &slot.reply)
+        self.write_reply(slot.epoch, &mut slot.wbufs, &slot.reply)
     }
 
     /// Tread from the virtqueue: the data goes from the host file straight into
@@ -1956,7 +2609,8 @@ impl P9Device {
                 // SAFETY: each run lies in a host_range-validated, device-writable
                 // guest buffer that stays valid until the used-ring push. The OS
                 // writes it directly; it is never borrowed as a slice.
-                match unsafe { fs::read_at_raw(h.get(), p, n as u32, offset + got as u64) } {
+                let at = offset.saturating_add(got as u64);
+                match unsafe { fs::read_at_raw(h.get(), p, n as u32, at) } {
                     Ok(k) => {
                         got += k as usize;
                         if (k as usize) < n {
@@ -1973,11 +2627,14 @@ impl P9Device {
                 slot.bounce.resize(len, 0);
             }
             match fs::read_at(h.get(), &mut slot.bounce[..len], offset) {
-                // SAFETY: as above; the runs cover `len` >= `k` bytes.
-                Ok(k) => unsafe {
-                    scatter(&slot.runs, &slot.bounce[..k as usize]);
+                Ok(k) => {
+                    // After a reset the buffers are the driver's again.
+                    if self.current(slot.epoch) {
+                        // SAFETY: as above; the runs cover `len` >= `k` bytes.
+                        unsafe { scatter(&slot.runs, &slot.bounce[..k as usize]) };
+                    }
                     k as usize
-                },
+                }
                 Err(e) => return self.fail_slot(slot, tag, errno_from_win32(e)),
             }
         };
@@ -1986,7 +2643,7 @@ impl P9Device {
         hdr[4] = R_READ;
         hdr[5..7].copy_from_slice(&tag.to_le_bytes());
         hdr[7..11].copy_from_slice(&(got as u32).to_le_bytes());
-        write_chain(&mut slot.wbufs, &hdr);
+        self.write_reply(slot.epoch, &mut slot.wbufs, &hdr);
         self.reads.fetch_add(1, Ordering::Relaxed);
         self.read_bytes.fetch_add(got as u64, Ordering::Relaxed);
         (RREAD_HEADER_SIZE + got) as u32
@@ -2021,7 +2678,8 @@ impl P9Device {
             for &(p, n) in &slot.runs {
                 // SAFETY: each run lies in a host_range-validated, device-readable
                 // guest buffer that stays valid until the used-ring push.
-                match unsafe { write_raw(h.get(), append, p, n, offset + done as u64) } {
+                let at = offset.saturating_add(done as u64);
+                match unsafe { write_raw(h.get(), append, p, n, at) } {
                     Ok(k) => {
                         done += k as usize;
                         if (k as usize) < n {
@@ -2061,7 +2719,7 @@ impl P9Device {
         rep[4] = R_WRITE;
         rep[5..7].copy_from_slice(&tag.to_le_bytes());
         rep[7..11].copy_from_slice(&wrote.to_le_bytes());
-        write_chain(&mut slot.wbufs, &rep)
+        self.write_reply(slot.epoch, &mut slot.wbufs, &rep)
     }
 
     fn h_read(&self, tag: u16, body: &[u8], reply: &mut Vec<u8>, cap: u32) {
@@ -2161,26 +2819,6 @@ impl P9Device {
             build_rlerror(reply, tag, E_PROTO);
             return;
         };
-        let (is_dir, opened, has_handle, cache_built);
-        {
-            let f = self.fids.lock().unwrap();
-            let Some(e) = f.map.get(&fid) else {
-                build_rlerror(reply, tag, E_BADF);
-                return;
-            };
-            is_dir = e.is_dir;
-            opened = e.opened;
-            has_handle = e.handle.is_some();
-            cache_built = e.dir_cache.is_some();
-        }
-        if !is_dir {
-            build_rlerror(reply, tag, E_NOTDIR);
-            return;
-        }
-        if !opened || !has_handle {
-            build_rlerror(reply, tag, E_BADF);
-            return;
-        }
         let max_payload = if cap as usize > RREAD_HEADER_SIZE {
             cap - RREAD_HEADER_SIZE as u32
         } else {
@@ -2189,126 +2827,168 @@ impl P9Device {
         if count > max_payload {
             count = max_payload;
         }
+        // The place in the directory's listing to read on from: 0, or the
+        // offset an earlier Rreaddir gave with the entry before.
+        let offset = usize::try_from(req_offset).unwrap_or(usize::MAX);
 
-        // A readdir from the start lists the directory afresh; one carrying on
-        // after the budget dropped this fid's listing lists it again. The
-        // chunk is encoded under the same lock hold that found or stored the
-        // listing, so another fid's readdir can't drop it in between.
-        let mut rebuild = req_offset == 0 || !cache_built;
-        let f = loop {
-            if rebuild {
-                // Clone the fid's already-open directory handle and enumerate
-                // by HANDLE — no per-entry open.
-                let dir_h = {
-                    let f = self.fids.lock().unwrap();
-                    f.map.get(&fid).and_then(|e| e.handle.clone())
-                };
-                let Some(dir_h) = dir_h else {
-                    build_rlerror(reply, tag, E_BADF);
-                    return;
-                };
-                let cache = self.build_dir_cache(dir_h.get());
-                let mut f = self.fids.lock().unwrap();
-                f.set_dir_cache(fid, cache);
-                break f;
+        // A readdir that carries on is served from the stretch of the listing
+        // the fid holds, if that reaches so far: encoded under the lock that
+        // found it, so another fid's readdir can't drop it meanwhile, and
+        // with no copy of it. The loop is bounded by `count` (<= msize), so
+        // the lock hold is short. A readdir from the start lists the
+        // directory afresh.
+        let held = |e: &FidEntry, reply: &mut Vec<u8>| {
+            if offset == 0 {
+                return false;
             }
+            let Some(entries) = e.dir_cache.as_ref().and_then(|c| c.entries_from(offset)) else {
+                return false;
+            };
+            build_rreaddir(reply, tag, entries, offset, count);
+            true
+        };
+        let dir_h = {
             let f = self.fids.lock().unwrap();
-            if f.map.get(&fid).is_some_and(|e| e.dir_cache.is_none()) {
-                rebuild = true;
-                continue;
+            let Some(e) = f.map.get(&fid) else {
+                build_rlerror(reply, tag, E_BADF);
+                return;
+            };
+            if !e.is_dir {
+                build_rlerror(reply, tag, E_NOTDIR);
+                return;
             }
-            break f;
+            let Some(dir_h) = e.handle.clone().filter(|_| e.opened) else {
+                build_rlerror(reply, tag, E_BADF);
+                return;
+            };
+            if held(e, reply) {
+                return;
+            }
+            dir_h
         };
 
-        // Encode the requested chunk directly from the cached entries under the
-        // fids lock — no per-call clone of the whole directory (that made a
-        // multi-chunk readdir O(N^2) in the entry count). The encode loop is pure
-        // CPU bounded by `count` (<= msize), so the lock hold is short and in fact
-        // shorter than the previous O(N) clone.
-        let Some(e) = f.map.get(&fid) else {
-            build_rlerror(reply, tag, E_BADF);
-            return;
-        };
-        let cache: &[DirEntryCached] = e.dir_cache.as_ref().map_or(&[], |c| &c.entries);
-
-        reply.clear();
-        enc4(reply, 0);
-        enc1(reply, R_READDIR);
-        enc2(reply, tag);
-        let count_off = reply.len();
-        enc4(reply, 0);
-        let start_payload = reply.len();
-
-        let start_index = (req_offset as usize).min(cache.len());
-        for (i, de) in cache.iter().enumerate().skip(start_index) {
-            let need = 13 + 8 + 1 + 2 + de.name.len();
-            if (reply.len() - start_payload) + need > count as usize {
-                break;
+        // Read the stretch from `offset` on through the fid's directory
+        // handle, one listing of it at a time (see `OwnedHandle::listing`),
+        // and leave it with the fid for the chunks that follow.
+        let _listing = dir_h.listing.lock().unwrap();
+        let carry_on = {
+            let f = self.fids.lock().unwrap();
+            match f.map.get(&fid) {
+                Some(e) if e.handle.as_ref().is_some_and(|h| Arc::ptr_eq(h, &dir_h)) => {
+                    // Another request may have read it while this one waited.
+                    if held(e, reply) {
+                        return;
+                    }
+                    // The handle stands where this stretch starts if the one
+                    // before it ended there; else the directory is read from
+                    // the top again (a rewind, a seek, or a stretch the
+                    // budget dropped before the guest had read it all).
+                    offset != 0 && e.dir_cursor == Some(offset)
+                }
+                // Clunked or opened anew meanwhile: `dir_h` is this request's
+                // alone, and is where nobody left it.
+                _ => false,
             }
-            enc_qid(reply, de.qid_type, de.qid_version, de.qid_path);
-            enc8(reply, (i + 1) as u64);
-            enc1(reply, de.d_type);
-            enc_str(reply, &de.name);
-        }
-        drop(f);
-        let payload_len = (reply.len() - start_payload) as u32;
-        reply[count_off..count_off + 4].copy_from_slice(&payload_len.to_le_bytes());
-        finalize(reply);
+        };
+        let max_bytes = self.dir_window_bytes.load(Ordering::Relaxed);
+        let window = self.list_dir(dir_h.get(), offset, carry_on, max_bytes);
+        build_rreaddir(reply, tag, &window.entries, offset, count);
+        self.fids
+            .lock()
+            .unwrap()
+            .set_dir_window(fid, &dir_h, window);
     }
 
-    /// Build the readdir cache by enumerating the fid's open directory HANDLE
-    /// with `FileIdBothDirectoryInfo`. Each entry comes back with its 64-bit
-    /// file-ID, so there is **no per-entry open / GetFileInformation / Close**
-    /// — one buffer-full per ~500 entries instead of ~4 syscalls per entry.
-    /// (Profiled on a 5 000-entry dir: ~20 K host syscalls/readdir → ~10.)
-    fn build_dir_cache(&self, dir_h: HANDLE) -> Vec<DirEntryCached> {
-        let mut cache: Vec<DirEntryCached> = Vec::new();
-        let mut saw_dot = false;
-        let mut saw_dotdot = false;
-        for e in fs::read_dir_ids(dir_h) {
-            if e.name.is_empty() {
-                continue;
+    /// Read a stretch of the listing of the directory `dir_h`: its entries
+    /// from the `start`th on, about `max_bytes` worth. `carry_on` says the
+    /// handle stands at `start`, where the stretch read before this one left
+    /// it; otherwise the directory is read from the top and the entries
+    /// before `start` are passed over. A stretch ends where a batch of
+    /// entries from the file system does, as the handle's place in the
+    /// directory moves a batch at a time, so it may run past `max_bytes` by
+    /// one batch (some 600 entries at most).
+    ///
+    /// The listing is what the handle enumerates with
+    /// `FileIdBothDirectoryInfo`: each entry comes back with its 64-bit
+    /// file ID, so there is **no per-entry open / GetFileInformation /
+    /// Close** — one buffer-full per ~500 entries instead of ~4 syscalls per
+    /// entry. (Profiled on a 5 000-entry dir: ~20 K host syscalls/readdir →
+    /// ~10.) It starts with `.` and `..`: the file system's own entries where
+    /// it lists them first (NTFS does, below a volume's root), made up where
+    /// it lists none.
+    fn list_dir(&self, dir_h: HANDLE, start: usize, carry_on: bool, max_bytes: usize) -> DirWindow {
+        let mut window = DirWindow {
+            entries: Vec::new(),
+            base: start,
+            ended: false,
+            cursor: if carry_on { start } else { 0 },
+        };
+        // Whether the listing's `.` and `..` are behind the handle.
+        let (mut dot, mut dotdot) = (carry_on, carry_on);
+        let made_up = |name: &str| DirEntryCached {
+            qid_type: QT_DIR,
+            qid_version: 0,
+            qid_path: self.alloc_qid_path(),
+            d_type: DT_DIR,
+            name: name.into(),
+        };
+        let mut dir = fs::read_dir_ids_from(dir_h, !carry_on);
+        loop {
+            // Never an empty stretch short of the listing's end: a readdir
+            // would take it for the end.
+            if dir.at_batch_end()
+                && !window.entries.is_empty()
+                && dir_cache_bytes(&window.entries) >= max_bytes
+            {
+                break;
             }
-            saw_dot |= e.name == ".";
-            saw_dotdot |= e.name == "..";
-            let qp = if e.file_id != 0 {
-                e.file_id
-            } else {
-                self.alloc_qid_path()
+            let Some(e) = dir.next() else {
+                window.ended = true;
+                break;
             };
-            cache.push(DirEntryCached {
+            match e.name.as_str() {
+                "" => continue,
+                "." if dot => continue,
+                ".." if dotdot => continue,
+                "." => {}
+                ".." => {
+                    if !dot {
+                        window.push(made_up("."));
+                    }
+                }
+                _ => {
+                    if !dot {
+                        window.push(made_up("."));
+                    }
+                    if !dotdot {
+                        window.push(made_up(".."));
+                    }
+                    dotdot = true;
+                }
+            }
+            dot = true;
+            dotdot |= e.name == "..";
+            window.push(DirEntryCached {
                 qid_type: if e.is_dir { QT_DIR } else { QT_FILE },
                 qid_version: 0,
-                qid_path: qp,
+                qid_path: if e.file_id != 0 {
+                    e.file_id
+                } else {
+                    self.alloc_qid_path()
+                },
                 d_type: if e.is_dir { DT_DIR } else { DT_REG },
                 name: e.name,
             });
         }
-        if !saw_dot {
-            cache.insert(
-                0,
-                DirEntryCached {
-                    qid_type: QT_DIR,
-                    qid_version: 0,
-                    qid_path: self.alloc_qid_path(),
-                    d_type: DT_DIR,
-                    name: ".".into(),
-                },
-            );
+        if window.ended {
+            if !dot {
+                window.push(made_up("."));
+            }
+            if !dotdot {
+                window.push(made_up(".."));
+            }
         }
-        if !saw_dotdot {
-            cache.insert(
-                1.min(cache.len()),
-                DirEntryCached {
-                    qid_type: QT_DIR,
-                    qid_version: 0,
-                    qid_path: self.alloc_qid_path(),
-                    d_type: DT_DIR,
-                    name: "..".into(),
-                },
-            );
-        }
-        cache
+        window
     }
 
     fn h_getattr(&self, tag: u16, body: &[u8], reply: &mut Vec<u8>) {
@@ -2324,7 +3004,7 @@ impl P9Device {
                 build_rlerror(reply, tag, E_BADF);
                 return;
             };
-            rel = e.rel.clone();
+            rel = e.rel.to_path_buf();
             was_open = e.opened;
             existing = e.handle.clone();
         }
@@ -2423,7 +3103,7 @@ impl P9Device {
                 build_rlerror(reply, tag, E_BADF);
                 return;
             };
-            rel = e.rel.clone();
+            rel = e.rel.to_path_buf();
             open = e.handle.clone().filter(|_| e.opened);
             is_dir = e.is_dir;
         }
@@ -2512,7 +3192,7 @@ impl P9Device {
                 build_rlerror(reply, tag, E_BADF);
                 return;
             };
-            rel = e.rel.clone();
+            rel = e.rel.to_path_buf();
             is_dir = e.is_dir;
             e.close_handle(); // explicit; dropped at end of scope anyway
         }
@@ -2583,7 +3263,7 @@ impl P9Device {
                 build_rlerror(reply, tag, E_NOTDIR);
                 return;
             }
-            parent = e.rel.clone();
+            parent = e.rel.to_path_buf();
             creator = e.uid;
         }
         let how = fs::Open::existing(0)
@@ -2646,21 +3326,26 @@ impl P9Device {
                 build_rlerror(reply, tag, E_NOTDIR);
                 return;
             }
-            old_rel = src.rel.clone();
-            new_parent = dir.rel.clone();
+            old_rel = src.rel.to_path_buf();
+            new_parent = dir.rel.to_path_buf();
         }
         // The share root can't be moved.
         if old_rel.as_os_str().is_empty() {
             build_rlerror(reply, tag, E_ACCES);
             return;
         }
+        // The path the fid will have, reserved before anything is renamed.
+        let Some(new_rel) = self.fid_path(new_parent.join(&name)) else {
+            build_rlerror(reply, tag, E_NOMEM);
+            return;
+        };
         // The fid's open handle, if any, stays valid: it follows the file.
         if let Err(e) = self.rename_entry(&old_rel, &new_parent, &name) {
             build_rlerror(reply, tag, errno_from_win32(e));
             return;
         }
         if let Some(e) = self.fids.lock().unwrap().map.get_mut(&fid) {
-            e.rel = new_parent.join(&name);
+            e.rel = new_rel;
         }
         build_header_only(reply, R_RENAME, tag);
     }
@@ -2692,8 +3377,8 @@ impl P9Device {
                 build_rlerror(reply, tag, E_NOTDIR);
                 return;
             }
-            old_dir = o.rel.clone();
-            new_dir = n.rel.clone();
+            old_dir = o.rel.to_path_buf();
+            new_dir = n.rel.to_path_buf();
         }
         if let Err(e) = self.rename_entry(&old_dir.join(&old_name), &new_dir, &new_name) {
             build_rlerror(reply, tag, errno_from_win32(e));
@@ -2727,7 +3412,7 @@ impl P9Device {
                 build_rlerror(reply, tag, E_NOTDIR);
                 return;
             }
-            parent = e.rel.clone();
+            parent = e.rel.to_path_buf();
         }
         // Without AT_REMOVEDIR a directory fails with EISDIR, as on Linux.
         let kind = kind_of(flags & AT_REMOVEDIR != 0);
@@ -2970,10 +3655,29 @@ impl VirtioDevice for P9Device {
     }
 
     fn reset(&self) {
+        // A guest-triggered reset (status write of 0) can race with requests
+        // still in flight. It must not wait for them: it runs under the
+        // transport `common` lock, which a retiring request's IRQ path
+        // re-takes. Instead the reset completes asynchronously (see
+        // `reset_pending`), as virtio-blk's does: under the queue lock, end
+        // the epoch and reset the virtqueue. A request taken before this is
+        // stale (see `epoch`), as the used ring and its buffers may belong to
+        // a re-enabled queue by the time it is done. The slot pool and the
+        // flight list are left alone: each stale request gives back its own
+        // slot, exactly once, as it settles.
+        {
+            let mut q = self.queue.lock().unwrap();
+            self.epoch.fetch_add(1, Ordering::Relaxed);
+            q.reset();
+        }
         self.driver_ok.store(false, Ordering::Relaxed);
         self.acked_features.store(0, Ordering::Relaxed);
         self.negotiated_msize.store(0, Ordering::Relaxed);
         self.fids.lock().unwrap().map.clear();
+    }
+
+    fn reset_pending(&self) -> bool {
+        self.active.load(Ordering::Acquire) != 0
     }
 
     // ---- save/restore ----
@@ -3073,14 +3777,18 @@ impl VirtioDevice for P9Device {
                 );
                 continue;
             };
+            let Some(rel) = self.fid_path(rel) else {
+                eprintln!(
+                    "[9p] restore: fid {id} ({}) is more path than the share's fids may hold; \
+                     dropping it",
+                    path.display()
+                );
+                continue;
+            };
             let mut e = FidEntry::new(rel, is_dir, qid, uid);
             if opened {
                 match self.reopen_fid_handle(&e.rel, is_dir, flags) {
-                    Some(h) => {
-                        e.handle = Some(Arc::new(h));
-                        e.opened = true;
-                        e.open_flags = flags;
-                    }
+                    Some(h) => e.open(h, flags),
                     None => eprintln!(
                         "[9p] restore: could not reopen fid {id} ({}); leaving it unopened",
                         path.display()
@@ -3107,6 +3815,8 @@ impl VirtioDevice for P9Device {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Condvar;
+    use std::time::{Duration, Instant};
 
     /// Create the directory junction `link` -> `target`; `mklink /J` needs no
     /// elevation. False where junctions are unavailable, and the caller skips.
@@ -3118,6 +3828,11 @@ mod tests {
             .output()
             .is_ok_and(|o| o.status.success())
             && link.exists()
+    }
+
+    /// `path` as a fid's path, counted on its own.
+    fn rel(path: impl Into<PathBuf>) -> FidPath {
+        FidPath::within(path.into(), &Arc::default(), usize::MAX).unwrap()
     }
 
     /// Links in the share are followed only to places inside it: a junction to
@@ -3493,21 +4208,20 @@ mod tests {
                 .reopen_fid_handle(Path::new("sub"), true, O_RDONLY)
                 .unwrap();
             let mut fids = dev.fids.lock().unwrap();
-            let mut ef = FidEntry::new(PathBuf::from("file.txt"), false, 7, 1000);
+            let mut ef = FidEntry::new(rel("file.txt"), false, 7, 1000);
             ef.handle = Some(Arc::new(hf));
             ef.opened = true;
             ef.open_flags = O_RDONLY;
             fids.map.insert(1, ef);
-            let mut ed = FidEntry::new(PathBuf::from("sub"), true, 8, 0);
+            let mut ed = FidEntry::new(rel("sub"), true, 8, 0);
             ed.handle = Some(Arc::new(hd));
             ed.opened = true;
             ed.open_flags = O_RDONLY;
             fids.map.insert(2, ed);
             // A walked-but-not-opened fid: path only, no handle.
-            fids.map
-                .insert(3, FidEntry::new(PathBuf::new(), true, 1, 1001));
+            fids.map.insert(3, FidEntry::new(rel(""), true, 1, 1001));
             let outside = Path::new("..").join("outside");
-            fids.map.insert(4, FidEntry::new(outside, true, 9, 0));
+            fids.map.insert(4, FidEntry::new(rel(outside), true, 9, 0));
         }
 
         let blob = dev.capture_device_state();
@@ -3528,7 +4242,7 @@ mod tests {
         assert!(f3.is_dir && !f3.opened && f3.handle.is_none() && f3.qid_path == 1);
         assert_eq!((f1.uid, f2.uid, f3.uid), (1000, 0, 1001));
         assert_eq!(
-            [&f1.rel, &f2.rel, &f3.rel],
+            [&*f1.rel, &*f2.rel, &*f3.rel],
             [Path::new("file.txt"), Path::new("sub"), Path::new("")]
         );
         drop(fids);
@@ -3649,7 +4363,7 @@ mod tests {
         let mut f = Fids::default();
         for fid in 0..4 {
             f.map
-                .insert(fid, FidEntry::new(PathBuf::new(), true, u64::from(fid), 0));
+                .insert(fid, FidEntry::new(rel(""), true, u64::from(fid), 0));
         }
         let built = |f: &Fids| -> Vec<u32> {
             let mut v: Vec<u32> = f
@@ -3685,10 +4399,9 @@ mod tests {
         f.set_dir_cache_within(3, listing(5), budget);
         total(&f);
         f.map.remove(&now[0]);
-        f.map
-            .insert(now[1], FidEntry::new(PathBuf::new(), true, 9, 0));
+        f.map.insert(now[1], FidEntry::new(rel(""), true, 9, 0));
         assert_eq!(total(&f), dir_cache_bytes(&listing(5)));
-        f.map.insert(0, FidEntry::new(PathBuf::new(), true, 0, 0));
+        f.map.insert(0, FidEntry::new(rel(""), true, 0, 0));
         f.set_dir_cache_within(0, listing(100), budget);
         assert_eq!(built(&f), [0], "an oversized listing is kept, alone");
         f.map.clear();
@@ -4047,5 +4760,1053 @@ mod tests {
                 mode: Some(want.0),
             })
         );
+    }
+
+    /// Win32 takes more names for DOS devices than the bare ones: any with
+    /// spaces between the device name and the first dot, and COM and LPT
+    /// followed by a superscript digit. The guest can't create those either.
+    #[test]
+    fn names_win32_takes_for_devices_are_refused() {
+        for name in [
+            "NUL",
+            "nul.txt",
+            "NUL .txt",
+            "con  .log",
+            "COM1 .x",
+            "lpt9 .a.b",
+            "COM\u{b9}",
+            "com\u{b2}.txt",
+            "LPT\u{b3} .x",
+            "lpt\u{b9}",
+        ] {
+            assert!(!is_safe_name_component(name), "{name:?}");
+        }
+        for name in [
+            "NULL",
+            "console.txt",
+            "COM10",
+            "LPT",
+            "nul_.txt",
+            "a NUL",
+            " nul",
+            "COM\u{2074}",
+        ] {
+            assert!(is_safe_name_component(name), "{name:?}");
+        }
+    }
+
+    /// A Tsetattr time is the guest's to pick: one past what a FILETIME holds
+    /// is the last FILETIME, not an overflow, nor one of the values the
+    /// kernel takes for something other than a time.
+    #[test]
+    fn times_past_the_end_of_filetime_saturate() {
+        let last = i64::MAX as u64;
+        assert_eq!(unix_to_filetime(0, 0), FILETIME_BIAS_TO_1970);
+        assert_eq!(unix_to_filetime(1, 500), FILETIME_BIAS_TO_1970 + 10_000_005);
+        assert_eq!(unix_to_filetime(u64::MAX, 999_999_999), last);
+        assert_eq!(unix_to_filetime(u64::MAX / 10_000_000, u64::MAX), last);
+        // No overflow, but past the last tick.
+        assert_eq!(unix_to_filetime(1_000_000_000_000, 0), last);
+    }
+
+    /// Rgetattr's errno for `fid`.
+    fn getattr_err(dev: &P9Device, fid: u32) -> u32 {
+        call_err(dev, T_GETATTR, |t| {
+            enc4(t, fid);
+            enc8(t, STATS_BASIC);
+        })
+    }
+
+    #[test]
+    fn a_link_target_is_placed_below_the_root_by_its_text() {
+        let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        // The steps joined by `/`, or None.
+        let steps = |root: &str, parts: &[&str]| {
+            let parts: Vec<Vec<u16>> = parts.iter().map(|p| w(p)).collect();
+            let parts: Vec<&[u16]> = parts.iter().map(Vec::as_slice).collect();
+            steps_below(&w(root), &parts).map(|steps| {
+                let names: Vec<String> =
+                    steps.iter().map(|s| String::from_utf16_lossy(s)).collect();
+                names.join("/")
+            })
+        };
+        let some = |s: &str| Some(s.to_string());
+        let root = r"\Device\HarddiskVolume3\Work\Share";
+        let dir = r"\Device\HarddiskVolume3\Work\Share\a\b";
+
+        // A relative target, from the directory its link is in.
+        assert_eq!(steps(root, &[dir, r"x"]), some("a/b/x"));
+        assert_eq!(steps(root, &[dir, r"..\c\.\x"]), some("a/c/x"));
+        // Up to the root, which is no step at all, and no further.
+        assert_eq!(steps(root, &[dir, r"..\.."]), some(""));
+        assert_eq!(steps(root, &[dir, r"..\..\..\Other\x"]), None);
+        assert_eq!(steps(root, &[dir, r"..\..\..\..\..\..\..\x"]), None);
+        // Out of the share and back in by its own name is in.
+        assert_eq!(steps(root, &[dir, r"..\..\..\SHARE\x"]), some("x"));
+        // A neighbour whose name begins as the root's does is not.
+        assert_eq!(steps(root, &[dir, r"..\..\..\Share2\x"]), None);
+
+        // An absolute target: its device as mapped, then its path, in the
+        // case it was written in.
+        let volume = r"\Device\HarddiskVolume3";
+        assert_eq!(steps(root, &[volume, r"\WORK\share\Sub\f"]), some("Sub/f"));
+        assert_eq!(steps(root, &[volume, r"\Work\Share\a\..\..\x"]), None);
+        assert_eq!(
+            steps(root, &[r"\Device\HarddiskVolume4", r"\Work\Share\x"]),
+            None
+        );
+        assert_eq!(
+            steps(root, &[r"\Device\Mup", r"\server\Work\Share\x"]),
+            None
+        );
+        // A whole volume shared: its path ends in a separator.
+        assert_eq!(
+            steps(r"\Device\HarddiskVolume3\", &[volume, r"\a\b"]),
+            some("a/b")
+        );
+    }
+
+    /// A link whose target is gone is missing, as any name that isn't there,
+    /// when the target would lie inside the share: what looks for a file
+    /// through a stale link gets "no such file". One that leads out of the
+    /// share, or would, still tells nothing.
+    #[test]
+    fn a_stale_link_inside_the_share_is_just_missing() {
+        use std::os::windows::fs::symlink_file;
+        let base = std::env::temp_dir().join(format!("tinyvmm_p9_stale_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("share").join("sub").join("there")).unwrap();
+        std::fs::create_dir_all(base.join("outside")).unwrap();
+        // Real paths: a link's absolute target is matched with the root's by
+        // its text, and the temporary directory may be named by a short name.
+        let real = |p: PathBuf| {
+            let p = std::fs::canonicalize(p).unwrap();
+            PathBuf::from(p.to_str().unwrap().trim_start_matches(r"\\?\"))
+        };
+        let (share, outside) = (real(base.join("share")), real(base.join("outside")));
+        let sub = share.join("sub");
+        std::fs::write(sub.join("file"), b"a file").unwrap();
+        for gone in [sub.join("gone"), outside.join("gone")] {
+            std::fs::create_dir(gone).unwrap();
+        }
+        if !junction(&share.join("in_gone"), &sub.join("gone"))
+            || !junction(&share.join("out_gone"), &outside.join("gone"))
+            || !junction(&share.join("in_there"), &sub.join("there"))
+        {
+            eprintln!("[p9-test] skipping: could not create a directory junction");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        for gone in [sub.join("gone"), outside.join("gone")] {
+            std::fs::remove_dir(gone).unwrap();
+        }
+
+        let mem = std::sync::Arc::new(whpsys::memory::GuestMemory::new_host_only(4096).unwrap());
+        let root = std::fs::canonicalize(&share).unwrap();
+        let dev = P9Device::new(mem, "t".into(), root, ShareOptions::default());
+        connect(&dev, 0);
+
+        // A junction (its target is an absolute path) to nothing: inside the
+        // share, outside it, and a name below each.
+        assert_eq!(walk_err(&dev, 0, 9, &["in_gone"]), E_NOENT);
+        assert_eq!(walk_err(&dev, 0, 9, &["in_gone", "x"]), E_NOENT);
+        assert_eq!(walk_err(&dev, 0, 9, &["out_gone"]), E_ACCES);
+        assert_eq!(walk_err(&dev, 0, 9, &["out_gone", "x"]), E_ACCES);
+
+        // Symlinks, where this process may create them: in the root (fid 0)
+        // or in `sub` (fid 1), each with its target and what a walk to it
+        // must say.
+        walk(&dev, 0, 1, &["sub"]);
+        let mut links = vec![
+            share.join("in_gone"),
+            share.join("out_gone"),
+            share.join("in_there"),
+        ];
+        let abs_gone = sub.join("nofile").to_str().unwrap().to_string();
+        let cases: [(u32, &str, &str, u32); 12] = [
+            // Relative targets: beside the link, below it, above it.
+            (0, "rel_gone", r"sub\nofile", E_NOENT),
+            (0, "rel_deep", r"sub\nodir\nofile", E_NOENT),
+            (1, "up", r"..\nofile", E_NOENT),
+            // Out of the share by `..`, at once or after a look inside.
+            (0, "rel_out", r"..\outside\nofile", E_ACCES),
+            (0, "rel_out2", r"sub\..\..\outside\nofile", E_ACCES),
+            (1, "up_out", r"..\..\nofile", E_ACCES),
+            // A file where the target's path needs a directory.
+            (0, "through_file", r"sub\file\x", E_NOTDIR),
+            // Through other links: a stale one, one that stays inside, one
+            // that leads out, and two that lead to each other.
+            (0, "chain", r"rel_gone", E_NOENT),
+            (0, "via_in", r"in_there\nofile", E_NOENT),
+            (0, "via_out", r"out_gone\x", E_ACCES),
+            (0, "loop_a", r"loop_b", E_ACCES),
+            // An absolute target inside the share.
+            (0, "abs_gone", &abs_gone, E_NOENT),
+        ];
+        let dir_of = |fid: u32| if fid == 0 { share.clone() } else { sub.clone() };
+        if symlink_file(r"loop_a", share.join("loop_b")).is_ok() {
+            links.push(share.join("loop_b"));
+            for (dir, link, target, _) in &cases {
+                symlink_file(target, dir_of(*dir).join(link)).unwrap();
+                links.push(dir_of(*dir).join(link));
+            }
+            for (dir, link, target, errno) in &cases {
+                assert_eq!(
+                    walk_err(&dev, *dir, 9, &[link]),
+                    *errno,
+                    "{link} -> {target}"
+                );
+            }
+            // The target appears: the links lead to it.
+            std::fs::write(sub.join("nofile"), b"now there").unwrap();
+            for (fid, link) in ["rel_gone", "chain", "abs_gone"].iter().enumerate() {
+                walk(&dev, 0, 20 + fid as u32, &[link]);
+            }
+        } else {
+            eprintln!("[p9-test] skipping the symlink cases: no privilege to create one");
+        }
+        std::fs::create_dir(sub.join("gone")).unwrap();
+        walk(&dev, 0, 40, &["in_gone"]);
+
+        drop(dev);
+        for link in links {
+            let _ = std::fs::remove_dir(&link).or_else(|_| std::fs::remove_file(&link));
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// What a link that leads out of the share leads to stays unknown: an
+    /// operation through it fails the same way whether the path beyond the
+    /// link names a directory, a file or nothing at all. Inside the share,
+    /// through a link or not, the errors are what they were.
+    #[test]
+    fn a_link_out_of_the_share_tells_nothing_of_what_is_there() {
+        let base = std::env::temp_dir().join(format!("tinyvmm_p9_oracle_{}", std::process::id()));
+        let (share, outside) = (base.join("share"), base.join("outside"));
+        let _ = std::fs::remove_dir_all(&base);
+        for dir in ["dir", "file", "none"] {
+            std::fs::create_dir_all(share.join("a").join(dir)).unwrap();
+            std::fs::write(share.join("a").join(dir).join("x"), b"inside").unwrap();
+        }
+        for dir in ["d", "e"] {
+            std::fs::create_dir_all(share.join("sub").join(dir)).unwrap();
+            std::fs::write(share.join("sub").join(dir).join("x"), b"inside").unwrap();
+        }
+        std::fs::create_dir_all(outside.join("dir")).unwrap();
+        std::fs::create_dir_all(outside.join("gone")).unwrap();
+        std::fs::write(outside.join("file"), b"outside").unwrap();
+        if !junction(&share.join("link"), &share.join("sub"))
+            || !junction(&share.join("to_dir"), &outside.join("dir"))
+            || !junction(&share.join("to_gone"), &outside.join("gone"))
+        {
+            eprintln!("[p9-test] skipping: could not create a directory junction");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        std::fs::remove_dir(outside.join("gone")).unwrap();
+
+        let root = std::fs::canonicalize(&share).unwrap();
+        let mem = std::sync::Arc::new(whpsys::memory::GuestMemory::new_host_only(4096).unwrap());
+        let dev = P9Device::new(mem, "t".into(), root, ShareOptions::default());
+        connect(&dev, 0);
+        // Fids from before `a` turned into a link out of the share: beyond
+        // it, their paths name a directory, a file and nothing.
+        walk(&dev, 0, 1, &["a", "dir", "x"]);
+        walk(&dev, 0, 2, &["a", "file", "x"]);
+        walk(&dev, 0, 3, &["a", "none", "x"]);
+        // And fids through a link that stays inside.
+        walk(&dev, 0, 4, &["link", "d", "x"]);
+        walk(&dev, 0, 5, &["link", "e", "x"]);
+        walk(&dev, 0, 6, &["link"]);
+        walk(&dev, 0, 7, &[]);
+        std::fs::rename(share.join("a"), share.join("a_real")).unwrap();
+        if !junction(&share.join("a"), &outside) {
+            eprintln!("[p9-test] skipping: could not create a directory junction");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        let create = |name: &str| {
+            call_err(&dev, T_LCREATE, |t| {
+                enc4(t, 7);
+                enc_str(t, name);
+                enc4(t, O_WRONLY);
+                enc4(t, 0o644);
+                enc4(t, 0);
+            })
+        };
+
+        assert_eq!(
+            [
+                getattr_err(&dev, 1),
+                getattr_err(&dev, 2),
+                getattr_err(&dev, 3)
+            ],
+            [E_ACCES; 3]
+        );
+        // A link to a directory outside, and one to nothing there.
+        assert_eq!(walk_err(&dev, 0, 9, &["to_dir"]), E_ACCES);
+        assert_eq!(walk_err(&dev, 0, 9, &["to_gone"]), E_ACCES);
+        // A file can't be created over either, as over any directory: a
+        // junction is one itself, wherever it leads.
+        assert_eq!([create("to_dir"), create("to_gone")], [E_ISDIR; 2]);
+        assert!(!outside.join("gone").exists());
+
+        // Inside the share: a name missing below a link, a file created over
+        // a link, and a directory on a fid's path that has gone, or turned
+        // into a file.
+        assert_eq!(walk_err(&dev, 6, 9, &["missing"]), E_NOENT);
+        assert_eq!(create("link"), E_ISDIR);
+        std::fs::remove_dir_all(share.join("sub").join("d")).unwrap();
+        std::fs::remove_dir_all(share.join("sub").join("e")).unwrap();
+        std::fs::write(share.join("sub").join("e"), b"a file now").unwrap();
+        assert_eq!(getattr_err(&dev, 4), E_NOENT);
+        assert_eq!(getattr_err(&dev, 5), E_NOTDIR);
+
+        drop(dev);
+        for link in ["a", "link", "to_dir", "to_gone"] {
+            let _ = std::fs::remove_dir(share.join(link));
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The bytes the fids' paths hold, checked against the share's count.
+    fn fid_path_bytes(dev: &P9Device) -> usize {
+        let f = dev.fids.lock().unwrap();
+        let sum: usize = f.map.values().map(|e| e.rel.bytes).sum();
+        assert_eq!(dev.fid_path_bytes.load(Ordering::Relaxed), sum);
+        sum
+    }
+
+    /// The share's count of fid path bytes is what the fids hold, however a
+    /// path comes or goes: a walk to a new fid or over its own, a clone, a
+    /// rename, a create, a clunk, a remove, Tversion and a reset.
+    #[test]
+    fn fid_paths_are_counted_as_they_come_and_go() {
+        let base = std::env::temp_dir().join(format!("tinyvmm_p9_fidbytes_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("dir").join("sub")).unwrap();
+        std::fs::write(base.join("dir").join("a.txt"), b"a").unwrap();
+        let root = std::fs::canonicalize(&base).unwrap();
+        let mem = std::sync::Arc::new(whpsys::memory::GuestMemory::new_host_only(4096).unwrap());
+        let dev = P9Device::new(mem, "t".into(), root, ShareOptions::default());
+        let (dir, sub, a, b) = (
+            3,
+            r"dir\sub".len(),
+            r"dir\a.txt".len(),
+            r"dir\sub\b.txt".len(),
+        );
+
+        connect(&dev, 0);
+        assert_eq!(fid_path_bytes(&dev), 0, "the root's path is empty");
+        walk(&dev, 0, 1, &["dir"]);
+        walk(&dev, 1, 2, &["sub"]);
+        walk(&dev, 2, 3, &[]);
+        walk(&dev, 0, 4, &["dir", "a.txt"]);
+        assert_eq!(fid_path_bytes(&dev), dir + 2 * sub + a);
+        // Fid 3 walks over itself, up to `dir`.
+        walk(&dev, 3, 3, &[".."]);
+        assert_eq!(fid_path_bytes(&dev), 2 * dir + sub + a);
+        // Fid 4's file moves to `dir\sub\b.txt`.
+        call(&dev, T_RENAME, |t| {
+            enc4(t, 4);
+            enc4(t, 2);
+            enc_str(t, "b.txt");
+        });
+        assert_eq!(fid_path_bytes(&dev), 2 * dir + sub + b);
+        // Fid 5, the root, becomes the file it creates.
+        walk(&dev, 0, 5, &[]);
+        lcreate(&dev, 5, "new.txt", O_WRONLY, 0o644, 0);
+        assert_eq!(fid_path_bytes(&dev), 2 * dir + sub + b + "new.txt".len());
+        call(&dev, T_CLUNK, |t| enc4(t, 2));
+        call(&dev, T_REMOVE, |t| enc4(t, 5));
+        assert_eq!(fid_path_bytes(&dev), 2 * dir + b);
+        connect(&dev, 0);
+        assert_eq!(fid_path_bytes(&dev), 0, "Tversion drops every fid");
+        walk(&dev, 0, 1, &["dir"]);
+        assert_eq!(fid_path_bytes(&dev), dir);
+        dev.reset();
+        assert_eq!(fid_path_bytes(&dev), 0, "a reset drops every fid");
+
+        drop(dev);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A fid costs the guest one small Twalk, while its path may be tens of
+    /// kilobytes, so the paths of a share's fids have a byte budget. At the
+    /// budget a walk, a clone, a create and a rename that need a longer path
+    /// fail with ENOMEM, before they do anything, until fids give paths back.
+    #[test]
+    fn fid_paths_stop_at_their_budget() {
+        let base =
+            std::env::temp_dir().join(format!("tinyvmm_p9_fidbudget_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let root = std::fs::canonicalize(&base).unwrap();
+        // A path of some 1.9 KiB: eight directories with 240-byte names.
+        let names: Vec<String> = (0..8).map(|i| format!("{i}{}", "d".repeat(239))).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let deep: PathBuf = names.iter().collect();
+        std::fs::create_dir_all(root.join(&deep)).unwrap();
+        std::fs::write(root.join("f"), b"f").unwrap();
+        let mem = std::sync::Arc::new(whpsys::memory::GuestMemory::new_host_only(4096).unwrap());
+        let dev = P9Device::new(mem, "t".into(), root.clone(), ShareOptions::default());
+        let held = || dev.fid_path_bytes.load(Ordering::Relaxed);
+
+        connect(&dev, 0);
+        walk(&dev, 0, 1, &names);
+        walk(&dev, 0, 2, &names[..1]);
+        // Clones of the long path, then of a short one, until neither fits.
+        let mut clone = 10;
+        for (fid, len) in [(1, deep.as_os_str().len()), (2, names[0].len())] {
+            for _ in 0..(FID_PATH_BUDGET - held()) / len {
+                walk(&dev, fid, clone, &[]);
+                clone += 1;
+            }
+            assert_eq!(walk_err(&dev, fid, clone, &[]), E_NOMEM);
+            assert_eq!(walk_err(&dev, 0, clone, &names), E_NOMEM);
+        }
+        assert!(clone < MAX_FIDS as u32, "the fid count ran out first");
+        assert!(held() <= FID_PATH_BUDGET, "{} bytes", held());
+        fid_path_bytes(&dev);
+
+        // A fid's path can't grow past it either, and nothing is created or
+        // renamed for the path that didn't fit. The short ones still do.
+        let long = format!("{}.txt", "n".repeat(250));
+        walk(&dev, 0, 3, &[]);
+        walk(&dev, 0, 4, &["f"]);
+        let create = call_err(&dev, T_LCREATE, |t| {
+            enc4(t, 3);
+            enc_str(t, &long);
+            enc4(t, O_WRONLY);
+            enc4(t, 0o644);
+            enc4(t, 0);
+        });
+        let rename = call_err(&dev, T_RENAME, |t| {
+            enc4(t, 4);
+            enc4(t, 0);
+            enc_str(t, &long);
+        });
+        assert_eq!([create, rename], [E_NOMEM; 2]);
+        assert!(!root.join(&long).exists() && root.join("f").exists());
+
+        // A clunk makes room for the path it gave back.
+        call(&dev, T_CLUNK, |t| enc4(t, 10));
+        walk(&dev, 1, 10, &[]);
+        connect(&dev, 0);
+        assert_eq!(held(), 0);
+
+        drop(dev);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The offsets and names of the entries of fid `fid`'s directory that an
+    /// Rreaddir of `count` bytes holds from `offset` on.
+    fn readdir(dev: &P9Device, fid: u32, offset: u64, count: u32) -> Vec<(u64, String)> {
+        let r = call(dev, T_READDIR, |t| {
+            enc4(t, fid);
+            enc8(t, offset);
+            enc4(t, count);
+        });
+        // Rreaddir: size[4] type[1] tag[2] count[4], then entries of qid[13]
+        // offset[8] type[1] name[2+n].
+        let end = 11 + u32::from_le_bytes(r[7..11].try_into().unwrap()) as usize;
+        let mut out = Vec::new();
+        let mut p = 11;
+        while p < end {
+            let off = u64::from_le_bytes(r[p + 13..p + 21].try_into().unwrap());
+            let len = u16::from_le_bytes(r[p + 22..p + 24].try_into().unwrap()) as usize;
+            out.push((
+                off,
+                String::from_utf8(r[p + 24..p + 24 + len].to_vec()).unwrap(),
+            ));
+            p += 24 + len;
+        }
+        out
+    }
+
+    /// A directory too big for one stretch of a listing is read a stretch at
+    /// a time as the readdir moves through it: the fid never holds it all,
+    /// yet every entry comes exactly once, at consecutive offsets, and a seek
+    /// back or a rewind finds the same entries again.
+    #[test]
+    fn a_big_directory_is_listed_a_stretch_at_a_time() {
+        let base = std::env::temp_dir().join(format!("tinyvmm_p9_bigdir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // Some four batches of entries from the file system.
+        let mut want: Vec<String> = vec![".".into(), "..".into()];
+        for i in 0..2000 {
+            let name = format!("f{i:04}");
+            std::fs::write(base.join(&name), b"").unwrap();
+            want.push(name);
+        }
+        let root = std::fs::canonicalize(&base).unwrap();
+        let mem = std::sync::Arc::new(whpsys::memory::GuestMemory::new_host_only(4096).unwrap());
+        let dev = P9Device::new(mem, "t".into(), root, ShareOptions::default());
+        // Every batch is a stretch of its own.
+        dev.dir_window_bytes.store(1, Ordering::Relaxed);
+        connect(&dev, 0);
+        walk(&dev, 0, 1, &[]);
+        call(&dev, T_LOPEN, |t| {
+            enc4(t, 1);
+            enc4(t, O_RDONLY);
+        });
+
+        let mut names = Vec::new();
+        let mut stretches = std::collections::BTreeSet::new();
+        let mut most = 0;
+        let mut offset = 0;
+        loop {
+            let chunk = readdir(&dev, 1, offset, 4096);
+            let Some(&(last, _)) = chunk.last() else {
+                break;
+            };
+            for (i, (off, _)) in chunk.iter().enumerate() {
+                assert_eq!(*off, offset + i as u64 + 1);
+            }
+            offset = last;
+            names.extend(chunk.into_iter().map(|(_, n)| n));
+            let f = dev.fids.lock().unwrap();
+            let cache = f.map[&1].dir_cache.as_ref().unwrap();
+            stretches.insert(cache.base);
+            most = most.max(cache.entries.len());
+            assert_eq!(f.dir_cache_total.load(Ordering::Relaxed), cache.bytes);
+            assert_eq!(cache.bytes, dir_cache_bytes(&cache.entries));
+        }
+        let mut sorted = names.clone();
+        sorted.sort();
+        want.sort();
+        assert_eq!(sorted, want);
+        assert!(stretches.len() >= 3, "stretches at {stretches:?}");
+        assert!(most < 1000, "the fid held {most} entries at once");
+
+        // A seek back to a stretch the fid no longer holds, a rewind, and
+        // offsets at and past the end.
+        assert_eq!(readdir(&dev, 1, 5, 4096)[0], (6, names[5].clone()));
+        assert_eq!(readdir(&dev, 1, 700, 4096)[0], (701, names[700].clone()));
+        assert_eq!(readdir(&dev, 1, 0, 4096)[0], (1, names[0].clone()));
+        assert!(readdir(&dev, 1, names.len() as u64, 4096).is_empty());
+        assert!(readdir(&dev, 1, 1 << 40, 4096).is_empty());
+
+        drop(dev);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A listing counts against the budget for the memory it holds, spare
+    /// capacity included, not just for its names.
+    #[test]
+    fn a_listing_counts_for_the_memory_it_holds() {
+        let mut name = String::with_capacity(100);
+        name.push('x');
+        let mut listing = Vec::with_capacity(50);
+        listing.push(DirEntryCached {
+            name,
+            ..Default::default()
+        });
+        assert!(dir_cache_bytes(&listing) >= 50 * std::mem::size_of::<DirEntryCached>() + 100);
+    }
+
+    /// One directory handle is listed by one request at a time (its place in
+    /// the directory is the handle's), while other directories are listed
+    /// meanwhile: a listing under way holds up only readdirs of its own
+    /// handle.
+    #[test]
+    fn a_listing_holds_up_only_its_own_directory() {
+        let base = std::env::temp_dir().join(format!("tinyvmm_p9_onedir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dirs = 2u32;
+        for d in 0..dirs {
+            std::fs::create_dir_all(base.join(format!("d{d}"))).unwrap();
+        }
+        let root = std::fs::canonicalize(&base).unwrap();
+        let mem = std::sync::Arc::new(whpsys::memory::GuestMemory::new_host_only(4096).unwrap());
+        let dev = P9Device::new(mem, "t".into(), root, ShareOptions::default());
+        connect(&dev, 0);
+        for d in 0..dirs {
+            let name = format!("d{d}");
+            walk(&dev, 0, 1 + d, &[name.as_str()]);
+            call(&dev, T_LOPEN, |t| {
+                enc4(t, 1 + d);
+                enc4(t, O_RDONLY);
+            });
+        }
+        let handle = |fid: u32| {
+            let f = dev.fids.lock().unwrap();
+            f.map[&fid].handle.clone().unwrap()
+        };
+        let (held, other) = (1, 2);
+
+        // As if a listing of `held`'s directory were under way.
+        let h = handle(held);
+        let listing = h.listing.lock().unwrap();
+        let read = |fid: u32| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let dev = dev.clone();
+            let reader = thread::spawn(move || tx.send(readdir(&dev, fid, 0, 4096).len()).unwrap());
+            (rx, reader)
+        };
+        let (other_rx, other_reader) = read(other);
+        assert_eq!(
+            other_rx.recv_timeout(Duration::from_secs(10)),
+            Ok(2),
+            "another directory waited for this one's listing"
+        );
+        let (held_rx, held_reader) = read(held);
+        assert!(
+            held_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "a directory was read while a listing of it was under way"
+        );
+        drop(listing);
+        assert_eq!(held_rx.recv_timeout(Duration::from_secs(10)), Ok(2));
+        other_reader.join().unwrap();
+        held_reader.join().unwrap();
+
+        drop(dev);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- requests through the virtqueue ----
+
+    const NEXT: u16 = 1;
+    const WRITE: u16 = 2;
+    /// The entries of a test [`Ring`].
+    const RING: u16 = P9_QUEUE_MAX as u16;
+
+    /// A share over a fresh directory, with guest RAM for a couple of rings.
+    fn ring_device(name: &str) -> (PathBuf, Arc<GuestMemory>, Arc<P9Device>) {
+        let base = std::env::temp_dir().join(format!("tinyvmm_p9_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let root = std::fs::canonicalize(&base).unwrap();
+        let mem = Arc::new(GuestMemory::new_host_only(2 << 20).unwrap());
+        let dev = P9Device::new(mem.clone(), "t".into(), root, ShareOptions::default());
+        (base, mem, dev)
+    }
+
+    /// A split virtqueue in guest RAM: the descriptor table at `self.0`, then
+    /// the avail ring, the used ring and each request's two buffers (its
+    /// T-message, then room for the reply), a page apart.
+    #[derive(Clone, Copy)]
+    struct Ring(u64);
+
+    impl Ring {
+        /// The size of a request's buffers.
+        const BUF: u64 = 0x100;
+
+        fn avail(self) -> u64 {
+            self.0 + 0x1000
+        }
+        fn used(self) -> u64 {
+            self.0 + 0x2000
+        }
+        fn enable(self, dev: &P9Device) {
+            dev.enable_queue(
+                P9_REQUEST_QUEUE,
+                self.0,
+                self.avail(),
+                self.used(),
+                RING,
+                false,
+            );
+        }
+        /// The descriptor that heads request `slot`'s chain.
+        fn head(self, slot: u16) -> u16 {
+            slot * 2
+        }
+        fn reply_gpa(self, slot: u16) -> u64 {
+            self.0 + 0x3000 + u64::from(slot) * 2 * Self::BUF + Self::BUF
+        }
+        fn desc(self, mem: &GuestMemory, i: u16, addr: u64, len: u32, flags: u16) {
+            let mut d = [0u8; 16];
+            d[0..8].copy_from_slice(&addr.to_le_bytes());
+            d[8..12].copy_from_slice(&len.to_le_bytes());
+            d[12..14].copy_from_slice(&flags.to_le_bytes());
+            d[14..16].copy_from_slice(&(i + 1).to_le_bytes());
+            mem.write_at(self.0 + u64::from(i) * 16, &d).unwrap();
+        }
+        /// Make chain `head` the ring's `slot`th request and publish it.
+        fn publish(self, mem: &GuestMemory, slot: u16, head: u16) {
+            let entry = self.avail() + 4 + u64::from(slot % RING) * 2;
+            mem.write_at(entry, &head.to_le_bytes()).unwrap();
+            mem.write_at(self.avail() + 2, &(slot + 1).to_le_bytes())
+                .unwrap();
+        }
+        /// Publish `t_msg` as the ring's `slot`th request, without a kick. Its
+        /// reply buffer is preset to 0xEE.
+        fn request(self, mem: &GuestMemory, slot: u16, t_msg: &[u8]) {
+            assert!(slot < RING / 2 && t_msg.len() <= Self::BUF as usize);
+            let msg = self.reply_gpa(slot) - Self::BUF;
+            mem.write_at(msg, t_msg).unwrap();
+            mem.write_at(self.reply_gpa(slot), &[0xEE; Self::BUF as usize])
+                .unwrap();
+            let head = self.head(slot);
+            self.desc(mem, head, msg, t_msg.len() as u32, NEXT);
+            self.desc(mem, head + 1, self.reply_gpa(slot), Self::BUF as u32, WRITE);
+            self.publish(mem, slot, head);
+        }
+        fn used_idx(self, mem: &GuestMemory) -> u16 {
+            u16::from_le_bytes(mem.read_array::<2>(self.used() + 2).unwrap())
+        }
+        /// The chain and the reply length of the `i`th request retired.
+        fn used_elem(self, mem: &GuestMemory, i: u16) -> (u16, u32) {
+            let at = self.used() + 4 + u64::from(i % RING) * 8;
+            let e = mem.read_array::<8>(at).unwrap();
+            (
+                u32::from_le_bytes(e[0..4].try_into().unwrap()) as u16,
+                u32::from_le_bytes(e[4..8].try_into().unwrap()),
+            )
+        }
+        /// The chains retired so far, in order.
+        fn retired(self, mem: &GuestMemory) -> Vec<u16> {
+            (0..self.used_idx(mem))
+                .map(|i| self.used_elem(mem, i).0)
+                .collect()
+        }
+        /// The type and tag of the reply to request `slot`: (0xEE, 0xEEEE)
+        /// while its buffer is untouched.
+        fn reply(self, mem: &GuestMemory, slot: u16) -> (u8, u16) {
+            let r = mem.read_array::<7>(self.reply_gpa(slot)).unwrap();
+            (r[4], u16::from_le_bytes([r[5], r[6]]))
+        }
+    }
+
+    /// A T-message of type `mtype` tagged `tag`.
+    fn t_msg(mtype: u8, tag: u16, body: impl Fn(&mut Vec<u8>)) -> Vec<u8> {
+        let mut t = Vec::new();
+        enc4(&mut t, 0);
+        enc1(&mut t, mtype);
+        enc2(&mut t, tag);
+        body(&mut t);
+        finalize(&mut t);
+        t
+    }
+
+    fn tversion(tag: u16) -> Vec<u8> {
+        t_msg(T_VERSION, tag, |t| {
+            enc4(t, 8192);
+            enc_str(t, "9P2000.L");
+        })
+    }
+
+    fn tflush(tag: u16, oldtag: u16) -> Vec<u8> {
+        t_msg(T_FLUSH, tag, |t| enc2(t, oldtag))
+    }
+
+    /// Where a test holds requests on the way into their handlers.
+    #[derive(Default)]
+    struct Gate {
+        open: Mutex<bool>,
+        opened: Condvar,
+        arrived: AtomicUsize,
+    }
+
+    impl Gate {
+        /// How many requests have reached the gate.
+        fn arrived(&self) -> usize {
+            self.arrived.load(Ordering::SeqCst)
+        }
+        fn open(&self) {
+            *self.open.lock().unwrap() = true;
+            self.opened.notify_all();
+        }
+        fn pass(&self) {
+            self.arrived.fetch_add(1, Ordering::SeqCst);
+            let open = self.open.lock().unwrap();
+            let _held = self
+                .opened
+                .wait_timeout_while(open, Duration::from_secs(30), |open| !*open)
+                .unwrap();
+        }
+    }
+
+    /// Have `dev` hold the requests whose tag `held` picks at a gate, each on
+    /// the thread about to handle it, until the gate is opened.
+    fn hold(dev: &P9Device, held: impl Fn(u16) -> bool + Send + Sync + 'static) -> Arc<Gate> {
+        let gate = Arc::new(Gate::default());
+        let at = gate.clone();
+        let hook = move |t_msg: &[u8]| {
+            if t_msg.len() >= REPLY_HEADER_SIZE && held(u16::from_le_bytes([t_msg[5], t_msg[6]])) {
+                at.pass();
+            }
+        };
+        assert!(dev.before_request.set(Box::new(hook)).is_ok());
+        gate
+    }
+
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn parked(dev: &P9Device) -> usize {
+        dev.engine.flights.lock().unwrap().parked()
+    }
+
+    /// A Tflush is answered only after the request it flushes: its Rflush
+    /// tells the client that no reply to that request will follow, and Linux
+    /// then frees the request and its buffers. Meanwhile it is parked, not
+    /// kept on a worker, so other requests are answered; a Tflush of the
+    /// Tflush follows it in turn.
+    #[test]
+    fn rflush_follows_the_reply_to_the_request_it_flushes() {
+        let (base, mem, dev) = ring_device("flush");
+        let ring = Ring(0x1_0000);
+        ring.enable(&dev);
+        let gate = hold(&dev, |tag| tag == 7);
+        ring.request(&mem, 0, &tversion(7));
+        dev.notify_queue(P9_REQUEST_QUEUE);
+        wait_until("the request to reach its handler", || gate.arrived() == 1);
+
+        ring.request(&mem, 1, &tflush(8, 7));
+        ring.request(&mem, 2, &tflush(9, 8));
+        ring.request(&mem, 3, &tversion(10));
+        dev.notify_queue(P9_REQUEST_QUEUE);
+        wait_until(
+            "the Tflushes to be parked and the bystander answered",
+            || parked(&dev) == 2 && ring.used_idx(&mem) == 1,
+        );
+        assert_eq!(ring.retired(&mem), [ring.head(3)]);
+        assert_eq!(ring.reply(&mem, 3), (R_VERSION, 10));
+        for slot in 0..3 {
+            assert_eq!(ring.reply(&mem, slot), (0xEE, 0xEEEE), "request {slot}");
+        }
+
+        gate.open();
+        wait_until("the request and its Tflushes to be answered", || {
+            ring.used_idx(&mem) == 4
+        });
+        assert_eq!(
+            ring.retired(&mem)[1..],
+            [ring.head(0), ring.head(1), ring.head(2)]
+        );
+        assert_eq!(ring.reply(&mem, 0), (R_VERSION, 7));
+        assert_eq!(ring.reply(&mem, 1), (R_FLUSH, 8));
+        assert_eq!(ring.reply(&mem, 2), (R_FLUSH, 9));
+        assert_eq!(ring.used_elem(&mem, 2).1, REPLY_HEADER_SIZE as u32);
+        assert!(dev.quiesce(), "a slot stayed in use");
+        assert_eq!(parked(&dev), 0);
+
+        drop(dev);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Two Tflushes that name each other, as only a hostile guest sends, can't
+    /// each wait for the other: one is answered at once, the other right
+    /// after it, and neither keeps its slot.
+    #[test]
+    fn tflushes_naming_each_other_are_both_answered() {
+        let (base, mem, dev) = ring_device("flushring");
+        let ring = Ring(0x1_0000);
+        ring.enable(&dev);
+        // Both are in flight before either is looked at.
+        let gate = hold(&dev, |_| true);
+        ring.request(&mem, 0, &tflush(20, 21));
+        ring.request(&mem, 1, &tflush(21, 20));
+        dev.notify_queue(P9_REQUEST_QUEUE);
+        wait_until("both to reach their handlers", || gate.arrived() == 2);
+        gate.open();
+        wait_until("both to be answered", || ring.used_idx(&mem) == 2);
+        assert_eq!(ring.reply(&mem, 0), (R_FLUSH, 20));
+        assert_eq!(ring.reply(&mem, 1), (R_FLUSH, 21));
+        assert!(dev.quiesce(), "a slot stayed in use");
+        assert_eq!(parked(&dev), 0);
+
+        drop(dev);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The flight list on its own: Tflushes parked on a request come back in
+    /// the order they arrived when it ends, a tag two requests carry (which
+    /// the protocol forbids) leaves nothing behind, and no slot ever waits
+    /// for itself through others.
+    #[test]
+    fn flights_park_in_order_and_never_in_a_ring() {
+        let mut f = Flights::new(8);
+        f.begin(0, 5, 0);
+        f.begin(1, 5, 0);
+        f.begin(2, 6, 0);
+        f.begin(3, 7, 0);
+        f.begin(4, 8, 0);
+        assert_eq!(f.find(5, 0, 2), Some(0));
+        assert_eq!(f.find(5, 0, 0), Some(1), "the other request tagged 5");
+        assert_eq!(f.find(5, 1, 2), None, "a request of another epoch");
+        assert_eq!(f.find(6, 0, 2), None, "the Tflush itself");
+        // 2 and 3 flush 0; 4 flushes 3.
+        assert!(f.park(2, 0) && f.park(3, 0) && f.park(4, 3));
+        assert_eq!(f.parked(), 3);
+        // 0 can't then wait for any of them, nor 3 for 4.
+        assert!(!f.park(0, 2) && !f.park(0, 4) && !f.park(3, 4));
+        assert_eq!(f.parked(), 3);
+
+        assert_eq!(f.end(1), (NO_SLOT, NO_SLOT));
+        assert_eq!(f.end(0), (2, 3));
+        assert_eq!((f.next[2], f.next[3]), (3, NO_SLOT));
+        assert_eq!(f.end(2), (NO_SLOT, NO_SLOT));
+        assert_eq!(f.end(3), (4, 4));
+        assert_eq!(f.end(4), (NO_SLOT, NO_SLOT));
+        assert_eq!(f.parked(), 0);
+        assert!(f.request.iter().all(Option::is_none));
+        assert!(f.first.iter().chain(&f.last).all(|&s| s == NO_SLOT));
+    }
+
+    /// A guest can publish one chain over and over and so have more requests
+    /// in flight than there are slots. The one too many is retired empty;
+    /// the others are all answered, and every slot comes back.
+    #[test]
+    fn a_request_beyond_the_slot_pool_is_retired_empty() {
+        let (base, mem, dev) = ring_device("slots");
+        let ring = Ring(0x1_0000);
+        ring.enable(&dev);
+        let gate = hold(&dev, |_| true);
+        ring.request(&mem, 0, &tversion(7));
+        for slot in 1..RING {
+            ring.publish(&mem, slot, ring.head(0));
+        }
+        dev.notify_queue(P9_REQUEST_QUEUE);
+        assert_eq!(
+            dev.engine.pool.in_use.load(Ordering::Relaxed),
+            u32::from(RING)
+        );
+        assert_eq!(ring.used_idx(&mem), 0);
+
+        ring.publish(&mem, RING, ring.head(0));
+        dev.notify_queue(P9_REQUEST_QUEUE);
+        assert_eq!(ring.retired(&mem), [ring.head(0)]);
+        assert_eq!(ring.used_elem(&mem, 0).1, 0);
+        assert!(dev.reset_pending(), "requests are in flight");
+
+        gate.open();
+        wait_until("every request to settle", || !dev.reset_pending());
+        assert_eq!(ring.used_idx(&mem), RING + 1);
+        assert!(dev.quiesce(), "a slot stayed in use");
+
+        drop(dev);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A reset restarts the virtqueue, as for every other device: the queue
+    /// serves nothing until the driver enables it again, and then starts at
+    /// the top of the driver's new ring, not where the old one had got to.
+    #[test]
+    fn a_reset_restarts_the_virtqueue() {
+        let (base, mem, dev) = ring_device("reset");
+        let (old, fresh) = (Ring(0x1_0000), Ring(0x4_0000));
+        old.enable(&dev);
+        for slot in 0..3 {
+            old.request(&mem, slot, &tversion(slot + 1));
+        }
+        dev.notify_queue(P9_REQUEST_QUEUE);
+        wait_until("three replies", || old.used_idx(&mem) == 3);
+        wait_until("them to settle", || !dev.reset_pending());
+        assert_eq!(dev.requests_handled(), 3);
+
+        dev.reset();
+        let q = dev.capture_queue(P9_REQUEST_QUEUE).unwrap();
+        assert!(!q.ready, "the queue outlived the reset");
+        assert_eq!((q.last_avail, q.last_used_idx), (0, 0));
+        // A late doorbell, then the driver's new, still empty ring.
+        dev.notify_queue(P9_REQUEST_QUEUE);
+        fresh.enable(&dev);
+        dev.notify_queue(P9_REQUEST_QUEUE);
+        assert!(dev.quiesce());
+        assert_eq!(
+            dev.requests_handled(),
+            3,
+            "requests taken from an empty ring"
+        );
+        assert_eq!((old.used_idx(&mem), fresh.used_idx(&mem)), (3, 0));
+
+        fresh.request(&mem, 0, &tversion(9));
+        dev.notify_queue(P9_REQUEST_QUEUE);
+        wait_until("a reply on the new ring", || fresh.used_idx(&mem) == 1);
+        assert_eq!(fresh.retired(&mem), [fresh.head(0)]);
+        assert_eq!(fresh.reply(&mem, 0), (R_VERSION, 9));
+
+        drop(dev);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Reset with requests in flight, then enable a fresh queue at once (as a
+    /// driver that doesn't wait for the reset might). Those a worker had
+    /// started run to their end, the others are dropped, and none touches
+    /// the guest: no reply in its buffers, nothing on either used ring. The
+    /// reset is pending until they have all settled.
+    #[test]
+    fn a_reset_makes_requests_in_flight_harmless() {
+        let (base, mem, dev) = ring_device("resetbusy");
+        let (old, fresh) = (Ring(0x1_0000), Ring(0x4_0000));
+        old.enable(&dev);
+        let gate = hold(&dev, |tag| tag == 7);
+        // More requests than workers: each worker holds one in its handler's
+        // doorway, the rest wait for a worker.
+        let workers = p9_worker_count();
+        let requests = 20;
+        assert!(workers < usize::from(requests));
+        for slot in 0..requests {
+            old.request(&mem, slot, &tversion(7));
+        }
+        dev.notify_queue(P9_REQUEST_QUEUE);
+        wait_until("every worker to hold a request", || {
+            gate.arrived() == workers
+        });
+
+        dev.reset();
+        assert!(dev.reset_pending());
+        fresh.enable(&dev);
+        gate.open();
+        wait_until("the reset to settle", || !dev.reset_pending());
+        assert_eq!(
+            dev.requests_handled(),
+            workers as u64,
+            "a request not yet started ran after the reset"
+        );
+        assert_eq!((old.used_idx(&mem), fresh.used_idx(&mem)), (0, 0));
+        for slot in 0..requests {
+            assert_eq!(old.reply(&mem, slot), (0xEE, 0xEEEE), "request {slot}");
+        }
+        assert!(dev.quiesce(), "a slot stayed in use");
+
+        // The new queue works.
+        fresh.request(&mem, 0, &tversion(9));
+        dev.notify_queue(P9_REQUEST_QUEUE);
+        wait_until("a reply on the new ring", || fresh.used_idx(&mem) == 1);
+        assert_eq!(fresh.reply(&mem, 0), (R_VERSION, 9));
+
+        drop(dev);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A Tflush parked on a request when the device is reset settles with it,
+    /// as silently.
+    #[test]
+    fn a_reset_silences_a_parked_tflush_too() {
+        let (base, mem, dev) = ring_device("resetflush");
+        let (old, fresh) = (Ring(0x1_0000), Ring(0x4_0000));
+        old.enable(&dev);
+        let gate = hold(&dev, |tag| tag == 7);
+        old.request(&mem, 0, &tversion(7));
+        dev.notify_queue(P9_REQUEST_QUEUE);
+        wait_until("the request to reach its handler", || gate.arrived() == 1);
+        old.request(&mem, 1, &tflush(8, 7));
+        dev.notify_queue(P9_REQUEST_QUEUE);
+        wait_until("the Tflush to be parked", || parked(&dev) == 1);
+
+        dev.reset();
+        assert!(dev.reset_pending());
+        fresh.enable(&dev);
+        gate.open();
+        wait_until("the reset to settle", || !dev.reset_pending());
+        assert_eq!((old.used_idx(&mem), fresh.used_idx(&mem)), (0, 0));
+        for slot in 0..2 {
+            assert_eq!(old.reply(&mem, slot), (0xEE, 0xEEEE), "request {slot}");
+        }
+        assert_eq!(parked(&dev), 0);
+        assert!(dev.quiesce(), "a slot stayed in use");
+
+        drop(dev);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

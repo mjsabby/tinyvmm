@@ -36,6 +36,7 @@ import threading
 import time
 from pathlib import Path
 from vhdx import make_vhdx
+from vmm_harness import sentinel_args
 
 
 REPO = Path(__file__).resolve().parent.parent
@@ -231,7 +232,7 @@ def main() -> int:
 
     argv = [
         str(args.tinyvmm),
-        "--pvh-run",
+        "--pvh-run", *sentinel_args(args.tinyvmm),
         "--ram-mb", "256",
         "--drive", str(vdb),
         "--drive", f"{vdc},readonly",

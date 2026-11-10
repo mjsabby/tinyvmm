@@ -1,27 +1,37 @@
 #!/usr/bin/env python3
 """Fetch libslirp for `--net-backend slirp`: MSYS2's ucrt64 build of
-libslirp-0.dll and the DLLs it loads (GLib and what GLib needs), found by
-following the DLLs' import tables through the MSYS2 package database.
+libslirp-0.dll and the DLLs it loads (GLib and what GLib needs).
 
-tinyvmm loads libslirp-0.dll at run time, from (in order) the path in
-TINYVMM_LIBSLIRP, the directory of tinyvmm.exe, or the DLL search path; its
-dependencies load from the directory it is in. So by default this writes
-into target\\release, next to tinyvmm.exe. The license files of each package
-used go to <out>\\licenses\\<package>.
+The packages are pinned: tools\\libslirp.lock.json names each package file
+and its SHA-256, and only those bytes are accepted, from whichever mirror
+(--repo) serves them. These DLLs run inside tinyvmm, so what a build fetches
+must not depend on what the repository offers that day. MSYS2 keeps only
+current versions online; when a pinned file is gone, or to take an update,
+run with --update-lock: that follows the DLLs' import tables through the
+MSYS2 package database, as before, and rewrites the lock for review.
+
+tinyvmm loads libslirp-0.dll at run time from the path in TINYVMM_LIBSLIRP
+if that is set, else from the directory of tinyvmm.exe, and from nowhere
+else (never the current directory or PATH); its dependencies load from the
+directory it is in. So by default this writes into target\\release, next to
+tinyvmm.exe. The license files of each package used go to
+<out>\\licenses\\<package>.
 
 Needs Python 3.14+ (compression.zstd) and access to repo.msys2.org.
 
 Usage:
-  python tools\\fetch_libslirp.py [--out target\\release] [--repo URL]
+  python tools\\fetch_libslirp.py [--out target\\release] [--repo URL] [--update-lock]
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import io
+import json
 import struct
 import sys
 import tarfile
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -31,6 +41,7 @@ except ImportError:  # pragma: no cover - older Pythons
     sys.exit("fetch_libslirp.py needs Python 3.14+ (for compression.zstd)")
 
 REPO = Path(__file__).resolve().parent.parent
+LOCK = Path(__file__).resolve().parent / "libslirp.lock.json"
 DEFAULT_URL = "https://repo.msys2.org/mingw/ucrt64/"
 PREFIX = "mingw-w64-ucrt-x86_64-"
 ROOT_DLL = "libslirp-0.dll"
@@ -96,14 +107,29 @@ def pe_imports(dll: bytes) -> list[str]:
     return names
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out", type=Path, default=REPO / "target" / "release")
-    ap.add_argument("--repo", default=DEFAULT_URL, help="MSYS2 ucrt64 repository URL")
-    a = ap.parse_args()
-    url = a.repo.rstrip("/") + "/"
+def package(url: str, fname: str, sha256: str) -> tarfile.TarFile:
+    """Download the package file `fname` and open it, if it is the pinned one."""
+    try:
+        data = fetch(url + fname)
+    except urllib.error.HTTPError as e:
+        sys.exit(f"fetch_libslirp: {url}{fname}: HTTP {e.code}. MSYS2 keeps only current versions "
+                 f"online: rerun with --update-lock and review the change to {LOCK.name}")
+    if hashlib.sha256(data).hexdigest() != sha256:
+        sys.exit(f"fetch_libslirp: {fname}: SHA-256 mismatch")
+    print(f"[fetch-libslirp] {fname}")
+    return untar_zst(data)
 
+
+def dll_bytes(tar: tarfile.TarFile, dll: str) -> tuple[str, bytes]:
+    member = next(m for m in tar.getmembers()
+                  if m.isfile() and m.name.lower().endswith("/bin/" + dll))
+    return Path(member.name).name, tar.extractfile(member).read()
+
+
+def resolve(url: str) -> tuple[dict[str, dict], dict[str, tarfile.TarFile]]:
+    """What libslirp-0.dll needs as the repository offers it today: each
+    package's file, SHA-256 and the DLLs taken from it, found by following
+    import tables through the package database. Also the opened packages."""
     print(f"[fetch-libslirp] reading the package database at {url}")
     desc = {d["NAME"][0]: d for d in read_db(untar_zst(fetch(url + "ucrt64.db")), "desc").values()}
     files = read_db(untar_zst(fetch(url + "ucrt64.files")), "files")
@@ -117,33 +143,61 @@ def main() -> int:
             if len(parts) == 3 and parts[1] == "bin" and parts[2].lower().endswith(".dll"):
                 owner.setdefault(parts[2].lower(), name)
 
-    a.out.mkdir(parents=True, exist_ok=True)
     tars: dict[str, tarfile.TarFile] = {}
-    done: dict[str, str] = {}
+    pinned: dict[str, dict] = {}
     todo = [ROOT_DLL.lower()]
+    seen: set[str] = set()
     while todo:
         dll = todo.pop()
-        if dll in done:
+        if dll in seen:
             continue
+        seen.add(dll)
         pkg = owner.get(dll)
         if pkg is None:
             sys.exit(f"fetch_libslirp: no MSYS2 package ships {dll}")
         if pkg not in tars:
-            fname = desc[pkg]["FILENAME"][0]
-            data = fetch(url + fname)
-            if hashlib.sha256(data).hexdigest() != desc[pkg]["SHA256SUM"][0]:
-                sys.exit(f"fetch_libslirp: {fname}: SHA-256 mismatch")
-            print(f"[fetch-libslirp] {fname}")
-            tars[pkg] = untar_zst(data)
-        tar = tars[pkg]
-        member = next(m for m in tar.getmembers()
-                      if m.isfile() and m.name.lower().endswith("/bin/" + dll))
-        image = tar.extractfile(member).read()
-        (a.out / Path(member.name).name).write_bytes(image)
-        done[dll] = pkg
+            fname, sha256 = desc[pkg]["FILENAME"][0], desc[pkg]["SHA256SUM"][0]
+            tars[pkg] = package(url, fname, sha256)
+            pinned[pkg] = {"file": fname, "sha256": sha256, "dlls": []}
+        name, image = dll_bytes(tars[pkg], dll)
+        pinned[pkg]["dlls"].append(name)
         # Imports no package ships are Windows' own (KERNEL32, WS2_32, the
         # UCRT api sets, ...).
         todo.extend(i.lower() for i in pe_imports(image) if i.lower() in owner)
+    for entry in pinned.values():
+        entry["dlls"].sort()
+    return dict(sorted(pinned.items())), tars
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--out", type=Path, default=REPO / "target" / "release")
+    ap.add_argument("--repo", default=DEFAULT_URL, help="MSYS2 ucrt64 repository URL")
+    ap.add_argument("--update-lock", action="store_true",
+                    help="take what the repository offers today and rewrite the lock file")
+    a = ap.parse_args()
+    url = a.repo.rstrip("/") + "/"
+
+    if a.update_lock:
+        pinned, tars = resolve(url)
+        LOCK.write_text(json.dumps({"packages": pinned}, indent=2) + "\n", encoding="utf-8")
+        print(f"[fetch-libslirp] wrote {LOCK}: review the change before committing it")
+    else:
+        if not LOCK.is_file():
+            sys.exit(f"fetch_libslirp: {LOCK} is missing; run with --update-lock to create it")
+        pinned = json.loads(LOCK.read_text(encoding="utf-8"))["packages"]
+        tars = {pkg: package(url, e["file"], e["sha256"]) for pkg, e in pinned.items()}
+
+    a.out.mkdir(parents=True, exist_ok=True)
+    done: dict[str, str] = {}
+    for pkg, entry in pinned.items():
+        for dll in entry["dlls"]:
+            name, image = dll_bytes(tars[pkg], dll.lower())
+            (a.out / name).write_bytes(image)
+            done[name] = pkg
+    if ROOT_DLL not in done:
+        sys.exit(f"fetch_libslirp: the lock names no package with {ROOT_DLL}")
 
     for pkg, tar in tars.items():
         for m in tar.getmembers():

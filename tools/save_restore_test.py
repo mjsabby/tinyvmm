@@ -52,6 +52,8 @@ import threading
 import time
 from pathlib import Path
 
+from vmm_harness import sentinel_args
+
 
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_TINYVMM = REPO / "target" / "release" / "tinyvmm.exe"
@@ -69,8 +71,17 @@ CLOCK_RE = re.compile(
 SHUTDOWN_SENTINEL = "[init] === tinyvmm shutdown requested ==="
 
 
+# The --watchdog-secs thread writes a line like this to stderr every second.
+# stdout and stderr share the pipe here, and the guest prints its own lines a
+# whole number of seconds after it resumes, so now and then a tick lands in the
+# middle of a guest line. It is taken out of the log before anything is looked
+# for in it.
+WATCHDOG_TICK = re.compile(r"\[(?:pvh-run|restore)\] @ *\d+s  io=\d+ cpuid=\d+ msr=\d+\r?\n")
+
+
 def run_vmm(argv: list[str], timeout_sec: int, tag: str) -> tuple[int, str, float]:
-    """Run tinyvmm; return (returncode, combined_stdout_stderr, wall_seconds)."""
+    """Run tinyvmm; return (returncode, combined_stdout_stderr, wall_seconds),
+    the output without the watchdog's ticks."""
     print(f"[{tag}] launching: " + " ".join(argv))
     t_start = time.monotonic()
     proc = subprocess.Popen(
@@ -113,7 +124,7 @@ def run_vmm(argv: list[str], timeout_sec: int, tag: str) -> tuple[int, str, floa
     t.join(timeout=5)
     wall = time.monotonic() - t_start
     blob = b"".join(out).decode("utf-8", errors="replace")
-    return (proc.returncode or 0), blob, wall
+    return (proc.returncode or 0), WATCHDOG_TICK.sub("", blob), wall
 
 
 def sha256_file(p: Path) -> str:
@@ -141,7 +152,7 @@ def phase1_save(args: argparse.Namespace) -> None:
         cmdline += " tinyvmm.snap_load=1"
     argv = [
         str(args.tinyvmm),
-        "--pvh-run",
+        "--pvh-run", *sentinel_args(args.tinyvmm),
         "--ram-mb", str(args.ram_mb),
         "--vcpus", str(args.vcpus),
         "--watchdog-secs", str(args.save_timeout),
@@ -184,7 +195,7 @@ def phase1_save(args: argparse.Namespace) -> None:
 def phase2_restore(args: argparse.Namespace, attempt: int) -> float:
     argv = [
         str(args.tinyvmm),
-        "--restore", str(args.snap_path),
+        "--restore", str(args.snap_path), *sentinel_args(args.tinyvmm),
         "--watchdog-secs", str(args.restore_timeout),
     ]
     rc, log, wall = run_vmm(argv, args.restore_timeout + 10,

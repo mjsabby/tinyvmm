@@ -6,13 +6,8 @@
 //! concurrently, from threads tinyvmm doesn't own, until [`Gvisor::close`].
 
 use core::ffi::{c_char, c_void};
-use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
-use windows_sys::Win32::Foundation::{GetLastError, HMODULE};
-use windows_sys::Win32::System::LibraryLoader::{
-    GetProcAddress, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
-    LoadLibraryExW, LoadLibraryW,
-};
+use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
 
 const DLL: &str = "tinyvmm_gvisor.dll";
 
@@ -43,52 +38,21 @@ struct Api {
     version: VersionFn,
 }
 
-/// Load the DLL once: from `TINYVMM_GVISOR` (a path to it), else next to the
-/// running executable, else from the DLL search path.
+/// Load the DLL once: from the path in `TINYVMM_GVISOR` if that is set, else
+/// from the running executable's directory, and from nowhere else (see
+/// `crate::dll`).
 fn api() -> Result<&'static Api, String> {
     static API: OnceLock<Result<Api, String>> = OnceLock::new();
     API.get_or_init(load).as_ref().map_err(Clone::clone)
 }
 
 fn load() -> Result<Api, String> {
-    let wide = |s: &std::ffi::OsStr| -> Vec<u16> {
-        use std::os::windows::ffi::OsStrExt;
-        s.encode_wide().chain([0]).collect()
-    };
-    let mut paths: Vec<PathBuf> = Vec::new();
-    if let Some(p) = std::env::var_os("TINYVMM_GVISOR") {
-        paths.push(p.into());
-    }
-    if let Some(dir) = std::env::current_exe()
-        .ok()
-        .and_then(|e| e.parent().map(PathBuf::from))
-    {
-        paths.push(dir.join(DLL));
-    }
-    let mut module: HMODULE = std::ptr::null_mut();
-    for p in paths.iter().filter(|p| p.is_file()) {
-        let w = wide(p.as_os_str());
-        module = unsafe {
-            LoadLibraryExW(
-                w.as_ptr(),
-                std::ptr::null_mut(),
-                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
-            )
-        };
-        if !module.is_null() {
-            break;
-        }
-    }
-    if module.is_null() {
-        module = unsafe { LoadLibraryW(wide(DLL.as_ref()).as_ptr()) };
-    }
-    if module.is_null() {
-        return Err(format!(
-            "could not load {DLL} (err={}); build it with gvisor\\build.ps1, which puts it next \
-             to tinyvmm.exe, or set TINYVMM_GVISOR to its path",
-            unsafe { GetLastError() }
-        ));
-    }
+    let module = crate::dll::load(
+        DLL,
+        "TINYVMM_GVISOR",
+        "build it with gvisor\\build.ps1, which puts it next to tinyvmm.exe, or set \
+         TINYVMM_GVISOR to its path",
+    )?;
     let sym = |name: &str| -> Result<*const (), String> {
         let c: Vec<u8> = name.bytes().chain([0]).collect();
         match unsafe { GetProcAddress(module, c.as_ptr()) } {

@@ -3,11 +3,14 @@
 //! `winsys::gvisor`). It terminates the guest's TCP and UDP itself and
 //! relays them through Go's host sockets.
 //!
-//! The guest network is the NAT's (172.29.255.0/29, gateway .1 whose TCP
-//! ports are the host's loopback, the guest .2) and so is its DHCP server,
+//! The guest network is the NAT's (172.29.255.0/29, gateway .1 whose ports
+//! are the host's loopback, the guest .2) and so is its DHCP server,
 //! answered here before frames reach gVisor. Pings to the gateway are
 //! gVisor's; pings to other hosts are dropped, as gVisor, which accepts
-//! every destination address, would otherwise answer them itself.
+//! every destination address, would otherwise answer them itself. Which of
+//! the guest's frames gVisor is given is the NAT's destination policy
+//! (`net::filter`): its shim dials, as the host, whatever address the guest
+//! names.
 //!
 //! gVisor builds TCP segments for the guest up to ~64 KiB with a partial
 //! checksum (host GSO), which reach the guest as GSO frames, or are finished
@@ -16,6 +19,7 @@
 //! RX backlog is deep wait here until the guest drains it.
 
 use crate::net::dhcp;
+use crate::net::filter::GuestFilter;
 use crate::net::nat::PortForward;
 use crate::net::wire::*;
 use crate::virtio::net::{
@@ -38,6 +42,9 @@ pub struct GvisorOptions {
     pub port_forwards: Vec<PortForward>,
     /// DNS servers DHCP offers (those the guest can reach; see the NAT's).
     pub dns_servers: Vec<[u8; 4]>,
+    /// `--nat-host-local`: let the guest reach host-local destinations (see
+    /// `nat::host_dest`).
+    pub host_local: bool,
 }
 
 /// Where gVisor's frames for the guest go.
@@ -146,6 +153,8 @@ pub struct GvisorBackend {
     stack: Gvisor<Host>,
     host: Arc<Host>,
     lease: dhcp::Lease,
+    /// Which guest frames gVisor is given.
+    filter: GuestFilter,
     flusher: Mutex<Option<JoinHandle<()>>>,
     icmp_drops: AtomicU64,
     stopped: AtomicBool,
@@ -215,6 +224,7 @@ impl GvisorBackend {
                 stack,
                 host,
                 lease,
+                filter: GuestFilter::new(crate::net::GATEWAY_IP, None, opts.host_local),
                 flusher: Mutex::new(Some(flusher)),
                 icmp_drops: AtomicU64::new(0),
                 stopped: AtomicBool::new(false),
@@ -225,8 +235,20 @@ impl GvisorBackend {
     }
 
     /// Handle what the gateway answers here rather than in gVisor: DHCP, and
-    /// pings to other hosts (dropped). True if `frame` was consumed.
+    /// pings to other hosts (dropped). Frames for a destination the guest
+    /// may not reach end here too, a connection attempt with a reset. True
+    /// if `frame` was consumed.
     fn intercept(&self, frame: &[u8]) -> bool {
+        let mut reset = Vec::new();
+        if !self.filter.admits(frame, &mut reset) {
+            if !reset.is_empty()
+                && let Some(dev) = self.host.net.upgrade()
+            {
+                self.host.deliver(&dev, &reset, RxHeader::default());
+                dev.notify_rx();
+            }
+            return true;
+        }
         let Some(eth) = parse_eth(frame) else {
             return false;
         };
@@ -301,7 +323,7 @@ impl NetBackend for GvisorBackend {
         Some(format!(
             "gvisor: tcp_flows={} refused={} udp_flows={} segs_out={} segs_in={} retransmits={} \
              fast_retransmits={} rto={} dsacked={} input_drops={} rx_drops={} rx_held_max={} \
-             soft_offload={} icmp_drops={}",
+             soft_offload={} icmp_drops={} filtered={}",
             s.tcp_flows,
             s.tcp_refused,
             s.udp_flows,
@@ -316,6 +338,7 @@ impl NetBackend for GvisorBackend {
             ld(&self.host.held_max),
             ld(&self.host.soft_offload),
             ld(&self.icmp_drops),
+            self.filter.refused(),
         ))
     }
 

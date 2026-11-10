@@ -30,13 +30,16 @@ fn resolve_from<R: ReadAt>(iso: &Iso9660<R>) -> Result<IsoBoot> {
         if !iso.lookup(config)?.is_some_and(|e| !e.dir) {
             continue;
         }
-        let text = iso.read_file(config)?;
-        let Some(entry) = grub_cfg::first_linux_entry(&String::from_utf8_lossy(&text)) else {
+        // No more of a configuration is read than the parser takes.
+        let text = iso.read_file_capped(config, grub_cfg::MAX_CONFIG_BYTES as u64)?;
+        let entry =
+            grub_cfg::first_linux_entry(&text).map_err(|e| Error::msg(format!("{config}: {e}")))?;
+        let Some(entry) = entry else {
             continue;
         };
         return Ok(IsoBoot {
             config,
-            entry: LoadedEntry::load(entry, |path| iso.read_file(path))?,
+            entry: LoadedEntry::load(entry, |path, max| iso.read_file_capped(path, max))?,
         });
     }
     Err(Error::msg(format!(
@@ -88,5 +91,50 @@ mod tests {
             vec![Node::Dir("grub", vec![Node::File("grub.cfg", cfg)])],
         )]);
         assert!(resolve_from(&Iso9660::new(image).unwrap()).is_err());
+    }
+
+    #[test]
+    fn a_configuration_over_the_caps_is_an_error_naming_it() {
+        // What booting an image with this configuration comes to: the length
+        // of the initrds it loads (`/z`, 6 bytes), or the error.
+        let booting = |cfg: &str| {
+            let image = build(vec![
+                Node::Dir(
+                    "boot",
+                    vec![Node::Dir(
+                        "grub",
+                        vec![Node::File("grub.cfg", cfg.as_bytes())],
+                    )],
+                ),
+                Node::File("k", b"kernel"),
+                Node::File("z", b"initrd"),
+            ]);
+            match resolve_from(&Iso9660::new(image).unwrap()) {
+                Ok(boot) => Ok(boot.entry.initrd.map_or(0, |initrd| initrd.len())),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+        let entry = |initrds: usize| {
+            format!(
+                "menuentry x {{\n linux /k\n initrd{}\n}}\n",
+                " /z".repeat(initrds)
+            )
+        };
+        assert_eq!(booting(&entry(8)), Ok(64));
+        assert_eq!(
+            booting(&entry(9)).unwrap_err(),
+            "boot/grub/grub.cfg: grub.cfg: an entry with 9 initrds is too large (at most 8)"
+        );
+        // A variable that multiplies itself: this one asked for 16 TiB.
+        let grow = format!("set a={}\n", "$a".repeat(16)).repeat(10);
+        let error = booting(&format!("set a={}\n{grow}{}", "A".repeat(16), entry(1)));
+        let line = "boot/grub/grub.cfg: grub.cfg: line 4 with its variables";
+        assert!(error.clone().unwrap_err().starts_with(line), "{error:?}");
+        // No more than a megabyte of configuration is read.
+        let padded = "# padding\n".repeat(110_000) + &entry(1);
+        assert_eq!(
+            booting(&padded).unwrap_err(),
+            "ISO 9660: boot/grub/grub.cfg is too large (1100037 bytes; at most 1048576 here)"
+        );
     }
 }

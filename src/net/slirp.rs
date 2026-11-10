@@ -6,15 +6,20 @@
 //! that socket and libslirp's own, feeds it the queued frames, and lets it
 //! service its host sockets and timers.
 //!
-//! The guest network is the NAT's: 172.29.255.0/29, gateway .1 (whose TCP
-//! ports are the host's loopback, as with the NAT), the guest .2 by DHCP.
-//! libslirp's own DNS forwarder is .3. As in QEMU, libslirp takes and builds
+//! The guest network is the NAT's: 172.29.255.0/29, gateway .1 (whose ports
+//! are the host's loopback, as with the NAT), the guest .2 by DHCP.
+//! libslirp's own DNS forwarder is .3. Which of the guest's frames libslirp
+//! is given is the NAT's destination policy (`net::filter`): by itself it
+//! would connect, as the host, to anything the guest names, and takes every
+//! address on the guest's link for the host's loopback. As in QEMU, libslirp
+//! takes and builds
 //! MTU-sized frames with complete checksums: guest TSO super-segments are
 //! segmented in software first (the `NetBackend` default), and frames to the
 //! guest carry no offload metadata. Like QEMU's net queue, frames libslirp
 //! builds while the guest's RX backlog is deep wait here for it to drain
 //! rather than being dropped.
 
+use crate::net::filter::GuestFilter;
 use crate::net::nat::PortForward;
 use crate::virtio::net::{NetBackend, NetDevice, RxHeader};
 use std::collections::VecDeque;
@@ -37,6 +42,9 @@ const IDLE_MS: u32 = 1000;
 
 pub struct SlirpOptions {
     pub port_forwards: Vec<PortForward>,
+    /// `--nat-host-local`: let the guest reach host-local destinations (see
+    /// `nat::host_dest`).
+    pub host_local: bool,
 }
 
 #[derive(Default)]
@@ -69,6 +77,10 @@ impl Shared {
 pub struct SlirpBackend {
     shared: Arc<Shared>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    /// Which guest frames libslirp is given.
+    filter: GuestFilter,
+    /// Where a refused connection's reset goes.
+    net: Weak<NetDevice>,
 }
 
 /// libslirp's view of the guest: frames it sends go to the NIC, or wait in
@@ -154,6 +166,7 @@ impl SlirpBackend {
             spare: Vec::new(),
             shared: shared.clone(),
         };
+        let filter = GuestFilter::new(crate::net::GATEWAY_IP, Some(NAMESERVER_IP), opts.host_local);
         let s = shared.clone();
         let worker = std::thread::Builder::new()
             .name("slirp".into())
@@ -171,6 +184,8 @@ impl SlirpBackend {
             Arc::new(SlirpBackend {
                 shared,
                 worker: Mutex::new(Some(worker)),
+                filter,
+                net: Arc::downgrade(net),
             }),
             version,
         ))
@@ -250,6 +265,15 @@ fn run(
 
 impl NetBackend for SlirpBackend {
     fn on_guest_frame(&self, frame: &[u8]) {
+        let mut reset = Vec::new();
+        if !self.filter.admits(frame, &mut reset) {
+            if !reset.is_empty()
+                && let Some(dev) = self.net.upgrade()
+            {
+                dev.inject_rx(&reset);
+            }
+            return;
+        }
         {
             let mut q = self.shared.queue.lock().unwrap();
             if q.frames.len() >= TX_QUEUE_MAX {
@@ -272,10 +296,11 @@ impl NetBackend for SlirpBackend {
     fn diag_summary(&self) -> Option<String> {
         let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
         Some(format!(
-            "slirp: tx_drops={} rx_drops={} rx_held_max={}",
+            "slirp: tx_drops={} rx_drops={} rx_held_max={} refused={}",
             ld(&self.shared.tx_drops),
             ld(&self.shared.rx_drops),
             ld(&self.shared.rx_held_max),
+            self.filter.refused(),
         ))
     }
 

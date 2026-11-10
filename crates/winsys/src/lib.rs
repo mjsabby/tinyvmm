@@ -17,6 +17,7 @@
 
 pub mod audio;
 pub mod cpu_affinity;
+mod dll;
 pub mod error;
 pub mod etw;
 pub mod fs;

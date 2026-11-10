@@ -9,9 +9,12 @@
 //! block they log to the journal block holding its newest copy, which reads
 //! consult first. Reads then see what Linux sees after recovery. Every field
 //! read from the image is bounds-checked; a malformed image yields an error,
-//! not a panic.
+//! not a panic. A guest may have written the image, so what it can make us
+//! allocate or read is bounded too: files, paths and the journal have caps,
+//! and a file's block map is held to the order Linux requires of it, in
+//! which no part of the file is mapped twice.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::convenience::ReadAt;
 use crate::error::{Error, Result};
@@ -72,6 +75,16 @@ const MAX_FILE_BYTES: u64 = 1 << 30;
 const MAX_DIR_BYTES: u64 = 64 << 20;
 const MAX_SYMLINK_BYTES: u64 = 4096;
 const MAX_MAP_BLOCKS: usize = 1 << 16;
+/// A path (Linux's `PATH_MAX`), and the names looked up along one, those of
+/// its symlinks' targets included: each lookup reads a directory.
+const MAX_PATH_BYTES: usize = 4096;
+const MAX_LOOKUPS: usize = 256;
+/// A journal: four times the largest mke2fs makes by default (2^18 blocks,
+/// 1 GiB of 4 KiB ones). Its log is walked a block at a time.
+const MAX_JOURNAL_BYTES: u64 = 4 << 30;
+const MAX_JOURNAL_BLOCKS: u64 = 1 << 20;
+/// The revoke records in a journal's log.
+const MAX_REVOKES: usize = 4 << 20;
 /// Contiguous blocks are read in pieces of at most this many bytes.
 const READ_PIECE: usize = 4 << 20;
 
@@ -138,6 +151,17 @@ struct Run {
     physical: u64,
     len: u64,
     unwritten: bool,
+}
+
+/// An extent tree as it is walked.
+struct ExtentWalk {
+    runs: Vec<Run>,
+    /// The file's size in blocks: nothing is mapped from there on.
+    blocks: u64,
+    /// The first block the next entry may map: those before it are taken.
+    next: u64,
+    /// Index blocks that may still be read.
+    budget: usize,
 }
 
 impl<R: ReadAt> Ext4<R> {
@@ -228,20 +252,40 @@ impl<R: ReadAt> Ext4<R> {
     }
 
     /// Read a whole regular file, following symlinks.
+    #[cfg(test)]
     pub fn read_file(&self, path: &str) -> Result<Vec<u8>> {
+        self.read_file_capped(path, MAX_FILE_BYTES)
+    }
+
+    /// Read a whole regular file of at most `max` bytes, following symlinks.
+    /// A larger one is an error before any of it is read (or allocated).
+    pub fn read_file_capped(&self, path: &str, max: u64) -> Result<Vec<u8>> {
         let inode = self
             .resolve(path)?
             .filter(|inode| inode.mode & S_IFMT == S_IFREG)
             .ok_or_else(|| Error::msg(format!("ext4: no file {path}")))?;
-        self.read_data(&inode, MAX_FILE_BYTES)
+        let max = max.min(MAX_FILE_BYTES);
+        if inode.size > max {
+            return Err(Error::msg(format!(
+                "ext4: {path} is too large ({} bytes; at most {max} here)",
+                inode.size
+            )));
+        }
+        self.read_data(&inode, max)
     }
 
     /// The inode `path` names: each component is looked up in the directory
     /// before it, `..` steps back, and a symlink's target is spliced in.
     fn resolve(&self, path: &str) -> Result<Option<Inode>> {
+        if path.len() > MAX_PATH_BYTES {
+            return Err(Error::msg(format!(
+                "ext4: a {}-byte path is too long",
+                path.len()
+            )));
+        }
         let mut chain = vec![ROOT_INODE];
         let mut todo: Vec<Vec<u8>> = components(path.as_bytes());
-        let mut links = 0;
+        let (mut links, mut lookups) = (0, 0);
         while let Some(name) = todo.pop() {
             match name.as_slice() {
                 b"" | b"." => continue,
@@ -252,6 +296,12 @@ impl<R: ReadAt> Ext4<R> {
                     continue;
                 }
                 _ => {}
+            }
+            lookups += 1;
+            if lookups > MAX_LOOKUPS {
+                return Err(Error::msg(format!(
+                    "ext4: {path}: too many path components"
+                )));
             }
             let dir = self.read_inode(chain[chain.len() - 1])?;
             if dir.mode & S_IFMT != S_IFDIR {
@@ -377,19 +427,27 @@ impl<R: ReadAt> Ext4<R> {
             || [3, 5, 7].into_iter().any(power_of)
     }
 
-    /// Where a file's blocks are.
+    /// Where a file's blocks are, in file order: no two runs share a block
+    /// of the file, and none starts past its end, so a file has no more runs
+    /// than blocks and reading them reads no more than its size.
     fn runs(&self, inode: &Inode) -> Result<Vec<Run>> {
         if inode.flags & INODE_INLINE_DATA != 0 {
             return Err(Error::msg("ext4: inline data is not supported"));
         }
+        let blocks = inode.size.div_ceil(self.block_size);
+        if inode.flags & INODE_EXTENTS != 0 {
+            let mut walk = ExtentWalk {
+                runs: Vec::new(),
+                blocks,
+                next: 0,
+                budget: MAX_MAP_BLOCKS,
+            };
+            self.extent_runs(&inode.block, None, &mut walk)?;
+            return Ok(walk.runs);
+        }
         let mut runs = Vec::new();
         let mut budget = MAX_MAP_BLOCKS;
-        if inode.flags & INODE_EXTENTS != 0 {
-            self.extent_runs(&inode.block, None, &mut runs, &mut budget)?;
-            return Ok(runs);
-        }
         // Twelve direct blocks, then single, double and triple indirect ones.
-        let blocks = inode.size.div_ceil(self.block_size);
         let pointer = |i: usize| le32(&inode.block, 4 * i);
         let mut logical = 0;
         for i in 0..12 {
@@ -412,41 +470,58 @@ impl<R: ReadAt> Ext4<R> {
         Ok(runs)
     }
 
-    fn extent_runs(
-        &self,
-        node: &[u8],
-        depth: Option<u16>,
-        runs: &mut Vec<Run>,
-        budget: &mut usize,
-    ) -> Result<()> {
+    /// The runs below a node of an extent tree. A node's entries must be as
+    /// Linux requires them (`ext4_valid_extent_entries`): in file order, no
+    /// extent empty or overlapping the one before it, and a child's entries
+    /// at or after the index entry that leads to them. However a crafted
+    /// tree's blocks are linked, each run then maps blocks no other does.
+    fn extent_runs(&self, node: &[u8], depth: Option<u16>, walk: &mut ExtentWalk) -> Result<()> {
         let bad = || Error::msg("ext4: bad extent tree");
         if node.len() < 12 || le16(node, 0) != EXTENT_MAGIC {
             return Err(bad());
         }
-        let entries = usize::from(le16(node, 2));
+        let (entries, max) = (usize::from(le16(node, 2)), usize::from(le16(node, 4)));
         let here = le16(node, 6);
-        if here > MAX_EXTENT_DEPTH || depth.is_some_and(|d| d != here) {
+        if here > MAX_EXTENT_DEPTH || depth.is_some_and(|d| d != here) || entries > max {
             return Err(bad());
         }
-        let body = node.get(12..12 + 12 * entries).ok_or_else(bad)?;
-        for e in body.as_chunks::<12>().0 {
+        let body = node.get(12..12 + 12 * max).ok_or_else(bad)?;
+        for e in &body.as_chunks::<12>().0[..entries] {
+            let logical = u64::from(le32(e, 0));
+            if logical < walk.next {
+                return Err(bad());
+            }
+            // An entry past the end of the file (blocks preallocated there)
+            // is held to the same order, but maps nothing and is not read.
+            let mapped = logical < walk.blocks;
             if here == 0 {
                 let (len, unwritten) = match le16(e, 4) {
                     len if len > EXTENT_INIT_MAX => (len - EXTENT_INIT_MAX, true),
                     len => (len, false),
                 };
-                runs.push(Run {
-                    logical: u64::from(le32(e, 0)),
-                    physical: u64::from(le16(e, 6)) << 32 | u64::from(le32(e, 8)),
-                    len: u64::from(len),
-                    unwritten,
-                });
+                if len == 0 {
+                    return Err(bad());
+                }
+                if mapped {
+                    walk.runs.push(Run {
+                        logical,
+                        physical: u64::from(le16(e, 6)) << 32 | u64::from(le32(e, 8)),
+                        len: u64::from(len),
+                        unwritten,
+                    });
+                }
+                walk.next = logical + u64::from(len);
             } else {
-                *budget = budget.checked_sub(1).ok_or_else(bad)?;
-                let child = u64::from(le16(e, 8)) << 32 | u64::from(le32(e, 4));
-                let mut buf = vec![0u8; self.block_size as usize];
-                self.read_block(child, &mut buf)?;
-                self.extent_runs(&buf, Some(here - 1), runs, budget)?;
+                walk.next = logical;
+                if mapped {
+                    walk.budget = walk.budget.checked_sub(1).ok_or_else(bad)?;
+                    let child = u64::from(le16(e, 8)) << 32 | u64::from(le32(e, 4));
+                    let mut buf = vec![0u8; self.block_size as usize];
+                    self.read_block(child, &mut buf)?;
+                    self.extent_runs(&buf, Some(here - 1), walk)?;
+                }
+                // The next index entry leads to later blocks than this one.
+                walk.next = walk.next.max(logical + 1);
             }
         }
         Ok(())
@@ -580,12 +655,25 @@ impl<R: ReadAt> Ext4<R> {
     fn replay(&self, journal_inode: u32) -> Result<HashMap<u64, JournalCopy>> {
         let bad = |what: &str| Error::msg(format!("ext4: bad journal ({what})"));
         let inode = self.read_inode(journal_inode)?;
-        let runs = self.runs(&inode)?;
+        // A regular file, as Linux requires, and of a size that bounds its
+        // block map and the walk of its log below. A larger journal isn't a
+        // bad one, only more than is replayed here.
+        if inode.mode & S_IFMT != S_IFREG {
+            return Err(bad("not a regular file"));
+        }
         let blocks = inode.size / self.block_size;
-        // The filesystem block holding journal block `n`.
+        if inode.size > MAX_JOURNAL_BYTES || blocks > MAX_JOURNAL_BLOCKS {
+            return Err(Error::msg(format!(
+                "ext4: a {}-byte journal is too large to replay",
+                inode.size
+            )));
+        }
+        let runs = self.runs(&inode)?;
+        // The filesystem block holding journal block `n`: runs are in file
+        // order, so the first that ends after `n` is the one that may hold it.
         let locate = |n: u64| {
-            runs.iter()
-                .find(|r| !r.unwritten && n < blocks && (r.logical..r.logical + r.len).contains(&n))
+            runs.get(runs.partition_point(|r| r.logical + r.len <= n))
+                .filter(|r| !r.unwritten && n < blocks && r.logical <= n)
                 .map(|r| r.physical + (n - r.logical))
                 .ok_or_else(|| bad("unmapped block"))
         };
@@ -642,11 +730,17 @@ impl<R: ReadAt> Ext4<R> {
         let next = |n: u64| if n + 1 == last { first } else { n + 1 };
 
         let mut logged: Vec<(u64, JournalCopy)> = Vec::new();
-        let mut revokes: Vec<u64> = Vec::new();
         let mut committed: Vec<(u32, u64, JournalCopy)> = Vec::new();
+        // The blocks the open transaction revokes, and jbd2's revoke table:
+        // the newest committed transaction to revoke each block. Both hold a
+        // block once however many records name it.
+        let mut revokes: HashSet<u64> = HashSet::new();
         let mut revoked: HashMap<u64, u32> = HashMap::new();
+        let mut revoke_records = 0usize;
         let mut at = start;
-        // The log is circular: visit each of its blocks at most once.
+        // The log is circular: visit each of its blocks at most once. A
+        // logged block takes one of them, which bounds `logged` and
+        // `committed` by the log's length.
         let mut budget = last - first;
         'log: while budget > 0 {
             budget -= 1;
@@ -693,7 +787,7 @@ impl<R: ReadAt> Ext4<R> {
                             .drain(..)
                             .map(|(block, copy)| (sequence, block, copy)),
                     );
-                    for block in revokes.drain(..) {
+                    for block in revokes.drain() {
                         let newest = revoked.entry(block).or_insert(sequence);
                         if newer(sequence, *newest) {
                             *newest = sequence;
@@ -706,7 +800,13 @@ impl<R: ReadAt> Ext4<R> {
                     let size = if features & JBD2_64BIT != 0 { 8 } else { 4 };
                     let mut record = 16;
                     while record + size <= used {
-                        revokes.push(if size == 8 {
+                        revoke_records += 1;
+                        if revoke_records > MAX_REVOKES {
+                            return Err(Error::msg(
+                                "ext4: the journal has too many revoke records to replay",
+                            ));
+                        }
+                        revokes.insert(if size == 8 {
                             be64(&buf, record)
                         } else {
                             u64::from(be32(&buf, record))
@@ -1560,5 +1660,268 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         assert!(fs.read_file("/f").is_err());
+    }
+
+    /// Where `path`'s `i_block` is in the image.
+    fn i_block_at(image: &Image, path: &str) -> usize {
+        let (block, offset) = image.inode_location(image.inodes[path]);
+        block as usize * image.layout.block_size + offset + I_BLOCK
+    }
+
+    #[test]
+    fn extents_map_each_block_of_a_file_once_and_in_order() {
+        let data = pattern(3 * SMALL.block_size, 4);
+        let file = || Image::new(SMALL, vec![Node::File("f", &data)]);
+        let first = file().blocks["/f"][0];
+        // The file as `extents` map it.
+        let read = |extents: &[Extent]| {
+            let mut image = file();
+            let (i_block, flags) = image.map(extents, 0);
+            let number = image.inodes["/f"];
+            image.put_inode(number, S_IFREG | 0o644, data.len() as u64, flags, &i_block);
+            Ext4::probe(image.bytes).unwrap().unwrap().read_file("/f")
+        };
+        let bad = |extents: &[Extent]| {
+            let error = read(extents).map(|_| ()).unwrap_err().to_string();
+            assert_eq!(error, "ext4: bad extent tree", "{extents:?}");
+        };
+        // Extents in file order read as before, one after the other.
+        assert_eq!(read(&[(0, first, 3, false)]).unwrap(), data);
+        let split = [(0, first, 1, false), (1, first + 1, 2, false)];
+        assert_eq!(read(&split).unwrap(), data);
+        // One that maps blocks again made us read them again: eighty times
+        // here, and a tree of such leaves as often as it had extents.
+        bad(&[(0, first, 3, false); 2]);
+        bad(&[(0, first, 3, false); 80]);
+        bad(&[(0, first, 2, false), (1, first + 1, 2, false)]);
+        bad(&[(0, first, 2, false), (1, first + 1, 1, true)]);
+        // Out of order, and empty (which could repeat without end).
+        bad(&[(1, first + 1, 2, false), (0, first, 1, false)]);
+        bad(&[(0, first, 0, false), (0, first, 3, false)]);
+        // Blocks preallocated past the end of the file aren't read, as
+        // before, but their extents are held to the same order.
+        let past = [
+            (0, first, 3, false),
+            (5, first, 1, true),
+            (9, first, 1, false),
+        ];
+        assert_eq!(read(&past).unwrap(), data);
+        bad(&[
+            (0, first, 3, false),
+            (9, first, 1, false),
+            (5, first, 1, true),
+        ]);
+    }
+
+    #[test]
+    fn extent_index_entries_lead_to_blocks_after_those_before_them() {
+        let bs = SMALL.block_size;
+        let data = pattern(6 * bs, 5);
+        // Six extents: in a leaf, behind the one index entry in the inode.
+        let mut image = Image::new(SMALL, vec![Node::Scattered("f", &data)]);
+        let root = i_block_at(&image, "/f");
+        assert_eq!(image.bytes[root..root + 8], [0x0A, 0xF3, 1, 0, 4, 0, 1, 0]);
+        let leaf = le32(&image.bytes, root + 16) as usize * bs;
+        let number = image.inodes["/f"];
+        // The file, and how many runs it is mapped by.
+        let read = |bytes: &[u8]| {
+            let fs = Ext4::probe(bytes.to_vec()).unwrap().unwrap();
+            let runs = fs.runs(&fs.read_inode(number)?)?;
+            Ok::<_, Error>((fs.read_file("/f")?, runs.len()))
+        };
+        let bad = |bytes: &[u8]| {
+            let error = read(bytes).map(|_| ()).unwrap_err().to_string();
+            assert_eq!(error, "ext4: bad extent tree");
+        };
+        assert_eq!(read(&image.bytes).unwrap(), (data.clone(), 6));
+
+        // As a crafted image has it: all four index entries of the inode
+        // lead to the one leaf, to have its blocks read four times.
+        let mut aliased = image.bytes.clone();
+        aliased[root + 2] = 4;
+        for entry in 1..4 {
+            aliased.copy_within(root + 12..root + 24, root + 12 + 12 * entry);
+        }
+        bad(&aliased);
+        // Nor when the entries claim to lead to later and later blocks (2, 4
+        // and 6): the leaf's extents run on past the second entry's block.
+        // With only two extents in the leaf, they come before it.
+        for entry in 1..4 {
+            let at = root + 12 + 12 * entry;
+            put(&mut aliased, at, &(2 * entry as u32).to_le_bytes());
+        }
+        bad(&aliased);
+        aliased[leaf + 2] = 2;
+        bad(&aliased);
+
+        // Two leaves in file order read as the one did: the first three
+        // extents stay, and the others move to a block of their own, which
+        // the inode's second index entry leads to.
+        let second = image.alloc(1) as usize;
+        let mut split = image.bytes.clone();
+        split.copy_within(leaf..leaf + 12, second * bs);
+        split.copy_within(leaf + 12 + 3 * 12..leaf + 12 + 6 * 12, second * bs + 12);
+        split[leaf + 2] = 3;
+        split[second * bs + 2] = 3;
+        split[root + 2] = 2;
+        put(&mut split, root + 24, &3u32.to_le_bytes());
+        put(&mut split, root + 28, &(second as u32).to_le_bytes());
+        assert_eq!(read(&split).unwrap(), (data.clone(), 6));
+        // Unless the second leaf's extents come before its index entry.
+        put(&mut split, root + 24, &4u32.to_le_bytes());
+        bad(&split);
+
+        // A node has no more entries than it says it holds, and holds no
+        // more than fit it: four in an inode, 84 in a 1 KiB block.
+        for (at, max) in [(root, 0), (root, 5), (leaf, 5), (leaf, 85)] {
+            let mut bytes = image.bytes.clone();
+            bytes[at + 4] = max;
+            bad(&bytes);
+        }
+    }
+
+    #[test]
+    fn a_journal_is_a_regular_file_of_bounded_size() {
+        for extents in [true, false] {
+            let layout = Layout { extents, ..SMALL };
+            let mut image = Image::new(layout, vec![Node::File("a", b"a-home")]);
+            let tx = Tx {
+                writes: vec![(image.blocks["/a"][0], b"a-tx7!".to_vec())],
+                revokes: vec![],
+                commit: true,
+            };
+            image.journal(16, 1, 7, 0, &[tx]);
+            let replayed = |bytes: &[u8]| {
+                let fs = Ext4::probe(bytes.to_vec())?.unwrap();
+                Ok::<_, Error>((fs.journal_blocks(), fs.read_file("/a")?))
+            };
+            assert_eq!(replayed(&image.bytes).unwrap(), (1, b"a-tx7!".to_vec()));
+
+            // As Linux, which takes no directory (or device) for a journal.
+            let (block, offset) = image.inode_location(JOURNAL_INODE);
+            let inode = block as usize * layout.block_size + offset;
+            let mut bytes = image.bytes.clone();
+            put(&mut bytes, inode, &(S_IFDIR | 0o600).to_le_bytes());
+            assert!(replayed(&bytes).is_err());
+            // Its size bounds its block map and the walk of its log: 2^20
+            // blocks (1 GiB of these) are the most.
+            let sized = |size: u64| {
+                let mut bytes = image.bytes.clone();
+                put(&mut bytes, inode + 0x4, &(size as u32).to_le_bytes());
+                put(
+                    &mut bytes,
+                    inode + 0x6C,
+                    &((size >> 32) as u32).to_le_bytes(),
+                );
+                replayed(&bytes).map(|(blocks, _)| blocks)
+            };
+            let most = MAX_JOURNAL_BLOCKS * layout.block_size as u64;
+            assert_eq!(sized(most).unwrap(), 1);
+            let error = sized(most + layout.block_size as u64).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "ext4: a 1073742848-byte journal is too large to replay"
+            );
+            assert!(sized(MAX_JOURNAL_BYTES + 1).is_err());
+            assert!(sized(u64::MAX).is_err());
+        }
+    }
+
+    /// A filesystem whose journal's log is `runs` runs of 256 blocks, all of
+    /// them the same 256 blocks on the disk: revoke blocks, 252 records
+    /// each, of a transaction that never commits.
+    fn revoking(runs: u64) -> Vec<u8> {
+        let bs = SMALL.block_size;
+        let mut image = Image::new(SMALL, vec![Node::File("f", b"data")]);
+        let (superblock, revokes) = (image.alloc(1), image.alloc(256));
+        let mut log: Vec<Extent> = vec![(0, superblock, 1, false)];
+        log.extend((0..runs).map(|i| (1 + 256 * i, revokes, 256, false)));
+        let blocks = 1 + 256 * runs;
+        let (i_block, flags) = image.map(&log, blocks);
+        image.put_inode(
+            JOURNAL_INODE,
+            S_IFREG | 0o600,
+            blocks * bs as u64,
+            flags,
+            &i_block,
+        );
+        // A block of transaction 7's, with these fields after its header.
+        let mut write = |block: u64, kind: u32, fields: &[(usize, u32)]| {
+            let header = [(0, JBD2_MAGIC), (4, kind), (8, 7)];
+            for &(offset, value) in header.iter().chain(fields) {
+                put(
+                    &mut image.bytes,
+                    block as usize * bs + offset,
+                    &value.to_be_bytes(),
+                );
+            }
+        };
+        // Block size, log length, first block, sequence, start.
+        let fields = [
+            (12, bs as u32),
+            (16, blocks as u32),
+            (20, 1),
+            (24, 7),
+            (28, 1),
+        ];
+        write(superblock, JBD2_SUPERBLOCK_V2, &fields);
+        for block in revokes..revokes + 256 {
+            // Full of records (of block 0, over and over).
+            write(block, JBD2_REVOKE, &[(12, bs as u32)]);
+        }
+        let compat = le32(&image.bytes[1024..], 0x5C) | COMPAT_HAS_JOURNAL;
+        put(&mut image.bytes, 1024 + 0x5C, &compat.to_le_bytes());
+        put(&mut image.bytes, 1024 + 0xE0, &JOURNAL_INODE.to_le_bytes());
+        Image::set_incompat(&mut image.bytes, INCOMPAT_RECOVER, true);
+        image.bytes
+    }
+
+    #[test]
+    fn a_log_of_revoke_records_is_read_up_to_their_cap() {
+        // A block is revoked once however many records name it, so a log
+        // under the cap costs nothing to remember: 65 * 256 * 252 records.
+        let fs = Ext4::probe(revoking(65)).unwrap().unwrap();
+        assert_eq!(fs.journal_blocks(), 0);
+        assert_eq!(fs.read_file("/f").unwrap(), b"data");
+        // One run more is over 2^22 records: an error, where every record
+        // read took eight bytes for as long as the log went on.
+        let error = Ext4::probe(revoking(66)).err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "ext4: the journal has too many revoke records to replay"
+        );
+    }
+
+    #[test]
+    fn paths_are_bounded_in_length_and_in_names_looked_up() {
+        let tree = vec![Node::Dir("boot", vec![Node::File("k", b"kernel")])];
+        let fs = Ext4::probe(Image::new(SMALL, tree).bytes).unwrap().unwrap();
+        // Each name looked up reads a directory: 256 are the most, however
+        // a path comes by them.
+        let looking_up = |names: usize| format!("{}boot/k", "boot/../".repeat(names - 2));
+        assert_eq!(fs.read_file(&looking_up(256)).unwrap(), b"kernel");
+        let error = fs.read_file(&looking_up(257)).unwrap_err().to_string();
+        assert!(error.ends_with("too many path components"), "{error}");
+        // And a path is 4096 bytes at most.
+        let long = |len: usize| format!("{}boot/k", "/".repeat(len - 6));
+        assert_eq!(fs.read_file(&long(4096)).unwrap(), b"kernel");
+        assert!(fs.read_file(&long(4097)).is_err());
+        assert!(fs.lookup(&long(4097)).is_err());
+    }
+
+    #[test]
+    fn a_file_over_the_callers_cap_is_refused_unread() {
+        let image = Image::new(SMALL, vec![Node::Sparse("big", 2000, b"tail")]);
+        let fs = Ext4::probe(image.bytes).unwrap().unwrap();
+        let size = 2000 * 1024 + 4;
+        assert_eq!(
+            fs.read_file_capped("/big", size).unwrap().len() as u64,
+            size
+        );
+        let error = fs.read_file_capped("/big", size - 1).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "ext4: /big is too large (2048004 bytes; at most 2048003 here)"
+        );
     }
 }

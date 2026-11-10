@@ -19,7 +19,28 @@ DEFAULT_TINYVMM = REPO / "target" / "release" / "tinyvmm.exe"
 DEFAULT_VMLINUX = REPO / "vmlinux"
 DEFAULT_BUSYBOX = REPO / "busybox-x86_64"
 DEFAULT_INITRD = REPO / "initramfs-blk.cpio.gz"
+# What the test guests print on hvc0 when they are done. tinyvmm stops on it
+# only when started with --shutdown-sentinel, which every harness passes (see
+# `sentinel_args`): the test kernel may be built without ACPI, and then cannot
+# power off.
 SENTINEL = "=== tinyvmm shutdown requested ==="
+_TAKES_SENTINEL_FLAG: dict[str, bool] = {}
+
+
+def sentinel_args(tinyvmm) -> list[str]:
+    """`--shutdown-sentinel`, if this tinyvmm takes it.
+
+    Builds from before the flag stop on the sentinel whatever they are told
+    and reject the flag as unknown; the A/B tools are run against those too.
+    A build says which it is in its usage text."""
+    exe = str(tinyvmm)
+    if exe not in _TAKES_SENTINEL_FLAG:
+        try:
+            out = subprocess.run([exe], capture_output=True, text=True, errors="replace", timeout=60)
+            _TAKES_SENTINEL_FLAG[exe] = "--shutdown-sentinel" in out.stdout + out.stderr
+        except (OSError, subprocess.SubprocessError):
+            _TAKES_SENTINEL_FLAG[exe] = False
+    return ["--shutdown-sentinel"] if _TAKES_SENTINEL_FLAG[exe] else []
 GUEST_CMDLINE = ["console=hvc0", "pci=conf1,nocrs,lastbus=0"]
 
 _K32 = ctypes.WinDLL("kernel32", use_last_error=True)
