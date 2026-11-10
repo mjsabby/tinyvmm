@@ -6,9 +6,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# Needed so the workflow can create releases/tags with the built-in GITHUB_TOKEN.
+# The built-in GITHUB_TOKEN can only read the repository in the jobs that
+# build: they run the kernel's build system, cargo build scripts and pip
+# installs. Only the `release` job, which runs none of that, may write.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   kernel:
@@ -17,6 +19,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Cache kernel and corresponding source
         id: kernel-cache
@@ -62,12 +66,14 @@ jobs:
           if-no-files-found: error
 
   build:
-    name: Build & release (windows)
+    name: Build (windows)
     needs: kernel
     runs-on: windows-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       # Install the toolchain via rustup (preinstalled on windows runners) rather
       # than a third-party toolchain action.
@@ -116,14 +122,14 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 
       - name: Run tests
         shell: pwsh
         run: |
-          cargo test --workspace --release
+          cargo test --workspace --release --locked
           if ($LASTEXITCODE -ne 0) { throw 'Workspace tests failed.' }
           python -m unittest discover -s tinyinit\tests -p test_rootfs.py
           if ($LASTEXITCODE -ne 0) { throw 'Rootfs tests failed.' }
@@ -153,13 +159,35 @@ jobs:
             out/deploy/*.pdb
           if-no-files-found: error
 
+  release:
+    name: Publish release
+    needs: [kernel, build]
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    # The one job whose token can write to the repository. It checks nothing
+    # out and builds nothing: it publishes what the jobs above uploaded.
+    permissions:
+      contents: write
+    steps:
+      - name: Download tinyvmm artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: tinyvmm-windows-x86_64
+          path: out/deploy
+
+      - name: Download kernel source
+        uses: actions/download-artifact@v4
+        with:
+          name: tinyvmm-kernel
+          path: out/kernel
+
       # Publish a GitHub Release using the gh CLI (preinstalled on runners)
       # instead of a third-party release action.
       - name: Publish GitHub Release
-        if: github.ref == 'refs/heads/main'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           $ErrorActionPreference = 'Stop'
           # `gh release delete` is expected to fail when no prior release exists;

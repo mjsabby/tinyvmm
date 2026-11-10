@@ -1,6 +1,6 @@
-# Rust build output
+# Rust build output. Cargo.lock is tracked: tinyvmm is a binary, and its
+# releases are built with --locked from the versions recorded there.
 /target
-Cargo.lock
 
 # IDE / editor
 .vs/

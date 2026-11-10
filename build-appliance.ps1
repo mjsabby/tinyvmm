@@ -13,7 +13,8 @@ try {
     New-Item -ItemType Directory -Force $out | Out-Null
     $flavors = if ($Flavor -eq 'all') { @('init', 'dotnet', 'plain') } else { @($Flavor) }
     foreach ($selected in $flavors) {
-        $buildArgs = @('build', '--release', '--no-default-features')
+        # --locked: build from the dependency versions in Cargo.lock, or fail.
+        $buildArgs = @('build', '--release', '--locked', '--no-default-features')
         $name = 'tinyvmm'
         if ($selected -ne 'plain') {
             if (-not $Kernel) { throw '-Kernel must name a PVH vmlinux for embedded builds.' }
