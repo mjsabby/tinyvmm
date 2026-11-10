@@ -176,6 +176,20 @@ const (
 	udpIdle = 60 * time.Second
 	// Relay buffer per direction (tinyvmm's NAT receives up to 256 KiB).
 	relayBuf = 256 * 1024
+	// The most guest flows relayed at once, as tinyvmm's NAT (MAX_TCP_FLOWS,
+	// MAX_UDP_FLOWS). A flow holds a host socket and its buffers for as long
+	// as the guest keeps it, and costs the guest one packet to start, so
+	// without a bound a guest pins gigabytes and tens of thousands of
+	// sockets. Past it a TCP connection is refused, and the least recently
+	// used UDP flow gives way to a new one (a resolver sends each query from
+	// a fresh port).
+	maxTCPFlows = 4096
+	maxUDPFlows = 256
+	// With more TCP flows than this open, a new one relays through small
+	// buffers, as tinyvmm's NAT gives a crowd its smallest tier: the most
+	// flows then hold a few hundred MiB of relay buffers, not gigabytes.
+	relayCrowd    = 256
+	relayBufSmall = 32 * 1024
 )
 
 // linkEP is the stack's NIC: inbound frames come from tvg_input, outbound
@@ -320,6 +334,47 @@ type natStack struct {
 	tcpRefused atomic.Uint64
 	tcpFlows   atomic.Uint64
 	udpFlows   atomic.Uint64
+
+	// TCP flows being dialed or relayed, and the UDP flows being relayed.
+	tcpLive atomic.Int64
+	udpMu   sync.Mutex
+	udpLive map[*udpFlow]struct{}
+}
+
+// A UDP flow being relayed: when it last carried a datagram, and how to end
+// it (idempotent).
+type udpFlow struct {
+	last atomic.Int64
+	stop func()
+}
+
+// trackUDP lists f among the live UDP flows, first ending the least recently
+// used one if there are maxUDPFlows already.
+func (n *natStack) trackUDP(f *udpFlow) {
+	var victim *udpFlow
+	n.udpMu.Lock()
+	if n.udpLive == nil {
+		n.udpLive = make(map[*udpFlow]struct{})
+	}
+	if len(n.udpLive) >= maxUDPFlows {
+		for live := range n.udpLive {
+			if victim == nil || live.last.Load() < victim.last.Load() {
+				victim = live
+			}
+		}
+		delete(n.udpLive, victim)
+	}
+	n.udpLive[f] = struct{}{}
+	n.udpMu.Unlock()
+	if victim != nil {
+		victim.stop()
+	}
+}
+
+func (n *natStack) untrackUDP(f *udpFlow) {
+	n.udpMu.Lock()
+	delete(n.udpLive, f)
+	n.udpMu.Unlock()
 }
 
 // hostAddr is where a guest connection to ip:port goes on the host: the
@@ -333,6 +388,14 @@ func (n *natStack) hostAddr(ip tcpip.Address, port uint16) string {
 }
 
 func (n *natStack) forwardTCP(r *tcp.ForwarderRequest) {
+	// This goroutine lasts as long as the flow does.
+	if n.tcpLive.Add(1) > maxTCPFlows {
+		n.tcpLive.Add(-1)
+		n.tcpRefused.Add(1)
+		r.Complete(true)
+		return
+	}
+	defer n.tcpLive.Add(-1)
 	id := r.ID()
 	addr := n.hostAddr(id.LocalAddress, id.LocalPort)
 	name := fmt.Sprintf("%v:%d -> %s", id.RemoteAddress, id.RemotePort, addr)
@@ -363,7 +426,11 @@ func (n *natStack) forwardTCP(r *tcp.ForwarderRequest) {
 	markStage(name, "relay")
 	debugf("tcp ready %s (dial %v)", name, time.Since(t0))
 	n.tcpFlows.Add(1)
-	relayTCP(name, gonet.NewTCPConn(&wq, ep), ep, host.(*net.TCPConn))
+	bufs := &relayBufs
+	if n.tcpLive.Load() > relayCrowd {
+		bufs = &relayBufsSmall
+	}
+	relayTCP(name, gonet.NewTCPConn(&wq, ep), ep, host.(*net.TCPConn), bufs)
 	markStage(name, "")
 }
 
@@ -372,17 +439,18 @@ type readerOnly struct{ io.Reader }
 type writerOnly struct{ io.Writer }
 
 var relayBufs = sync.Pool{New: func() any { b := make([]byte, relayBuf); return &b }}
+var relayBufsSmall = sync.Pool{New: func() any { b := make([]byte, relayBufSmall); return &b }}
 
 // relayTCP copies both ways until both are done. A clean EOF is passed on as
 // a half-close; an error resets the other side, so a cut-off stream never
 // looks complete.
-func relayTCP(name string, guest *gonet.TCPConn, gep tcpip.Endpoint, host *net.TCPConn) {
+func relayTCP(name string, guest *gonet.TCPConn, gep tcpip.Endpoint, host *net.TCPConn, bufs *sync.Pool) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		bp := relayBufs.Get().(*[]byte)
-		defer relayBufs.Put(bp)
+		bp := bufs.Get().(*[]byte)
+		defer bufs.Put(bp)
 		n, err := io.CopyBuffer(writerOnly{guest}, readerOnly{host}, *bp)
 		debugf("tcp %s: %d B to the guest, %v", name, n, err)
 		if err != nil {
@@ -393,8 +461,8 @@ func relayTCP(name string, guest *gonet.TCPConn, gep tcpip.Endpoint, host *net.T
 	}()
 	go func() {
 		defer wg.Done()
-		bp := relayBufs.Get().(*[]byte)
-		defer relayBufs.Put(bp)
+		bp := bufs.Get().(*[]byte)
+		defer bufs.Put(bp)
 		n, err := io.CopyBuffer(writerOnly{host}, readerOnly{guest}, *bp)
 		debugf("tcp %s: %d B to the host, %v", name, n, err)
 		if err != nil {
@@ -423,13 +491,22 @@ func (n *natStack) forwardUDP(r *udp.ForwarderRequest) bool {
 		return true
 	}
 	n.udpFlows.Add(1)
-	go relayUDP(guest, host)
+	f := &udpFlow{}
+	var once sync.Once
+	f.stop = func() {
+		once.Do(func() {
+			guest.Close()
+			host.Close()
+			n.untrackUDP(f)
+		})
+	}
+	f.last.Store(time.Now().UnixNano())
+	n.trackUDP(f)
+	go relayUDP(guest, host, f)
 	return true
 }
 
-func relayUDP(guest *gonet.UDPConn, host net.Conn) {
-	var once sync.Once
-	stop := func() { once.Do(func() { guest.Close(); host.Close() }) }
+func relayUDP(guest *gonet.UDPConn, host net.Conn, f *udpFlow) {
 	go func() {
 		b := make([]byte, 65536)
 		for {
@@ -438,9 +515,10 @@ func relayUDP(guest *gonet.UDPConn, host net.Conn) {
 			if err != nil {
 				break
 			}
+			f.last.Store(time.Now().UnixNano())
 			guest.Write(b[:k])
 		}
-		stop()
+		f.stop()
 	}()
 	b := make([]byte, 65536)
 	for {
@@ -449,9 +527,10 @@ func relayUDP(guest *gonet.UDPConn, host net.Conn) {
 		if err != nil {
 			break
 		}
+		f.last.Store(time.Now().UnixNano())
 		host.Write(b[:k])
 	}
-	stop()
+	f.stop()
 }
 
 // dialGuest opens a TCP connection from the gateway to the guest, keeping
@@ -502,7 +581,7 @@ func (n *natStack) serveForward(l net.Listener, guest tcpip.FullAddress) {
 				return
 			}
 			n.tcpFlows.Add(1)
-			relayTCP(fmt.Sprintf("%v -> guest port %d", c.RemoteAddr(), guest.Port), g, gep, c.(*net.TCPConn))
+			relayTCP(fmt.Sprintf("%v -> guest port %d", c.RemoteAddr(), guest.Port), g, gep, c.(*net.TCPConn), &relayBufs)
 		}()
 	}
 }
