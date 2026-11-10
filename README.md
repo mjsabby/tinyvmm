@@ -777,17 +777,25 @@ including the audio track.
   completions per `GetQueuedCompletionStatusEx` and interrupts the guest once
   for the TCP and UDP frames a batch delivered (sooner if 8 are waiting); ARP
   and ICMP replies interrupt right away. While its connections move data, a
-  worker waits at most 25 ms for completions and sweeps its flows' TCP timers
-  (retransmission, tail-loss probe, delayed ACK) at most every 20 ms. Once a
-  whole wait brings no work, no flow is paused on the guest's RX backlog and
-  no TCP timer is due within a second, it waits for its earliest timer instead
-  (tcp-sans-io's `next_deadline`, smoltcp's `poll_at`): about once a second,
-  for the idle sweep, while it holds any flow, and not at all while it holds
-  none. Any completion puts it back on the 20 ms cadence, so connections that
-  move data keep their timers exactly as before. With the guest idle, the
-  four workers used to wake about 135 times a second between them; now they
-  don't wake with no connection open, and about 4 times a second with 8 idle
-  ones (`net_compare.py --idle`). A UDP flow keeps one overlapped
+  worker waits at most 25 ms for completions, sweeps its flows' TCP timers
+  (retransmission, tail-loss probe, delayed ACK) at most every 20 ms and runs
+  its idle sweep (watchdogs, UDP expiry, freeing idle buffers) every second.
+  Once a whole wait brings no work, no flow is paused on the guest's RX
+  backlog and no TCP timer is due within a second, it waits instead for its
+  earliest timer (tcp-sans-io's `next_deadline`, smoltcp's `poll_at`) or the
+  idle sweep's next job on a TCP flow (a watchdog, an emptied buffer to free),
+  and indefinitely with neither. Those jobs, and timers ten seconds or more
+  away (keepalive, TIME_WAIT), wait for the next whole second of a clock the
+  workers share, so their wakeups coalesce. UDP entries and fragments don't
+  wake the worker, as in OpenVMM's `consomme`: an expired one waits for the
+  next sweep, and meanwhile a host datagram for a UDP entry idle over a minute
+  ends it undelivered, the guest's own datagram refreshes it, and a late
+  fragment starts a new datagram. Any completion puts the worker back on the
+  20 ms cadence, so connections that move data keep their timers exactly as
+  before. With the guest idle, the four workers used to wake about 135 times
+  a second between them; now they don't wake with no connection open, and
+  almost never with 8 idle ones (`net_compare.py --idle`).
+  A UDP flow keeps one overlapped
   receive posted on a socket set to skip the IOCP for receives that complete
   at once, so after a completion it takes the datagrams already queued inline,
   up to 32 per pass, instead of one completion and worker wake each (one per
@@ -981,7 +989,7 @@ VMM's threads wake while the guest sits idle. Measured as above, against
 OpenVMM's `consomme` (`--vmm openvmm-pcie`, OpenVMM `3536f22c`), with one
 kernel for both VMMs (the harness configuration plus iptables' raw table and
 `statistic` match), 16 MiB transfers, means over six boots for `nat` and
-three for the others (two each for the idle row):
+three for the others (medians of three boots for the idle row):
 
 | | `nat` | `smoltcp` | OpenVMM `consomme` |
 |---|---|---|---|
@@ -989,7 +997,7 @@ three for the others (two each for the idle row):
 | download, 2 streams, at 2% loss (Gbps) | 1.90 | 0.010 | 0.039 |
 | connect + request + response at 2% loss: txn/s; per request p99 / max (ms) | 62; 0.9 / 223 | 21; 1025 / 3025 | 25; 1008 / 1015 |
 | at 5% loss | 0.07 Gbps one stream, 19 txn/s | — | didn't finish in 15 min |
-| VMM wakeups/s with the guest idle: no connection / 8 idle ones | 13 / 16 | 13 / 20 | 13 / 11 |
+| VMM wakeups/s with the guest idle: 8 idle connections / after they closed | 9.4 / 8.8 | 9.9 / 10.0 | 7.5 / 6.7 |
 
 `tcp-sans-io` recovers with SACK, RACK and tail-loss probes, and its minimum
 RTO is 200 ms, so a lost segment usually costs a round trip or a probe rather
@@ -1002,9 +1010,10 @@ a second (the guest or the NAT retransmits after 1 s), which is what holds
 the connection rate down at every loss rate. Idle, all of them sleep until
 their next timer: `consomme` arms one timer for its connections' earliest
 deadline (`PolledTimer::poll_until`) and checks UDP expiry when it next
-wakes, while tinyvmm's NAT also wakes each worker that holds flows once a
-second for its idle sweep (UDP expiry, TCP watchdogs, freeing idle buffers).
-What remains of either VMM's wakeups is mostly the guest's own timer.
+wakes, and tinyvmm's NAT wakes only for its TCP flows' timers and watchdogs,
+on whole seconds for those far off, and leaves UDP and fragment expiry to the
+next traffic too. What remains of either VMM's wakeups is mostly the guest's
+own timer.
 
 ### Doorbells — the "notify without a VM exit" path
 
