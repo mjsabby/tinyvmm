@@ -114,7 +114,7 @@ def main() -> int:
     for n in [int(x) for x in args.vcpus.split(",") if x.strip()]:
         print(f"\n========== irq test: --vcpus {n} ==========")
         make_vhdx(scratch, SCRATCH_BYTES, args.tinyvmm)
-        argv = [str(args.tinyvmm), "--pvh-run", "--vcpus", str(n), "--ram-mb", "256",
+        argv = [str(args.tinyvmm), "--pvh-run", *vh.sentinel_args(args.tinyvmm), "--vcpus", str(n), "--ram-mb", "256",
                 *args.extra_arg,
                 "--drive", str(scratch), "--initrd", str(args.initrd), str(args.vmlinux),
                 "--", "tinyvmm.test=irq", *vh.GUEST_CMDLINE]
